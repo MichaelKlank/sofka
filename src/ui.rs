@@ -547,90 +547,70 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let sort_col = app.sort_column;
     let sort_arrow = if app.sort_desc { " ↓" } else { " ↑" };
     // Offset from a displayed column index back to the view spec's (the spec
-    // doesn't know about the prepended PF indicator, NAMESPACE, or appended
-    // CPU/MEM). The PF column is always at index 0, injected at render time.
-    let pf_off = 1;
+    // doesn't know about the prepended NAMESPACE or appended CPU/MEM).
     let ns_off = usize::from(show_ns);
-    // Horizontal column scroll: everything after the anchored PF/NAMESPACE/NAME
+    // Horizontal column scroll: everything after the anchored NAMESPACE/NAME
     // prefix can be shifted off the left edge with ←/→. Clamped here (not
     // only in the key handler) because the header set can change underneath
     // the offset (wide toggle, printer columns arriving).
-    let name_col = pf_off + ns_off;
-    let total_cols = headers.len() + pf_off; // headers doesn't include PF column
-    let scrollable_cols = total_cols.saturating_sub(name_col + 1);
+    let name_col = if show_ns { 1 } else { 0 };
+    let scrollable_cols = headers.len().saturating_sub(name_col + 1);
     app.col_offset = app.col_offset.min(scrollable_cols.saturating_sub(1));
     let col_offset = app.col_offset;
     let col_visible = move |i: usize| i <= name_col || i >= name_col + 1 + col_offset;
     // Per-column custom alignment, precomputed so cells don't re-borrow app.
-    // PF column (index 0) has no alignment; view-spec indices start after PF+NS.
-    let aligns: Vec<Option<Alignment>> = (0..total_cols)
+    let aligns: Vec<Option<Alignment>> = (0..headers.len())
         .map(|i| {
-            i.checked_sub(pf_off + ns_off)
+            i.checked_sub(ns_off)
                 .and_then(|si| app.view_spec().align_at(si))
                 .map(cell_alignment)
         })
         .collect();
     let align_of = |i: usize| aligns.get(i).copied().flatten();
 
-    let header_row = Row::new({
-        let mut hdr: Vec<Cell> = Vec::with_capacity(total_cols);
-        // PF indicator column: empty header (no title).
-        if col_visible(0) {
-            hdr.push(Cell::from(""));
-        }
-        hdr.extend(
-            headers
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| col_visible(i + pf_off))
-                .map(|(i, h)| {
-                    let disp_i = i + pf_off;
-                    // Active sort column gets a direction arrow in the sorter color
-                    // (sky, bold), matching k9s; the label inherits the header color.
-                    if Some(i) == sort_col {
-                        let mut line = Line::from(vec![
-                            Span::raw(h.clone()),
-                            Span::styled(
-                                sort_arrow,
-                                Style::default()
-                                    .fg(theme::sorter())
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ]);
-                        if let Some(a) = align_of(disp_i) {
-                            line = line.alignment(a);
-                        }
-                        Cell::from(line)
-                    } else {
-                        match align_of(disp_i) {
-                            Some(a) => Cell::from(Text::from(h.clone()).alignment(a)),
-                            None => Cell::from(h.clone()),
-                        }
+    let header_row = Row::new(
+        headers
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| col_visible(*i))
+            .map(|(i, h)| {
+                // Active sort column gets a direction arrow in the sorter color
+                // (sky, bold), matching k9s; the label inherits the header color.
+                if Some(i) == sort_col {
+                    let mut line = Line::from(vec![
+                        Span::raw(h.clone()),
+                        Span::styled(
+                            sort_arrow,
+                            Style::default()
+                                .fg(theme::sorter())
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]);
+                    if let Some(a) = align_of(i) {
+                        line = line.alignment(a);
                     }
-                }),
-        );
-        hdr
-    })
+                    Cell::from(line)
+                } else {
+                    match align_of(i) {
+                        Some(a) => Cell::from(Text::from(h.clone()).alignment(a)),
+                        None => Cell::from(h.clone()),
+                    }
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
     .style(theme::header_row());
 
     // Column indices (fixed for the whole table) for the columns that get
     // their own visibility treatment below, computed once rather than
-    // string-compared per cell. These are indices into `display_headers()`
-    // (no PF column); shifted by `pf_off` to match the cells vector which
-    // has the PF column at index 0.
-    let age_idx = headers.iter().position(|h| h == "AGE").map(|i| i + pf_off);
-    let ready_idx = headers
-        .iter()
-        .position(|h| h == "READY")
-        .map(|i| i + pf_off);
-    let restarts_idx = headers
-        .iter()
-        .position(|h| h == "RESTARTS")
-        .map(|i| i + pf_off);
-    let cpu_idx = headers.iter().position(|h| h == "CPU").map(|i| i + pf_off);
-    let mem_idx = headers.iter().position(|h| h == "MEM").map(|i| i + pf_off);
-    let pct_cpu_idx = headers.iter().position(|h| h == "%CPU").map(|i| i + pf_off);
-    let pct_mem_idx = headers.iter().position(|h| h == "%MEM").map(|i| i + pf_off);
+    // string-compared per cell.
+    let age_idx = headers.iter().position(|h| h == "AGE");
+    let ready_idx = headers.iter().position(|h| h == "READY");
+    let restarts_idx = headers.iter().position(|h| h == "RESTARTS");
+    let cpu_idx = headers.iter().position(|h| h == "CPU");
+    let mem_idx = headers.iter().position(|h| h == "MEM");
+    let pct_cpu_idx = headers.iter().position(|h| h == "%CPU");
+    let pct_mem_idx = headers.iter().position(|h| h == "%MEM");
 
     let count = app.row_count();
     let visible_rows = area.height.saturating_sub(3).max(1) as usize;
@@ -663,13 +643,15 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Widest visible value per display column (headers count too, plus the
     // sort arrow on the active sort column). Drives the content-aware widths
-    // below so a narrow window trims padding, not data (#166). The PF column
-    // (index 0) is prepended with a fixed width of 1.
-    let mut needed: Vec<u16> = vec![1]; // PF indicator: "●" or empty = 1 char
-    needed.extend(headers.iter().enumerate().map(|(i, h)| {
-        let arrow = if Some(i) == sort_col { 2 } else { 0 };
-        cell_width(h) + arrow
-    }));
+    // below so a narrow window trims padding, not data (#166).
+    let mut needed: Vec<u16> = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let arrow = if Some(i) == sort_col { 2 } else { 0 };
+            cell_width(h) + arrow
+        })
+        .collect();
 
     let rows: Vec<Row> = visible_objects
         .iter()
@@ -679,23 +661,13 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
             let (base_cells, status_idx) = cell_cache
                 .get(&row_key)
                 .expect("visible rows are warmed in the table cell cache");
-            // All display-indices from the cell cache are relative to
-            // `display_headers()` (no PF column); shift by `pf_off` to match
-            // the cells vector which has PF at index 0. NAMESPACE (if shown)
-            // is inserted before the spec cells, adding one more offset.
-            let offset = pf_off + usize::from(show_ns);
-            let style_idx = status_idx.map(|i| i + offset);
-            let mut cells = Vec::with_capacity(total_cols);
-            // Port-forward indicator column (no header): teal ● or empty.
-            let ns = obj.metadata.namespace.as_deref().unwrap_or_default();
-            let name = obj.metadata.name.as_deref().unwrap_or_default();
-            cells.push(TableCellText::Owned(if app.has_port_forward(ns, name) {
-                "●".into()
-            } else {
-                String::new()
-            }));
+            let mut style_idx = status_idx;
+            let mut cells = Vec::with_capacity(headers.len());
             if show_ns {
-                cells.push(TableCellText::Borrowed(ns));
+                cells.push(TableCellText::Borrowed(
+                    obj.metadata.namespace.as_deref().unwrap_or_default(),
+                ));
+                style_idx = status_idx.map(|i| i + 1);
             }
             for (i, cell) in base_cells.iter().enumerate() {
                 if let Some(value) = spec.volatile(obj, &app.kind_plural, i) {
@@ -777,15 +749,13 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                                 .fg(theme::mark())
                                 .add_modifier(Modifier::BOLD),
                         )
-                    } else if i == 0 {
-                        // Port-forward indicator: teal ● or empty.
-                        c.into_cell_aligned(align)
-                            .style(Style::default().fg(theme::teal()))
                     } else if Some(i) == style_idx {
                         c.into_cell_aligned(align)
                             .style(Style::default().fg(status_badge))
                     } else if i == name_col {
-                        render_name_cell(app, c.as_str(), row_color)
+                        let ns = obj.metadata.namespace.as_deref().unwrap_or_default();
+                        let fwd = app.has_port_forward(ns, c.as_str(), &app.kind_plural);
+                        render_name_cell(app, c.as_str(), row_color, fwd)
                     } else if Some(i) == age_idx {
                         c.into_cell_aligned(align).style(theme::dim())
                     } else if Some(i) == restarts_idx {
@@ -829,15 +799,11 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     // `distribute_column_widths` splits the frame. A `Fill`-style layout is
     // deliberately avoided — it hands NAME padding it doesn't need while a
     // long EXTERNAL-IP next to it gets silently trimmed.
-    let col_rules: Vec<(ColWidth, u16)> = {
-        let mut rules: Vec<(ColWidth, u16)> = Vec::new();
-        // PF indicator column (always visible, fixed 1 char).
-        rules.push((ColWidth::Exact(1), needed[0]));
-        for (i, h) in headers.iter().enumerate() {
-            let disp_i = i + pf_off;
-            if !col_visible(disp_i) {
-                continue;
-            }
+    let col_rules: Vec<(ColWidth, u16)> = headers
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| col_visible(*i))
+        .map(|(i, h)| {
             // A custom column's configured width wins over the curated rules.
             let rule = if let Some(w) = i
                 .checked_sub(ns_off)
@@ -878,10 +844,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                     _ => ColWidth::Flex(1),
                 }
             };
-            rules.push((rule, needed[disp_i]));
-        }
-        rules
-    };
+            (rule, needed[i])
+        })
+        .collect();
     // Mirror the Table widget's fixed overhead: borders, the always-reserved
     // 2-cell highlight symbol, and the 2-cell spacing between columns.
     let ncols = col_rules.len() as u16;
@@ -967,15 +932,8 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
             inner.x.saturating_add(inner.width),
             rects
                 .iter()
-                .zip((0..total_cols).filter(|&i| col_visible(i)))
-                .filter_map(|(r, i)| {
-                    // Skip the PF indicator column — it has no sortable header.
-                    if i >= pf_off {
-                        Some((r.x, r.x + r.width, i - pf_off))
-                    } else {
-                        None
-                    }
-                })
+                .zip((0..headers.len()).filter(|&i| col_visible(i)))
+                .map(|(r, i)| (r.x, r.x + r.width, i))
                 .collect(),
         );
     }
@@ -1112,9 +1070,17 @@ fn all_ready(ready: &str) -> bool {
 /// fuzzy row filter (bold yellow) so a scan across many filtered results is
 /// faster — every visible row already matched, this just shows *where*.
 /// Falls back to a flat `base`-colored cell when there's no active filter.
-fn render_name_cell(app: &App, name: &str, base: Color) -> Cell<'static> {
+fn render_name_cell(app: &App, name: &str, base: Color, forwarded: bool) -> Cell<'static> {
+    // A teal ● prepended when a port-forward is active for this row.
+    let marker = if forwarded {
+        vec![Span::styled("● ", Style::default().fg(theme::teal()))]
+    } else {
+        Vec::new()
+    };
     let Some(matched) = app.filter_match_indices(name).filter(|idx| !idx.is_empty()) else {
-        return Cell::from(name.to_string()).style(Style::default().fg(base));
+        let mut spans = marker;
+        spans.push(Span::styled(name.to_string(), Style::default().fg(base)));
+        return Cell::from(Line::from(spans));
     };
     let matched: std::collections::HashSet<usize> = matched.into_iter().collect();
     let plain = Style::default().fg(base);
@@ -1122,7 +1088,7 @@ fn render_name_cell(app: &App, name: &str, base: Color) -> Cell<'static> {
         .fg(theme::yellow())
         .add_modifier(Modifier::BOLD);
 
-    let mut spans = Vec::new();
+    let mut spans = marker;
     let mut run = String::new();
     let mut run_matched = false;
     for (i, ch) in name.chars().enumerate() {

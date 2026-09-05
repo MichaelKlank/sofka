@@ -1,3 +1,4 @@
+use super::actions::forward_target;
 use super::*;
 
 impl App {
@@ -255,11 +256,7 @@ impl App {
                         if input.is_empty() {
                             self.flash_warn("no ports given");
                         } else {
-                            let target = if self.kind_plural == "services" {
-                                format!("svc/{name}")
-                            } else {
-                                name
-                            };
+                            let target = forward_target(&self.kind_plural, &name);
                             self.start_port_forward(ns, target, input);
                         }
                     }
@@ -382,13 +379,8 @@ impl App {
                     self.prompt_kind = Some(PromptKind::PortForward { ns, name });
                     self.mode = Mode::Prompt;
                 } else {
-                    // Extract the "LOCAL:REMOTE" portion before any "  (name)" suffix.
                     let ports = item.split_whitespace().next().unwrap_or(&item).to_string();
-                    let target = if self.kind_plural == "services" {
-                        format!("svc/{name}")
-                    } else {
-                        name
-                    };
+                    let target = forward_target(&self.kind_plural, &name);
                     self.start_port_forward(ns, target, ports);
                     self.mode = Mode::Table;
                 }

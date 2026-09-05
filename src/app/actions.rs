@@ -1238,18 +1238,18 @@ impl App {
     }
 
     /// Whether any live port-forward targets the given `(namespace, name)` on
-    /// the current cluster. Used by the table renderer to mark forwarded rows.
-    /// Matched by both context name and cluster URL so neither a context name
-    /// remap nor same-server-different-credentials causes a false marker.
-    /// The forward target may be prefixed with `svc/` for services.
-    pub fn has_port_forward(&self, ns: &str, name: &str) -> bool {
+    /// the current cluster and resource kind. Used by the table renderer to
+    /// mark forwarded rows. Matched by both context name and cluster URL so
+    /// neither a context name remap nor same-server-different-credentials
+    /// causes a false marker. The `kind_plural` distinguishes `svc/web` from
+    /// `pod/web` so a forward on a service doesn't mark a pod with the same
+    /// name and vice-versa.
+    pub fn has_port_forward(&self, ns: &str, name: &str, kind_plural: &str) -> bool {
         let ctx = &self.cluster.context;
         let url = &self.cluster.cluster_url;
+        let target = forward_target(kind_plural, name);
         self.port_forwards.iter().any(|pf| {
-            pf.context == *ctx
-                && pf.cluster_url == *url
-                && pf.ns == ns
-                && pf.target.strip_prefix("svc/").unwrap_or(&pf.target) == name
+            pf.context == *ctx && pf.cluster_url == *url && pf.ns == ns && pf.target == target
         })
     }
 
@@ -2622,13 +2622,26 @@ impl App {
     }
 }
 
+/// Build the `kubectl port-forward` target string for a resource kind.
+/// Services use `svc/name`; pods use the bare name (kubectl accepts it
+/// directly); all other kinds use `kind/name` via the short-name lookup.
+pub(super) fn forward_target(kind_plural: &str, name: &str) -> String {
+    match kind_plural {
+        "pods" => name.to_string(),
+        "services" => format!("svc/{name}"),
+        other => format!("{}/{name}", other.trim_end_matches('s')),
+    }
+}
+
 /// Collect declared ports from a Service manifest as `"port:port  (name)"` labels.
+/// Only TCP ports are included — `kubectl port-forward` doesn't support UDP/SCTP.
 fn service_port_labels(data: &Value) -> Vec<String> {
     let Some(ports) = data.pointer("/spec/ports").and_then(Value::as_array) else {
         return Vec::new();
     };
     ports
         .iter()
+        .filter(|p| is_tcp(p, "protocol"))
         .filter_map(|p| {
             let port = p.get("port")?.as_i64()?;
             let name = p.get("name").and_then(Value::as_str).unwrap_or("");
@@ -2640,7 +2653,8 @@ fn service_port_labels(data: &Value) -> Vec<String> {
 /// Collect declared container ports from a Pod manifest as
 /// `"port:port  (container/portname)"` labels. Scans regular, init, and
 /// ephemeral containers. Init containers that have already terminated are
-/// skipped — their ports are no longer listening.
+/// skipped — their ports are no longer listening. Only TCP ports are
+/// included — `kubectl port-forward` doesn't support UDP/SCTP.
 fn pod_port_labels(data: &Value) -> Vec<String> {
     let mut out = Vec::new();
     for (path, is_init) in [
@@ -2653,8 +2667,6 @@ fn pod_port_labels(data: &Value) -> Vec<String> {
         };
         for c in containers {
             let cname = c.get("name").and_then(Value::as_str).unwrap_or("");
-            // Skip init containers that have already terminated — nothing is
-            // listening on their ports.
             if is_init && container_terminated(data, "/status/initContainerStatuses", cname) {
                 continue;
             }
@@ -2662,6 +2674,9 @@ fn pod_port_labels(data: &Value) -> Vec<String> {
                 continue;
             };
             for p in ports {
+                if !is_tcp(p, "protocol") {
+                    continue;
+                }
                 let Some(port) = p.get("containerPort").and_then(Value::as_i64) else {
                     continue;
                 };
@@ -2671,6 +2686,15 @@ fn pod_port_labels(data: &Value) -> Vec<String> {
         }
     }
     out
+}
+
+/// Whether a port entry is TCP. Absent protocol defaults to TCP (the API
+/// default), so only explicit non-TCP values are excluded.
+fn is_tcp(port: &Value, key: &str) -> bool {
+    match port.get(key).and_then(Value::as_str) {
+        Some(proto) => proto == "TCP",
+        None => true,
+    }
 }
 
 /// Whether the named container in `status_path` has a `terminated` state.
