@@ -2623,14 +2623,15 @@ impl App {
 }
 
 /// Build the `kubectl port-forward` target string for a resource kind.
-/// Services use `svc/name`; pods use the bare name (kubectl accepts it
-/// directly); all other kinds use `kind/name` via the short-name lookup.
+/// Uses kubectl's documented short-name syntax: `pod/name`, `svc/name`,
+/// `deploy/name`, etc. Saved forwards use the same spelling.
 pub(super) fn forward_target(kind_plural: &str, name: &str) -> String {
-    match kind_plural {
-        "pods" => name.to_string(),
-        "services" => format!("svc/{name}"),
-        other => format!("{}/{name}", other.trim_end_matches('s')),
-    }
+    let prefix = match kind_plural {
+        "pods" => "pod",
+        "services" => "svc",
+        other => other.trim_end_matches('s'),
+    };
+    format!("{prefix}/{name}")
 }
 
 /// Collect declared ports from a Service manifest as `"port:port  (name)"` labels.
@@ -2652,22 +2653,30 @@ fn service_port_labels(data: &Value) -> Vec<String> {
 
 /// Collect declared container ports from a Pod manifest as
 /// `"port:port  (container/portname)"` labels. Scans regular, init, and
-/// ephemeral containers. Init containers that have already terminated are
-/// skipped — their ports are no longer listening. Only TCP ports are
-/// included — `kubectl port-forward` doesn't support UDP/SCTP.
+/// ephemeral containers. Init and ephemeral containers that have already
+/// terminated are skipped — their ports are no longer listening. Only TCP
+/// ports are included — `kubectl port-forward` doesn't support UDP/SCTP.
 fn pod_port_labels(data: &Value) -> Vec<String> {
     let mut out = Vec::new();
-    for (path, is_init) in [
-        ("/spec/containers", false),
-        ("/spec/initContainers", true),
-        ("/spec/ephemeralContainers", false),
+    for (path, status_path) in [
+        ("/spec/containers", None),
+        (
+            "/spec/initContainers",
+            Some("/status/initContainerStatuses"),
+        ),
+        (
+            "/spec/ephemeralContainers",
+            Some("/status/ephemeralContainerStatuses"),
+        ),
     ] {
         let Some(containers) = data.pointer(path).and_then(Value::as_array) else {
             continue;
         };
         for c in containers {
             let cname = c.get("name").and_then(Value::as_str).unwrap_or("");
-            if is_init && container_terminated(data, "/status/initContainerStatuses", cname) {
+            if let Some(sp) = status_path
+                && container_terminated(data, sp, cname)
+            {
                 continue;
             }
             let Some(ports) = c.pointer("/ports").and_then(Value::as_array) else {
