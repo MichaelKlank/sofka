@@ -168,6 +168,9 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   container) - download from or upload to a pod via `kubectl cp`, off-thread
   with a completion flash. Uploads are gated by the `transfer` guardrail and
   read-only mode.
+- **PVC explore** (`x` on a PVC, or `:pvc-explore`) - a two-pane browser over a
+  volume's contents, with `s` for a shell inside it. See
+  [PVC explore](#pvc-explore).
 - **Ephemeral debug containers** and **node debug pods** (`:debug`). See
   [Debug containers and pods](debugging.md#debug-containers-and-pods).
 - **Logs** (`l`) - per-container on a pod, or aggregated across all matching
@@ -196,6 +199,89 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   `kubectl apply`s - sofka diffs against the previous revision this session's
   watch saw, so "what just changed?" has an answer. The last revision of up to
   256 changed objects is kept in memory.
+
+## PVC explore
+
+A PersistentVolumeClaim has no API that returns its contents: the only way to
+see what is on a volume is from inside a pod that mounts it. `x` on a PVC row
+(or `:pvc-explore`) does that for you and puts the result on screen as a
+two-pane file browser - your local filesystem on the left, the volume on the
+right - so a download or an upload is one keystroke rather than a hand-written
+`kubectl cp` path.
+
+- **It uses a pod that is already there.** sofka looks for a running pod in the
+  claim's namespace that mounts it, preferring one with a writable mount, and
+  execs into that container at its `mountPath`. Nothing is created, so this
+  works in read-only mode.
+- **Otherwise it offers a helper pod.** When nothing mounts the claim - the
+  common case for a volume you are trying to inspect *because* its workload is
+  scaled to zero - sofka asks before creating a short-lived pod that mounts it
+  at `/pvc`. That is a write: it is blocked in read-only mode, matches the
+  `pvc-explore` guardrail action, and always confirms, naming the image and the
+  namespace. The helper carries both a `sleep` and `activeDeadlineSeconds`, so
+  it expires on its own even if sofka never gets to delete it, and closing the
+  browser - or quitting sofka - deletes it immediately. `:pvc-clean` removes
+  any a crashed session left behind: it sweeps the current namespace, or every
+  namespace when the view is across all of them, matching on both the name
+  prefix and the label sofka sets, and skipping the pod your own open browser
+  is using. It cannot tell a leftover from a pod *another* session is browsing
+  through right now, so the confirmation says so. Deleting pods is a mutation
+  like any other: blocked in read-only mode, matched by the `pvc-explore`
+  guardrail, recorded in `:journal`.
+- **Navigation is confined to the mount.** `⌫` stops at the mount point, and
+  every listing verifies with `pwd -P` that it actually landed inside the
+  volume - so a symlink on the volume pointing at `/` is refused rather than
+  quietly dropping you into the serving pod's root. sofka also treats the
+  volume's contents as untrusted: GNU `ls` writes file names into a pipe
+  unescaped, so a file whose name contains a newline can inject what looks
+  like an extra row, and a symlink target can carry an absolute path. Such a
+  row may still appear as a phantom entry - there is no way to tell it from a
+  real one - but it is contained: entries naming `.`, `..`, or anything
+  containing `/` are discarded, so a forged row can reach neither outside the
+  mount nor outside the directory a download lands in. busybox `ls` - the
+  default helper image - substitutes `?` for control characters instead, so
+  there is nothing to forge; such a name lists looking ordinary and fails when
+  you open or copy it.
+- **`c` copies from the focused pane into the other one** - out of the volume
+  when the right pane has the cursor, into it when the left one does. Uploads go
+  through `kubectl cp`, are blocked in read-only mode, match the `pvc-upload`
+  guardrail action, and are refused up front when the mount is `readOnly`. A
+  download that would overwrite a local file confirms first. `kubectl cp`
+  splits its arguments on the first `:`, so a name containing one is refused
+  with an explanation rather than a `filespec must match the canonical format`
+  from kubectl.
+- **`s` opens a shell** at the directory the remote pane is showing (or at the
+  mount point, from the PVC row directly). The exec lands in a real pod, so it
+  passes the same `shell` guardrail as `s` on that pod's row - a rule that
+  denies shells in prod is not defeated by reaching the pod through a claim it
+  mounts, and a denied shell is refused before a helper pod is created rather
+  than after.
+
+Listings are read with `ls -A -l` over `kubectl exec`, so the pod's image needs
+a shell and `ls`; transfers additionally need `tar`, as `kubectl cp` always
+does. An entry `ls` cannot stat still appears, with an unknown size and a
+warning, rather than blanking the whole directory. The helper-pod image and
+lifetime are configurable:
+
+```toml
+[pvc_explore]
+image = "busybox:1.37"   # helper-pod image
+ttl = "30m"              # how long it lives before deleting itself
+```
+
+Only a `Bound` filesystem claim can be browsed: an unbound one has no volume
+behind it, and a `volumeMode: Block` one has no filesystem. A listing is a
+point-in-time read, not a watch: `r` re-reads both panes. Both panes cap one
+directory at 5,000 entries - on the volume side by `head` inside the pod, so a
+spool directory is never streamed out in full. An entry nothing could stat
+still lists, with `?` for its size.
+
+The helper pod runs as whatever user its image defaults to, because reading a
+volume's contents generally needs root. It drops all capabilities and sets
+`allowPrivilegeEscalation: false` and `seccompProfile: RuntimeDefault`, which
+satisfies the `baseline` Pod Security Standard - but not `restricted`, which
+also requires `runAsNonRoot`. In a namespace enforcing `restricted` the helper
+pod is rejected; browse through a pod that already mounts the claim instead.
 
 ## Safety
 

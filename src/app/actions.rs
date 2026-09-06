@@ -2,7 +2,7 @@ use super::*;
 
 /// Interactive-shell entrypoint for `exec`/`debug`: prefer bash when the image
 /// ships it, otherwise fall back to sh, in a single `sh -c` invocation.
-const SHELL_FALLBACK: &str = "command -v bash >/dev/null 2>&1 && exec bash || exec sh";
+pub(super) const SHELL_FALLBACK: &str = "command -v bash >/dev/null 2>&1 && exec bash || exec sh";
 
 impl App {
     // ----- actions -------------------------------------------------------
@@ -1431,6 +1431,7 @@ impl App {
         self.guardrails = resolved.config.guardrails;
         self.debug = resolved.config.debug;
         self.bundle_cfg = resolved.config.bundle;
+        self.pvc_cfg = resolved.config.pvc_explore;
         self.logs_cfg = resolved.config.logs;
         self.fleet_cfg = resolved.config.fleet;
         // Running forwards keep running; :reload only refreshes what's saved.
@@ -1442,6 +1443,7 @@ impl App {
         warnings.extend(crate::config::guardrail_warnings(&self.guardrails));
         warnings.extend(crate::config::forward_warnings(&self.forwards_cfg));
         warnings.extend(crate::config::notify_warnings(&self.notify_cfg));
+        warnings.extend(crate::config::pvc_explore_warnings(&self.pvc_cfg));
         let (palette_keys, key_warnings) =
             crate::config::compile_palette_keys(&resolved.config.keys);
         self.palette_keys = palette_keys;
@@ -1719,6 +1721,7 @@ impl App {
                 ns,
                 pod,
                 container,
+                upload: true,
                 src,
                 dest,
             },

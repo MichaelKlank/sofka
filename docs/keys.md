@@ -27,7 +27,7 @@ pickers keep both characters available as input.
 | `o`                                           | show the node the selected row names (pods built in; other kinds via `[views."…"].node`)                                                                      |
 | `ctrl-r`                                      | refresh the watch                                                                                                                                             |
 | `y` / `d` / `E`                               | view YAML / describe (`kubectl`) / live events                                                                                                                |
-| `x`                                           | secrets: show `data` base64-decoded (as `stringData`)                                                                                                         |
+| `x`                                           | secrets: show `data` base64-decoded (as `stringData`) · PVCs: browse the volume                                                                               |
 | `X` / `T`                                     | explain why the selection is unhealthy / session-local state-change timeline                                                                                  |
 | `:gitops` / `:flux`                           | Flux owner, source, revisions & reconciliation chain for the selection (`⏎` to jump)                                                                          |
 | `:can-i` / `:can-i <verb> <resource> [ns]`    | what you can do here / check a single action (`SelfSubjectAccessReview`)                                                                                      |
@@ -43,10 +43,11 @@ pickers keep both characters available as input.
 | `c`                                           | copy resource name to clipboard                                                                                                                               |
 | `Y`                                           | copy any cell of the selected row: picker over the displayed columns (type to match a column name or value), `⏎` copies                                       |
 | `e`                                           | edit in `$EDITOR` (`kubectl edit`)                                                                                                                            |
-| `s`                                           | shell into pod / scale a workload (context-dependent)                                                                                                         |
+| `s`                                           | shell into pod / shell into a PVC's volume / scale a workload (context-dependent)                                                                             |
 | `a`                                           | attach to pod                                                                                                                                                 |
 | `:debug`                                      | pod: ephemeral debug container (`d` in the picker targets one) · node: privileged debug pod (previewed + confirmed)                                           |
 | `:debug-clean`                                | delete the node debugger pods launched this session                                                                                                           |
+| `:pvc-explore` / `:pvc-clean`                 | browse the selected PVC (also `:pvc-browse`; see below) · delete helper pods a previous session left behind (also `:pvc-cleanup`)                             |
 | `:bundle` / `:bundle-save`                    | assemble a redacted diagnostic bundle for the selection · write the previewed bundle to a file                                                                |
 | `:snapshot [text\|json\|yaml]` / `:snapshots` | capture the current view to a file · browse, open, and delete saved snapshots                                                                                 |
 | `:notify`                                     | toggle watch notifications on the selected object                                                                                                             |
@@ -62,6 +63,23 @@ pickers keep both characters available as input.
 | `:q`, `ctrl-c`                                | quit                                                                                                                                                          |
 | `?`                                           | help                                                                                                                                                          |
 | _(config)_                                    | plugin / bookmark / workspace key chords — `ctrl-`/`alt-`/`shift-`/`fN`; listed in `?` help                                                                   |
+
+## PVC explore (`x` on a PVC)
+
+A two-pane file browser over a PersistentVolumeClaim: your local filesystem on
+the left, the volume on the right. `s` on a PVC row opens a shell at the mount
+point instead. See [PVC explore](features.md#pvc-explore).
+
+| Key              | Action                                                                      |
+| ---------------- | --------------------------------------------------------------------------- |
+| `tab`, `←` / `→` | switch pane (the focused pane has the bright border)                        |
+| `j`/`k`, `g`/`G` | move within the focused pane                                                |
+| `enter`          | open the selected directory                                                 |
+| `⌫` or `-`       | go up one directory - stops at the mount point, never above it              |
+| `c`              | copy the selection into the other pane: download from the volume, or upload |
+| `s`              | shell into the volume at the directory the remote pane is showing           |
+| `r`              | re-read both panes                                                          |
+| `esc` / `q`      | close (and delete the helper pod, if one was created)                       |
 
 ## Logs view
 

@@ -762,6 +762,9 @@ impl App {
         // where they're still valid (a successful switch drops the cache).
         // Bump first: this switch's own progress flash belongs to the new
         // generation, and the bump clears any left over from the old one.
+        // The browser (and any helper pod it created) belongs to the context
+        // being left: nothing in the new one can serve it.
+        self.leave_pvc_explore();
         self.bump_generation();
         self.set_flash(format!("switching to {name}…"));
         self.stash_view_snapshot();
@@ -797,6 +800,7 @@ impl App {
         self.guardrails = resolved.config.guardrails;
         self.debug = resolved.config.debug;
         self.bundle_cfg = resolved.config.bundle;
+        self.pvc_cfg = resolved.config.pvc_explore;
         self.logs_cfg = resolved.config.logs;
         self.fleet_cfg = resolved.config.fleet;
         // Tracked debuggers belong to the previous cluster/context.
@@ -805,6 +809,7 @@ impl App {
         plugin_warnings.extend(crate::config::bookmark_warnings(&self.bookmarks));
         plugin_warnings.extend(crate::config::workspace_warnings(&self.workspaces));
         plugin_warnings.extend(crate::config::guardrail_warnings(&self.guardrails));
+        plugin_warnings.extend(crate::config::pvc_explore_warnings(&self.pvc_cfg));
         let (palette_keys, key_warnings) =
             crate::config::compile_palette_keys(&resolved.config.keys);
         self.palette_keys = palette_keys;

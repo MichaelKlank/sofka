@@ -30,6 +30,7 @@ pub mod logfilter;
 pub mod nsmem;
 pub mod plugins;
 pub mod providers;
+pub mod pvcexplore;
 pub mod rightsize;
 pub mod sanitize;
 pub mod snapshot;

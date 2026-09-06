@@ -84,6 +84,8 @@ pub struct Config {
     pub debug: DebugConfig,
     /// Diagnostic-bundle (`:bundle`) options — see [`BundleConfig`].
     pub bundle: BundleConfig,
+    /// Helper-pod defaults for the PVC browser — see [`PvcExploreConfig`].
+    pub pvc_explore: PvcExploreConfig,
     /// Log-view options — see [`LogsConfig`].
     pub logs: LogsConfig,
     /// Cross-context fleet dashboard (`:fleet`) — see [`FleetConfig`].
@@ -428,6 +430,64 @@ impl Default for BundleConfig {
             max_pods: 3,
         }
     }
+}
+
+/// Fallback TTL for a PVC-explore helper pod when [`PvcExploreConfig::ttl`] is
+/// unreadable. Also the default itself.
+pub const PVC_DEFAULT_TTL_SECS: u64 = 1_800;
+
+/// Defaults for the PVC browser (`x` on a PVC, `:pvc-explore`).
+///
+/// A claim that some running pod already mounts is browsed through that pod
+/// and none of this applies. When nothing mounts it, sofka offers to create a
+/// short-lived pod that does — these are that pod's image and lifetime.
+///
+/// ```toml
+/// [pvc_explore]
+/// image = "busybox:1.37"   # helper-pod image; needs a shell and `ls`
+/// ttl = "30m"              # helper pod self-destructs after this
+/// ```
+///
+/// The image needs `sh`, `ls`, and — for transfers, which go through
+/// `kubectl cp` — `tar`. busybox has all three.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PvcExploreConfig {
+    /// Image for the helper pod.
+    pub image: String,
+    /// How long the helper pod lives before it deletes itself, as a duration
+    /// like `"30m"`. Set on the pod as both a `sleep` and
+    /// `activeDeadlineSeconds`, so it expires even if sofka never gets to
+    /// delete it. Validated by [`pvc_explore_warnings`].
+    pub ttl: String,
+}
+
+impl Default for PvcExploreConfig {
+    fn default() -> Self {
+        Self {
+            image: "busybox:1.37".into(),
+            ttl: "30m".into(),
+        }
+    }
+}
+
+/// Validate `[pvc_explore]`: an empty image or an unparseable/absurd TTL.
+pub fn pvc_explore_warnings(cfg: &PvcExploreConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    if cfg.image.trim().is_empty() {
+        out.push("pvc_explore: image is empty — helper pods cannot be created".into());
+    }
+    match crate::providers::parse_lookback(&cfg.ttl) {
+        Err(e) => out.push(format!("pvc_explore: ttl: {e}; using 30m")),
+        Ok(secs) if secs <= 0 => {
+            out.push(format!(
+                "pvc_explore: ttl {:?} must be positive; using 30m",
+                cfg.ttl
+            ));
+        }
+        Ok(_) => {}
+    }
+    out
 }
 
 /// Defaults for `:debug`, which attaches an ephemeral debug container to the
@@ -982,8 +1042,8 @@ pub fn workspace_warnings(workspaces: &[Workspace]) -> Vec<String> {
 /// A declarative safety policy: match dangerous actions by context, namespace,
 /// resource, and action, then require extra confirmation, deny them, or cap a
 /// bulk selection. Gates `delete`, `force-delete`, `drain`, `restart`,
-/// `shell`, `debug`, and `node-debug` today. Empty match lists mean "any";
-/// glob `*` supported.
+/// `shell`, `debug`, `node-debug`, `transfer`, `pvc-explore`, and
+/// `pvc-upload` today. Empty match lists mean "any"; glob `*` supported.
 ///
 /// ```toml
 /// [[guardrails]]
@@ -1012,7 +1072,8 @@ pub struct Guardrail {
     /// Resource plurals/kinds this applies to (globs). Empty = any.
     pub resources: Vec<String>,
     /// Actions this applies to: `delete`, `force-delete`, `drain`, `restart`,
-    /// `shell`, `debug`, `node-debug`, `transfer`. Empty = any.
+    /// `shell`, `debug`, `node-debug`, `transfer`, `pvc-explore` (creating or
+    /// sweeping a PVC-explore helper pod), `pvc-upload`. Empty = any.
     pub actions: Vec<String>,
     /// Block the action outright.
     pub deny: bool,

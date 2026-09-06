@@ -33,6 +33,7 @@ use crate::k8s::{Cluster, Kind};
 use crate::store::{Msg, Pulse, RowKey, StatusClaim, Store, StoreMutation, XrayItem, row_key};
 
 pub(crate) use guardrails::ConfirmLevel;
+pub use pvcexplore::{Pane, PvcExplore, PvcIntent};
 
 impl App {
     /// Mark the row ordering stale without touching the store — the shape of a
@@ -187,6 +188,9 @@ pub enum Mode {
     Fleet,
     /// Global fuzzy-find results picker (`:find <text>`).
     Find,
+    /// Split-pane PVC browser (`x` on a PVC): local files on the left, the
+    /// volume's contents on the right.
+    PvcExplore,
 }
 
 /// A request for the run loop to suspend the TUI and run an interactive
@@ -264,13 +268,17 @@ enum ConfirmAction {
     Edit { argv: Vec<String> },
     /// Shell into a pod, once a guardrail confirmation is satisfied.
     Exec { ns: String, name: String },
-    /// Upload a local file into a pod (`kubectl cp`), once a guardrail
-    /// confirmation is satisfied. Upload only — a download doesn't mutate
-    /// the pod, so it never needs confirming.
+    /// Copy a file between a pod and the local filesystem (`kubectl cp`),
+    /// once its confirmation is satisfied. An upload is confirmed because a
+    /// guardrail asked; a download because it would overwrite a local file.
+    /// The direction has to travel with the action — running a download as an
+    /// upload would write into the cluster, past every check the upload path
+    /// makes.
     Transfer {
         ns: String,
         pod: String,
         container: Option<String>,
+        upload: bool,
         src: String,
         dest: String,
     },
@@ -305,6 +313,25 @@ enum ConfirmAction {
     },
     /// Delete the node debugger pods sofka launched this session (`:debug-clean`).
     CleanupDebuggers,
+    /// Create a temporary pod that mounts a PVC nothing else mounts, so it can
+    /// be browsed or shelled into.
+    PvcHelper {
+        ns: String,
+        claim: String,
+        intent: PvcIntent,
+    },
+    /// Shell into the pod a PVC is reachable through, once the `shell`
+    /// guardrail is satisfied.
+    PvcShell {
+        ns: String,
+        pod: String,
+        container: String,
+        path: String,
+        claim: String,
+    },
+    /// Delete the PVC-explore helper pods left behind by earlier sessions.
+    /// `None` sweeps every namespace, matching an all-namespaces view.
+    PvcClean { scope: Option<String> },
     /// Run a confirmed plugin (`confirm`/`dangerous`) once accepted — one job
     /// (label, argv) per target, so a bulk run confirms once.
     Plugin {
@@ -534,6 +561,8 @@ enum PaletteAction {
     Info,
     Fleet,
     Rightsize,
+    PvcExplore,
+    PvcClean,
     Find,
     Diff,
     Events,
@@ -654,6 +683,19 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         action: PaletteAction::Rightsize,
         names: &["rightsize", "sizing", "vpa"],
+    },
+    PaletteCommand {
+        action: PaletteAction::PvcExplore,
+        // Both names stay prefixed. A bare "pvc" is the kubectl alias for
+        // the PVC list, and a palette command outranks a kind, so claiming it
+        // would stop `:pvc` navigating; bare "explore"/"browse" are words a
+        // user plugin may already have taken, and the palette reserves what
+        // it names.
+        names: &["pvc-explore", "pvc-browse"],
+    },
+    PaletteCommand {
+        action: PaletteAction::PvcClean,
+        names: &["pvc-clean", "pvc-cleanup"],
     },
     PaletteCommand {
         action: PaletteAction::Quit,
@@ -1743,6 +1785,16 @@ pub struct App {
     pub transfer_menu_state: ListState,
     pub transfer_target: Option<(String, String, Option<String>)>,
 
+    /// Split-pane PVC browser state (`x` on a PVC row, `:pvc-explore`).
+    pub pvc: PvcExplore,
+    /// `[pvc_explore]` helper-pod defaults.
+    pub pvc_cfg: crate::config::PvcExploreConfig,
+
+    /// Where a confirm/guardrail overlay returns to once it is answered. Only
+    /// the PVC browser sets it away from the table: every other guarded action
+    /// is launched from the table and returns there.
+    pub(super) confirm_return: Mode,
+
     /// Background `kubectl port-forward` processes started with `f`/`F`.
     /// Viewed/stopped via `:pf`; killed automatically on drop.
     pub port_forwards: Vec<PortForward>,
@@ -2010,6 +2062,9 @@ impl App {
             flux_menu_state: ListState::default(),
             transfer_menu_state: ListState::default(),
             transfer_target: None,
+            pvc: PvcExplore::default(),
+            pvc_cfg: crate::config::PvcExploreConfig::default(),
+            confirm_return: Mode::Table,
             port_forwards: Vec::new(),
             forwards_cfg: Vec::new(),
             notify_cfg: crate::config::NotifyConfig::default(),
@@ -2104,6 +2159,31 @@ impl App {
         matches!(self.prompt_kind, Some(PromptKind::RenameContext { .. }))
     }
 
+    /// Where a confirm dialog returns to. Not every `Mode::Confirm` goes
+    /// through `begin_guarded` (`:debug-clean` sets it directly), so a stale
+    /// `confirm_return` must never send us to a browser that isn't open.
+    pub(super) fn overlay_return(&self) -> Mode {
+        if self.confirm_return == Mode::PvcExplore && self.pvc.active {
+            Mode::PvcExplore
+        } else {
+            Mode::Table
+        }
+    }
+
+    /// Whether the open dialog belongs to the PVC browser, so the renderer
+    /// keeps the two panes underneath it.
+    pub fn over_pvc_browser(&self) -> bool {
+        self.pvc.active && self.confirm_return == Mode::PvcExplore
+    }
+
+    /// Whether the active prompt is a guardrail confirmation raised from the
+    /// PVC browser, so esc/enter return to the browser instead of the table.
+    pub(super) fn prompt_over_pvc(&self) -> bool {
+        self.pvc.active
+            && self.confirm_return == Mode::PvcExplore
+            && matches!(self.prompt_kind, Some(PromptKind::GuardConfirm { .. }))
+    }
+
     /// Whether the logs view is showing the external log provider (enables
     /// provider-only keys like `T`).
     pub fn provider_logs_active(&self) -> bool {
@@ -2134,6 +2214,7 @@ mod notify;
 mod overlays;
 mod pickers;
 mod plugins;
+mod pvcexplore;
 mod rightsize;
 mod rows;
 mod snapshot;
