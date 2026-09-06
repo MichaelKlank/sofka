@@ -1961,7 +1961,7 @@ fn value_style(value: &str) -> Style {
     Style::default().fg(theme::text())
 }
 
-fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
     let bind = |k: &str, d: &str| {
         Line::from(vec![
             Span::styled(format!("  {k:<14}"), Style::default().fg(theme::yellow())),
@@ -2202,8 +2202,21 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         let title = format!(" Help · /{} [{}] ", app.help_filter, shown.len());
         (shown, title)
     };
+    // The bindings list is taller than any terminal, so help scrolls: record
+    // the clamp for the key handler, then render from the current offset. The
+    // title carries a hint whenever there is more below the fold.
+    let inner_h = area.height.saturating_sub(2);
+    let max_scroll = (lines.len() as u16).saturating_sub(inner_h);
+    app.help_max_scroll = max_scroll;
+    let scroll = app.help_scroll.min(max_scroll);
+    app.help_scroll = scroll;
+    let title = if max_scroll > 0 {
+        format!("{title}· j/k scroll · / search ")
+    } else {
+        title
+    };
     frame.render_widget(
-        Paragraph::new(lines).block(
+        Paragraph::new(lines).scroll((scroll, 0)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)

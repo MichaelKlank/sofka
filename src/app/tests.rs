@@ -7699,6 +7699,46 @@ async fn help_search_uses_own_buffer() {
 }
 
 #[tokio::test]
+async fn help_scrolls_and_resets_on_reopen() {
+    let (mut app, _rx) = test_app();
+    app.handle_key(press(KeyCode::Char('?'))).unwrap();
+    assert_eq!(app.mode, Mode::Help);
+    // The renderer records the clamp; without it there is nothing to scroll.
+    app.help_max_scroll = 40;
+
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    assert_eq!(app.help_scroll, 1);
+    app.handle_key(press(KeyCode::Char('k'))).unwrap();
+    assert_eq!(app.help_scroll, 0);
+    // Up at the top stays at the top rather than underflowing.
+    app.handle_key(press(KeyCode::Up)).unwrap();
+    assert_eq!(app.help_scroll, 0);
+
+    app.handle_key(ctrl(KeyCode::Char('f'))).unwrap();
+    assert_eq!(app.help_scroll, 10);
+    app.handle_key(ctrl(KeyCode::Char('b'))).unwrap();
+    assert_eq!(app.help_scroll, 0);
+
+    app.handle_key(press(KeyCode::Char('G'))).unwrap();
+    assert_eq!(app.help_scroll, 40, "G goes to the last line");
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    assert_eq!(app.help_scroll, 40, "paging past the end clamps");
+    app.handle_key(press(KeyCode::Char('g'))).unwrap();
+    assert_eq!(app.help_scroll, 0);
+
+    // A search re-lays out the panel, and reopening starts at the top.
+    app.help_scroll = 12;
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    assert_eq!(app.help_scroll, 0);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.help_scroll = 12;
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    app.handle_key(press(KeyCode::Char('?'))).unwrap();
+    assert_eq!(app.help_scroll, 0);
+}
+
+#[tokio::test]
 async fn copy_doc_copies_the_whole_document() {
     let (mut app, _rx) = test_app();
     app.detail = Scrollable {

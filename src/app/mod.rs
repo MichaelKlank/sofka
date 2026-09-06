@@ -1439,6 +1439,14 @@ pub struct App {
     pub help_filter: String,
     /// Which view help was opened from, so closing it returns to that view.
     pub help_return: Mode,
+    /// First visible line of the help view (`?`). The help text is longer than
+    /// any terminal, so it scrolls; without this the sections rendered last
+    /// (plugins, bookmarks, workspaces) are unreachable.
+    pub help_scroll: u16,
+    /// Lines the last help render produced, minus the visible height: the
+    /// clamp for `help_scroll`, recorded by the renderer because the line
+    /// count is only known there.
+    pub help_max_scroll: u16,
     /// Which doc view (`Detail`/`Diff`/`Events`/`Help`) the `/` search prompt
     /// was opened from, so the renderer keeps drawing it underneath and
     /// enter/esc return to it.
@@ -1774,6 +1782,8 @@ impl App {
             detail: Scrollable::empty(),
             help_filter: String::new(),
             help_return: Mode::Table,
+            help_scroll: 0,
+            help_max_scroll: 0,
             doc_filter_return: Mode::Detail,
             palette_return: Mode::Table,
             logs: LogsView::default(),

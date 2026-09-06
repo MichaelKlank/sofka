@@ -141,6 +141,7 @@ impl App {
     fn open_help(&mut self) {
         self.help_return = self.mode;
         self.help_filter.clear();
+        self.help_scroll = 0;
         self.mode = Mode::Help;
     }
 
@@ -1244,17 +1245,50 @@ impl App {
     }
 
     pub(super) fn key_help(&mut self, key: KeyEvent) {
+        // The help text runs past the bottom of any terminal, so it scrolls
+        // with the same keys as the document views (j/k, arrows, ctrl-f/b,
+        // space, g/G). `help_max_scroll` is set by the renderer, which is the
+        // only place the wrapped line count is known.
+        let page = 10u16;
         match key.code {
             // Esc backs out of an active search first, then closes help.
-            KeyCode::Esc if !self.help_filter.is_empty() => self.help_filter.clear(),
+            KeyCode::Esc if !self.help_filter.is_empty() => {
+                self.help_filter.clear();
+                self.help_scroll = 0;
+            }
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
                 self.mode = self.help_return;
                 self.help_return = Mode::Table;
             }
             KeyCode::Char('/') => {
+                self.help_scroll = 0;
                 self.doc_filter_return = self.mode;
                 self.mode = Mode::DocFilter;
             }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.help_scroll = self.help_scroll.saturating_add(1).min(self.help_max_scroll);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.help_scroll = self.help_scroll.saturating_sub(1);
+            }
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                self.help_scroll = self
+                    .help_scroll
+                    .saturating_add(page)
+                    .min(self.help_max_scroll);
+            }
+            KeyCode::Char('f') if key.modifiers == KeyModifiers::CONTROL => {
+                self.help_scroll = self
+                    .help_scroll
+                    .saturating_add(page)
+                    .min(self.help_max_scroll);
+            }
+            KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(page),
+            KeyCode::Char('b') if key.modifiers == KeyModifiers::CONTROL => {
+                self.help_scroll = self.help_scroll.saturating_sub(page);
+            }
+            KeyCode::Char('g') | KeyCode::Home => self.help_scroll = 0,
+            KeyCode::Char('G') | KeyCode::End => self.help_scroll = self.help_max_scroll,
             _ => {}
         }
     }
