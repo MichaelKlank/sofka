@@ -191,6 +191,10 @@ pub enum Mode {
     /// Split-pane PVC browser (`x` on a PVC): local files on the left, the
     /// volume's contents on the right.
     PvcExplore,
+    /// Port-forward target picker (`f` on a pod/service): lists the object's
+    /// declared ports for single-select, plus a "Custom…" entry that falls
+    /// through to the typed prompt.
+    PortForwardPicker,
 }
 
 /// A request for the run loop to suspend the TUI and run an interactive
@@ -205,6 +209,8 @@ pub enum Suspend {
 /// a quit (or panic-unwind) never leaves an orphaned `kubectl` holding the
 /// local port open.
 pub struct PortForward {
+    context: String,
+    cluster_url: String,
     ns: String,
     target: String,
     ports: String,
@@ -224,6 +230,19 @@ impl Drop for PortForward {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
     }
+}
+
+/// Spawns a background `kubectl port-forward` child. Overridable in tests
+/// so the unit suite doesn't require `kubectl` on PATH.
+type PortForwardSpawner = fn(&[String]) -> std::io::Result<tokio::process::Child>;
+
+fn default_pf_spawner(argv: &[String]) -> std::io::Result<tokio::process::Child> {
+    tokio::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
 }
 
 /// How dependents are handled on delete (kubectl `--cascade`, k9s propagation
@@ -1798,7 +1817,16 @@ pub struct App {
     /// Background `kubectl port-forward` processes started with `f`/`F`.
     /// Viewed/stopped via `:pf`; killed automatically on drop.
     pub port_forwards: Vec<PortForward>,
+    /// Injectable spawner for `kubectl port-forward` children. Tests override
+    /// this to avoid depending on `kubectl` being on PATH.
+    pf_spawner: PortForwardSpawner,
     pub pf_state: ListState,
+    /// Port-forward picker (`f`): the declared ports of the selected object,
+    /// each as a `LOCAL:REMOTE` string, plus a trailing "Custom…" entry.
+    pub pf_picker_items: Vec<String>,
+    pub pf_picker_state: ListState,
+    /// The `(ns, name)` target the port-forward picker is acting on.
+    pub(super) pf_picker_target: Option<(String, String)>,
     /// Saved `[[forwards]]` from config: shown in `:pf` even while stopped,
     /// startable with one keystroke, autostarted on connect when configured.
     pub forwards_cfg: Vec<crate::config::Forward>,
@@ -2066,7 +2094,11 @@ impl App {
             pvc_cfg: crate::config::PvcExploreConfig::default(),
             confirm_return: Mode::Table,
             port_forwards: Vec::new(),
+            pf_spawner: default_pf_spawner,
             forwards_cfg: Vec::new(),
+            pf_picker_items: Vec::new(),
+            pf_picker_state: ListState::default(),
+            pf_picker_target: None,
             notify_cfg: crate::config::NotifyConfig::default(),
             palette_keys: crate::config::PaletteKeys::default(),
             pf_state: ListState::default(),

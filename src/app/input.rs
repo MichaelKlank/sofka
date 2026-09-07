@@ -173,6 +173,7 @@ impl App {
             Mode::Fleet => self.key_fleet(key),
             Mode::Find => self.key_find(key),
             Mode::PvcExplore => self.key_pvc_explore(key),
+            Mode::PortForwardPicker => self.key_port_forward_picker(key),
         }
         Ok(())
     }

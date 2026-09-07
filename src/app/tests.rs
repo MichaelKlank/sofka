@@ -10,7 +10,17 @@ fn obj(v: serde_json::Value) -> DynamicObject {
 
 fn test_app() -> (App, Receiver<Msg>) {
     let (tx, rx) = mpsc::channel(1024);
-    (App::new(Cluster::fake(), tx), rx)
+    let mut app = App::new(Cluster::fake(), tx);
+    // Stub the port-forward spawner so tests don't require kubectl on PATH.
+    app.pf_spawner = |_argv| {
+        tokio::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    };
+    (app, rx)
 }
 
 /// The claim the operation that just started owns, for tests that hand-build
@@ -1642,6 +1652,8 @@ async fn saved_forwards_show_as_stopped_until_running() {
 
     // A live child linked by name moves the entry out of the stopped tail.
     app.port_forwards.push(PortForward {
+        context: app.cluster.context.clone(),
+        cluster_url: app.cluster.cluster_url.clone(),
         config_name: Some("argocd".into()),
         ns: "argocd".into(),
         target: "svc/argocd-server".into(),
@@ -1667,7 +1679,7 @@ async fn saved_forwards_show_as_stopped_until_running() {
 }
 
 #[tokio::test]
-async fn port_forward_prompt_prefills_first_exposed_port() {
+async fn port_forward_picker_lists_service_ports() {
     let (mut app, _rx) = test_app();
     app.switch_kind("services");
     apply(
@@ -1675,32 +1687,43 @@ async fn port_forward_prompt_prefills_first_exposed_port() {
         json!({
             "apiVersion": "v1", "kind": "Service",
             "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
-            "spec": {"ports": [{"port": 8080}, {"port": 9090}]}
+            "spec": {"ports": [{"port": 8080, "name": "http"}, {"port": 9090, "name": "metrics"}]}
         }),
     );
     app.table_state.select(Some(0));
     app.request_port_forward();
-    assert_eq!(app.mode, Mode::Prompt);
-    assert_eq!(
-        app.prompt_input, "8080:8080",
-        "first service port, LOCAL:REMOTE"
-    );
+    assert_eq!(app.mode, Mode::PortForwardPicker);
+    assert_eq!(app.pf_picker_items.len(), 3);
+    assert!(app.pf_picker_items[0].contains("8080:8080"));
+    assert!(app.pf_picker_items[0].contains("http"));
+    assert!(app.pf_picker_items[1].contains("9090:9090"));
+    assert!(app.pf_picker_items[1].contains("metrics"));
+    assert_eq!(app.pf_picker_items[2], "Custom…");
+}
 
-    // Pods take the first declared container port.
+#[tokio::test]
+async fn port_forward_picker_lists_pod_container_ports() {
+    let (mut app, _rx) = test_app();
     app.switch_kind("pods");
     apply(
         &mut app,
         json!({
             "apiVersion": "v1", "kind": "Pod",
             "metadata": {"name": "db", "namespace": "default", "resourceVersion": "1"},
-            "spec": {"containers": [{"name": "pg", "ports": [{"containerPort": 5432}]}]}
+            "spec": {"containers": [{"name": "pg", "ports": [{"containerPort": 5432, "name": "pgsql"}]}]}
         }),
     );
     app.table_state.select(Some(0));
     app.request_port_forward();
-    assert_eq!(app.prompt_input, "5432:5432");
+    assert_eq!(app.mode, Mode::PortForwardPicker);
+    assert_eq!(app.pf_picker_items.len(), 2);
+    assert!(app.pf_picker_items[0].contains("5432:5432"));
+    assert!(app.pf_picker_items[0].contains("pg/pgsql"));
+}
 
-    // No declared ports: the prompt stays empty as before.
+#[tokio::test]
+async fn port_forward_picker_no_ports_only_custom() {
+    let (mut app, _rx) = test_app();
     app.switch_kind("pods");
     apply(
         &mut app,
@@ -1712,7 +1735,408 @@ async fn port_forward_prompt_prefills_first_exposed_port() {
     );
     app.table_state.select(Some(0));
     app.request_port_forward();
-    assert_eq!(app.prompt_input, "");
+    assert_eq!(app.mode, Mode::PortForwardPicker);
+    assert_eq!(app.pf_picker_items, vec!["Custom…"]);
+}
+
+#[tokio::test]
+async fn port_forward_picker_filters_non_tcp_ports() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "dns", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [
+                {"port": 53, "protocol": "UDP", "name": "udp"},
+                {"port": 53, "protocol": "TCP", "name": "tcp"},
+                {"port": 8080, "name": "http"}
+            ]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    // UDP port filtered, TCP (explicit and default) kept + Custom…
+    assert_eq!(app.pf_picker_items.len(), 3);
+    assert!(!app.pf_picker_items.iter().any(|i| i.contains("udp")));
+    assert!(app.pf_picker_items[0].contains("53:53"));
+    assert!(app.pf_picker_items[0].contains("tcp"));
+    assert!(app.pf_picker_items[1].contains("8080:8080"));
+}
+
+#[tokio::test]
+async fn port_forward_handle_key_f_opens_picker() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 80}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('f'))).unwrap();
+    assert_eq!(app.mode, Mode::PortForwardPicker);
+    assert_eq!(app.pf_picker_items.len(), 2);
+    assert!(app.pf_picker_items[0].contains("80:80"));
+}
+
+#[tokio::test]
+async fn port_forward_picker_select_port_starts_forward() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 8080}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash.contains("port-forwarding"), "{}", app.flash);
+    assert_eq!(app.port_forwards.len(), 1);
+    assert_eq!(app.port_forwards[0].ports, "8080:8080");
+    assert_eq!(app.port_forwards[0].target, "svc/web");
+}
+
+#[tokio::test]
+async fn port_forward_picker_pod_target_no_svc_prefix() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "db", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "pg", "ports": [{"containerPort": 5432}]}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.port_forwards.len(), 1);
+    assert_eq!(app.port_forwards[0].target, "pod/db");
+}
+
+#[tokio::test]
+async fn port_forward_picker_custom_falls_through_to_prompt() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 8080}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    let custom_idx = app.pf_picker_items.len() - 1;
+    app.pf_picker_state.select(Some(custom_idx));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Prompt);
+    assert!(app.prompt_label.contains("Port-forward web"));
+    assert!(app.prompt_input.is_empty());
+}
+
+#[tokio::test]
+async fn port_forward_picker_esc_cancels() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 8080}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.port_forwards.is_empty());
+}
+
+#[tokio::test]
+async fn port_forward_picker_jk_navigation() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 80}, {"port": 443}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    assert_eq!(app.pf_picker_state.selected(), Some(0));
+
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    assert_eq!(app.pf_picker_state.selected(), Some(1));
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    assert_eq!(app.pf_picker_state.selected(), Some(2));
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    assert_eq!(app.pf_picker_state.selected(), Some(2)); // clamps
+
+    app.handle_key(press(KeyCode::Char('k'))).unwrap();
+    assert_eq!(app.pf_picker_state.selected(), Some(1));
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    assert_eq!(app.pf_picker_state.selected(), Some(2));
+    app.handle_key(press(KeyCode::Up)).unwrap();
+    assert_eq!(app.pf_picker_state.selected(), Some(1));
+}
+
+#[tokio::test]
+async fn port_forward_picker_includes_init_and_ephemeral_ports() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "multi", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "app", "ports": [{"containerPort": 8080}]}],
+                "initContainers": [{"name": "init", "ports": [{"containerPort": 9090}]}],
+                "ephemeralContainers": [{"name": "debug", "ports": [{"containerPort": 2222}]}]
+            }
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    assert_eq!(app.pf_picker_items.len(), 4);
+    assert!(app.pf_picker_items[0].contains("8080:8080"));
+    assert!(app.pf_picker_items[0].contains("app"));
+    assert!(app.pf_picker_items[1].contains("9090:9090"));
+    assert!(app.pf_picker_items[1].contains("init"));
+    assert!(app.pf_picker_items[2].contains("2222:2222"));
+    assert!(app.pf_picker_items[2].contains("debug"));
+}
+
+#[tokio::test]
+async fn port_forward_picker_skips_terminated_init_container_ports() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "multi", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "app", "ports": [{"containerPort": 8080}]}],
+                "initContainers": [{"name": "init", "ports": [{"containerPort": 9090}]}]
+            },
+            "status": {
+                "initContainerStatuses": [{
+                    "name": "init",
+                    "state": {"terminated": {"reason": "Completed"}}
+                }]
+            }
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    assert_eq!(app.pf_picker_items.len(), 2);
+    assert!(app.pf_picker_items[0].contains("8080:8080"));
+    assert!(!app.pf_picker_items.iter().any(|i| i.contains("9090")));
+}
+
+#[tokio::test]
+async fn port_forward_picker_dedups_identical_ports() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "dup", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [
+                    {"name": "a", "ports": [{"containerPort": 8080}]},
+                    {"name": "b", "ports": [{"containerPort": 8080}]}
+                ]
+            }
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    assert_eq!(app.pf_picker_items.len(), 3); // 2 unique labels + Custom…
+}
+
+#[tokio::test]
+async fn has_port_forward_matches_context_cluster_url_and_kind() {
+    let (mut app, _rx) = test_app();
+    app.cluster.context = "ctx-a".into();
+    app.cluster.cluster_url = "https://cluster-a".into();
+    app.port_forwards.push(PortForward {
+        context: "ctx-a".into(),
+        cluster_url: "https://cluster-a".into(),
+        config_name: None,
+        ns: "default".into(),
+        target: "svc/web".into(),
+        ports: "8080:80".into(),
+        child: spawn_test_child("sleep", "30"),
+    });
+
+    // Matching kind + ns + name → match.
+    assert!(app.has_port_forward("default", "web", "services"));
+
+    // Wrong kind (pod instead of service) → no match.
+    assert!(!app.has_port_forward("default", "web", "pods"));
+
+    // Different cluster URL → no match.
+    app.cluster.cluster_url = "https://cluster-b".into();
+    assert!(!app.has_port_forward("default", "web", "services"));
+    app.cluster.cluster_url = "https://cluster-a".into();
+
+    // Different context → no match.
+    app.cluster.context = "ctx-b".into();
+    assert!(!app.has_port_forward("default", "web", "services"));
+    app.cluster.context = "ctx-a".into();
+
+    // Wrong namespace → no match.
+    assert!(!app.has_port_forward("other", "web", "services"));
+
+    // Wrong name → no match.
+    assert!(!app.has_port_forward("default", "other", "services"));
+}
+
+#[tokio::test]
+async fn has_port_forward_pod_target_no_prefix() {
+    let (mut app, _rx) = test_app();
+    app.port_forwards.push(PortForward {
+        context: app.cluster.context.clone(),
+        cluster_url: app.cluster.cluster_url.clone(),
+        config_name: None,
+        ns: "default".into(),
+        target: "pod/db".into(),
+        ports: "5432:5432".into(),
+        child: spawn_test_child("sleep", "30"),
+    });
+    // Pod target matches via pod/db spelling.
+    assert!(app.has_port_forward("default", "db", "pods"));
+    // Service with same name should NOT match.
+    assert!(!app.has_port_forward("default", "db", "services"));
+}
+
+#[tokio::test]
+async fn has_port_forward_matches_saved_pod_target_spelling() {
+    let (mut app, _rx) = test_app();
+    // Saved forwards use the documented `pod/name` spelling.
+    app.port_forwards.push(PortForward {
+        context: app.cluster.context.clone(),
+        cluster_url: app.cluster.cluster_url.clone(),
+        config_name: Some("db-forward".into()),
+        ns: "default".into(),
+        target: "pod/db".into(),
+        ports: "5432:5432".into(),
+        child: spawn_test_child("sleep", "30"),
+    });
+    assert!(app.has_port_forward("default", "db", "pods"));
+    assert!(!app.has_port_forward("default", "db", "services"));
+}
+
+#[tokio::test]
+async fn port_forward_picker_skips_terminated_ephemeral_container_ports() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "multi", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "app", "ports": [{"containerPort": 8080}]}],
+                "ephemeralContainers": [{"name": "debug", "ports": [{"containerPort": 2222}]}]
+            },
+            "status": {
+                "ephemeralContainerStatuses": [{
+                    "name": "debug",
+                    "state": {"terminated": {"reason": "Completed"}}
+                }]
+            }
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    assert_eq!(app.pf_picker_items.len(), 2); // app port + Custom…
+    assert!(app.pf_picker_items[0].contains("8080:8080"));
+    assert!(!app.pf_picker_items.iter().any(|i| i.contains("2222")));
+}
+
+#[tokio::test]
+async fn port_forward_marker_renders_in_table() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "alpha", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 80}]}
+        }),
+    );
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "beta", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 8080}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+
+    // Start a forward on the first row (alpha) so it gets the marker.
+    app.request_port_forward();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.port_forwards.len(), 1);
+    assert_eq!(app.port_forwards[0].target, "svc/alpha");
+
+    let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let buffer = term.backend().buffer().clone();
+    let screen: String = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // The forwarded row "alpha" should have a ● before its name.
+    let alpha_line = screen
+        .lines()
+        .find(|l| l.contains("alpha"))
+        .expect("alpha row in screen");
+    assert!(
+        alpha_line.contains("●"),
+        "expected ● marker on forwarded row, got: {alpha_line}"
+    );
+
+    // The non-forwarded row "beta" should NOT have a ●.
+    let beta_line = screen
+        .lines()
+        .find(|l| l.contains("beta"))
+        .expect("beta row in screen");
+    assert!(
+        !beta_line.contains("●"),
+        "unexpected ● on non-forwarded row, got: {beta_line}"
+    );
 }
 
 #[test]
@@ -5050,6 +5474,8 @@ fn spawn_test_child(argv0: &str, arg: &str) -> tokio::process::Child {
 async fn stopping_a_forward_kills_only_that_one() {
     let (mut app, _rx) = test_app();
     app.port_forwards.push(PortForward {
+        context: app.cluster.context.clone(),
+        cluster_url: app.cluster.cluster_url.clone(),
         config_name: None,
         ns: "default".into(),
         target: "pod/a".into(),
@@ -5057,6 +5483,8 @@ async fn stopping_a_forward_kills_only_that_one() {
         child: spawn_test_child("sleep", "30"),
     });
     app.port_forwards.push(PortForward {
+        context: app.cluster.context.clone(),
+        cluster_url: app.cluster.cluster_url.clone(),
         config_name: None,
         ns: "default".into(),
         target: "pod/b".into(),
@@ -5083,6 +5511,8 @@ async fn reap_drops_exited_forwards_and_flashes() {
     let mut child = spawn_test_child("true", "");
     child.wait().await.unwrap(); // let it exit before reaping
     app.port_forwards.push(PortForward {
+        context: app.cluster.context.clone(),
+        cluster_url: app.cluster.cluster_url.clone(),
         config_name: None,
         ns: "default".into(),
         target: "pod/a".into(),
