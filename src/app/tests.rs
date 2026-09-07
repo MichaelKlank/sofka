@@ -3250,6 +3250,77 @@ async fn drill_into_workload_then_esc_restores() {
 }
 
 #[tokio::test]
+async fn drill_into_machinedeployment_shows_machines() {
+    let (mut app, _rx) = test_app();
+    app.cluster.register_kind(
+        "cluster.x-k8s.io",
+        "MachineDeployment",
+        "machinedeployments",
+        true,
+    );
+    app.cluster
+        .register_kind("cluster.x-k8s.io", "Machine", "machines", true);
+    app.switch_kind("machinedeployments");
+    assert_eq!(app.kind_plural, "machinedeployments");
+
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "cluster.x-k8s.io/v1", "kind": "MachineDeployment",
+            "metadata": {"name": "md-1", "namespace": "default"},
+            "spec": {"selector": {"matchLabels": {"cluster.x-k8s.io/cluster-name": "my-cluster"}}}
+        }),
+    );
+    app.table_state.select(Some(0));
+    assert_eq!(app.rows().len(), 1);
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.kind_plural, "machines");
+    assert_eq!(
+        app.labels.as_deref(),
+        Some("cluster.x-k8s.io/cluster-name=my-cluster")
+    );
+    assert_eq!(app.scope_label.as_deref(), Some("machinedeployment/md-1"));
+    assert_eq!(app.stack.len(), 1);
+
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.kind_plural, "machinedeployments");
+    assert_eq!(app.labels, None);
+    assert!(app.stack.is_empty());
+}
+
+#[tokio::test]
+async fn machinedeployment_without_selector_warns() {
+    let (mut app, _rx) = test_app();
+    app.cluster.register_kind(
+        "cluster.x-k8s.io",
+        "MachineDeployment",
+        "machinedeployments",
+        true,
+    );
+    app.cluster
+        .register_kind("cluster.x-k8s.io", "Machine", "machines", true);
+    app.switch_kind("machinedeployments");
+
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "cluster.x-k8s.io/v1", "kind": "MachineDeployment",
+            "metadata": {"name": "md-1", "namespace": "default"},
+            "spec": {"selector": {}}
+        }),
+    );
+    app.table_state.select(Some(0));
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(
+        app.kind_plural, "machinedeployments",
+        "stays on machinedeployments"
+    );
+    assert!(app.flash.contains("no machine selector"));
+}
+
+#[tokio::test]
 async fn o_on_pod_scopes_to_its_host_node() {
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");

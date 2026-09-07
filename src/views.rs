@@ -136,6 +136,7 @@ pub const BUILTIN_DRILLS: &[&str] = &[
     "cronjobs",
     "services",
     "pods",
+    "machinedeployments",
     "customresourcedefinitions",
     "helm",
     "helmhistory",

@@ -34,6 +34,18 @@ impl App {
                 Some(sel) => self.drill_to_pods(ns, Some(sel), None, format!("svc/{name}")),
                 None => self.flash_warn("service has no selector"),
             },
+            // Cluster API: MachineDeployment → Machines, same selector
+            // pattern as workload → pods.
+            "machinedeployments" => match label_selector(&obj, "matchLabels") {
+                Some(sel) => self.drill_to(
+                    "machines",
+                    ns,
+                    Some(sel),
+                    None,
+                    format!("machinedeployment/{name}"),
+                ),
+                None => self.flash_warn("no machine selector on this object"),
+            },
             "pods" => self.open_containers(&obj),
             "cronjobs" => self.drill_into_cronjob_jobs(&obj),
             // enter on a CRD lists its custom resources, not its YAML.
