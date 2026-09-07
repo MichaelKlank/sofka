@@ -10362,6 +10362,27 @@ async fn help_scrolls_and_resets_on_reopen() {
 }
 
 #[tokio::test]
+async fn help_pages_use_new_dimensions_immediately_after_resize() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for (before, after, page) in [(24, 19, 8), (19, 24, 13)] {
+        let (mut app, _rx) = test_app();
+        app.handle_key(press(KeyCode::Char('?'))).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, before)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        term.backend_mut().resize(120, after);
+        crate::ui::resize(&mut term, &mut app).unwrap();
+        app.handle_key(press(KeyCode::PageDown)).unwrap();
+        assert_eq!(app.help_scroll, page);
+        app.handle_key(press(KeyCode::PageUp)).unwrap();
+        assert_eq!(app.help_scroll, 0);
+        app.handle_key(press(KeyCode::End)).unwrap();
+        assert_eq!(app.help_scroll, app.help_max_scroll);
+    }
+}
+
+#[tokio::test]
 async fn help_paging_updates_after_resize_and_compact_mode() {
     use ratatui::{Terminal, backend::TestBackend};
 

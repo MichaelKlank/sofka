@@ -56,6 +56,15 @@ fn cell_alignment(align: crate::views::Align) -> Alignment {
     }
 }
 
+/// Refresh layout after a resize before another input event can use its dimensions.
+pub fn resize<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut App,
+) -> Result<(), B::Error> {
+    terminal.draw(|frame| draw(frame, app))?;
+    Ok(())
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     // Fill the whole frame with the skin's background first (when enabled), so
     // every view that only sets foreground colors sits on it. Widgets that set
