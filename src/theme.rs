@@ -521,8 +521,9 @@ pub fn status_color(s: &str) -> Color {
         // Faded, not "healthy green" — a finished pod isn't running, and a
         // scaled-to-zero workload isn't serving.
         "Succeeded" | "Completed" | "superseded" | "uninstalled" | "ScaledDown" => overlay0(),
-        "Pending" | "ContainerCreating" | "PodInitializing" | "SchedulingGated" | "Progressing"
-        | "pending-install" | "pending-upgrade" | "pending-rollback" => yellow(),
+        "Pending" | "Suspended" | "Completing" | "ContainerCreating" | "PodInitializing"
+        | "SchedulingGated" | "Progressing" | "pending-install" | "pending-upgrade"
+        | "pending-rollback" => yellow(),
         // Matches row_color's killColor — a distinct "on its way out" hue,
         // not the same bucket as Pending.
         "Terminating" | "uninstalling" => mauve(),
@@ -580,8 +581,9 @@ pub fn row_color(s: &str) -> Color {
     match s {
         s if failure_status(s) => red(),
         s if s.starts_with("Init:") => peach(),
-        "Pending" | "ContainerCreating" | "PodInitializing" | "SchedulingGated" | "Progressing"
-        | "pending-install" | "pending-upgrade" | "pending-rollback" => peach(),
+        "Pending" | "Suspended" | "Completing" | "ContainerCreating" | "PodInitializing"
+        | "SchedulingGated" | "Progressing" | "pending-install" | "pending-upgrade"
+        | "pending-rollback" => peach(),
         "Completed" | "Succeeded" | "superseded" | "uninstalled" | "ScaledDown" => overlay0(),
         // k9s killColor — terminating/deleting rows.
         "Terminating" | "uninstalling" => mauve(),

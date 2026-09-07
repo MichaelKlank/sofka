@@ -192,6 +192,7 @@ const SECRET_COLUMNS: &[Column] = &[
 
 const JOB_COLUMNS: &[Column] = &[
     column("NAME", col_name),
+    status_column("STATUS", col_job_status),
     column("COMPLETIONS", col_job_completions),
     column("DURATION", col_job_duration),
     column("AGE", col_age),
@@ -951,6 +952,27 @@ fn col_secret_type<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
 
 fn col_secret_data<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     Cow::Owned(count_obj(ctx.data, &["data"]).to_string())
+}
+
+fn col_job_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    let d = ctx.data;
+    if ctx.obj.metadata.deletion_timestamp.is_some() {
+        "Terminating".into()
+    } else if condition_is(d, "Failed", "True") || condition_is(d, "FailureTarget", "True") {
+        "Failed".into()
+    } else if condition_is(d, "Complete", "True") {
+        "Completed".into()
+    } else if condition_is(d, "SuccessCriteriaMet", "True") {
+        "Completing".into()
+    } else if d.pointer("/spec/suspend").and_then(Value::as_bool) == Some(true)
+        || condition_is(d, "Suspended", "True")
+    {
+        "Suspended".into()
+    } else if iget(d, &["status", "active"]) > 0 {
+        "Running".into()
+    } else {
+        "Pending".into()
+    }
 }
 
 fn col_job_completions<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
@@ -2524,10 +2546,10 @@ mod tests {
         let (cells, _) = cells(&job, "jobs", now_secs());
         assert_eq!(
             headers("jobs"),
-            vec!["NAME", "COMPLETIONS", "DURATION", "AGE"]
+            vec!["NAME", "STATUS", "COMPLETIONS", "DURATION", "AGE"]
         );
-        assert_eq!(cells[1], "2/3");
-        assert_eq!(cells[2], "1h5m");
+        assert_eq!(cells[2], "2/3");
+        assert_eq!(cells[3], "1h5m");
     }
 
     #[test]
