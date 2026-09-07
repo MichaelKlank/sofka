@@ -329,25 +329,7 @@ fn parse_cpu(s: &str) -> Option<i64> {
 /// Memory quantity → bytes: `1Gi`, `512Mi`, `2000000`. Validating twin of
 /// [`crate::columns::parse_mem_bytes`].
 fn parse_mem(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let suffixes: &[(&str, f64)] = &[
-        ("Ki", 1024.0),
-        ("Mi", 1024.0 * 1024.0),
-        ("Gi", 1024.0 * 1024.0 * 1024.0),
-        ("Ti", 1024.0f64.powi(4)),
-        ("K", 1e3),
-        ("M", 1e6),
-        ("G", 1e9),
-        ("T", 1e12),
-    ];
-    for (suf, mult) in suffixes {
-        if let Some(num) = s.strip_suffix(suf) {
-            let v: f64 = num.trim().parse().ok()?;
-            return (v >= 0.0).then(|| (v * mult) as i64);
-        }
-    }
-    let v: f64 = s.parse().ok()?;
-    (v >= 0.0).then_some(v as i64)
+    crate::columns::parse_memory_quantity(s)
 }
 
 /// Duration → seconds: `90s`, `2h`, `1d2h`, `1h30m`, bare `300` (seconds).

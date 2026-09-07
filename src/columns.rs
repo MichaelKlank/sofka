@@ -1887,23 +1887,14 @@ pub fn parse_cpu_milli(s: &str) -> i64 {
 
 /// Parse a Kubernetes memory quantity (e.g. `512Mi`, `1Gi`, `2000000`) into bytes.
 pub fn parse_mem_bytes(s: &str) -> i64 {
-    let s = s.trim();
-    let suffixes: &[(&str, f64)] = &[
-        ("Ki", 1024.0),
-        ("Mi", 1024.0 * 1024.0),
-        ("Gi", 1024.0 * 1024.0 * 1024.0),
-        ("Ti", 1024.0f64.powi(4)),
-        ("K", 1e3),
-        ("M", 1e6),
-        ("G", 1e9),
-        ("T", 1e12),
-    ];
-    for (suf, mult) in suffixes {
-        if let Some(num) = s.strip_suffix(suf) {
-            return (num.trim().parse::<f64>().unwrap_or(0.0) * mult) as i64;
-        }
-    }
-    s.parse::<f64>().unwrap_or(0.0) as i64
+    parse_memory_quantity(s).unwrap_or(0)
+}
+
+/// Parse a nonnegative memory quantity with the same units as view columns.
+pub(crate) fn parse_memory_quantity(s: &str) -> Option<i64> {
+    crate::views::parse_quantity(s)
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .map(|n| n.ceil() as i64)
 }
 
 /// A node's allocatable CPU (millicores) and memory (bytes) from
