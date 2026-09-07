@@ -300,9 +300,12 @@ pub enum Msg {
     /// Deliberately generation-free: it must surface no matter which view is
     /// current.
     Panic(String),
-    /// A state change on a `:notify`-watched object. Generation-free like
-    /// [`Msg::Panic`]: the whole point is firing from any view.
-    Notify(String),
+    /// A state change on a `:notify`-watched object. The notification epoch
+    /// survives view changes but invalidates messages from a previous context.
+    Notify {
+        epoch: u64,
+        text: String,
+    },
 }
 
 /// One hit from the global fuzzy find (`:find <text>`).

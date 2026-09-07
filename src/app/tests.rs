@@ -2906,18 +2906,86 @@ async fn notify_survives_view_switches() {
     app.table_state.select(Some(0));
     assert!(app.run_palette_command("notify"));
     assert_eq!(app.notify_tasks.len(), 1);
+    let epoch = app.notify_epoch;
 
     // bump_generation (any view switch) aborts self.tasks — the notify watch
     // must not be among them.
     app.switch_kind("services");
     assert_eq!(app.notify_tasks.len(), 1);
     assert!(!app.notify_tasks["pods/default/web"].is_finished());
+    assert_eq!(app.notify_epoch, epoch);
+    app.handle_msg(Msg::Notify {
+        epoch,
+        text: "pod/web: Ready True → False".into(),
+    });
+    assert_eq!(
+        app.take_notification().as_deref(),
+        Some("pod/web: Ready True → False")
+    );
+}
+
+#[tokio::test]
+async fn context_switch_stops_notifications_and_drops_stale_messages() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Pod",
+               "metadata": {"name": "web", "namespace": "default"}}),
+    );
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    for ch in ":notify".chars() {
+        app.handle_key(press(KeyCode::Char(ch))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.notify_tasks.len(), 1);
+    let old_epoch = app.notify_epoch;
+    let old_task = app.notify_tasks["pods/default/web"].abort_handle();
+
+    app.handle_msg(Msg::Notify {
+        epoch: old_epoch,
+        text: "pod/web: old cluster".into(),
+    });
+    assert_eq!(app.pending_notify.len(), 1);
+
+    pick_context(&mut app, "west");
+    assert_eq!(app.notify_tasks.len(), 1);
+    assert_eq!(app.notify_epoch, old_epoch);
+    land_context(&mut app, "west");
+    tokio::task::yield_now().await;
+    assert!(app.notify_tasks.is_empty());
+    assert!(old_task.is_finished());
+    assert_eq!(app.notify_epoch, old_epoch + 1);
+    assert_eq!(app.take_notification(), None);
+
+    let flash = app.flash.clone();
+    app.handle_msg(Msg::Notify {
+        epoch: old_epoch,
+        text: "pod/web: late old cluster".into(),
+    });
+    assert_eq!(app.flash, flash);
+    assert_eq!(app.take_notification(), None);
+
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Pod",
+               "metadata": {"name": "web", "namespace": "default"}}),
+    );
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    for ch in ":notify".chars() {
+        app.handle_key(press(KeyCode::Char(ch))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(app.notify_tasks.contains_key("pods/default/web"));
 }
 
 #[tokio::test]
 async fn notify_msg_flashes_and_queues_bell() {
     let (mut app, _rx) = test_app();
-    app.handle_msg(Msg::Notify("pod/web: Ready True → False".into()));
+    app.handle_msg(Msg::Notify {
+        epoch: app.notify_epoch,
+        text: "pod/web: Ready True → False".into(),
+    });
     assert!(!app.flash_err);
     assert!(app.flash.contains("pod/web"), "{}", app.flash);
     assert_eq!(
@@ -2933,8 +3001,15 @@ async fn notification_bursts_coalesce_into_one_delivery() {
     // the first of a burst) — everything pending in one frame batch must
     // leave as a single bounded delivery.
     let (mut app, _rx) = test_app();
-    app.handle_msg(Msg::Notify("pod/a: Ready True → False".into()));
-    app.handle_msg(Msg::Notify("pod/a: deleted".into()));
+    let epoch = app.notify_epoch;
+    app.handle_msg(Msg::Notify {
+        epoch,
+        text: "pod/a: Ready True → False".into(),
+    });
+    app.handle_msg(Msg::Notify {
+        epoch,
+        text: "pod/a: deleted".into(),
+    });
     assert_eq!(
         app.take_notification().as_deref(),
         Some("pod/a: Ready True → False · pod/a: deleted")
@@ -2942,7 +3017,10 @@ async fn notification_bursts_coalesce_into_one_delivery() {
     assert_eq!(app.take_notification(), None);
 
     for i in 0..100 {
-        app.handle_msg(Msg::Notify(format!("pod/pod-{i}: restarts 0 → 1")));
+        app.handle_msg(Msg::Notify {
+            epoch,
+            text: format!("pod/pod-{i}: restarts 0 → 1"),
+        });
     }
     let text = app.take_notification().unwrap();
     assert!(text.chars().count() <= 300, "bounded: {}", text.len());
@@ -4780,7 +4858,10 @@ async fn background_status_borrows_the_bar_without_orphaning_an_action() {
     assert_eq!(app.flash, "scaled web → 3");
 
     let claim = app.claim_status("draining node-1…");
-    app.handle_msg(Msg::Notify("pod/web: Ready True → False".into()));
+    app.handle_msg(Msg::Notify {
+        epoch: app.notify_epoch,
+        text: "pod/web: Ready True → False".into(),
+    });
     assert!(app.flash.starts_with('🔔'), "{}", app.flash);
 
     // A transient notification may expire before the action. The pending
