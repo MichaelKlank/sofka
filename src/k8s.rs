@@ -723,6 +723,14 @@ impl Cluster {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn client_accepts_socks5_proxy() {
+        let mut config = Config::new("https://127.0.0.1:6443".parse().unwrap());
+        config.proxy_url = Some("socks5://127.0.0.1:9090".parse().unwrap());
+
+        Client::try_from(config).expect("build client with a SOCKS5 proxy");
+    }
+
     #[test]
     fn expired_watch_errors_are_benign() {
         let expired = watcher::Error::WatchError(Box::new(kube::core::Status {
