@@ -30,8 +30,11 @@ requires confirmation, because the package is declared mutating.
 
 ## Deletion states
 
-The names are the STATUS values the pods view shows, so what you read in the
-table is what `states` selects.
+The categories use application container waiting or termination reasons, then
+Pod phase when no such reason applies. The table can show a more specific
+reason. For example, a failed Pod shown as `Evicted` still belongs to the
+terminal set. A Pod shown as `SchedulingGated` belongs to the Pending category.
+Init failure labels and numeric exit labels do not add deletion categories.
 
 | `states`   | Deletes                                                                       |
 | ---------- | ----------------------------------------------------------------------------- |

@@ -17,6 +17,11 @@ generation bumps, replica and readiness changes, pod phase, restarts, waiting
 reasons, condition flips. Diffed from the watch stream, bounded in size, never
 written to disk.
 
+Restart history includes normal init containers and native sidecars. It keeps
+completed init restart counts in its total, so the end of initialization does
+not reset the count. The pod table excludes normal init restarts after
+initialization is complete.
+
 ## Diff (`:diff`)
 
 A unified diff of the live object against its `last-applied-configuration`. When

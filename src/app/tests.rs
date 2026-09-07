@@ -14088,3 +14088,281 @@ async fn workload_table_keeps_active_rollouts_progressing_when_unavailable() {
         );
     }
 }
+
+fn health_test_pod(name: &str) -> Value {
+    json!({"apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": name, "namespace": "default", "uid": name, "resourceVersion": "1"},
+        "spec": {"containers": [{"name": "app"}]},
+        "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}],
+            "containerStatuses": [{"name": "app", "ready": true, "restartCount": 0,
+                "state": {"running": {}}}]}})
+}
+
+fn health_row_color(app: &mut App, name: &str, text: &str) -> ratatui::style::Color {
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 24)).unwrap();
+    terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    for y in 0..buffer.area.height {
+        let line: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect();
+        if line.contains(name)
+            && let Some(offset) = line.find(text)
+        {
+            let x = line[..offset].chars().count() as u16;
+            return buffer[(x, y)].fg;
+        }
+    }
+    panic!("missing {text} in row {name}");
+}
+
+#[tokio::test]
+async fn pod_init_states_and_restarts_are_visible_through_filter_keys() {
+    for (state, status) in [
+        (json!({"running": {}}), "Init:0/1"),
+        (
+            json!({"waiting": {"reason": "CrashLoopBackOff"}}),
+            "Init:CrashLoopBackOff",
+        ),
+        (
+            json!({"terminated": {"reason": "Error", "exitCode": 1}}),
+            "Init:Error",
+        ),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("pods");
+        let mut pod = health_test_pod("init-target");
+        pod["spec"]["initContainers"] = json!([{"name": "init"}]);
+        pod["status"]["phase"] = json!("Pending");
+        pod["status"]["conditions"] = json!([]);
+        pod["status"]["containerStatuses"][0] = json!({"name": "app", "ready": false,
+            "restartCount": 0, "state": {"waiting": {"reason": "PodInitializing"}}});
+        pod["status"]["initContainerStatuses"] = json!([{"name": "init", "ready": false,
+            "restartCount": 7, "state": state}]);
+        apply(&mut app, pod);
+        apply(&mut app, health_test_pod("healthy"));
+        type_filter(&mut app, &format!("status={status} restarts>=7"));
+        assert_eq!(row_names(&app), ["init-target"]);
+        let (headers, rows) = app.snapshot_table();
+        let cell = |header| &rows[0][headers.iter().position(|h| h == header).unwrap()];
+        assert_eq!(cell("READY"), "0/1");
+        assert_eq!(cell("STATUS"), status);
+        assert_eq!(cell("RESTARTS"), "7");
+    }
+}
+
+#[tokio::test]
+async fn pod_specific_reasons_are_visible_through_filter_keys() {
+    for (status, expected) in [
+        (json!({"phase": "Failed", "reason": "Evicted"}), "Evicted"),
+        (
+            json!({"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "False",
+            "reason": "SchedulingGated"}]}),
+            "SchedulingGated",
+        ),
+        (
+            json!({"phase": "Running", "containerStatuses": [{"state": {"terminated": {"exitCode": 42}}}]}),
+            "ExitCode:42",
+        ),
+        (
+            json!({"phase": "Running", "containerStatuses": [{"state": {"terminated": {"reason": "", "signal": 9, "exitCode": 137}}}]}),
+            "Signal:9",
+        ),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("pods");
+        let mut pod = health_test_pod("reason-target");
+        pod["spec"]["initContainers"] = json!([{"name": "init"}]);
+        pod["status"] = status;
+        apply(&mut app, pod);
+        apply(&mut app, health_test_pod("healthy"));
+        type_filter(&mut app, &format!("status={expected}"));
+        assert_eq!(row_names(&app), ["reason-target"]);
+        let (headers, rows) = app.snapshot_table();
+        assert_eq!(
+            rows[0][headers.iter().position(|h| h == "STATUS").unwrap()],
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn readiness_gate_colors_follow_watch_updates_after_faults_key() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let mut pod = health_test_pod("a-gated");
+    pod["spec"]["readinessGates"] = json!([{"conditionType": "example.com/ready"}]);
+    pod["status"]["conditions"] = json!([{"type": "Ready", "status": "False"}]);
+    apply(&mut app, pod.clone());
+    apply(&mut app, health_test_pod("z-selected"));
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(row_names(&app), ["a-gated"]);
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    app.handle_key(press(KeyCode::End)).unwrap();
+    assert_eq!(
+        health_row_color(&mut app, "a-gated", "Running"),
+        crate::theme::yellow()
+    );
+    assert_eq!(
+        health_row_color(&mut app, "a-gated", "a-gated"),
+        crate::theme::peach()
+    );
+    pod["metadata"]["resourceVersion"] = json!("2");
+    pod["status"]["conditions"] = json!([
+        {"type": "Ready", "status": "True"}, {"type": "example.com/ready", "status": "True"}]);
+    apply(&mut app, pod.clone());
+    assert_eq!(
+        health_row_color(&mut app, "a-gated", "Running"),
+        crate::theme::green()
+    );
+    pod["metadata"]["resourceVersion"] = json!("3");
+    pod["status"]["conditions"][1]["status"] = json!("Unknown");
+    apply(&mut app, pod);
+    assert_eq!(
+        health_row_color(&mut app, "a-gated", "Running"),
+        crate::theme::yellow()
+    );
+}
+
+#[tokio::test]
+async fn specific_failure_colors_render_after_navigation_keys() {
+    for reason in [
+        "CreateContainerConfigError",
+        "InvalidImageName",
+        "ContainerCannotRun",
+        "DeadlineExceeded",
+    ] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("pods");
+        let mut pod = health_test_pod("a-failure");
+        pod["status"]["containerStatuses"][0]["state"] = json!({"waiting": {"reason": reason}});
+        apply(&mut app, pod);
+        apply(&mut app, health_test_pod("z-selected"));
+        app.handle_key(press(KeyCode::End)).unwrap();
+        assert_eq!(
+            health_row_color(&mut app, "a-failure", reason),
+            crate::theme::red()
+        );
+        assert_eq!(
+            health_row_color(&mut app, "a-failure", "a-failure"),
+            crate::theme::red()
+        );
+    }
+    let (mut app, _rx) = test_app();
+    app.cluster
+        .register_kind("", "PersistentVolumeClaim", "persistentvolumeclaims", true);
+    app.switch_kind("persistentvolumeclaims");
+    for (name, phase) in [("a-lost", "Lost"), ("z-selected", "Bound")] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+            "metadata": {"name": name, "namespace": "default"}, "status": {"phase": phase}}),
+        );
+    }
+    app.handle_key(press(KeyCode::End)).unwrap();
+    assert_eq!(
+        health_row_color(&mut app, "a-lost", "Lost"),
+        crate::theme::red()
+    );
+    assert_eq!(
+        health_row_color(&mut app, "a-lost", "a-lost"),
+        crate::theme::red()
+    );
+}
+
+#[tokio::test]
+async fn timeline_key_shows_init_and_sidecar_restart_updates() {
+    for sidecar in [false, true] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("pods");
+        let mut pod = health_test_pod("restart-target");
+        pod["spec"]["initContainers"] = json!([{"name": "init"}]);
+        if sidecar {
+            pod["spec"]["initContainers"][0]["restartPolicy"] = json!("Always");
+        } else {
+            pod["status"]["phase"] = json!("Pending");
+        }
+        pod["status"]["initContainerStatuses"] = json!([{"name": "init", "restartCount": 2,
+            "state": {"running": {}}}]);
+        apply(&mut app, pod.clone());
+        pod["metadata"]["resourceVersion"] = json!("2");
+        pod["status"]["initContainerStatuses"][0]["restartCount"] = json!(3);
+        apply(&mut app, pod);
+        app.handle_key(press(KeyCode::Home)).unwrap();
+        app.handle_key(press(KeyCode::Char('T'))).unwrap();
+        assert_eq!(app.mode, Mode::Timeline);
+        let (plural, key) = app.timeline_target.as_ref().unwrap();
+        let entries = app.timeline.entries(plural, key).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.level == crate::timeline::Level::Warn
+                    && entry.text == "container restart (2 → 3 total)")
+        );
+    }
+}
+#[tokio::test]
+async fn sidecar_failures_remain_visible_after_initialization() {
+    for (app_state, phase, expected) in [
+        (json!({"running": {}}), "Running", "Init:CrashLoopBackOff"),
+        (
+            json!({"waiting": {"reason": "ImagePullBackOff"}}),
+            "Pending",
+            "ImagePullBackOff",
+        ),
+        (
+            json!({"terminated": {"reason": "Error", "exitCode": 1}}),
+            "Failed",
+            "Error",
+        ),
+        (
+            json!({"terminated": {"reason": "Completed", "exitCode": 0}}),
+            "Succeeded",
+            "Succeeded",
+        ),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("pods");
+        let mut pod = health_test_pod("a-sidecar");
+        pod["spec"]["initContainers"] = json!([
+            {"name": "setup"}, {"name": "proxy", "restartPolicy": "Always"}
+        ]);
+        pod["status"]["phase"] = json!(phase);
+        pod["status"]["conditions"] = json!([
+            {"type": "Initialized", "status": "True"},
+            {"type": "Ready", "status": "False"}
+        ]);
+        pod["status"]["containerStatuses"][0]["ready"] = json!(app_state.get("running").is_some());
+        pod["status"]["containerStatuses"][0]["state"] = app_state;
+        pod["status"]["initContainerStatuses"] = json!([
+            {"name": "setup", "ready": true, "restartCount": 5,
+             "state": {"terminated": {"reason": "Completed", "exitCode": 0}}},
+            {"name": "proxy", "ready": false, "started": false, "restartCount": 3,
+             "state": {"waiting": {"reason": "CrashLoopBackOff"}}}
+        ]);
+        apply(&mut app, pod);
+        apply(&mut app, health_test_pod("z-selected"));
+        type_filter(&mut app, &format!("status={expected} restarts=3"));
+        assert_eq!(row_names(&app), ["a-sidecar"], "{expected}");
+        let (headers, rows) = app.snapshot_table();
+        if expected == "Init:CrashLoopBackOff" {
+            assert_eq!(
+                rows[0][headers.iter().position(|h| h == "READY").unwrap()],
+                "1/2"
+            );
+        }
+        assert_eq!(
+            rows[0][headers.iter().position(|h| h == "RESTARTS").unwrap()],
+            "3"
+        );
+        retype_filter(&mut app, "");
+        app.handle_key(press(KeyCode::End)).unwrap();
+        let color = if expected == "Succeeded" {
+            crate::theme::overlay0()
+        } else {
+            crate::theme::red()
+        };
+        assert_eq!(health_row_color(&mut app, "a-sidecar", expected), color);
+        assert_eq!(health_row_color(&mut app, "a-sidecar", "a-sidecar"), color);
+    }
+}

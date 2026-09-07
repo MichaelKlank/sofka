@@ -1431,57 +1431,158 @@ fn pod_summary(obj: &DynamicObject) -> (String, String, String) {
         .filter(|s| sidecars(d).any(|c| c.get("name") == s.get("name")));
 
     let mut ready = 0usize;
-    let mut restarts = 0i64;
     for c in statuses.iter().chain(sidecar_statuses) {
         if c.get("ready").and_then(Value::as_bool).unwrap_or(false) {
             ready += 1;
         }
-        restarts += c.get("restartCount").and_then(Value::as_i64).unwrap_or(0);
     }
 
     (
         format!("{ready}/{total}"),
         pod_status(obj),
-        restarts.to_string(),
+        pod_restarts(obj).to_string(),
     )
 }
 
-/// A pod's STATUS cell. Exposed so the `:sanitize` plugin selects pods by the
-/// status the pods view shows, rather than a second, drifting derivation.
+/// Restarts shown in the pod row. Normal init restarts apply only while the
+/// pod initializes; native sidecars continue to count after initialization.
+pub(crate) fn pod_restarts(obj: &DynamicObject) -> i64 {
+    let d = &obj.data;
+    let initializing = !pod_initialized(obj) && pod_init_status(obj).is_some();
+    array(d, "/status/containerStatuses")
+        .iter()
+        .chain(
+            array(d, "/status/initContainerStatuses")
+                .iter()
+                .filter(|s| initializing || sidecars(d).any(|c| c.get("name") == s.get("name"))),
+        )
+        .filter_map(|c| c.get("restartCount").and_then(Value::as_i64))
+        .sum()
+}
+
+fn pod_initialized(obj: &DynamicObject) -> bool {
+    array(&obj.data, "/status/conditions").iter().any(|c| {
+        c.get("type").and_then(Value::as_str) == Some("Initialized")
+            && c.get("status").and_then(Value::as_str) == Some("True")
+    })
+}
+
+/// Init state can still report a sidecar failure after the pod initializes.
+fn pod_init_status(obj: &DynamicObject) -> Option<String> {
+    let d = &obj.data;
+    let init = array(d, "/spec/initContainers");
+    let statuses = array(d, "/status/initContainerStatuses");
+    for (i, container) in init.iter().enumerate() {
+        let Some(status) = statuses
+            .iter()
+            .find(|s| s.get("name") == container.get("name"))
+        else {
+            // Before the kubelet reports init state, keep the Pod reason or
+            // scheduling condition instead of inventing init progress.
+            continue;
+        };
+        if status
+            .pointer("/state/terminated/exitCode")
+            .and_then(Value::as_i64)
+            == Some(0)
+        {
+            continue;
+        }
+        let sidecar = container.get("restartPolicy").and_then(Value::as_str) == Some("Always");
+        if sidecar
+            && (status.get("started").and_then(Value::as_bool) == Some(true)
+                || (status.get("started").is_none() && status.pointer("/state/running").is_some()))
+        {
+            continue;
+        }
+        if let Some(terminated) = status.pointer("/state/terminated") {
+            return Some(format!("Init:{}", termination_reason(terminated)));
+        }
+        if let Some(reason) = status
+            .pointer("/state/waiting/reason")
+            .and_then(Value::as_str)
+            && !reason.is_empty()
+            && reason != "PodInitializing"
+        {
+            return Some(format!("Init:{reason}"));
+        }
+        return Some(format!("Init:{i}/{}", init.len()));
+    }
+    None
+}
+
+fn termination_reason(terminated: &Value) -> String {
+    if let Some(reason) = terminated
+        .get("reason")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return reason.to_string();
+    }
+    let signal = terminated
+        .get("signal")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if signal != 0 {
+        format!("Signal:{signal}")
+    } else {
+        format!(
+            "ExitCode:{}",
+            terminated
+                .get("exitCode")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+        )
+    }
+}
+
+/// A pod's STATUS cell, including initialization and specific failure reasons.
 pub fn pod_status(obj: &DynamicObject) -> String {
     let d = &obj.data;
-    let empty = vec![];
-    let statuses = d
-        .get("status")
-        .and_then(|s| s.get("containerStatuses"))
-        .and_then(|c| c.as_array())
-        .unwrap_or(&empty);
+    if obj.metadata.deletion_timestamp.is_some() {
+        return "Terminating".to_string();
+    }
+    let init_status = match pod_init_status(obj) {
+        Some(status) if !pod_initialized(obj) => return status,
+        status => status,
+    };
+    let statuses = array(d, "/status/containerStatuses");
 
     let mut waiting_reason: Option<String> = None;
     let mut terminated_reason: Option<String> = None;
+    let mut completed = false;
     for c in statuses {
         if let Some(r) = c.pointer("/state/waiting/reason").and_then(Value::as_str)
+            && !r.is_empty()
             && (r != "ContainerCreating" || waiting_reason.is_none())
         {
             waiting_reason = Some(r.to_string());
         }
-        if let Some(r) = c
-            .pointer("/state/terminated/reason")
-            .and_then(Value::as_str)
-            && r != "Completed"
-        {
-            terminated_reason = Some(r.to_string());
+        if let Some(terminated) = c.pointer("/state/terminated") {
+            let reason = termination_reason(terminated);
+            if reason == "Completed" {
+                completed = true;
+            } else {
+                terminated_reason = Some(reason);
+            }
         }
     }
 
-    if obj.metadata.deletion_timestamp.is_some() {
-        "Terminating".to_string()
-    } else if let Some(r) = waiting_reason {
+    if let Some(r) = waiting_reason {
         r
     } else if let Some(r) = terminated_reason {
         r
+    } else if let Some(status) = init_status.filter(|_| !completed) {
+        status
+    } else if array(d, "/status/conditions").iter().any(|c| {
+        c.get("type").and_then(Value::as_str) == Some("PodScheduled")
+            && c.get("reason").and_then(Value::as_str) == Some("SchedulingGated")
+    }) {
+        "SchedulingGated".to_string()
     } else {
-        sget(d, &["status", "phase"])
+        sget(d, &["status", "reason"])
+            .filter(|r| !r.is_empty())
+            .or_else(|| sget(d, &["status", "phase"]))
             .unwrap_or("Unknown")
             .to_string()
     }
@@ -2854,5 +2955,151 @@ mod tests {
             SortValue::Num(n) => assert_eq!(n, 1.0),
             SortValue::Text(t) => panic!("pod READY must sort numerically, got '{t}'"),
         }
+    }
+
+    #[test]
+    fn pod_init_status_and_restart_counts_follow_initialization() {
+        let mut pod = obj(json!({
+            "apiVersion": "v1", "kind": "Pod", "metadata": {"name": "init"},
+            "spec": {"containers": [{"name": "app"}],
+                "initContainers": [{"name": "first"}, {"name": "second"}]},
+            "status": {"phase": "Pending", "containerStatuses": [{"name": "app",
+                "ready": false, "restartCount": 0, "state": {"waiting": {"reason": "PodInitializing"}}}],
+                "initContainerStatuses": [
+                    {"name": "first", "restartCount": 2, "state": {"terminated": {"exitCode": 0}}},
+                    {"name": "second", "restartCount": 3, "state": {"running": {}}}]}
+        }));
+        assert_eq!(
+            pod_summary(&pod),
+            ("0/1".into(), "Init:1/2".into(), "5".into())
+        );
+        for (state, expected) in [
+            (
+                json!({"waiting": {"reason": "CrashLoopBackOff"}}),
+                "Init:CrashLoopBackOff",
+            ),
+            (
+                json!({"terminated": {"reason": "Error", "exitCode": 1}}),
+                "Init:Error",
+            ),
+            (json!({"terminated": {"exitCode": 42}}), "Init:ExitCode:42"),
+            (
+                json!({"terminated": {"reason": "", "exitCode": 137, "signal": 9}}),
+                "Init:Signal:9",
+            ),
+        ] {
+            pod.data["status"]["initContainerStatuses"][1]["state"] = state;
+            assert_eq!(pod_status(&pod), expected);
+            assert_eq!(pod_restarts(&pod), 5);
+        }
+        pod.data["status"]["initContainerStatuses"][1]["state"] =
+            json!({"terminated": {"exitCode": 0}});
+        pod.data["status"]["phase"] = json!("Running");
+        pod.data["status"]["containerStatuses"][0] = json!({"name": "app", "ready": true,
+            "restartCount": 1, "state": {"running": {}}});
+        assert_eq!(
+            pod_summary(&pod),
+            ("1/1".into(), "Running".into(), "1".into())
+        );
+        pod.data["status"]["initContainerStatuses"] = json!([]);
+        assert_eq!(pod_status(&pod), "Running");
+        pod.data["status"]["conditions"] = json!([{"type": "Initialized", "status": "True"}]);
+        assert_eq!(pod_status(&pod), "Running");
+    }
+
+    #[test]
+    fn pod_reason_and_termination_fallbacks_preserve_precedence() {
+        let mut pod = obj(
+            json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "reason"},
+            "status": {"phase": "Failed", "reason": "Evicted"}}),
+        );
+        assert_eq!(pod_status(&pod), "Evicted");
+        pod.data["status"]["reason"] = json!("");
+        assert_eq!(pod_status(&pod), "Failed");
+        pod.data["status"]["phase"] = json!("Pending");
+        pod.data["status"]["conditions"] =
+            json!([{"type": "PodScheduled", "status": "False", "reason": "SchedulingGated"}]);
+        assert_eq!(pod_status(&pod), "SchedulingGated");
+        for (terminated, expected) in [
+            (json!({"exitCode": 42}), "ExitCode:42"),
+            (json!({"reason": "", "exitCode": 42}), "ExitCode:42"),
+            (json!({"signal": 9, "exitCode": 137}), "Signal:9"),
+            (
+                json!({"reason": "OOMKilled", "signal": 9, "exitCode": 137}),
+                "OOMKilled",
+            ),
+        ] {
+            pod.data["status"]["containerStatuses"] =
+                json!([{"state": {"terminated": terminated}}]);
+            assert_eq!(pod_status(&pod), expected);
+        }
+        pod.data["status"]["containerStatuses"] = json!([
+            {"state": {"waiting": {"reason": "CrashLoopBackOff"}}},
+            {"state": {"waiting": {"reason": "ContainerCreating"}}}
+        ]);
+        assert_eq!(pod_status(&pod), "CrashLoopBackOff");
+        pod.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                "2026-09-07T00:00:00Z".parse().unwrap(),
+            ));
+        assert_eq!(pod_status(&pod), "Terminating");
+    }
+    #[test]
+    fn absent_init_status_preserves_pod_and_scheduling_reasons() {
+        for (status, expected) in [
+            (json!({"phase": "Pending"}), "Pending"),
+            (json!({"phase": "Failed", "reason": "Evicted"}), "Evicted"),
+            (
+                json!({"phase": "Pending", "conditions": [{"type": "PodScheduled",
+                "status": "False", "reason": "SchedulingGated"}]}),
+                "SchedulingGated",
+            ),
+        ] {
+            let pod = obj(
+                json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "pending"},
+                "spec": {"containers": [{"name": "app"}], "initContainers": [{"name": "init"}]},
+                "status": status}),
+            );
+            assert_eq!(pod_status(&pod), expected);
+            assert_eq!(pod_restarts(&pod), 0);
+        }
+    }
+
+    #[test]
+    fn sidecar_startup_is_separate_from_readiness() {
+        let mut pod = obj(
+            json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "sidecar"},
+            "spec": {"containers": [{"name": "app"}],
+                "initContainers": [{"name": "proxy", "restartPolicy": "Always"}]},
+            "status": {"phase": "Pending", "containerStatuses": [{"name": "app", "ready": false,
+                "state": {"waiting": {"reason": "PodInitializing"}}}],
+                "initContainerStatuses": [{"name": "proxy", "started": false, "ready": false,
+                    "restartCount": 2, "state": {"running": {}}}]}}),
+        );
+        assert_eq!(
+            pod_summary(&pod),
+            ("0/2".into(), "Init:0/1".into(), "2".into())
+        );
+        pod.data["status"]["initContainerStatuses"][0]["started"] = json!(true);
+        pod.data["status"]["phase"] = json!("Running");
+        pod.data["status"]["containerStatuses"][0] = json!({"name": "app", "ready": true,
+            "restartCount": 0, "state": {"running": {}}});
+        assert_eq!(
+            pod_summary(&pod),
+            ("1/2".into(), "Running".into(), "2".into())
+        );
+        pod.data["status"]["initContainerStatuses"][0]["ready"] = json!(true);
+        assert_eq!(
+            pod_summary(&pod),
+            ("2/2".into(), "Running".into(), "2".into())
+        );
+        // The Kubernetes printer skips successful terminations before checking
+        // started. Keep that display rule separate from READY and cleanup.
+        pod.data["status"]["initContainerStatuses"][0] = json!({"name": "proxy", "started": false,
+            "ready": false, "restartCount": 2, "state": {"terminated": {"exitCode": 0}}});
+        assert_eq!(
+            pod_summary(&pod),
+            ("1/2".into(), "Running".into(), "2".into())
+        );
     }
 }

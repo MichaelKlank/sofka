@@ -19,6 +19,18 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   26 characters so status changes do not move adjacent columns. A configured
   column width takes priority. Column widths use the full filtered list so
   vertical scrolling does not move the columns.
+- **Pod health** shows init progress and failure reasons, Pod reasons such as
+  `Evicted`, scheduling gates, and termination signals or exit codes.
+  Init progress appears after the kubelet reports init state. Until then, the
+  table keeps the Pod phase or reason, including `SchedulingGated`.
+  Normal init containers count toward RESTARTS during initialization, but not READY.
+  Native sidecars count toward READY and RESTARTS. Their failures remain
+  visible after initialization, without adding restarts from completed normal init containers.
+  Application waiting and termination reasons take precedence after initialization.
+  A blocked readiness gate
+  gives a Running pod warning colors even when all containers are ready.
+  Failure reasons use red rows and status text, including init failures and
+  the `Lost` PVC state.
 - **Horizontal scrolling** - Left and Right move the table by five text positions.
   NAME and NAMESPACE stay fixed. Other columns keep their widths while you
   scroll. Arrows in the title show where more content is available. When all
@@ -217,7 +229,7 @@ right - so a download or an upload is one keystroke rather than a hand-written
   execs into that container at its `mountPath`. Nothing is created, so this
   works in read-only mode.
 - **Otherwise it offers a helper pod.** When nothing mounts the claim - the
-  common case for a volume you are trying to inspect *because* its workload is
+  common case for a volume you are trying to inspect _because_ its workload is
   scaled to zero - sofka asks before creating a short-lived pod that mounts it
   at `/pvc`. That is a write: it is blocked in read-only mode, matches the
   `pvc-explore` guardrail action, and always confirms, naming the image and the
@@ -230,11 +242,11 @@ right - so a download or an upload is one keystroke rather than a hand-written
   skipping the pod your own open browser is using. None of that evidence is
   unforgeable - anything sofka writes on creation, anything else can write too
   - so it is there to make an accidental match essentially impossible, not as
-  a permission check; the confirmation, the guardrail and read-only mode are
-  what bound a deliberate one. It cannot tell a leftover from a pod *another* session is browsing
-  through right now, so the confirmation says so. Deleting pods is a mutation
-  like any other: blocked in read-only mode, matched by the `pvc-explore`
-  guardrail, recorded in `:journal`.
+    a permission check; the confirmation, the guardrail and read-only mode are
+    what bound a deliberate one. It cannot tell a leftover from a pod _another_ session is browsing
+    through right now, so the confirmation says so. Deleting pods is a mutation
+    like any other: blocked in read-only mode, matched by the `pvc-explore`
+    guardrail, recorded in `:journal`.
 - **Navigation is confined to the mount.** `⌫` stops at the mount point, and
   every listing verifies with `pwd -P` that it actually landed inside the
   volume - so a symlink on the volume pointing at `/` is refused rather than
@@ -333,8 +345,9 @@ pod is rejected; browse through a pod that already mounts the claim instead.
 - **`:sanitize`** deletes the pods a namespace has finished with - completed
   jobs, failed and evicted pods, and optionally the wedged ones. It ships with
   sofka and needs no runtime on `PATH`; the adapter is the sofka binary.
-  `states` selects `terminal` (the default), `stuck`, or `all`, named after the
-  STATUS values the pods view shows. `dry_run=true` reports without deleting.
+  `states` selects `terminal` (the default), `stuck`, or `all`, based on
+  application container state and Pod phase. Specific table reason labels do
+  not add deletion categories. `dry_run=true` reports without deleting.
   It confirms before running, is blocked in read-only mode, and matches
   guardrails as `plugin:sanitize`. It never deletes a pod that is terminating,
   still has a running container, or was replaced since the scan.
