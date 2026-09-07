@@ -15524,6 +15524,22 @@ fn explain_selected_with_pure_evidence(app: &mut App) {
 }
 
 #[tokio::test]
+async fn explain_key_reports_terminating_ready_pods_as_unhealthy() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let mut pod = health_test_pod("web");
+    pod["metadata"]["deletionTimestamp"] = json!("2026-09-07T10:00:00Z");
+    apply(&mut app, pod);
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    explain_selected_with_pure_evidence(&mut app);
+    assert_eq!(app.explain_items[0].level, crate::explain::Level::Warn);
+    assert_eq!(
+        app.explain_items[0].text,
+        "Pod/web is Terminating (1/1 ready)"
+    );
+}
+
+#[tokio::test]
 async fn explain_key_reports_node_pressure_without_warning_on_healthy_conditions() {
     for state in ["False", "True", "Unknown"] {
         let (mut app, _rx) = test_app();

@@ -392,6 +392,9 @@ fn pod_ready_counts(pod: &DynamicObject) -> (usize, usize) {
 }
 
 fn pod_is_ready(pod: &DynamicObject) -> bool {
+    if pod.metadata.deletion_timestamp.is_some() {
+        return false;
+    }
     // A pod is healthy when its Ready condition is True, or (Succeeded) it
     // completed. Fall back to container readiness when conditions are absent.
     if let Some(c) = condition(pod, "Ready")
