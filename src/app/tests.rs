@@ -6135,6 +6135,15 @@ async fn sort_picker_ctrl_n_p_navigate_without_touching_filter() {
         app.sort_picker_filter.is_empty(),
         "ctrl-n/p must not fall through to the type-to-filter buffer"
     );
+
+    // ctrl-alt-n is a distinct chord, left to typing "n" into the filter —
+    // not a nav move (see ctrl_alt_f leaves paging alone).
+    let ctrl_alt_n = KeyEvent::new(
+        KeyCode::Char('n'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    app.handle_key(ctrl_alt_n).unwrap();
+    assert_eq!(app.sort_picker_filter, "n");
 }
 
 #[tokio::test]
@@ -6204,6 +6213,15 @@ async fn copy_picker_ctrl_n_p_navigate_without_touching_filter() {
         app.copy_picker_filter.is_empty(),
         "ctrl-n/p must not fall through to the type-to-filter buffer"
     );
+
+    // ctrl-alt-n is a distinct chord, left to typing "n" into the filter —
+    // not a nav move (see ctrl_alt_f leaves paging alone).
+    let ctrl_alt_n = KeyEvent::new(
+        KeyCode::Char('n'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    app.handle_key(ctrl_alt_n).unwrap();
+    assert_eq!(app.copy_picker_filter, "n");
 }
 
 #[tokio::test]

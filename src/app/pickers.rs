@@ -267,10 +267,10 @@ impl App {
             }
             KeyCode::Down => list_step(&mut self.sort_picker_state, len, true),
             KeyCode::Up => list_step(&mut self.sort_picker_state, len, false),
-            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
                 list_step(&mut self.sort_picker_state, len, true)
             }
-            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
                 list_step(&mut self.sort_picker_state, len, false)
             }
             KeyCode::Enter => {
@@ -410,10 +410,10 @@ impl App {
             }
             KeyCode::Down => list_step(&mut self.copy_picker_state, len, true),
             KeyCode::Up => list_step(&mut self.copy_picker_state, len, false),
-            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
                 list_step(&mut self.copy_picker_state, len, true)
             }
-            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
                 list_step(&mut self.copy_picker_state, len, false)
             }
             KeyCode::Enter => {
