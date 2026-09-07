@@ -35,10 +35,11 @@ impl App {
                 None => self.flash_warn("service has no selector"),
             },
             // Cluster API: MachineDeployment → Machines, same selector
-            // pattern as workload → pods.
+            // pattern as workload → pods. Use the qualified name so a
+            // bare `machines` registered by an unrelated CRD can't hijack it.
             "machinedeployments" => match label_selector(&obj, "matchLabels") {
                 Some(sel) => self.drill_to(
-                    "machines",
+                    "machines.cluster.x-k8s.io",
                     ns,
                     Some(sel),
                     None,

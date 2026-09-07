@@ -3321,6 +3321,43 @@ async fn machinedeployment_without_selector_warns() {
 }
 
 #[tokio::test]
+async fn machinedeployment_drill_resolves_qualified_machine_group() {
+    let (mut app, _rx) = test_app();
+    app.cluster.register_kind(
+        "cluster.x-k8s.io",
+        "MachineDeployment",
+        "machinedeployments",
+        true,
+    );
+    app.cluster
+        .register_kind("cluster.x-k8s.io", "Machine", "machines", true);
+    // A competing CRD with the same plural but a different group. The bare
+    // `machines` key in the registry is last-write-wins, so it now resolves
+    // to the wrong kind. The drill must use the qualified name to avoid this.
+    app.cluster
+        .register_kind("other.example.com", "Machine", "machines", true);
+
+    app.switch_kind("machinedeployments");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "cluster.x-k8s.io/v1", "kind": "MachineDeployment",
+            "metadata": {"name": "md-1", "namespace": "default"},
+            "spec": {"selector": {"matchLabels": {"app": "web"}}}
+        }),
+    );
+    app.table_state.select(Some(0));
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.kind_plural, "machines");
+    assert_eq!(
+        app.kind.as_ref().unwrap().ar.group,
+        "cluster.x-k8s.io",
+        "qualified name resolves to Cluster API, not the competing CRD"
+    );
+}
+
+#[tokio::test]
 async fn o_on_pod_scopes_to_its_host_node() {
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
