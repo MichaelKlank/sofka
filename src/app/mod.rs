@@ -230,6 +230,19 @@ impl Drop for PortForward {
     }
 }
 
+/// Spawns a background `kubectl port-forward` child. Overridable in tests
+/// so the unit suite doesn't require `kubectl` on PATH.
+type PortForwardSpawner = fn(&[String]) -> std::io::Result<tokio::process::Child>;
+
+fn default_pf_spawner(argv: &[String]) -> std::io::Result<tokio::process::Child> {
+    tokio::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+}
+
 /// How dependents are handled on delete (kubectl `--cascade`, k9s propagation
 /// picker). Cycled with `c` in the delete confirm dialog.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1585,6 +1598,9 @@ pub struct App {
     /// Background `kubectl port-forward` processes started with `f`/`F`.
     /// Viewed/stopped via `:pf`; killed automatically on drop.
     pub port_forwards: Vec<PortForward>,
+    /// Injectable spawner for `kubectl port-forward` children. Tests override
+    /// this to avoid depending on `kubectl` being on PATH.
+    pf_spawner: PortForwardSpawner,
     pub pf_state: ListState,
     /// Port-forward picker (`f`): the declared ports of the selected object,
     /// each as a `LOCAL:REMOTE` string, plus a trailing "Custom…" entry.
@@ -1845,6 +1861,7 @@ impl App {
             transfer_menu_state: ListState::default(),
             transfer_target: None,
             port_forwards: Vec::new(),
+            pf_spawner: default_pf_spawner,
             forwards_cfg: Vec::new(),
             pf_picker_items: Vec::new(),
             pf_picker_state: ListState::default(),

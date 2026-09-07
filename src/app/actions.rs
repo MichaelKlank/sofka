@@ -1202,12 +1202,7 @@ impl App {
         }
         argv.push(target.clone());
         argv.push(ports.clone());
-        let mut cmd = tokio::process::Command::new(&argv[0]);
-        cmd.args(&argv[1..])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        match cmd.spawn() {
+        match (self.pf_spawner)(&argv) {
             Ok(child) => {
                 let pf = PortForward {
                     context: self.cluster.context.clone(),

@@ -658,6 +658,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|obj| {
             let row_key = crate::store::row_key(obj);
             let marked_row = !app.marked.is_empty() && app.marked.contains(&row_key);
+            let pf_ns = obj.metadata.namespace.as_deref().unwrap_or_default();
+            let pf_name = obj.metadata.name.as_deref().unwrap_or_default();
+            let forwarded = app.has_port_forward(pf_ns, pf_name, &app.kind_plural);
             let (base_cells, status_idx) = cell_cache
                 .get(&row_key)
                 .expect("visible rows are warmed in the table cell cache");
@@ -707,8 +710,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
             for (i, c) in cells.iter().enumerate() {
+                let extra = if i == name_col && forwarded { 2 } else { 0 }; // "● "
                 if let Some(n) = needed.get_mut(i) {
-                    *n = (*n).max(cell_width(c.as_str()));
+                    *n = (*n).max(cell_width(c.as_str()) + extra);
                 }
             }
             // Combined colorer: the whole row takes a k9s-style status tint
@@ -742,20 +746,24 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                 .map(|(i, c)| {
                     let align = align_of(i);
                     if marked_row {
-                        // Marked rows override everything so a bulk selection
-                        // stands out.
-                        c.into_cell_aligned(align).style(
-                            Style::default()
-                                .fg(theme::mark())
-                                .add_modifier(Modifier::BOLD),
-                        )
+                        if i == name_col {
+                            render_name_cell(app, c.as_str(), theme::mark(), forwarded).style(
+                                Style::default()
+                                    .fg(theme::mark())
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                        } else {
+                            c.into_cell_aligned(align).style(
+                                Style::default()
+                                    .fg(theme::mark())
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                        }
                     } else if Some(i) == style_idx {
                         c.into_cell_aligned(align)
                             .style(Style::default().fg(status_badge))
                     } else if i == name_col {
-                        let ns = obj.metadata.namespace.as_deref().unwrap_or_default();
-                        let fwd = app.has_port_forward(ns, c.as_str(), &app.kind_plural);
-                        render_name_cell(app, c.as_str(), row_color, fwd)
+                        render_name_cell(app, c.as_str(), row_color, forwarded)
                     } else if Some(i) == age_idx {
                         c.into_cell_aligned(align).style(theme::dim())
                     } else if Some(i) == restarts_idx {

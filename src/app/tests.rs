@@ -10,7 +10,17 @@ fn obj(v: serde_json::Value) -> DynamicObject {
 
 fn test_app() -> (App, Receiver<Msg>) {
     let (tx, rx) = mpsc::channel(1024);
-    (App::new(Cluster::fake(), tx), rx)
+    let mut app = App::new(Cluster::fake(), tx);
+    // Stub the port-forward spawner so tests don't require kubectl on PATH.
+    app.pf_spawner = |_argv| {
+        tokio::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    };
+    (app, rx)
 }
 
 /// The claim the operation that just started owns, for tests that hand-build
