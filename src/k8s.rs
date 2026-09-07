@@ -19,7 +19,8 @@ use tokio::task::JoinHandle;
 
 use crate::store::{Msg, row_key};
 
-pub(crate) fn build_client(config: Config) -> Result<Client, kube::Error> {
+pub(crate) fn build_client(config: Config, allow_v1_client_cert: bool) -> Result<Client> {
+    let builder = crate::legacy_tls::client_builder(config, allow_v1_client_cert)?;
     let layer =
         tower::util::MapRequestLayer::new(|mut request: http::Request<kube::client::Body>| {
             let watch = request.uri().query().is_some_and(|query| {
@@ -35,9 +36,7 @@ pub(crate) fn build_client(config: Config) -> Result<Client, kube::Error> {
             }
             request
         });
-    Ok(kube::client::ClientBuilder::try_from(config)?
-        .with_layer(&layer)
-        .build())
+    Ok(builder.with_layer(&layer).build())
 }
 
 /// A resolvable Kubernetes resource type.
@@ -100,6 +99,8 @@ pub struct Cluster {
     /// current context is unreachable at launch — the app then starts in the
     /// context picker instead of a resource view.
     pub connected: bool,
+    /// Explicit consent for v1 client certificates, retained for this run.
+    pub allow_v1_client_cert: bool,
     /// Per-cluster support for Kubernetes streaming-list watch startup:
     /// unknown, supported, or unsupported. Shared by all view watches so one
     /// negotiation failure avoids retrying the extension on every switch.
@@ -124,7 +125,7 @@ fn sanitize_server_version(version: &str) -> String {
 }
 
 impl Cluster {
-    pub async fn connect() -> Result<Self> {
+    pub async fn connect(allow_v1_client_cert: bool) -> Result<Self> {
         let config = Config::infer()
             .await
             .context("loading kubeconfig (is KUBECONFIG / ~/.kube/config present?)")?;
@@ -132,11 +133,11 @@ impl Cluster {
         // default; pass it explicitly so shell-outs can't drift from us.
         let cli_context = current_context_name();
         let context = cli_context.clone().unwrap_or_else(|| "default".into());
-        Self::from_config(config, context, cli_context).await
+        Self::from_config(config, context, cli_context, allow_v1_client_cert).await
     }
 
     /// Connect using a specific kubeconfig context (for the `:ctx` switcher).
-    pub async fn connect_context(name: &str) -> Result<Self> {
+    pub async fn connect_context(name: &str, allow_v1_client_cert: bool) -> Result<Self> {
         let kubeconfig = Kubeconfig::read().context("reading kubeconfig")?;
         let opts = KubeConfigOptions {
             context: Some(name.to_string()),
@@ -146,17 +147,24 @@ impl Cluster {
         let config = Config::from_custom_kubeconfig(kubeconfig, &opts)
             .await
             .with_context(|| format!("building config for context '{name}'"))?;
-        Self::from_config(config, name.to_string(), Some(name.to_string())).await
+        Self::from_config(
+            config,
+            name.to_string(),
+            Some(name.to_string()),
+            allow_v1_client_cert,
+        )
+        .await
     }
 
     async fn from_config(
         config: Config,
         context: String,
         cli_context: Option<String>,
+        allow_v1_client_cert: bool,
     ) -> Result<Self> {
         let cluster_url = config.cluster_url.to_string();
         let default_namespace = config.default_namespace.clone();
-        let client = build_client(config).context("building kube client")?;
+        let client = build_client(config, allow_v1_client_cert).context("building kube client")?;
         let version_client = client.clone();
 
         let cluster_name = cluster_name_for(&context).unwrap_or_default();
@@ -171,6 +179,7 @@ impl Cluster {
             registry: HashMap::new(),
             catalog: Vec::new(),
             connected: true,
+            allow_v1_client_cert,
             streaming_lists: Arc::new(AtomicU8::new(STREAMING_UNKNOWN)),
         };
         // Version is useful metadata, not a connectivity prerequisite. Fetch
@@ -237,6 +246,7 @@ impl Cluster {
             registry: HashMap::new(),
             catalog: Vec::new(),
             connected: false,
+            allow_v1_client_cert: false,
             streaming_lists: Arc::new(AtomicU8::new(STREAMING_UNKNOWN)),
         }
     }
@@ -615,6 +625,7 @@ impl Cluster {
             default_namespace: "default".into(),
             cli_context: Some("test".into()),
             connected: true,
+            allow_v1_client_cert: false,
             registry: HashMap::new(),
             catalog: Vec::new(),
             streaming_lists: Arc::new(AtomicU8::new(STREAMING_UNKNOWN)),
@@ -1071,7 +1082,7 @@ mod tests {
         // backoff) turns the mock's deliberate 503 into a ~4-minute stall;
         // retrying is not what these tests exercise.
         config.default_retry = false;
-        Cluster::from_config(config, "test".into(), None).await
+        Cluster::from_config(config, "test".into(), None, false).await
     }
 
     #[tokio::test]
