@@ -15,8 +15,6 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures_util::StreamExt;
-use fuzzy_matcher::FuzzyMatcher;
-use fuzzy_matcher::skim::SkimMatcherV2;
 use k8s_openapi::api::core::v1::Pod;
 use kube::Client;
 use kube::api::{
@@ -329,7 +327,7 @@ enum ConfirmAction {
     /// Run a confirmed plugin (`confirm`/`dangerous`) once accepted — one job
     /// (label, argv) per target, so a bulk run confirms once.
     Plugin {
-        jobs: Vec<(String, Vec<String>)>,
+        jobs: Vec<crate::plugins::Job>,
         name: String,
         mode: PluginMode,
         timeout: u64,
@@ -350,6 +348,8 @@ pub enum PluginMode {
     Terminal,
     /// Captured off-thread into a scrollable document view.
     Popup,
+    /// Versioned JSON report rendered as a searchable document.
+    Report,
     /// Detached; a notification flashes on completion.
     Background,
 }
@@ -1175,12 +1175,65 @@ impl SortKey {
         use std::cmp::Ordering;
         match (self, other) {
             (SortKey::Num(a), SortKey::Num(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-            (SortKey::Text(a), SortKey::Text(b)) => a.cmp(b),
+            (SortKey::Text(a), SortKey::Text(b)) => natural_cmp(a, b),
             // Mixed kinds shouldn't occur within one column; keep it stable.
             (SortKey::Num(_), SortKey::Text(_)) => Ordering::Less,
             (SortKey::Text(_), SortKey::Num(_)) => Ordering::Greater,
         }
     }
+}
+
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let (mut ai, mut bi) = (0, 0);
+
+    while ai < a.len() && bi < b.len() {
+        if a[ai].is_ascii_digit() && b[bi].is_ascii_digit() {
+            let a_end = digit_run_end(a, ai);
+            let b_end = digit_run_end(b, bi);
+            let a_sig = significant_digits(&a[ai..a_end]);
+            let b_sig = significant_digits(&b[bi..b_end]);
+            let ord = a_sig.len().cmp(&b_sig.len()).then_with(|| a_sig.cmp(b_sig));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            ai = a_end;
+            bi = b_end;
+        } else {
+            let ord = a[ai].cmp(&b[bi]);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            ai += 1;
+            bi += 1;
+        }
+    }
+
+    match (ai == a.len(), bi == b.len()) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (true, true) => a.len().cmp(&b.len()).then_with(|| a.cmp(b)),
+        (false, false) => unreachable!(),
+    }
+}
+
+fn digit_run_end(bytes: &[u8], start: usize) -> usize {
+    let mut end = start;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    end
+}
+
+fn significant_digits(digits: &[u8]) -> &[u8] {
+    let first = digits
+        .iter()
+        .position(|digit| *digit != b'0')
+        .unwrap_or(digits.len());
+    &digits[first..]
 }
 
 /// Maximum previous object revisions retained for the session diff.
@@ -1193,7 +1246,7 @@ const PREV_REVISIONS_MAX: usize = 256;
 /// drilling away and back keeps the baseline.
 #[derive(Default)]
 pub(super) struct PrevRevisions {
-    map: HashMap<(String, String), Arc<DynamicObject>>,
+    map: crate::store::FastMap<(String, String), Arc<DynamicObject>>,
     order: VecDeque<(String, String)>,
 }
 
@@ -1224,6 +1277,93 @@ struct FilterCache {
     parsed: crate::filter::ParsedFilter,
 }
 
+/// Highlight positions per row name for the active fuzzy needle.
+///
+/// The filter pass already ran the matcher over every row; without this the
+/// renderer ran it again for every *visible* row on every redraw, which is
+/// the same fuzzy scoring work repeated at frame rate for a result that only
+/// changes when the needle or the name does.
+#[derive(Default)]
+struct HighlightCache {
+    /// The needle these entries were matched against. Anything else empties
+    /// the map — a new needle invalidates every entry at once.
+    needle: String,
+    /// Match positions per name. `None` — the name did not match — is a real
+    /// answer and is cached too, so a filter that excludes most rows does not
+    /// re-run the matcher over them every frame.
+    rows: crate::store::FastMap<Box<str>, Option<Rc<[usize]>>>,
+}
+
+/// The display header list, valid for the view spec and column toggles it was
+/// built from.
+///
+/// `display_headers` is asked for the header list from a dozen places — the
+/// renderer, sorting, mouse hit-testing, the copy picker, bookmarks — several
+/// times per frame, and each call used to build a fresh `Vec<String>` of owned
+/// headers only to read one entry out of it.
+struct HeaderCache {
+    /// `(namespace column, node capacity columns, metrics columns)` — the
+    /// toggles that add columns around the spec's own.
+    shape: (bool, bool, bool),
+    /// Bumped whenever the view spec is rebuilt.
+    spec_rev: u64,
+    headers: Rc<[String]>,
+}
+
+/// Memoized picker lists.
+///
+/// Every one of these is fuzzy-scored and sorted from scratch on each draw,
+/// and again on each keystroke by the input handlers that ask it for a length,
+/// a selection or a lookup — several full rebuilds per frame while a picker is
+/// open.
+///
+/// Each memo is keyed on the inputs themselves rather than on a revision
+/// counter someone has to remember to bump: comparing them is a handful of
+/// string compares against no allocation, and a new writer to `ns_list` or the
+/// favourites cannot leave a stale list on screen.
+#[derive(Default)]
+struct PickerMemos {
+    namespaces: Option<NamespaceMemo>,
+    contexts: Option<ContextMemo>,
+    sort_entries: Option<SortEntryMemo>,
+    copy_entries: Option<CopyEntryMemo>,
+}
+
+struct NamespaceMemo {
+    filter: String,
+    context: String,
+    ns_list: Vec<String>,
+    favorites: Vec<String>,
+    recents: Vec<String>,
+    value: Rc<Vec<String>>,
+}
+
+struct ContextMemo {
+    filter: String,
+    ctx_list: Vec<String>,
+    value: Rc<Vec<String>>,
+}
+
+struct SortEntryMemo {
+    filter: String,
+    /// The header list this was built from. Held as the same handle
+    /// `display_headers` returns, so a hit is a pointer comparison.
+    headers: Rc<[String]>,
+    value: Rc<Vec<String>>,
+}
+
+struct CopyEntryMemo {
+    filter: String,
+    fields: Vec<(String, String)>,
+    value: Rc<Vec<(String, String)>>,
+}
+
+/// Names are only inserted when they are drawn, so this holds a screenful in
+/// practice. The bound is here for the pathological case — a session left on
+/// one filter while rows churn through it — and clearing costs one redraw's
+/// worth of rematching.
+const HIGHLIGHT_CACHE_LIMIT: usize = 4096;
+
 /// Lazily-rebuilt cache of the display-ordered, filtered row keys. Recomputing
 /// the sort + fuzzy filter on every `rows()` call (per frame, per keystroke) is
 /// wasteful on large clusters; we rebuild only when the store or filter changes.
@@ -1231,14 +1371,20 @@ struct FilterCache {
 struct RowsCache {
     dirty: bool,
     keys: Vec<RowKey>,
-    cells: HashMap<RowKey, CellCacheEntry>,
+    cells: crate::store::FastMap<RowKey, CellCacheEntry>,
+    column_widths: Option<TableWidthCache>,
     /// Computed primary sort keys, valid per (sort header, resourceVersion) —
     /// a rebuild touches every object, but only changed rows re-extract.
-    sort_keys: HashMap<RowKey, SortKeyEntry>,
+    sort_keys: crate::store::FastMap<RowKey, SortKeyEntry>,
     /// Helm view only: the latest-revision dedup, paired with the store
     /// version it was computed from. A rebuild staled by a filter keystroke or
     /// a sort toggle leaves the store untouched, so the dedup still holds.
-    helm_latest: Option<(u64, HashSet<RowKey>)>,
+    helm_latest: Option<(u64, crate::store::FastSet<RowKey>)>,
+}
+
+struct TableWidthCache {
+    headers: Rc<[String]>,
+    needed: Vec<u16>,
 }
 
 struct CellCacheEntry {
@@ -1385,6 +1531,9 @@ pub struct App {
     gen_flag: Arc<AtomicU64>,
     pub tasks: Vec<JoinHandle<()>>,
     pub tx: Sender<Msg>,
+    /// Ordered off-thread persistence for small UI state files. `None` keeps
+    /// unit tests and degraded startup on the synchronous fallback.
+    pub state_writer: Option<crate::state_writer::StateWriter>,
     stack: Vec<Frame>,
     /// Scope of the running watch, so its rows can be stashed under the right
     /// key when the user navigates away.
@@ -1413,15 +1562,26 @@ pub struct App {
     /// `None` for the natural namespace/name order.
     pub sort_column: Option<usize>,
     pub sort_desc: bool,
-    /// Horizontal column scroll: how many columns after the anchored
-    /// NAMESPACE/NAME prefix are hidden off the left edge (←/→ in the
-    /// table). Clamped by `draw_table`, since the header set can change
-    /// underneath it; reset when the view spec is rebuilt.
+    /// Horizontal offset in terminal cells after NAMESPACE/NAME.
+    /// The renderer clamps this when the viewport or columns change.
     pub col_offset: usize,
+    pub col_scroll_max: usize,
     pub filter: String,
+    pub faults_only: bool,
     /// Parsed form of `filter`, refreshed lazily when the string changes so
     /// neither row matching nor rendering reparses it per frame.
     filter_cache: RefCell<FilterCache>,
+    /// Fuzzy highlight positions per visible row name, valid for the needle
+    /// they were matched against.
+    highlight_cache: RefCell<HighlightCache>,
+    /// Memoized `display_headers()`, rebuilt when the spec or the column
+    /// toggles change.
+    header_cache: RefCell<Option<HeaderCache>>,
+    /// Memoized picker lists, each valid for the inputs it was built from.
+    picker_memos: RefCell<PickerMemos>,
+    /// Bumped on every view-spec rebuild, so caches derived from the spec can
+    /// tell that it moved.
+    spec_rev: u64,
     /// Server-side selectors (`-l`/`-f` filter terms) the running watch was
     /// started with. Compared against the parsed filter to know when a
     /// restart is needed and to mark the filter as server-side in the UI.
@@ -1503,6 +1663,9 @@ pub struct App {
     pub user_aliases: HashMap<String, String>,
     /// User-defined shell-out plugins.
     pub plugins: Vec<crate::config::Plugin>,
+    pub(super) plugin_task: Option<crate::plugins::Task>,
+    pub(super) plugin_run: u64,
+    pub(super) plugin_claim: Option<StatusClaim>,
     /// Saved navigation commands (`[[bookmarks]]`), re-applied on context
     /// switch and `:reload`.
     pub bookmarks: Vec<crate::config::Bookmark>,
@@ -1564,6 +1727,10 @@ pub struct App {
     pub watch_errors: u64,
     /// The most recent error message, for `:info` diagnostics.
     pub last_error: Option<String>,
+    /// The most recent failure to persist a small UI-state file (namespace,
+    /// sort, fleet marks). Kept apart from [`Self::last_error`], which `:info`
+    /// reports under watch health — a disk problem is not a watch problem.
+    pub last_state_write_error: Option<String>,
     /// Whether the Metrics API has ever returned data this session.
     pub metrics_seen: bool,
     /// The metrics poll's most recent failure (`None` while it works), for
@@ -1719,7 +1886,7 @@ pub struct App {
     /// return so the cursor lands back on the same object.
     return_selection: Option<String>,
     pub should_quit: bool,
-    matcher: SkimMatcherV2,
+    matcher: crate::fuzzy::Fuzzy,
     rows_cache: RefCell<RowsCache>,
     /// Scratch buffer for the fuzzy filter's "namespace name" haystack, reused
     /// across rows so the filter pass doesn't allocate a `String` per object.
@@ -1766,6 +1933,7 @@ impl App {
             gen_flag: Arc::new(AtomicU64::new(0)),
             tasks: Vec::new(),
             tx,
+            state_writer: None,
             stack: Vec::new(),
             watch_key: None,
             view_cache: HashMap::new(),
@@ -1779,11 +1947,17 @@ impl App {
             sort_column: None,
             sort_desc: false,
             col_offset: 0,
+            col_scroll_max: 0,
             filter: String::new(),
+            faults_only: false,
             filter_cache: RefCell::new(FilterCache {
                 raw: String::new(),
                 parsed: crate::filter::parse(""),
             }),
+            highlight_cache: RefCell::new(HighlightCache::default()),
+            header_cache: RefCell::new(None),
+            picker_memos: RefCell::new(PickerMemos::default()),
+            spec_rev: 0,
             applied_filter_labels: None,
             applied_filter_fields: None,
             command: String::new(),
@@ -1822,6 +1996,9 @@ impl App {
             all_contexts: Vec::new(),
             user_aliases: HashMap::new(),
             plugins: Vec::new(),
+            plugin_task: None,
+            plugin_run: 0,
+            plugin_claim: None,
             bookmarks: Vec::new(),
             pending_bookmark: None,
             workspaces: Vec::new(),
@@ -1848,6 +2025,7 @@ impl App {
             journal: crate::journal::Journal::default(),
             watch_errors: 0,
             last_error: None,
+            last_state_write_error: None,
             metrics_seen: false,
             metrics_error: None,
             rbac_allowed: None,
@@ -1921,13 +2099,14 @@ impl App {
             return_mode: Mode::Table,
             return_selection: None,
             should_quit: false,
-            matcher: SkimMatcherV2::default(),
+            matcher: crate::fuzzy::Fuzzy::new(),
             hay_buf: RefCell::new(String::new()),
             rows_cache: RefCell::new(RowsCache {
                 dirty: true,
                 keys: Vec::new(),
-                cells: HashMap::new(),
-                sort_keys: HashMap::new(),
+                cells: crate::store::FastMap::default(),
+                column_widths: None,
+                sort_keys: crate::store::FastMap::default(),
                 helm_latest: None,
             }),
             log_provider: None,
@@ -1975,7 +2154,7 @@ mod explain;
 mod find;
 mod fleet;
 mod gitops;
-mod guardrails;
+pub(crate) mod guardrails;
 mod helpers;
 mod input;
 mod journal;
@@ -1986,6 +2165,7 @@ mod navigation;
 mod notify;
 mod overlays;
 mod pickers;
+mod plugins;
 mod rightsize;
 mod rows;
 mod snapshot;
@@ -1998,3 +2178,8 @@ pub use pickers::DEFAULT_SORT_LABEL;
 
 #[cfg(test)]
 mod tests;
+
+/// Built-ins retain ownership of their command names when loading packages.
+pub(crate) fn plugin_command_reserved(name: &str) -> bool {
+    name == "plugin-cancel" || PALETTE_COMMANDS.iter().any(|c| c.names.contains(&name))
+}
