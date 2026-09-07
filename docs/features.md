@@ -19,6 +19,8 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   26 characters so status changes do not move adjacent columns. A configured
   column width takes priority. Column widths use the full filtered list so
   vertical scrolling does not move the columns.
+- **Service endpoints** include ExternalName targets, configured external IPs,
+  load balancer addresses, and NodePort values such as `80:30080/TCP`.
 - **Pod health** shows init progress and failure reasons, Pod reasons such as
   `Evicted`, scheduling gates, and termination signals or exit codes.
   Init progress appears after the kubelet reports init state. Until then, the

@@ -1616,24 +1616,48 @@ pub fn pod_status(obj: &DynamicObject) -> String {
 }
 
 fn external_ip(d: &Value, typ: &str) -> String {
-    if let Some(ing) = d
-        .pointer("/status/loadBalancer/ingress")
-        .and_then(Value::as_array)
+    if typ == "ExternalName" {
+        return sget(d, &["spec", "externalName"])
+            .unwrap_or("<none>")
+            .to_string();
+    }
+    let mut ips = Vec::new();
+    if typ == "LoadBalancer"
+        && let Some(ingress) = d
+            .pointer("/status/loadBalancer/ingress")
+            .and_then(Value::as_array)
     {
-        let ips: Vec<String> = ing
-            .iter()
-            .filter_map(|i| {
-                i.get("ip")
-                    .or_else(|| i.get("hostname"))
-                    .and_then(Value::as_str)
-                    .map(String::from)
-            })
-            .collect();
-        if !ips.is_empty() {
-            return ips.join(",");
+        for address in ingress {
+            if let Some(value) = address
+                .get("ip")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    address
+                        .get("hostname")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                })
+                && !ips.contains(&value)
+            {
+                ips.push(value);
+            }
         }
     }
-    if typ == "LoadBalancer" {
+    if let Some(external) = d.pointer("/spec/externalIPs").and_then(Value::as_array) {
+        for address in external
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            if !ips.contains(&address) {
+                ips.push(address);
+            }
+        }
+    }
+    if !ips.is_empty() {
+        ips.join(",")
+    } else if typ == "LoadBalancer" {
         "<pending>".into()
     } else {
         "<none>".into()
@@ -1649,11 +1673,15 @@ fn svc_ports(d: &Value) -> String {
                 .map(|p| {
                     let port = p.get("port").and_then(Value::as_i64).unwrap_or(0);
                     let proto = p.get("protocol").and_then(Value::as_str).unwrap_or("TCP");
-                    format!("{port}/{proto}")
+                    match p.get("nodePort").and_then(Value::as_i64).filter(|p| *p > 0) {
+                        Some(node_port) => format!("{port}:{node_port}/{proto}"),
+                        None => format!("{port}/{proto}"),
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join(",")
         })
+        .filter(|ports| !ports.is_empty())
         .unwrap_or_else(|| "<none>".into())
 }
 
