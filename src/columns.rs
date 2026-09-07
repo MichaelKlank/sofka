@@ -669,7 +669,7 @@ fn col_deploy_ready<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     Cow::Owned(format!(
         "{}/{}",
         iget(ctx.data, &["status", "readyReplicas"]),
-        iget(ctx.data, &["status", "replicas"])
+        iopt(ctx.data, &["spec", "replicas"]).unwrap_or(1)
     ))
 }
 
@@ -722,7 +722,7 @@ fn col_deploy_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
         return "Terminating".into();
     }
     Cow::Owned(workload_status(
-        ctx.data,
+        ctx.obj,
         WorkloadCounts::deployment(ctx.data),
     ))
 }
@@ -732,7 +732,7 @@ fn col_sts_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
         return "Terminating".into();
     }
     Cow::Owned(workload_status(
-        ctx.data,
+        ctx.obj,
         WorkloadCounts::statefulset(ctx.data),
     ))
 }
@@ -742,7 +742,7 @@ fn col_rs_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
         return "Terminating".into();
     }
     Cow::Owned(workload_status(
-        ctx.data,
+        ctx.obj,
         WorkloadCounts::replicaset(ctx.data),
     ))
 }
@@ -752,7 +752,7 @@ fn col_ds_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
         return "Terminating".into();
     }
     Cow::Owned(workload_status(
-        ctx.data,
+        ctx.obj,
         WorkloadCounts::daemonset(ctx.data),
     ))
 }
@@ -764,8 +764,8 @@ struct WorkloadCounts {
     desired: i64,
     current: i64,
     ready: i64,
-    /// Replicas already on the current template revision — below `desired`
-    /// means a rollout is still replacing pods.
+    /// Replicas that satisfy the update policy, including replicas retained
+    /// by a StatefulSet partition or an OnDelete strategy.
     updated: i64,
 }
 
@@ -781,7 +781,15 @@ impl WorkloadCounts {
     }
 
     fn statefulset(d: &Value) -> Self {
-        Self::deployment(d)
+        let mut counts = Self::deployment(d);
+        if sget(d, &["spec", "updateStrategy", "type"]) == Some("OnDelete") {
+            counts.updated = counts.desired;
+        } else {
+            let partition = iget(d, &["spec", "updateStrategy", "rollingUpdate", "partition"]);
+            let start = iget(d, &["spec", "ordinals", "start"]);
+            counts.updated += (partition - start).clamp(0, counts.desired.max(0));
+        }
+        counts
     }
 
     fn replicaset(d: &Value) -> Self {
@@ -800,7 +808,11 @@ impl WorkloadCounts {
             desired: iget(d, &["status", "desiredNumberScheduled"]),
             current: iget(d, &["status", "currentNumberScheduled"]),
             ready: iget(d, &["status", "numberReady"]),
-            updated: iget(d, &["status", "updatedNumberScheduled"]),
+            updated: if sget(d, &["spec", "updateStrategy", "type"]) == Some("OnDelete") {
+                iget(d, &["status", "desiredNumberScheduled"])
+            } else {
+                iget(d, &["status", "updatedNumberScheduled"])
+            },
         }
     }
 }
@@ -820,7 +832,13 @@ impl WorkloadCounts {
 ///   failing probes, unschedulable (red)
 /// - `Stalled` — the Progressing condition gave up
 ///   (ProgressDeadlineExceeded) or ReplicaFailure is set (red)
-fn workload_status(d: &Value, c: WorkloadCounts) -> String {
+fn workload_status(obj: &DynamicObject, c: WorkloadCounts) -> String {
+    let d = &obj.data;
+    if let Some(generation) = obj.metadata.generation
+        && iopt(d, &["status", "observedGeneration"]).unwrap_or(0) < generation
+    {
+        return "Progressing".into();
+    }
     if c.desired == 0 {
         return if c.current == 0 {
             "ScaledDown".into()
@@ -834,18 +852,17 @@ fn workload_status(d: &Value, c: WorkloadCounts) -> String {
     {
         return "Stalled".into();
     }
-    if c.ready >= c.desired {
-        return if condition_is(d, "Available", "False") {
-            "Unavailable".into()
-        } else {
-            "Ready".into()
-        };
-    }
     if c.ready == 0 {
         return "Unavailable".into();
     }
-    if c.updated < c.desired || c.current < c.desired {
+    if c.updated < c.desired || c.current != c.desired {
         return "Progressing".into();
+    }
+    if condition_is(d, "Available", "False") {
+        return "Unavailable".into();
+    }
+    if c.ready >= c.desired {
+        return "Ready".into();
     }
     "Degraded".into()
 }

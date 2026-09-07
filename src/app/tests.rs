@@ -12486,3 +12486,193 @@ async fn drain_key_blocks_missing_uid_before_any_evictions() {
     assert!(message.contains("UID is missing"), "{message}");
     assert_eq!(requests.len(), 2);
 }
+
+#[tokio::test]
+async fn workload_table_reports_rollout_generation_and_desired_readiness() {
+    for (plural, kind, spec, status, generation, expected_ready, expected_status) in [
+        (
+            "deployments",
+            "Deployment",
+            json!({"replicas": 3}),
+            json!({"replicas": 4, "readyReplicas": 4, "updatedReplicas": 3, "observedGeneration": 2}),
+            2,
+            "4/3",
+            "Progressing",
+        ),
+        (
+            "deployments",
+            "Deployment",
+            json!({}),
+            json!({"replicas": 1, "readyReplicas": 1, "updatedReplicas": 1, "observedGeneration": 2}),
+            2,
+            "1/1",
+            "Ready",
+        ),
+        (
+            "deployments",
+            "Deployment",
+            json!({"replicas": 0}),
+            json!({"observedGeneration": 1}),
+            2,
+            "0/0",
+            "Progressing",
+        ),
+        (
+            "statefulsets",
+            "StatefulSet",
+            json!({"replicas": 3, "ordinals": {"start": 5}, "updateStrategy": {"rollingUpdate": {"partition": 6}}}),
+            json!({"replicas": 3, "readyReplicas": 3, "updatedReplicas": 2, "observedGeneration": 2}),
+            2,
+            "3/3",
+            "Ready",
+        ),
+        (
+            "deployments",
+            "Deployment",
+            json!({"replicas": 3}),
+            json!({"replicas": 4, "readyReplicas": 3, "updatedReplicas": 1, "observedGeneration": 2}),
+            2,
+            "3/3",
+            "Progressing",
+        ),
+        (
+            "deployments",
+            "Deployment",
+            json!({"replicas": 3}),
+            json!({"replicas": 3, "readyReplicas": 3, "updatedReplicas": 3, "observedGeneration": 1}),
+            2,
+            "3/3",
+            "Progressing",
+        ),
+        (
+            "deployments",
+            "Deployment",
+            json!({"replicas": 3}),
+            json!({"replicas": 2, "readyReplicas": 2, "updatedReplicas": 2, "observedGeneration": 2}),
+            2,
+            "2/3",
+            "Progressing",
+        ),
+        (
+            "statefulsets",
+            "StatefulSet",
+            json!({"replicas": 3}),
+            json!({"replicas": 3, "readyReplicas": 3, "updatedReplicas": 1, "observedGeneration": 2}),
+            2,
+            "3/3",
+            "Progressing",
+        ),
+        (
+            "statefulsets",
+            "StatefulSet",
+            json!({"replicas": 3, "updateStrategy": {"rollingUpdate": {"partition": 2}}}),
+            json!({"replicas": 3, "readyReplicas": 3, "updatedReplicas": 1, "observedGeneration": 2}),
+            2,
+            "3/3",
+            "Ready",
+        ),
+        (
+            "statefulsets",
+            "StatefulSet",
+            json!({"replicas": 3, "updateStrategy": {"type": "OnDelete"}}),
+            json!({"replicas": 3, "readyReplicas": 3, "updatedReplicas": 0, "observedGeneration": 2}),
+            2,
+            "3/3",
+            "Ready",
+        ),
+        (
+            "daemonsets",
+            "DaemonSet",
+            json!({}),
+            json!({"desiredNumberScheduled": 3, "currentNumberScheduled": 3, "numberReady": 3, "updatedNumberScheduled": 1, "observedGeneration": 2}),
+            2,
+            "3",
+            "Progressing",
+        ),
+        (
+            "daemonsets",
+            "DaemonSet",
+            json!({"updateStrategy": {"type": "OnDelete"}}),
+            json!({"desiredNumberScheduled": 3, "currentNumberScheduled": 3, "numberReady": 3, "updatedNumberScheduled": 1, "observedGeneration": 2}),
+            2,
+            "3",
+            "Ready",
+        ),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.cluster.register_kind("apps", kind, plural, true);
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for ch in plural.chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        apply(
+            &mut app,
+            json!({"apiVersion": "apps/v1", "kind": kind, "metadata": {"name": "web", "namespace": "default", "generation": generation, "resourceVersion": format!("{spec}{status}")}, "spec": spec, "status": status}),
+        );
+        let headers = app.display_headers().to_vec();
+        let rows = app.rows();
+        app.ensure_table_cell_cache(&rows);
+        let cache = app.table_cell_cache();
+        let (cells, _) = cache.get(&row_key(rows[0])).unwrap();
+        assert_eq!(
+            cells[headers.iter().position(|h| h == "READY").unwrap()],
+            expected_ready,
+            "{kind}"
+        );
+        assert_eq!(
+            cells[headers.iter().position(|h| h == "STATUS").unwrap()],
+            expected_status,
+            "{kind}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn workload_table_keeps_active_rollouts_progressing_when_unavailable() {
+    for (current, ready, updated, stalled, expected) in [
+        (3, 1, 1, false, "Progressing"),
+        (4, 2, 3, false, "Progressing"),
+        (2, 1, 2, false, "Progressing"),
+        (3, 0, 1, false, "Unavailable"),
+        (3, 2, 3, false, "Unavailable"),
+        (3, 3, 3, false, "Unavailable"),
+        (3, 1, 1, true, "Stalled"),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.cluster
+            .register_kind("apps", "Deployment", "deployments", true);
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for ch in "deployments".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        let mut conditions = vec![json!({"type": "Available", "status": "False"})];
+        if stalled {
+            conditions.push(json!({"type": "Progressing", "status": "False", "reason": "ProgressDeadlineExceeded"}));
+        }
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "apps/v1", "kind": "Deployment",
+                "metadata": {"name": "web", "namespace": "default", "generation": 2},
+                "spec": {"replicas": 3},
+                "status": {
+                    "observedGeneration": 2, "replicas": current,
+                    "readyReplicas": ready, "updatedReplicas": updated,
+                    "conditions": conditions,
+                },
+            }),
+        );
+        let headers = app.display_headers().to_vec();
+        let rows = app.rows();
+        app.ensure_table_cell_cache(&rows);
+        let cache = app.table_cell_cache();
+        let (cells, _) = cache.get(&row_key(rows[0])).unwrap();
+        assert_eq!(
+            cells[headers.iter().position(|h| h == "STATUS").unwrap()],
+            expected,
+            "current={current}, ready={ready}, updated={updated}, stalled={stalled}"
+        );
+    }
+}
