@@ -26,6 +26,7 @@ pub mod helm;
 pub mod journal;
 pub mod k8s;
 pub mod keys;
+mod legacy_tls;
 pub mod logfilter;
 pub mod nsmem;
 pub mod plugins;

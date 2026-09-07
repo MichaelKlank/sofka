@@ -392,7 +392,7 @@ fn mock_cluster(url: &str) -> Cluster {
     // this test is about the app's fallback, not the client's retries.
     config.default_retry = false;
     let mut cluster = Cluster::fake();
-    cluster.client = crate::k8s::build_client(config).expect("mock client");
+    cluster.client = crate::k8s::build_client(config, false).expect("mock client");
     cluster.cluster_url = url.into();
     cluster
 }
@@ -16402,4 +16402,29 @@ async fn quoted_filter_folds_unicode_column_text() {
     assert_eq!(row_names(&app), ["event-1"]);
     retype_filter(&mut app, "!\"kube\"");
     assert_eq!(row_names(&app), ["event-2"]);
+}
+
+#[tokio::test]
+async fn bundled_plugin_receives_v1_consent_only_when_enabled() {
+    for allow in [false, true] {
+        let (mut app, _rx) = app_with_pod();
+        app.cluster.allow_v1_client_cert = allow;
+        app.plugins = crate::plugins::bundled()
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        plugin_command(&mut app, "sanitize");
+        let Some(ConfirmAction::Plugin { jobs, .. }) = app.confirm_action.as_ref() else {
+            panic!("expected plugin confirmation");
+        };
+        assert!(!jobs.is_empty());
+        for job in jobs {
+            assert_eq!(
+                job.argv.iter().any(|arg| arg == "--allow-v1-client-cert"),
+                allow
+            );
+        }
+        app.handle_key(press(KeyCode::Char('n'))).unwrap();
+        assert_eq!(app.mode, Mode::Table);
+    }
 }

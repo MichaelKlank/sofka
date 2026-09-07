@@ -784,8 +784,9 @@ impl App {
         self.invalidate_rows();
         let tx = self.tx.clone();
         let genr = self.generation;
+        let allow_v1_client_cert = self.cluster.allow_v1_client_cert;
         tokio::spawn(async move {
-            let result = Cluster::connect_context(&name)
+            let result = Cluster::connect_context(&name, allow_v1_client_cert)
                 .await
                 .map(Box::new)
                 .map_err(|e| e.to_string());
