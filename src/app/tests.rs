@@ -6442,10 +6442,10 @@ async fn saved_printer_sort_replaces_config_default_but_not_a_new_user_choice() 
         install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
         palette(&mut app, "certificates");
         assert_eq!(app.sort_column, Some(1));
-        assert!(app.sort_from_config);
+        assert_eq!(app.sort_origin, SortOrigin::Configured);
         if invert {
             app.handle_key(press(KeyCode::Char('I'))).unwrap();
-            assert!(!app.sort_from_config);
+            assert_eq!(app.sort_origin, SortOrigin::Selected);
         }
         let crd = json!({"spec": {"versions": [{
             "name": "v1", "served": true, "storage": true,
@@ -6473,7 +6473,7 @@ async fn saved_wide_sort_replaces_config_default_when_its_column_appears() {
     app.sort_memory.set("pods", "IP", false);
     install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
     palette(&mut app, "pods");
-    assert!(app.sort_from_config);
+    assert_eq!(app.sort_origin, SortOrigin::Configured);
     assert!(app.sort_desc);
     app.handle_key(press(KeyCode::Char('w'))).unwrap();
     assert_eq!(
@@ -6481,8 +6481,177 @@ async fn saved_wide_sort_replaces_config_default_when_its_column_appears() {
         app.display_headers().iter().position(|h| h == "IP")
     );
     assert!(app.sort_column.is_some());
-    assert!(!app.sort_from_config);
+    assert_eq!(app.sort_origin, SortOrigin::Selected);
     assert!(!app.sort_desc);
+}
+
+#[tokio::test]
+async fn cleared_sort_survives_column_changes_and_watch_refresh_until_navigation() {
+    for remember in [true, false] {
+        for view_key in ["*", "certificates"] {
+            for header in ["AGE", "READY"] {
+                let (mut app, _rx) = test_app();
+                app.remember_sort = remember;
+                app.sort_memory.set("certificates", "READY", false);
+                install_views(
+                    &mut app,
+                    &format!("[views.\"{view_key}\"]\nsort = \"{header}:desc\"\n"),
+                );
+                palette(&mut app, "certificates");
+                clear_sort_with_keys(&mut app);
+                deliver_ready_printer_column(&mut app);
+                assert_eq!(app.sort_column, None);
+                assert!(!app.sort_desc);
+                for key in [
+                    press(KeyCode::Char('w')),
+                    press(KeyCode::Char('w')),
+                    ctrl(KeyCode::Char('r')),
+                ] {
+                    app.handle_key(key).unwrap();
+                    assert_eq!(app.sort_column, None);
+                    assert_eq!(app.sort_origin, SortOrigin::Cleared);
+                }
+                assert_eq!(
+                    app.sort_memory.get("certificates"),
+                    (!remember).then(|| ("READY".into(), false))
+                );
+
+                palette(&mut app, "services");
+                palette(&mut app, "certificates");
+                assert_eq!(
+                    app.sort_column,
+                    app.display_headers().iter().position(|h| h == header)
+                );
+                assert!(app.sort_column.is_some());
+                assert!(app.sort_desc);
+            }
+        }
+    }
+}
+
+fn clear_sort_with_keys(app: &mut App) {
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    while app.sort_picker_state.selected().unwrap() > 0 {
+        app.handle_key(press(KeyCode::Up)).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.sort_column, None);
+}
+
+fn deliver_ready_printer_column(app: &mut App) {
+    let crd = json!({"spec": {"versions": [{
+        "name": "v1", "served": true, "storage": true,
+        "additionalPrinterColumns": [
+            {"name": "Ready", "type": "string", "jsonPath": ".status.ready"}
+        ]
+    }]}});
+    app.handle_msg(Msg::PrinterColumns {
+        generation: app.generation,
+        resource: app.cluster.resolve("certificates").unwrap().resource_key(),
+        view: Box::new(crate::views::printer_columns_view(&crd, "v1")),
+    });
+}
+
+#[tokio::test]
+async fn enabling_sort_memory_does_not_replace_a_cleared_sort_in_the_active_view() {
+    let dir = std::env::temp_dir().join(format!("sofka-sort-clear-reload-{}", std::process::id()));
+    write_config(&dir, "remember_sort = false\n");
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+    app.sort_memory.set("certificates", "READY", false);
+    palette(&mut app, "reload");
+    palette(&mut app, "certificates");
+    clear_sort_with_keys(&mut app);
+    write_config(&dir, "remember_sort = true\n");
+    palette(&mut app, "reload");
+    assert!(app.remember_sort);
+    deliver_ready_printer_column(&mut app);
+    assert_eq!(app.sort_column, None);
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.sort_column, None);
+    palette(&mut app, "services");
+    palette(&mut app, "certificates");
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "READY")
+    );
+    assert!(!app.sort_desc);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn bookmark_sort_keeps_priority_over_delayed_saved_and_configured_sorts() {
+    for remember in [true, false] {
+        let (mut app, _rx) = test_app();
+        app.remember_sort = remember;
+        install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+        app.sort_memory.set("certificates", "READY", false);
+        palette(&mut app, "certificates");
+        clear_sort_with_keys(&mut app);
+        app.sort_memory.set("certificates", "READY", false);
+        app.bookmarks = vec![crate::config::Bookmark {
+            key: Some("ctrl-y".into()),
+            name: "sorted certificates".into(),
+            resource: "certificates".into(),
+            sort: Some("NAME:desc".into()),
+            ..Default::default()
+        }];
+        app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+        deliver_ready_printer_column(&mut app);
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        assert_eq!(app.sort_column, Some(0));
+        assert!(app.sort_desc);
+        assert_eq!(app.sort_origin, SortOrigin::Selected);
+        assert_eq!(
+            app.sort_memory.get("certificates"),
+            Some(("READY".into(), false))
+        );
+    }
+}
+
+#[tokio::test]
+async fn sort_can_be_selected_again_after_clearing_with_memory_disabled() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    for mouse in [true, false] {
+        let (mut app, _rx) = test_app();
+        app.remember_sort = false;
+        install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+        app.sort_memory.set("certificates", "READY", false);
+        palette(&mut app, "certificates");
+        clear_sort_with_keys(&mut app);
+        if mouse {
+            let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
+            term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let hit = app.table_hit.borrow().clone().unwrap();
+            let (column, _, _) = hit.cols.iter().find(|(_, _, idx)| *idx == 0).unwrap();
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: *column,
+                row: hit.header_y,
+                modifiers: KeyModifiers::NONE,
+            })
+            .unwrap();
+        } else {
+            app.handle_key(press(KeyCode::Char('S'))).unwrap();
+            for c in "name".chars() {
+                app.handle_key(press(KeyCode::Char(c))).unwrap();
+            }
+            app.handle_key(press(KeyCode::Enter)).unwrap();
+        }
+        app.handle_key(press(KeyCode::Char('I'))).unwrap();
+        deliver_ready_printer_column(&mut app);
+        assert_eq!(app.sort_column, Some(0));
+        assert!(app.sort_desc);
+        assert_eq!(app.sort_origin, SortOrigin::Selected);
+        assert_eq!(
+            app.sort_memory.get("certificates"),
+            Some(("READY".into(), false))
+        );
+    }
 }
 
 #[tokio::test]

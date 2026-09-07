@@ -176,6 +176,10 @@ and restoring user sort choices. Sort changes still work in the active view.
 On a new view start, the configured sort applies again. Existing saved
 choices stay on disk while the option is disabled.
 
+The sort picker's no-sort entry clears sorting in the active view. Column
+updates, wide mode, config reload, and watch refresh keep that choice.
+Opening a resource view again applies its saved or configured sort as usual.
+
 The `node` and `drill` settings use the same key order, but each setting
 falls back separately. A view that sets only columns does not hide a
 `node` or `drill` setting on a less specific key. Built-in navigation rules

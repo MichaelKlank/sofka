@@ -98,7 +98,7 @@ impl App {
             Some(i) => {
                 self.sort_column = Some(i);
                 self.sort_desc = desc;
-                self.sort_from_config = false;
+                self.sort_origin = SortOrigin::Selected;
                 self.invalidate_rows();
             }
             None => self.flash_warn(&format!("bookmark sort column '{header}' not found")),
