@@ -4145,8 +4145,10 @@ async fn explain_findings_clear_the_progress_flash() {
     // so the handler has to clear it — as the `Msg::Gitops` arm does.
     app.handle_msg(Msg::Explain {
         generation: app.generation,
+        request: app.explain_request,
         claim,
         title: "explain — web".into(),
+        source: None,
         findings: Vec::new(),
     });
 
@@ -4206,8 +4208,10 @@ async fn a_finished_report_only_clears_its_own_status_claim() {
     });
     app.handle_msg(Msg::Explain {
         generation: app.generation,
+        request: app.explain_request,
         claim: explain_claim,
         title: "explain — web".into(),
+        source: None,
         findings: Vec::new(),
     });
     assert_eq!(app.mode, Mode::Explain);
@@ -14383,6 +14387,8 @@ fn explain_selected_with_pure_evidence(app: &mut App) {
         generation: app.generation,
         claim: current_claim(app),
         title: app.explain_title.clone(),
+        request: app.explain_request,
+        source: None,
         findings,
     });
 }
@@ -14534,4 +14540,381 @@ async fn workload_explain_requests_complete_expression_selector() {
         params.get("labelSelector").map(String::as_str),
         Some("app=web,tier in (api,frontend),environment notin (test),enabled,!disabled")
     );
+}
+
+type HealthResponses = Arc<std::sync::Mutex<HashMap<String, (u16, serde_json::Value)>>>;
+
+fn health_report_app(
+    plural: &str,
+    resource: serde_json::Value,
+) -> (
+    App,
+    Receiver<Msg>,
+    HealthResponses,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let (mut app, rx) = test_app();
+    app.switch_kind(plural);
+    apply(&mut app, resource);
+    app.table_state.select(Some(0));
+    let responses: HealthResponses = Arc::default();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let replies = responses.clone();
+    let seen = requests.clone();
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            assert_eq!(request.method(), http::Method::GET);
+            let path = request.uri().path().to_owned();
+            seen.lock().unwrap().push(path.clone());
+            let (code, response) = replies.lock().unwrap().get(&path).cloned().unwrap_or_else(
+                || {
+                    if path.ends_with("/namespaces") {
+                        (200, json!({"apiVersion":"v1","kind":"NamespaceList","metadata":{},"items":[]}))
+                    } else if path.ends_with("/events") {
+                        (
+                            200,
+                            json!({"apiVersion":"v1","kind":"EventList","metadata":{},"items":[]}),
+                        )
+                    } else if path.ends_with("/pods") {
+                        (
+                            200,
+                            json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":[]}),
+                        )
+                    } else {
+                        panic!("unexpected report GET {path}")
+                    }
+                },
+            );
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(code)
+                        .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                            response.to_string(),
+                        )))
+                        .unwrap(),
+                )
+            }
+        }),
+        "default",
+    );
+    (app, rx, responses, requests)
+}
+
+fn open_health_report_key(app: &mut App, gitops: bool) {
+    if gitops {
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for key in "gitops".chars() {
+            app.handle_key(press(KeyCode::Char(key))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+    } else {
+        app.handle_key(press(KeyCode::Char('X'))).unwrap();
+    }
+}
+
+async fn receive_health_report(app: &mut App, rx: &mut Receiver<Msg>, gitops: bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(message) = rx.recv().await {
+            let report = if gitops {
+                matches!(message, Msg::Gitops { .. })
+            } else {
+                matches!(message, Msg::Explain { .. })
+            };
+            if report {
+                app.handle_msg(message);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("health report did not finish");
+}
+
+#[tokio::test]
+async fn explain_refresh_reads_current_resource_without_watch_updates() {
+    let root = expression_workload(true);
+    let (mut app, mut rx, responses, requests) = health_report_app("deployments", root.clone());
+    let path = "/apis/apps/v1/namespaces/default/deployments/web";
+    responses
+        .lock()
+        .unwrap()
+        .insert(path.into(), (200, root.clone()));
+    open_health_report_key(&mut app, false);
+    receive_health_report(&mut app, &mut rx, false).await;
+    assert!(
+        app.explain_items
+            .iter()
+            .any(|finding| finding.text.contains("is healthy"))
+    );
+    let mut fresh = root;
+    fresh["status"]["readyReplicas"] = json!(0);
+    responses.lock().unwrap().insert(path.into(), (200, fresh));
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    receive_health_report(&mut app, &mut rx, false).await;
+    assert!(
+        app.explain_items
+            .iter()
+            .any(|finding| finding.text.contains("is unavailable"))
+    );
+    assert_eq!(
+        app.explain_source.as_ref().unwrap().data["status"]["readyReplicas"],
+        0
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| *request == path)
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn gitops_refresh_reads_current_owner_and_source_reference() {
+    let root = json!({"apiVersion":"kustomize.toolkit.fluxcd.io/v1","kind":"Kustomization",
+        "metadata":{"name":"web","namespace":"default","uid":"owner-uid"},
+        "spec":{"sourceRef":{"kind":"GitRepository","name":"old-source"}},
+        "status":{"conditions":[{"type":"Ready","status":"True"}]}});
+    let (mut app, mut rx, responses, requests) = health_report_app("kustomizations", root.clone());
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/kustomizations/web",
+        kind.ar.api_version
+    );
+    app.cluster.register_kind(
+        "source.toolkit.fluxcd.io",
+        "GitRepository",
+        "gitrepositories",
+        true,
+    );
+    let source_kind = app.cluster.resolve("gitrepositories").unwrap();
+    let source_path = format!(
+        "/apis/{}/namespaces/default/gitrepositories",
+        source_kind.ar.api_version
+    );
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(path.clone(), (200, root.clone()));
+        for name in ["old-source", "new-source"] {
+            replies.insert(format!("{source_path}/{name}"), (200, json!({"apiVersion":source_kind.ar.api_version,"kind":"GitRepository","metadata":{"name":name,"namespace":"default"},"status":{"conditions":[{"type":"Ready","status":"True"}]}})));
+        }
+    }
+    open_health_report_key(&mut app, true);
+    receive_health_report(&mut app, &mut rx, true).await;
+    let mut fresh = root;
+    fresh["status"]["conditions"][0]["status"] = json!("False");
+    fresh["spec"]["sourceRef"]["name"] = json!("new-source");
+    responses.lock().unwrap().insert(path.clone(), (200, fresh));
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    receive_health_report(&mut app, &mut rx, true).await;
+    assert!(
+        app.gitops_items
+            .iter()
+            .any(|finding| finding.text.contains("Ready: False"))
+    );
+    assert_eq!(
+        app.gitops_source.as_ref().unwrap().data["spec"]["sourceRef"]["name"],
+        "new-source"
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests.iter().filter(|request| **request == path).count(),
+        2
+    );
+    assert!(requests.contains(&format!("{source_path}/new-source")));
+}
+
+#[tokio::test]
+async fn health_refresh_does_not_analyze_replacements_or_failed_root_reads() {
+    for gitops in [false, true] {
+        let root = expression_workload(true);
+        let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+        let path = "/apis/apps/v1/namespaces/default/deployments/web";
+        responses
+            .lock()
+            .unwrap()
+            .insert(path.into(), (200, root.clone()));
+        open_health_report_key(&mut app, gitops);
+        receive_health_report(&mut app, &mut rx, gitops).await;
+        let mut replacement = root;
+        replacement["metadata"]["uid"] = json!("replacement-uid");
+        let cases = [
+            (200, replacement, "was replaced"),
+            (
+                404,
+                json!({"kind":"Status","apiVersion":"v1","status":"Failure","code":404,"reason":"NotFound","message":"resource is gone"}),
+                "resource is gone",
+            ),
+            (
+                403,
+                json!({"kind":"Status","apiVersion":"v1","status":"Failure","code":403,"reason":"Forbidden","message":"access denied"}),
+                "access denied",
+            ),
+        ];
+        for (code, response, expected) in cases {
+            responses
+                .lock()
+                .unwrap()
+                .insert(path.into(), (code, response));
+            app.handle_key(press(KeyCode::Char('r'))).unwrap();
+            receive_health_report(&mut app, &mut rx, gitops).await;
+            let (source, findings) = if gitops {
+                (&app.gitops_source, &app.gitops_items)
+            } else {
+                (&app.explain_source, &app.explain_items)
+            };
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].level, crate::explain::Level::Warn);
+            assert!(findings[0].text.contains(expected), "{}", findings[0].text);
+            assert_eq!(
+                source.as_ref().unwrap().metadata.uid.as_deref(),
+                Some("workload-uid")
+            );
+        }
+    }
+}
+
+async fn take_health_report(rx: &mut Receiver<Msg>, gitops: bool) -> Msg {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(message) = rx.recv().await {
+            if if gitops {
+                matches!(message, Msg::Gitops { .. })
+            } else {
+                matches!(message, Msg::Explain { .. })
+            } {
+                return message;
+            }
+        }
+        panic!("health response channel closed");
+    })
+    .await
+    .expect("health response did not arrive")
+}
+
+#[tokio::test]
+async fn health_report_keys_reject_an_older_resource_response() {
+    for gitops in [false, true] {
+        let first = expression_workload(true);
+        let mut second = first.clone();
+        second["metadata"]["name"] = json!("zzz");
+        second["metadata"]["uid"] = json!("second-uid");
+        let (mut app, mut rx, responses, requests) =
+            health_report_app("deployments", first.clone());
+        apply(&mut app, second.clone());
+        let first_path = "/apis/apps/v1/namespaces/default/deployments/web";
+        let second_path = "/apis/apps/v1/namespaces/default/deployments/zzz";
+        {
+            let mut responses = responses.lock().unwrap();
+            responses.insert(first_path.into(), (200, first));
+            responses.insert(second_path.into(), (200, second));
+        }
+        let generation = app.generation;
+        open_health_report_key(&mut app, gitops);
+        let old_reply = take_health_report(&mut rx, gitops).await;
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        app.handle_key(press(KeyCode::Char('j'))).unwrap();
+        assert_eq!(
+            app.selected().unwrap().metadata.name.as_deref(),
+            Some("zzz")
+        );
+        open_health_report_key(&mut app, gitops);
+        let new_reply = take_health_report(&mut rx, gitops).await;
+        assert_eq!(
+            app.generation, generation,
+            "both requests share the watch generation"
+        );
+        app.handle_msg(new_reply);
+        app.handle_msg(old_reply);
+        let (source, title) = if gitops {
+            (&app.gitops_source, &app.gitops_title)
+        } else {
+            (&app.explain_source, &app.explain_title)
+        };
+        assert_eq!(
+            source.as_ref().unwrap().metadata.uid.as_deref(),
+            Some("second-uid")
+        );
+        assert!(title.starts_with("zzz"), "{title}");
+        app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        app.handle_msg(take_health_report(&mut rx, gitops).await);
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.iter().filter(|path| *path == first_path).count(),
+            1
+        );
+        assert_eq!(
+            requests.iter().filter(|path| *path == second_path).count(),
+            2
+        );
+    }
+}
+
+#[tokio::test]
+async fn health_refresh_keys_preserve_the_newest_error_over_older_success() {
+    for gitops in [false, true] {
+        let root = expression_workload(true);
+        let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+        let path = "/apis/apps/v1/namespaces/default/deployments/web";
+        responses
+            .lock()
+            .unwrap()
+            .insert(path.into(), (200, root.clone()));
+        open_health_report_key(&mut app, gitops);
+        app.handle_msg(take_health_report(&mut rx, gitops).await);
+        let mut old_success = root.clone();
+        old_success["status"]["readyReplicas"] = json!(0);
+        responses
+            .lock()
+            .unwrap()
+            .insert(path.into(), (200, old_success));
+        app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        let old_reply = take_health_report(&mut rx, gitops).await;
+        responses.lock().unwrap().insert(path.into(), (403, json!({"kind":"Status","apiVersion":"v1","status":"Failure","code":403,"reason":"Forbidden","message":"latest access denied"})));
+        app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        app.handle_msg(take_health_report(&mut rx, gitops).await);
+        app.handle_msg(old_reply);
+        let (source, findings) = if gitops {
+            (&app.gitops_source, &app.gitops_items)
+        } else {
+            (&app.explain_source, &app.explain_items)
+        };
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].text.contains("latest access denied"));
+        assert_eq!(source.as_ref().unwrap().data["status"]["readyReplicas"], 1);
+        let mut current = root;
+        current["status"]["readyReplicas"] = json!(2);
+        responses
+            .lock()
+            .unwrap()
+            .insert(path.into(), (200, current));
+        app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        app.handle_msg(take_health_report(&mut rx, gitops).await);
+        let source = if gitops {
+            &app.gitops_source
+        } else {
+            &app.explain_source
+        };
+        assert_eq!(source.as_ref().unwrap().data["status"]["readyReplicas"], 2);
+    }
+}
+
+#[tokio::test]
+async fn leaving_health_view_rejects_its_pending_response() {
+    for gitops in [false, true] {
+        let root = expression_workload(true);
+        let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+        responses.lock().unwrap().insert(
+            "/apis/apps/v1/namespaces/default/deployments/web".into(),
+            (200, root),
+        );
+        open_health_report_key(&mut app, gitops);
+        let reply = take_health_report(&mut rx, gitops).await;
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        assert_eq!(app.mode, Mode::Table);
+        app.handle_msg(reply);
+        assert_eq!(app.mode, Mode::Table);
+    }
 }

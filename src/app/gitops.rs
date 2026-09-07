@@ -29,6 +29,7 @@ impl App {
         self.gitops_title = format!("{name} — GitOps");
         self.gitops_items.clear();
         self.gitops_state.select(None);
+        self.explain_request = self.explain_request.wrapping_add(1);
         self.gitops_source = Some(obj);
         self.mode = Mode::Gitops;
         self.spawn_gitops();
@@ -55,81 +56,91 @@ impl App {
         let subject = format!("{}/{name}", kind.ar.kind);
         let title = self.gitops_title.clone();
 
-        // The selection is itself the owner (a Kustomization/HelmRelease), or
-        // it's a managed object naming its owner via toolkit labels.
-        let self_is_owner = gitops::is_owner_plural(&plural);
-        let owner_ref = if self_is_owner {
-            Some(FluxRef {
-                kind: kind.ar.kind.clone(),
-                name,
-                namespace: ns,
-            })
-        } else {
-            gitops::owner_ref(&obj)
-        };
-        let owner_inline = self_is_owner.then(|| obj.clone());
-        let owner_plural_inline = self_is_owner.then(|| plural.clone());
-
         let flux = self.flux_kind_map();
         let client = self.cluster.client.clone();
         let tx = self.tx.clone();
         let genr = self.generation;
         let claim = self.claim_status(format!("GitOps: {}…", subject));
 
+        self.gitops_request = self.gitops_request.wrapping_add(1);
+        let request = self.gitops_request;
         tokio::spawn(async move {
-            let mut warn = None;
-            // Owner: the selection itself, or fetched from its label reference.
-            let owner = match owner_ref {
-                None => None,
-                Some(r) => {
-                    let (plural, obj) = match (owner_inline, owner_plural_inline) {
-                        (Some(o), Some(p)) => (p, Some(o)),
-                        _ => fetch_flux(&client, &flux, &r, &mut warn).await,
-                    };
-                    Some(Node {
-                        reference: r,
-                        plural,
-                        obj,
+            let gathered: Result<_, String> = async {
+                let obj = report_source(&client, &kind.ar, kind.namespaced, &obj).await?;
+                // The selection is itself the owner (a Kustomization/HelmRelease), or
+                // it's a managed object naming its owner via toolkit labels.
+                let self_is_owner = gitops::is_owner_plural(&plural);
+                let owner_ref = if self_is_owner {
+                    Some(FluxRef {
+                        kind: kind.ar.kind.clone(),
+                        name,
+                        namespace: ns,
                     })
-                }
-            };
+                } else {
+                    gitops::owner_ref(&obj)
+                };
+                let owner_inline = self_is_owner.then(|| obj.clone());
+                let owner_plural_inline = self_is_owner.then(|| plural.clone());
 
-            // Source + dependencies, read from the owner object.
-            let mut source = None;
-            let mut deps = Vec::new();
-            if let Some(owner_obj) = owner.as_ref().and_then(|n| n.obj.as_ref()) {
-                if let Some(sr) = gitops::source_ref(owner_obj) {
-                    let (plural, obj) = fetch_flux(&client, &flux, &sr, &mut warn).await;
-                    source = Some(Node {
-                        reference: sr,
-                        plural,
-                        obj,
-                    });
+                let mut warn = None;
+                // Owner: the selection itself, or fetched from its label reference.
+                let owner = match owner_ref {
+                    None => None,
+                    Some(r) => {
+                        let (plural, obj) = match (owner_inline, owner_plural_inline) {
+                            (Some(o), Some(p)) => (p, Some(o)),
+                            _ => fetch_flux(&client, &flux, &r, &mut warn).await,
+                        };
+                        Some(Node {
+                            reference: r,
+                            plural,
+                            obj,
+                        })
+                    }
+                };
+
+                // Source + dependencies, read from the owner object.
+                let mut source = None;
+                let mut deps = Vec::new();
+                if let Some(owner_obj) = owner.as_ref().and_then(|n| n.obj.as_ref()) {
+                    if let Some(sr) = gitops::source_ref(owner_obj) {
+                        let (plural, obj) = fetch_flux(&client, &flux, &sr, &mut warn).await;
+                        source = Some(Node {
+                            reference: sr,
+                            plural,
+                            obj,
+                        });
+                    }
+                    for dr in gitops::depends_on(owner_obj) {
+                        let (plural, obj) = fetch_flux(&client, &flux, &dr, &mut warn).await;
+                        deps.push(Node {
+                            reference: dr,
+                            plural,
+                            obj,
+                        });
+                    }
                 }
-                for dr in gitops::depends_on(owner_obj) {
-                    let (plural, obj) = fetch_flux(&client, &flux, &dr, &mut warn).await;
-                    deps.push(Node {
-                        reference: dr,
-                        plural,
-                        obj,
-                    });
-                }
+
+                let ev = gitops::Evidence {
+                    subject,
+                    self_is_owner,
+                    owner,
+                    source,
+                    deps,
+                };
+                let mut findings = gitops::describe(&ev);
+                prepend_warn_finding(&mut findings, warn);
+                Ok((obj, findings))
             }
-
-            let ev = gitops::Evidence {
-                subject,
-                self_is_owner,
-                owner,
-                source,
-                deps,
-            };
-            let mut findings = gitops::describe(&ev);
-            prepend_warn_finding(&mut findings, warn);
+            .await;
+            let (source, findings) = report_result(gathered);
             let _ = tx
                 .send(Msg::Gitops {
                     generation: genr,
+                    request,
                     claim,
                     title,
+                    source,
                     findings,
                 })
                 .await;
@@ -164,6 +175,7 @@ impl App {
         let len = self.gitops_items.len();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
+                self.gitops_request = self.gitops_request.wrapping_add(1);
                 self.mode = self.return_mode;
                 if self.return_mode == Mode::Table {
                     self.restore_selection();

@@ -1029,10 +1029,15 @@ impl App {
             }
             Msg::Explain {
                 generation,
+                request,
                 claim,
                 title,
+                source,
                 findings,
-            } if generation == self.generation => {
+            } if generation == self.generation && request == self.explain_request => {
+                if let Some(source) = source {
+                    self.explain_source = Some(*source);
+                }
                 self.explain_items = findings;
                 self.explain_title = title;
                 // Land the cursor on the first navigable finding, else the top.
@@ -1050,10 +1055,15 @@ impl App {
             }
             Msg::Gitops {
                 generation,
+                request,
                 claim,
                 title,
+                source,
                 findings,
-            } if generation == self.generation => {
+            } if generation == self.generation && request == self.gitops_request => {
+                if let Some(source) = source {
+                    self.gitops_source = Some(*source);
+                }
                 self.gitops_items = findings;
                 self.gitops_title = title;
                 let first = self

@@ -913,6 +913,54 @@ pub(super) async fn list_or_warn(
     }
 }
 
+/// Read the same resource instance before a health report gathers its evidence.
+pub(super) async fn report_source(
+    client: &Client,
+    ar: &ApiResource,
+    namespaced: bool,
+    source: &DynamicObject,
+) -> Result<DynamicObject, String> {
+    let name = source
+        .metadata
+        .name
+        .as_deref()
+        .ok_or("resource name is missing")?;
+    let api: Api<DynamicObject> = if namespaced {
+        let ns = source
+            .metadata
+            .namespace
+            .as_deref()
+            .ok_or("resource namespace is missing")?;
+        Api::namespaced_with(client.clone(), ns, ar)
+    } else {
+        Api::all_with(client.clone(), ar)
+    };
+    let fresh = api
+        .get(name)
+        .await
+        .map_err(|error| format!("reading {}/{name}: {error}", ar.plural))?;
+    if source.metadata.uid.is_some() && source.metadata.uid != fresh.metadata.uid {
+        return Err(format!(
+            "{}/{name} was replaced; return to the table and select the new resource",
+            ar.plural
+        ));
+    }
+    Ok(fresh)
+}
+
+pub(super) fn report_result(
+    result: Result<(DynamicObject, Vec<crate::explain::Finding>), String>,
+) -> (Option<Box<DynamicObject>>, Vec<crate::explain::Finding>) {
+    match result {
+        Ok((source, findings)) => (Some(Box::new(source)), findings),
+        Err(error) => {
+            let mut findings = Vec::new();
+            prepend_warn_finding(&mut findings, Some(error));
+            (None, findings)
+        }
+    }
+}
+
 /// Prepend an "evidence incomplete" warning to a findings list when one of
 /// the gather reads failed — the analysis below it saw only partial data.
 pub(super) fn prepend_warn_finding(
