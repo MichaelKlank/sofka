@@ -402,7 +402,11 @@ fn draw_compact_header(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(app.flash.clone(), style));
     }
 
-    let (synced, sync_color) = sync_indicator(app.mode, app.doc_filter_return, app.store.synced);
+    let (synced, sync_color) = if app.describe_refresh_task.is_some() {
+        ("● refresh", theme::sky())
+    } else {
+        sync_indicator(app.mode, app.doc_filter_return, app.store.synced)
+    };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(10), Constraint::Length(10)])
@@ -2195,6 +2199,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("  Inspect", theme::title())),
         bind("y · d", "view YAML · describe (kubectl)"),
+        bind("r (describe)", "turn automatic refresh on/off (5s)"),
         bind("l · p", "logs (workload = all pods) · previous logs"),
         bind(
             "shift-l · :vlogs",
@@ -3806,6 +3811,18 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 "  j/k:scroll  ^f/^b:page  h/l:← →  g/G:top/bottom  /:search  n/N:next/prev  w:wrap  c:copy  esc:back"
             };
+            let hint = if app.mode == Mode::Detail && app.describe_source.is_some() {
+                format!(
+                    "{hint}  r:refresh {}",
+                    if app.describe_refresh_task.is_some() {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                )
+            } else {
+                hint.to_string()
+            };
             Line::from(Span::styled(hint, theme::dim()))
         }
         Mode::Help => Line::from(Span::styled("  /:search  ?/esc:back", theme::dim())),
@@ -3903,7 +3920,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Style::default().fg(theme::subtext0())
     };
-    let (synced, sync_color) = sync_indicator(app.mode, app.doc_filter_return, app.store.synced);
+    let (synced, sync_color) = if app.describe_refresh_task.is_some() {
+        ("● refresh", theme::sky())
+    } else {
+        sync_indicator(app.mode, app.doc_filter_return, app.store.synced)
+    };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(10), Constraint::Length(12)])

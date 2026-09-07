@@ -105,6 +105,12 @@ highlighted. `n` / `N` go to the next or previous match. `w` wraps. `c` copies
 the document. `esc` backs out - the first press clears an active search. In the
 `?` help panel, `/` filters instead and narrows to matching keybinds.
 
+In the describe view, `r` turns automatic refresh on or off. Refresh is off
+when the view opens. When on, it runs `kubectl describe` immediately and then
+5 seconds after each result. This updates the full document, including events.
+The resource, scroll position, and search stay the same. Refresh stops when
+you leave the view or a request fails. A failed request keeps the last result.
+
 ## Explain view (`X`)
 
 `j` / `k` move, `⏎` goes to the resource behind a finding (a blocking pod), `E`

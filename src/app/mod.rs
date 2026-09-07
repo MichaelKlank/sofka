@@ -897,6 +897,7 @@ impl Scrollable {
             .as_ref()
             .map(|viewport| (viewport.width, viewport.height));
         self.lines = lines;
+        self.scroll_h(0);
         self.revision = self.revision.wrapping_add(1);
         self.viewport = None;
         if let Some((width, height)) = dimensions {
@@ -1676,6 +1677,9 @@ pub struct App {
     pub last_action_error: Option<String>,
 
     pub detail: Scrollable,
+    pub(super) describe_source: Option<(crate::store::StatusClaim, Vec<String>)>,
+    pub describe_refresh_task: Option<tokio::task::JoinHandle<()>>,
+    pub(super) describe_refresh_generation: u64,
     /// Search query for the help view (`?`), which has no backing
     /// [`Scrollable`] — its lines are built at render time.
     pub help_filter: String,
@@ -2055,6 +2059,9 @@ impl App {
             status_claim: None,
             last_action_error: None,
             detail: Scrollable::empty(),
+            describe_source: None,
+            describe_refresh_task: None,
+            describe_refresh_generation: 0,
             help_filter: String::new(),
             help_return: Mode::Table,
             doc_filter_return: Mode::Detail,

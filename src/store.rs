@@ -124,6 +124,10 @@ pub enum Msg {
         /// Set when describe failed and we fell back to YAML.
         warn: Option<String>,
     },
+    DescribeRefresh {
+        generation: u64,
+        result: Result<Vec<String>, String>,
+    },
     /// Live Event rows for the selected object.
     Events {
         generation: u64,

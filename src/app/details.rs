@@ -6,6 +6,8 @@ impl App {
     /// Remember which view a transient sub-view (logs/detail/diff) was opened
     /// from, so `esc` returns there (e.g. back to the xray tree, not the table).
     pub(super) fn set_return_mode(&mut self) {
+        self.stop_describe_refresh();
+        self.describe_source = None;
         self.stop_plugins();
         // A transient sub-view (logs/detail/events) opened from a list-style
         // view returns to that view, not the table underneath it.
@@ -71,6 +73,8 @@ impl App {
     /// in-document `x` binding lands here, so esc still returns to wherever
     /// the describe/YAML view was opened from.
     pub(super) fn show_decoded_secret(&mut self) {
+        self.stop_describe_refresh();
+        self.describe_source = None;
         let Some(obj) = self.selected_ref() else {
             return;
         };
@@ -143,6 +147,7 @@ impl App {
             argv.push(ns.clone());
         }
         let claim = self.claim_status(format!("describing {name}…"));
+        self.describe_source = Some((claim, argv.clone()));
         tokio::spawn(async move {
             let msg = match tokio::process::Command::new(&argv[0])
                 .args(&argv[1..])
@@ -182,6 +187,70 @@ impl App {
             };
             let _ = tx.send(msg).await;
         });
+    }
+
+    pub(super) fn stop_describe_refresh(&mut self) {
+        self.describe_refresh_generation += 1;
+        if let Some(task) = self.describe_refresh_task.take() {
+            task.abort();
+        }
+    }
+
+    pub(super) fn check_describe_refresh(&mut self) {
+        if self.should_quit
+            || (self.mode != Mode::Detail
+                && !(self.mode == Mode::DocFilter && self.doc_filter_return == Mode::Detail))
+        {
+            self.stop_describe_refresh();
+        }
+    }
+
+    pub(super) fn toggle_describe_refresh(&mut self) {
+        if self.describe_refresh_task.is_some() {
+            self.stop_describe_refresh();
+            self.flash = "describe refresh: off".into();
+            self.flash_err = false;
+            return;
+        }
+        let Some((_, argv)) = &self.describe_source else {
+            return;
+        };
+        let argv = argv.clone();
+        let tx = self.tx.clone();
+        let generation = self.describe_refresh_generation;
+        self.describe_refresh_task = Some(tokio::spawn(async move {
+            loop {
+                let result = match tokio::process::Command::new(&argv[0])
+                    .args(&argv[1..])
+                    .kill_on_drop(true)
+                    .output()
+                    .await
+                {
+                    Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout)
+                        .lines()
+                        .map(String::from)
+                        .collect()),
+                    Ok(out) => Err(format!(
+                        "describe refresh failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                            .lines()
+                            .next()
+                            .unwrap_or("error")
+                    )),
+                    Err(e) => Err(format!("describe refresh failed: {e}")),
+                };
+                if tx
+                    .send(Msg::DescribeRefresh { generation, result })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }));
+        self.flash = "describe refresh: on (5s)".into();
+        self.flash_err = false;
     }
 
     /// Render an object as YAML lines, stamping its type if missing.
