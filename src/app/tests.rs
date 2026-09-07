@@ -15545,3 +15545,69 @@ async fn storage_table_shows_deletion_before_bound_phase() {
         }
     }
 }
+
+#[tokio::test]
+async fn service_endpoint_columns_include_names_addresses_and_node_ports() {
+    for (spec, status, expected_ip, expected_ports) in [
+        (
+            json!({"type":"ExternalName", "externalName":"db.example.com"}),
+            json!({}),
+            "db.example.com",
+            "<none>",
+        ),
+        (
+            json!({"type":"ClusterIP", "externalIPs":["192.0.2.10"], "ports":[{"port":80,"protocol":"TCP"}]}),
+            json!({}),
+            "192.0.2.10",
+            "80/TCP",
+        ),
+        (
+            json!({"type":"NodePort", "ports":[{"port":80,"nodePort":30080,"protocol":"TCP"},{"port":53,"nodePort":30053,"protocol":"UDP"}]}),
+            json!({}),
+            "<none>",
+            "80:30080/TCP,53:30053/UDP",
+        ),
+        (
+            json!({"type":"LoadBalancer", "externalIPs":["192.0.2.10"], "ports":[]}),
+            json!({"loadBalancer":{"ingress":[{"hostname":"lb.example.com"}]}}),
+            "lb.example.com,192.0.2.10",
+            "<none>",
+        ),
+        (
+            json!({"type":"LoadBalancer"}),
+            json!({}),
+            "<pending>",
+            "<none>",
+        ),
+        (
+            json!({"type":"LoadBalancer", "externalIPs":["192.0.2.10"]}),
+            json!({}),
+            "192.0.2.10",
+            "<none>",
+        ),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for ch in "services".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1", "kind":"Service", "metadata":{"name":"svc","namespace":"default"}, "spec":spec, "status":status}),
+        );
+        let headers = app.display_headers().to_vec();
+        let rows = app.rows();
+        app.ensure_table_cell_cache(&rows);
+        let cache = app.table_cell_cache();
+        let (cells, _) = cache.get(&row_key(rows[0])).unwrap();
+        assert_eq!(
+            cells[headers.iter().position(|h| h == "EXTERNAL-IP").unwrap()],
+            expected_ip
+        );
+        assert_eq!(
+            cells[headers.iter().position(|h| h == "PORTS").unwrap()],
+            expected_ports
+        );
+    }
+}
