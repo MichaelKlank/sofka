@@ -514,7 +514,7 @@ pub fn accent() -> Style {
 /// (healthy, pending, error) keep a distinct pop color so they stand out
 /// against the row tint.
 pub fn status_color(s: &str) -> Color {
-    match s {
+    match s.strip_suffix(",SchedulingDisabled").unwrap_or(s) {
         s if failure_status(s) => red(),
         s if s.starts_with("Init:") => yellow(),
         "Running" | "Ready" | "Active" | "Bound" | "True" | "deployed" => green(),
@@ -578,7 +578,7 @@ fn failure_status(status: &str) -> bool {
 /// - everything healthy (Running/Ready/Bound/…) **or without a status** → the
 ///   standard row color (blue), so healthy rows read blue like k9s, not white.
 pub fn row_color(s: &str) -> Color {
-    match s {
+    match s.strip_suffix(",SchedulingDisabled").unwrap_or(s) {
         s if failure_status(s) => red(),
         s if s.starts_with("Init:") => peach(),
         "Pending" | "Suspended" | "Completing" | "ContainerCreating" | "PodInitializing"
@@ -693,6 +693,9 @@ mod tests {
         assert_eq!(row_color("Pending"), peach());
         assert_eq!(row_color("Completed"), overlay0());
         assert_eq!(row_color("Terminating"), mauve());
+        assert_eq!(row_color("Ready,SchedulingDisabled"), blue());
+        assert_eq!(row_color("NotReady,SchedulingDisabled"), red());
+        assert_eq!(row_color("Unknown,SchedulingDisabled"), blue());
     }
 
     #[test]
@@ -712,6 +715,9 @@ mod tests {
         // Pending pops distinct from the row's peach.
         assert_eq!(status_color("Pending"), yellow());
         assert_ne!(status_color("Pending"), row_color("Pending"));
+        assert_eq!(status_color("Ready,SchedulingDisabled"), green());
+        assert_eq!(status_color("NotReady,SchedulingDisabled"), red());
+        assert_eq!(status_color("Unknown,SchedulingDisabled"), overlay1());
     }
 
     #[test]

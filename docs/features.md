@@ -16,11 +16,12 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   statefulsets, daemonsets, services, nodes, namespaces, configmaps, secrets,
   jobs, cronjobs, PVC/PV, ingresses, endpoints, CustomResourceDefinitions), with
   a NAME/AGE fallback for everything else. STATUS columns use a fixed width of
-  26 characters so status changes do not move adjacent columns. A configured
-  column width takes priority. Column widths use the full filtered list so
+  26 characters, or 27 for Nodes, so status changes do not move adjacent
+  columns. A configured column width takes priority. Column widths use the full filtered list so
   vertical scrolling does not move the columns. Node ROLES combines
   `node-role.kubernetes.io/` labels with the legacy `kubernetes.io/role` value
-  and removes duplicate roles.
+  and removes duplicate roles. Node STATUS adds `SchedulingDisabled` when
+  the Node is cordoned and keeps its readiness color.
 - **Event timing** - LAST-SEEN shows the most recent reported occurrence for
   core and events.k8s.io Events. It advances with time and sorts by occurrence
   timestamp. AGE continues to show object creation age.
