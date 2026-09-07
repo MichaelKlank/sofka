@@ -16,6 +16,8 @@ readonly          = false  # true disables every mutating action (delete, edit,
                            # scale, shell, plugins, …); --readonly/--write win
 mouse             = true   # false keeps the terminal's native mouse behavior
                            # (text selection) instead of scroll/click/sort
+remember_sort     = true   # save and restore sort choices per resource kind
+                           # false makes sort changes temporary
 
 # Namespaces pinned to the top of the `n` switcher (★); session recents (·)
 # follow them.
@@ -23,6 +25,32 @@ favorite_namespaces = ["kube-system", "monitoring"]
 
 [aliases]
 dep = "deployments"
+```
+
+`remember_sort` is enabled by default. Set it to `false` to stop saving and
+restoring sort choices from `S`, `I`, and column header clicks. Existing saved
+choices stay on disk and become available again when you enable the option.
+The option supports cluster and context overrides and `:reload`. A reload
+keeps the active sort; the option controls later sort changes and view starts.
+
+To use an initial sort for all resource tables, set a global default:
+
+```toml
+remember_sort = false
+
+[views."*"]
+sort = "AGE:desc"
+```
+
+A resource-specific sort has priority over this default. Tables without the
+specified column ignore the global sort. See [Views](views.md) for details.
+
+CRD short names are discovered automatically. To override a short name, add it
+under `[aliases]`. Use a group-qualified target when resource names overlap:
+
+```toml
+[aliases]
+md = "machinedeployments.cluster.x-k8s.io"
 ```
 
 ## Skins
@@ -52,7 +80,7 @@ Each of these is documented where the feature itself is:
 
 | Section               | What it does                                | Docs                                                       |
 | --------------------- | ------------------------------------------- | ---------------------------------------------------------- |
-| `[views]`             | custom table columns per resource           | [Views and thresholds](views.md)                           |
+| `[views]`             | path, built-in, and metric columns per view | [Views and thresholds](views.md)                           |
 | `[thresholds]`        | RESTARTS/CPU/MEM/utilization coloring bands | [Views and thresholds](views.md#thresholds)                |
 | `[[plugins]]`         | shell-out commands bound to key chords      | [Plugins](plugins.md)                                      |
 | `[[bookmarks]]`       | saved navigation commands                   | [Plugins](plugins.md#bookmarks)                            |
@@ -64,6 +92,8 @@ Each of these is documented where the feature itself is:
 | `[keys]`              | palette completion key rebinds              | [Key reference](keys.md#palette-completion-keys)           |
 | `[debug]`             | ephemeral and node debug images             | [Debug containers](debugging.md#debug-containers-and-pods) |
 | `[bundle]`            | redaction and size caps for `:bundle`       | [Diagnostic bundles](debugging.md#diagnostic-bundles)      |
+| `[logging]`           | sofka's own structured log file             | [Runtime diagnostics](debugging.md#runtime-diagnostics)    |
+| `[pvc_explore]`       | helper pod image and TTL for PVC explore    | [PVC explore](features.md#pvc-explore)                     |
 | `[providers.metrics]` | Prometheus/VictoriaMetrics for `:rightsize` | [Providers](providers.md#right-sizing-metrics-provider)    |
 | `[providers.logs]`    | VictoriaLogs backend for `L`                | [Providers](providers.md#log-provider-victorialogs)        |
 | `[fleet]`             | contexts in the cross-cluster dashboard     | [Providers](providers.md#fleet-dashboard)                  |
@@ -105,3 +135,17 @@ A skin in an override sets the colors for that context. A context with no skin
 keeps the session skin (config `skin.name`, the auto-detected default, or your
 last `:skin` choice). Overrides are re-read on every `:ctx` switch, so edits
 apply without a restart.
+
+## Plugin packages
+
+sofka reads packages from the `plugins/` directory next to `config.toml`.
+Each package directory contains a `plugin.toml` manifest.
+Enter `:reload` to read package changes.
+The `:config` view shows invalid packages and absent executables.
+
+Inline `[[plugins]]` entries take priority over packages with the same name or palette command.
+Packages load after cluster and context overrides.
+An empty inline plugin list does not disable installed packages.
+
+The [manifest reference](plugin-authoring.md#manifest) describes the package fields.
+The [authoring guide](plugin-authoring.md) includes an adapter and tests without a cluster.

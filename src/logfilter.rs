@@ -22,7 +22,9 @@ pub struct LogMatcher {
 ///
 /// Built once per filter change and queried per line. Also used on its own by
 /// the document search (`/` in a YAML/describe/events view), which wants plain
-/// substring semantics without the `!`/`/re/` grammar [`LogMatcher`] adds.
+/// substring semantics without the `!`/`/re/` grammar [`LogMatcher`] adds, and
+/// by the row filter's `"quoted"` terms.
+#[derive(Clone)]
 pub enum Substring {
     /// ASCII pattern, matched by an Aho-Corasick automaton. For a single
     /// pattern the crate picks its `memmem`/Teddy prefilter, which is

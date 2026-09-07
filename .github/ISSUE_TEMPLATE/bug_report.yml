@@ -36,8 +36,15 @@ body:
   - type: textarea
     id: info
     attributes:
-      label: Output of `sofka --info`
-      description: Prints version/build, config sources, and directories without connecting to a cluster.
+      label: Output of `sofka info`
+      description: |
+        These diagnostics and redaction features require sofka 0.24.8 or later.
+        Run `sofka --version`. If your version is older, update sofka and try to reproduce the issue again.
+        Run `sofka info` against the affected cluster and paste the output.
+        To select a context, run `sofka --context <name> info`.
+        The command checks discovery and watch access, then prints diagnostics.
+        Use `sofka info --offline` if you cannot connect to the cluster.
+        Credentials and IP addresses are masked. Check names and paths before you share the report.
       render: text
     validations:
       required: true
@@ -87,5 +94,18 @@ body:
       label: Relevant config
       description: Any parts of your `~/.config/sofka/config.toml` (or per-cluster overrides) that might be involved. Redact anything sensitive.
       render: toml
+    validations:
+      required: false
+  - type: textarea
+    id: debug_log
+    attributes:
+      label: Debug log
+      description: |
+        Debug logging is available from sofka 0.24.8. Update older versions first.
+        If the report does not explain the failure, run `SOFKA_LOG=debug sofka` and repeat the steps.
+        Add the same context, namespace, and resource arguments that you used when the problem occurred.
+        Open `:info` in that session to find the log file under Logging.
+        Paste the relevant log lines here, or attach the log file. Check it before you share it.
+      render: text
     validations:
       required: false

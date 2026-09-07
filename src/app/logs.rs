@@ -433,14 +433,12 @@ impl App {
         let (tail, since) = self.log_tail_and_since();
         let handle = tokio::spawn(async move {
             let api: Api<Pod> = Api::namespaced(client, &ns);
-            // `since` and `tail` are mutually exclusive in the API; prefer the
-            // configured lookback when set. Previous-container logs take neither.
+            // The API applies the tail limit within the lookback window.
+            // Previous-container logs retain their full history.
             let (tail_lines, since_seconds) = if previous {
                 (None, None)
-            } else if since.is_some() {
-                (None, since)
             } else {
-                (Some(tail), None)
+                (Some(tail), since)
             };
             let lp = LogParams {
                 follow: !previous,
@@ -562,16 +560,12 @@ impl App {
                     let (pn, pns) = (pod_name.clone(), pod_ns.clone());
                     streams.spawn(async move {
                         let api: Api<Pod> = Api::namespaced(client, &pns);
-                        let (tail_lines, since_seconds) = match since {
-                            Some(s) => (None, Some(s)),
-                            None => (Some(per_pod_tail), None),
-                        };
                         let lp = LogParams {
                             follow: true,
                             container: Some(c),
                             timestamps,
-                            tail_lines,
-                            since_seconds,
+                            tail_lines: Some(per_pod_tail),
+                            since_seconds: since,
                             ..Default::default()
                         };
                         forward_log_stream(api, pn, lp, prefix, tx, genr, flag).await;

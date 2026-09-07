@@ -20,6 +20,8 @@ use serde_json::Value;
 /// How a custom column's value is rendered and sorted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColumnKind {
+    Metric(crate::columns::MetricColumn),
+    Builtin,
     #[default]
     Text,
     /// Text that also drives the row's status coloring.
@@ -187,9 +189,10 @@ const NODE_REFS: &[(&str, &str)] = &[
 fn setting<'a, T: ?Sized>(
     views: &'a HashMap<String, View>,
     ar: &ApiResource,
+    namespace: Option<&str>,
     pick: impl Fn(&'a View) -> Option<&'a T>,
 ) -> Option<&'a T> {
-    lookup_keys(ar)
+    lookup_keys(ar, namespace)
         .into_iter()
         .find_map(|k| views.get(&k).and_then(&pick))
 }
@@ -197,17 +200,25 @@ fn setting<'a, T: ?Sized>(
 /// Where `enter` drills for a kind, per `[views."…"].drill`. Kinds with a
 /// built-in drill-down (workloads to pods, CRDs to their resources, …) never
 /// consult this.
-pub fn drill_for<'a>(views: &'a HashMap<String, View>, ar: &ApiResource) -> Option<&'a Drill> {
-    setting(views, ar, |v| v.drill.as_ref())
+pub fn drill_for<'a>(
+    views: &'a HashMap<String, View>,
+    ar: &ApiResource,
+    namespace: Option<&str>,
+) -> Option<&'a Drill> {
+    setting(views, ar, namespace, |v| v.drill.as_ref())
 }
 
 /// The pointer to a kind's node name: an explicit `[views."…"].node` wins over
 /// the built-in table.
-pub fn node_pointer<'a>(views: &'a HashMap<String, View>, ar: &ApiResource) -> Option<&'a str> {
-    if let Some(pointer) = setting(views, ar, |v| v.node.as_deref()) {
+pub fn node_pointer<'a>(
+    views: &'a HashMap<String, View>,
+    ar: &ApiResource,
+    namespace: Option<&str>,
+) -> Option<&'a str> {
+    if let Some(pointer) = setting(views, ar, namespace, |v| v.node.as_deref()) {
         return Some(pointer);
     }
-    lookup_keys(ar).into_iter().find_map(|key| {
+    lookup_keys(ar, None).into_iter().find_map(|key| {
         NODE_REFS
             .iter()
             .find(|(row, _)| *row == key)
@@ -230,6 +241,21 @@ pub fn compile(
     let mut views = HashMap::new();
     let mut warnings = Vec::new();
     for (key, cfg) in raw {
+        if let Some((resource, namespace)) = key.split_once('@')
+            && (resource.is_empty()
+                || namespace.is_empty()
+                || namespace.len() > 63
+                || !namespace.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+                || !namespace.ends_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+                || !namespace
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-'))
+        {
+            warnings.push(format!(
+                "views.\"{key}\": invalid namespace suffix; view ignored"
+            ));
+            continue;
+        }
         let mut columns = Vec::new();
         for c in &cfg.columns {
             let header = c.name.trim().to_uppercase();
@@ -237,7 +263,7 @@ pub fn compile(
                 warnings.push(format!("views.\"{key}\": column with empty name skipped"));
                 continue;
             }
-            let kind = match c.kind.as_deref() {
+            let mut kind = match c.kind.as_deref() {
                 None | Some("text") => ColumnKind::Text,
                 Some("status") => ColumnKind::Status,
                 Some("number") => ColumnKind::Number,
@@ -252,6 +278,41 @@ pub fn compile(
                     ColumnKind::Text
                 }
             };
+            let sources = usize::from(!c.path.is_empty())
+                + usize::from(c.metric.is_some())
+                + usize::from(c.builtin.is_some());
+            if sources != 1 {
+                warnings.push(format!("views.\"{key}\": column {header}: set exactly one of path, metric, or builtin; column skipped"));
+                continue;
+            }
+            if columns
+                .iter()
+                .any(|column: &UserColumn| column.header == header)
+            {
+                warnings.push(format!(
+                    "views.\"{key}\": duplicate column {header}; column skipped"
+                ));
+                continue;
+            }
+            if c.kind.is_some() && (c.metric.is_some() || c.builtin.is_some()) {
+                warnings.push(format!("views.\"{key}\": column {header}: type applies only to path columns; column skipped"));
+                continue;
+            }
+            let mut pointer = c.path.trim().to_string();
+            if let Some(metric) = &c.metric {
+                let Some(metric) = crate::columns::MetricColumn::parse(metric) else {
+                    warnings.push(format!("views.\"{key}\": column {header}: unknown metric '{metric}'; column skipped"));
+                    continue;
+                };
+                kind = ColumnKind::Metric(metric);
+            } else if let Some(builtin) = &c.builtin {
+                pointer = builtin.trim().to_uppercase();
+                if pointer.is_empty() {
+                    warnings.push(format!("views.\"{key}\": column {header}: builtin must name a column; column skipped"));
+                    continue;
+                }
+                kind = ColumnKind::Builtin;
+            }
             // A condition column's path is the condition *type* name, not a
             // pointer — conditions are found by name because their array
             // order isn't guaranteed by anything.
@@ -263,7 +324,9 @@ pub fn compile(
                     ));
                     continue;
                 }
-            } else if !c.path.starts_with('/') {
+            } else if !matches!(kind, ColumnKind::Metric(_) | ColumnKind::Builtin)
+                && !c.path.starts_with('/')
+            {
                 warnings.push(format!(
                     "views.\"{key}\": column {header}: path '{}' is not a JSON Pointer \
                      (must start with '/', e.g. /status/phase); column skipped",
@@ -286,7 +349,7 @@ pub fn compile(
             };
             columns.push(UserColumn {
                 header,
-                pointer: c.path.trim().to_string(),
+                pointer,
                 kind,
                 wide: c.wide,
                 width: c.width,
@@ -317,7 +380,10 @@ pub fn compile(
             None => None,
         };
         let drill = cfg.drill.as_ref().and_then(|d| {
-            let key_lc = key.to_lowercase();
+            let key_lc = key
+                .split_once('@')
+                .map_or(key.as_str(), |(resource, _)| resource)
+                .to_lowercase();
             let plural = key_plural(&key_lc);
             if BUILTIN_DRILLS.contains(&plural) {
                 warnings.push(format!(
@@ -390,7 +456,8 @@ fn parse_sort(key: &str, s: &str, warnings: &mut Vec<String>) -> Option<(String,
 
 /// The keys a resource's view can be configured under, most specific first:
 /// `apiVersion/plural`, `group/plural`, plural, then lowercased kind.
-fn lookup_keys(ar: &ApiResource) -> Vec<String> {
+/// Try all namespace-qualified keys before the unqualified keys.
+fn lookup_keys(ar: &ApiResource, namespace: Option<&str>) -> Vec<String> {
     let plural = ar.plural.to_lowercase();
     let mut keys = vec![format!("{}/{plural}", ar.api_version.to_lowercase())];
     if !ar.group.is_empty() {
@@ -398,18 +465,101 @@ fn lookup_keys(ar: &ApiResource) -> Vec<String> {
     }
     keys.push(plural);
     keys.push(ar.kind.to_lowercase());
+    if let Some(namespace) = namespace.filter(|ns| !ns.is_empty()) {
+        let mut qualified: Vec<_> = keys
+            .iter()
+            .map(|key| format!("{key}@{namespace}"))
+            .collect();
+        qualified.extend(keys);
+        return qualified;
+    }
     keys
 }
 
 /// Find the view for a resource, most specific key first.
-pub fn lookup<'a>(views: &'a HashMap<String, View>, ar: &ApiResource) -> Option<&'a View> {
-    lookup_keys(ar).into_iter().find_map(|k| views.get(&k))
+pub fn lookup<'a>(
+    views: &'a HashMap<String, View>,
+    ar: &ApiResource,
+    namespace: Option<&str>,
+) -> Option<&'a View> {
+    lookup_keys(ar, namespace)
+        .into_iter()
+        .find_map(|k| views.get(&k))
 }
 
 /// Resolve a JSON Pointer against the object as served by the API:
 /// `/metadata/…` and `/apiVersion`/`/kind` come from the typed fields, the
 /// rest from the body (`DynamicObject::data` holds spec/status/…).
 pub fn extract(obj: &DynamicObject, pointer: &str) -> Option<Value> {
+    extract_ref(obj, pointer).map(Extracted::into_value)
+}
+
+/// A custom column's extracted value, borrowed wherever the object already
+/// holds it in the shape the renderer needs: `DynamicObject::data` is already
+/// a `Value` tree, and `ObjectMeta`'s scalars and label/annotation values are
+/// already `String`s. A column pointing at a 100-element array or a nested
+/// object therefore formats it where it lies instead of deep-cloning the whole
+/// subtree first, and only the finished cell allocates.
+///
+/// `Owned` covers the metadata shapes that have to be serialized to answer the
+/// pointer at all (`ownerReferences`, whole `metadata`, timestamps).
+pub(crate) enum Extracted<'a> {
+    /// A node of the object body.
+    Json(&'a Value),
+    /// A string the object already stores as one.
+    Text(&'a str),
+    /// A value that had to be built to answer the pointer.
+    Owned(Value),
+}
+
+impl<'a> Extracted<'a> {
+    /// The string form, when the value is one — text, time and quantity
+    /// columns all want this and nothing else.
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Extracted::Text(s) => Some(s),
+            Extracted::Json(v) => v.as_str(),
+            Extracted::Owned(v) => v.as_str(),
+        }
+    }
+
+    /// Give up the borrow. Only [`extract`]'s owned callers pay this.
+    fn into_value(self) -> Value {
+        match self {
+            Extracted::Json(v) => v.clone(),
+            Extracted::Text(s) => Value::String(s.to_string()),
+            Extracted::Owned(v) => v,
+        }
+    }
+
+    /// The rendered cell — the one allocation the extraction path owes.
+    fn render(&self) -> String {
+        match self {
+            Extracted::Text(s) => (*s).into(),
+            Extracted::Json(v) => render_value(v),
+            Extracted::Owned(v) => render_value(v),
+        }
+    }
+
+    fn number(&self) -> Option<f64> {
+        match self {
+            Extracted::Text(s) => s.trim().parse().ok(),
+            Extracted::Json(v) => number_of(v),
+            Extracted::Owned(v) => number_of(v),
+        }
+    }
+
+    fn quantity(&self) -> Option<f64> {
+        match self {
+            Extracted::Text(s) => parse_quantity(s),
+            Extracted::Json(v) => quantity_of(v),
+            Extracted::Owned(v) => quantity_of(v),
+        }
+    }
+}
+
+/// [`extract`] without the clone. See [`Extracted`].
+pub(crate) fn extract_ref<'a>(obj: &'a DynamicObject, pointer: &str) -> Option<Extracted<'a>> {
     if let Some(rest) = pointer.strip_prefix("/metadata")
         && (rest.is_empty() || rest.starts_with('/'))
     {
@@ -420,43 +570,53 @@ pub fn extract(obj: &DynamicObject, pointer: &str) -> Option<Value> {
             return obj
                 .types
                 .as_ref()
-                .map(|t| Value::String(t.api_version.clone()));
+                .map(|t| Extracted::Text(t.api_version.as_str()));
         }
-        "/kind" => return obj.types.as_ref().map(|t| Value::String(t.kind.clone())),
+        "/kind" => return obj.types.as_ref().map(|t| Extracted::Text(t.kind.as_str())),
         _ => {}
     }
-    obj.data.pointer(pointer).cloned()
+    obj.data.pointer(pointer).map(Extracted::Json)
 }
 
 /// Resolve metadata without serializing the entire `ObjectMeta` for every
 /// custom-column cell. Complex or whole-metadata requests still serialize the
 /// selected value, preserving the exact JSON Pointer behavior and output.
-fn extract_metadata(meta: &kube::core::ObjectMeta, rest: &str) -> Option<Value> {
+fn extract_metadata<'a>(meta: &'a kube::core::ObjectMeta, rest: &str) -> Option<Extracted<'a>> {
     if rest.is_empty() {
-        return serde_json::to_value(meta).ok();
+        return serde_json::to_value(meta).ok().map(Extracted::Owned);
     }
     let path = rest.strip_prefix('/')?;
     let field = path.split_once('/').map_or(path, |(field, _)| field);
     let tail = &path[field.len()..];
 
+    // A `String` field ObjectMeta already holds: the cell is that string.
+    // A pointer that walks further into a JSON string matches nothing, which
+    // is what serializing it and walking `tail` used to conclude the long way.
+    macro_rules! text {
+        ($value:expr) => {{
+            let s: &str = $value;
+            tail.is_empty().then_some(Extracted::Text(s))
+        }};
+    }
+
     macro_rules! selected {
         ($value:expr) => {{
             let value = serde_json::to_value($value).ok()?;
             if tail.is_empty() {
-                Some(value)
+                Some(Extracted::Owned(value))
             } else {
-                value.pointer(tail).cloned()
+                value.pointer(tail).cloned().map(Extracted::Owned)
             }
         }};
     }
 
     match field {
-        "name" => selected!(meta.name.as_ref()?),
-        "namespace" => selected!(meta.namespace.as_ref()?),
-        "uid" => selected!(meta.uid.as_ref()?),
-        "resourceVersion" => selected!(meta.resource_version.as_ref()?),
-        "generateName" => selected!(meta.generate_name.as_ref()?),
-        "selfLink" => selected!(meta.self_link.as_ref()?),
+        "name" => text!(meta.name.as_ref()?),
+        "namespace" => text!(meta.namespace.as_ref()?),
+        "uid" => text!(meta.uid.as_ref()?),
+        "resourceVersion" => text!(meta.resource_version.as_ref()?),
+        "generateName" => text!(meta.generate_name.as_ref()?),
+        "selfLink" => text!(meta.self_link.as_ref()?),
         "generation" => selected!(meta.generation?),
         "deletionGracePeriodSeconds" => selected!(meta.deletion_grace_period_seconds?),
         "creationTimestamp" => selected!(meta.creation_timestamp.as_ref()?),
@@ -470,29 +630,34 @@ fn extract_metadata(meta: &kube::core::ObjectMeta, rest: &str) -> Option<Value> 
     }
 }
 
-fn extract_string_map(
-    map: &std::collections::BTreeMap<String, String>,
+fn extract_string_map<'a>(
+    map: &'a std::collections::BTreeMap<String, String>,
     tail: &str,
-) -> Option<Value> {
+) -> Option<Extracted<'a>> {
     if tail.is_empty() {
-        return serde_json::to_value(map).ok();
+        return serde_json::to_value(map).ok().map(Extracted::Owned);
     }
     let token = tail.strip_prefix('/')?;
     if token.contains('/') {
         return None;
     }
     // JSON Pointer unescapes `~1` before `~0`; doing so in this order also
-    // preserves the RFC-defined meaning of tokens such as `~01`.
+    // preserves the RFC-defined meaning of tokens such as `~01`. A label or
+    // annotation value is borrowed straight out of the map — the whole map
+    // used to be serialized to JSON to read one key out of it.
     if token.contains('~') {
         let key = token.replace("~1", "/").replace("~0", "~");
-        map.get(&key).cloned().map(Value::String)
+        map.get(&key).map(|v| Extracted::Text(v.as_str()))
     } else {
-        map.get(token).cloned().map(Value::String)
+        map.get(token).map(|v| Extracted::Text(v.as_str()))
     }
 }
 
 /// Render one custom column's cell. Missing values read as `<none>`.
-pub fn render_cell(obj: &DynamicObject, col: &UserColumn) -> String {
+pub fn render_cell(obj: &DynamicObject, col: &UserColumn, now: i64) -> String {
+    if matches!(col.kind, ColumnKind::Metric(_)) {
+        return "-".into();
+    }
     if col.kind == ColumnKind::Condition {
         return condition_status(obj, &col.pointer).unwrap_or_else(|| "<none>".into());
     }
@@ -500,17 +665,17 @@ pub fn render_cell(obj: &DynamicObject, col: &UserColumn) -> String {
         return "<none>".into();
     };
     match col.kind {
-        ColumnKind::Time => render_time(&v),
-        _ => render_value(&v),
+        ColumnKind::Time => render_time(&v, now),
+        _ => v.render(),
     }
 }
 
 /// Value of a non-`Condition` column: a JSON Pointer extract, or a named
 /// field of a `status.conditions` entry looked up by type.
-fn cell_value(obj: &DynamicObject, col: &UserColumn) -> Option<Value> {
+fn cell_value<'a>(obj: &'a DynamicObject, col: &UserColumn) -> Option<Extracted<'a>> {
     match col.condition_field.as_deref() {
-        Some(field) => condition_value(obj, &col.pointer, field),
-        None => extract(obj, &col.pointer),
+        Some(field) => condition_value(obj, &col.pointer, field).map(Extracted::Json),
+        None => extract_ref(obj, &col.pointer),
     }
 }
 
@@ -524,14 +689,13 @@ pub fn condition_status(obj: &DynamicObject, cond_type: &str) -> Option<String> 
 
 /// One field of the `status.conditions` entry whose `type` is `cond_type`,
 /// found by name — array order isn't guaranteed by anything.
-fn condition_value(obj: &DynamicObject, cond_type: &str, field: &str) -> Option<Value> {
+fn condition_value<'a>(obj: &'a DynamicObject, cond_type: &str, field: &str) -> Option<&'a Value> {
     obj.data
         .pointer("/status/conditions")?
         .as_array()?
         .iter()
         .find(|c| c.get("type").and_then(Value::as_str) == Some(cond_type))?
         .get(field)
-        .cloned()
 }
 
 fn render_value(v: &Value) -> String {
@@ -547,27 +711,27 @@ fn render_value(v: &Value) -> String {
 /// Timestamps render as compact elapsed time (`3d4h`); a future timestamp
 /// (e.g. a certificate's `notAfter`) reads `in 30d`. Values that don't parse
 /// as RFC 3339 fall back to the raw string.
-fn render_time(v: &Value) -> String {
+fn render_time(v: &Extracted<'_>, now: i64) -> String {
     let Some(s) = v.as_str() else {
-        return render_value(v);
+        return v.render();
     };
     match s.parse::<Timestamp>() {
         Ok(ts) => {
-            let delta = Timestamp::now().as_second() - ts.as_second();
+            let delta = now - ts.as_second();
             if delta >= 0 {
                 crate::columns::humanize(delta)
             } else {
                 format!("in {}", crate::columns::humanize(-delta))
             }
         }
-        Err(_) => s.to_string(),
+        Err(_) => s.into(),
     }
 }
 
 /// Comparable value of a custom column's cell: numbers, quantities, and times
 /// sort by value (missing/unparseable last in ascending order), text sorts
 /// case-insensitively.
-pub fn sort_value(obj: &DynamicObject, col: &UserColumn) -> SortValue {
+pub fn sort_value(obj: &DynamicObject, col: &UserColumn, now: i64) -> SortValue {
     if col.kind == ColumnKind::Condition {
         return SortValue::Text(
             condition_status(obj, &col.pointer)
@@ -577,26 +741,33 @@ pub fn sort_value(obj: &DynamicObject, col: &UserColumn) -> SortValue {
     }
     let v = cell_value(obj, col);
     match col.kind {
-        ColumnKind::Number => SortValue::Num(v.as_ref().and_then(number_of).unwrap_or(f64::MAX)),
+        ColumnKind::Number => {
+            SortValue::Num(v.as_ref().and_then(Extracted::number).unwrap_or(f64::MAX))
+        }
         ColumnKind::Quantity => {
-            SortValue::Num(v.as_ref().and_then(quantity_of).unwrap_or(f64::MAX))
+            SortValue::Num(v.as_ref().and_then(Extracted::quantity).unwrap_or(f64::MAX))
         }
         // Elapsed seconds, like AGE: ascending = most recent (or furthest in
         // the future) first, unknowns last.
         ColumnKind::Time => SortValue::Num(
             v.as_ref()
-                .and_then(Value::as_str)
+                .and_then(Extracted::as_str)
                 .and_then(|s| s.parse::<Timestamp>().ok())
-                .map(|ts| (Timestamp::now().as_second() - ts.as_second()) as f64)
+                .map(|ts| (now - ts.as_second()) as f64)
                 .unwrap_or(f64::MAX),
         ),
         // Condition is handled above (its "pointer" is a condition name, not
         // something `extract` understands).
-        ColumnKind::Text | ColumnKind::Status | ColumnKind::Condition => SortValue::Text(
+        ColumnKind::Text
+        | ColumnKind::Status
+        | ColumnKind::Condition
+        | ColumnKind::Metric(_)
+        | ColumnKind::Builtin => SortValue::Text(
             v.as_ref()
-                .map(render_value)
+                .map(Extracted::render)
                 .unwrap_or_default()
-                .to_lowercase(),
+                .to_lowercase()
+                .to_string(),
         ),
     }
 }
@@ -804,6 +975,28 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
+    #[test]
+    fn column_sources_validate_without_discarding_other_columns() {
+        let cfg: crate::config::Config = toml::from_str(
+            r#"
+            [views."v1/pods"]
+            columns = [
+                { name = "NAME", builtin = "NAME" },
+                { name = "CPU", metric = "cpu" },
+                { name = "CPU", metric = "memory" },
+                { name = "BOTH", path = "/spec/cpu", metric = "cpu" },
+                { name = "UNKNOWN", metric = "cpus" },
+                { name = "BAD", builtin = "" },
+                { name = "TYPED", metric = "memory", type = "text" },
+            ]
+        "#,
+        )
+        .unwrap();
+        let (views, warnings) = compile(&cfg.views);
+        assert_eq!(views["v1/pods"].columns.len(), 2);
+        assert_eq!(warnings.len(), 5);
+    }
+
     fn col(pointer: &str, kind: ColumnKind) -> UserColumn {
         UserColumn {
             header: "COL".into(),
@@ -855,8 +1048,8 @@ mod tests {
             ]}
         }))
         .unwrap();
-        assert_eq!(render_cell(&obj, col), "False");
-        match sort_value(&obj, col) {
+        assert_eq!(render_cell(&obj, col, crate::columns::now_secs()), "False");
+        match sort_value(&obj, col, crate::columns::now_secs()) {
             SortValue::Text(t) => assert_eq!(t, "false"),
             SortValue::Num(_) => panic!("conditions sort as text"),
         }
@@ -866,7 +1059,10 @@ mod tests {
             "metadata": {"name": "new"}
         }))
         .unwrap();
-        assert_eq!(render_cell(&bare, col), "<none>");
+        assert_eq!(
+            render_cell(&bare, col, crate::columns::now_secs()),
+            "<none>"
+        );
     }
 
     #[test]
@@ -974,6 +1170,101 @@ mod tests {
     }
 
     #[test]
+    fn namespace_view_keys_use_two_precedence_groups() {
+        let ar = ApiResource {
+            group: "example.com".into(),
+            version: "v1".into(),
+            api_version: "example.com/v1".into(),
+            kind: "Widget".into(),
+            plural: "widgets".into(),
+        };
+        let keys = [
+            "example.com/v1/widgets@batch",
+            "example.com/widgets@batch",
+            "widgets@batch",
+            "widget@batch",
+            "example.com/v1/widgets",
+            "example.com/widgets",
+            "widgets",
+            "widget",
+        ];
+        let mut views: HashMap<_, _> = keys
+            .iter()
+            .map(|key| {
+                (
+                    key.to_string(),
+                    View {
+                        sort: Some((key.to_string(), false)),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        for key in keys {
+            assert_eq!(
+                lookup(&views, &ar, Some("batch"))
+                    .unwrap()
+                    .sort
+                    .as_ref()
+                    .unwrap()
+                    .0,
+                key
+            );
+            views.remove(key);
+        }
+        assert!(lookup(&views, &ar, Some("batch")).is_none());
+        let (views, warnings) = compile_toml(
+            r#"
+            [views."widgets@batch"]
+            sort = "NAME"
+            [views.widgets]
+            sort = "AGE"
+        "#,
+        );
+        assert!(warnings.is_empty());
+        for namespace in [None, Some(""), Some("other")] {
+            assert_eq!(
+                lookup(&views, &ar, namespace).unwrap().sort,
+                Some(("AGE".into(), false))
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_namespace_suffixes_warn_and_skip_the_view() {
+        for key in [
+            "pods@",
+            "@batch",
+            "pods@a@b",
+            "pods@Batch",
+            "pods@-batch",
+            "pods@batch-",
+            "pods@a.b",
+            "pods@a_b",
+            "pods@all namespaces",
+        ] {
+            let (views, warnings) = compile_toml(&format!("[views.\"{key}\"]"));
+            assert!(views.is_empty(), "{key}");
+            assert_eq!(warnings.len(), 1, "{key}");
+            assert!(warnings[0].contains("invalid namespace suffix"));
+        }
+        let key = format!("pods@{}", "a".repeat(64));
+        let (views, warnings) = compile_toml(&format!("[views.\"{key}\"]"));
+        assert!(views.is_empty());
+        assert_eq!(warnings.len(), 1);
+        let (_, warnings) = compile_toml(
+            r#"[views."pods@batch"]
+            drill = { kind = "secrets" }
+        "#,
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("drill is ignored"))
+        );
+    }
+
+    #[test]
     fn lookup_prefers_most_specific_key() {
         let ar = ApiResource {
             group: "cert-manager.io".into(),
@@ -989,22 +1280,22 @@ mod tests {
         let mut views = HashMap::new();
         views.insert("certificate".to_string(), mk("by-kind"));
         assert_eq!(
-            lookup(&views, &ar).unwrap().sort,
+            lookup(&views, &ar, None).unwrap().sort,
             Some(("BY-KIND".into(), false))
         );
         views.insert("certificates".to_string(), mk("by-plural"));
         assert_eq!(
-            lookup(&views, &ar).unwrap().sort,
+            lookup(&views, &ar, None).unwrap().sort,
             Some(("BY-PLURAL".into(), false))
         );
         views.insert("cert-manager.io/certificates".to_string(), mk("by-group"));
         assert_eq!(
-            lookup(&views, &ar).unwrap().sort,
+            lookup(&views, &ar, None).unwrap().sort,
             Some(("BY-GROUP".into(), false))
         );
         views.insert("cert-manager.io/v1/certificates".to_string(), mk("by-gvr"));
         assert_eq!(
-            lookup(&views, &ar).unwrap().sort,
+            lookup(&views, &ar, None).unwrap().sort,
             Some(("BY-GVR".into(), false))
         );
     }
@@ -1024,20 +1315,23 @@ mod tests {
         };
         let views = HashMap::new();
         assert_eq!(
-            node_pointer(&views, &ar("", "Pod", "pods")),
+            node_pointer(&views, &ar("", "Pod", "pods"), None),
             Some("/spec/nodeName")
         );
         let claims = ar("karpenter.sh", "NodeClaim", "nodeclaims");
-        assert_eq!(node_pointer(&views, &claims), Some("/status/nodeName"));
+        assert_eq!(
+            node_pointer(&views, &claims, None),
+            Some("/status/nodeName")
+        );
         // A kind the table doesn't list names no node until config says where.
         let pools = ar("karpenter.sh", "NodePool", "nodepools");
-        assert_eq!(node_pointer(&views, &pools), None);
+        assert_eq!(node_pointer(&views, &pools, None), None);
         // Rows are scoped to their group: a same-named plural elsewhere
         // (or PodMetrics, whose plural is also `pods`) gets nothing.
         let other_claims = ar("example.com", "NodeClaim", "nodeclaims");
-        assert_eq!(node_pointer(&views, &other_claims), None);
+        assert_eq!(node_pointer(&views, &other_claims, None), None);
         let pod_metrics = ar("metrics.k8s.io", "PodMetrics", "pods");
-        assert_eq!(node_pointer(&views, &pod_metrics), None);
+        assert_eq!(node_pointer(&views, &pod_metrics, None), None);
 
         let (configured, warnings) = compile_toml(
             r#"
@@ -1051,10 +1345,13 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         // Config overrides a shipped row and adds a kind without one.
         assert_eq!(
-            node_pointer(&configured, &claims),
+            node_pointer(&configured, &claims, None),
             Some("/status/providerID")
         );
-        assert_eq!(node_pointer(&configured, &pools), Some("/status/host"));
+        assert_eq!(
+            node_pointer(&configured, &pools, None),
+            Some("/status/host")
+        );
     }
 
     #[test]
@@ -1078,8 +1375,8 @@ mod tests {
             "#,
         );
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(lookup(&views, &widgets).unwrap().node, None);
-        assert_eq!(node_pointer(&views, &widgets), Some("/status/host"));
+        assert_eq!(lookup(&views, &widgets, None).unwrap().node, None);
+        assert_eq!(node_pointer(&views, &widgets, None), Some("/status/host"));
     }
 
     #[test]
@@ -1100,7 +1397,7 @@ mod tests {
             node = "status.host"
             "#,
         );
-        assert_eq!(node_pointer(&views, &pods), Some("/status/hostName"));
+        assert_eq!(node_pointer(&views, &pods, None), Some("/status/hostName"));
         // A path that isn't a pointer is dropped with a warning, like columns.
         assert_eq!(views["widgets"].node, None);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
@@ -1127,7 +1424,7 @@ mod tests {
         );
         assert!(warnings.is_empty(), "{warnings:?}");
         // Found on the broader key even though the narrower one matches first.
-        let drill = drill_for(&views, &pools).expect("drill configured");
+        let drill = drill_for(&views, &pools, None).expect("drill configured");
         assert_eq!(drill.kind, "nodeclaims");
         let pool = obj(json!({"metadata": {"name": "default"}}));
         assert_eq!(
@@ -1143,7 +1440,10 @@ mod tests {
             "#,
         );
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(drill_for(&views, &pools).unwrap().labels_for(&pool), None);
+        assert_eq!(
+            drill_for(&views, &pools, None).unwrap().labels_for(&pool),
+            None
+        );
     }
 
     #[test]
@@ -1223,6 +1523,142 @@ mod tests {
             warnings.iter().any(|w| w.contains("placeholder(s) uid")),
             "{warnings:?}"
         );
+    }
+
+    /// The borrowed extraction must answer every pointer exactly as the owned
+    /// one did — it is the same function now, so this pins the shapes that
+    /// actually get borrowed rather than cloned.
+    #[test]
+    fn borrowed_extraction_matches_the_owned_value_it_replaced() {
+        let big: Vec<Value> = (0..100).map(|i| json!({"i": i})).collect();
+        let o = obj(json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "w1",
+                "namespace": "team",
+                "labels": {"app": "web"},
+                "annotations": {"a.example.com/note": "hi", "with/slash": "s"},
+                "generation": 7,
+            },
+            "spec": {"size": 3, "tags": ["a", "b"], "items": big,
+                     "nested": {"deep": {"leaf": "found"}}},
+            "status": {"phase": "Ready"}
+        }));
+
+        // Borrowed straight out of the body: no subtree is cloned to read it.
+        assert!(matches!(
+            extract_ref(&o, "/spec/items"),
+            Some(Extracted::Json(_))
+        ));
+        assert!(matches!(
+            extract_ref(&o, "/spec/nested/deep"),
+            Some(Extracted::Json(_))
+        ));
+        // Borrowed straight out of ObjectMeta / a label map.
+        assert!(matches!(
+            extract_ref(&o, "/metadata/name"),
+            Some(Extracted::Text("w1"))
+        ));
+        assert!(matches!(
+            extract_ref(&o, "/metadata/labels/app"),
+            Some(Extracted::Text("web"))
+        ));
+        assert!(matches!(
+            extract_ref(&o, "/metadata/annotations/with~1slash"),
+            Some(Extracted::Text("s"))
+        ));
+        assert!(matches!(
+            extract_ref(&o, "/apiVersion"),
+            Some(Extracted::Text("example.com/v1"))
+        ));
+        // Still owned: these have to be built to answer the pointer at all.
+        assert!(matches!(
+            extract_ref(&o, "/metadata/generation"),
+            Some(Extracted::Owned(_))
+        ));
+        assert!(matches!(
+            extract_ref(&o, "/metadata/labels"),
+            Some(Extracted::Owned(_))
+        ));
+
+        // Whatever the representation, the owned answer is unchanged.
+        for pointer in [
+            "/spec/items",
+            "/spec/nested/deep",
+            "/spec/tags/1",
+            "/metadata/name",
+            "/metadata/namespace",
+            "/metadata/labels",
+            "/metadata/labels/app",
+            "/metadata/annotations/a.example.com~1note",
+            "/metadata/annotations/with~1slash",
+            "/metadata/generation",
+            "/metadata",
+            "/apiVersion",
+            "/kind",
+            "/status/phase",
+            // A pointer walking into a string still matches nothing.
+            "/metadata/name/nope",
+            "/metadata/labels/app/nope",
+            "/spec/missing",
+        ] {
+            let borrowed = extract_ref(&o, pointer).map(Extracted::into_value);
+            assert_eq!(borrowed, extract(&o, pointer), "pointer {pointer}");
+        }
+    }
+
+    /// Rendering and sorting read the borrowed value, so they must produce
+    /// what they produced when every extraction was a fresh `Value`.
+    #[test]
+    fn borrowed_cells_render_and_sort_unchanged() {
+        let o = obj(json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": {"name": "w1", "labels": {"replicas": "12"}},
+            "spec": {"tags": ["a", "b"], "cpu": "250m", "count": 42},
+            "status": {"phase": "Ready"}
+        }));
+        let now = crate::columns::now_secs();
+
+        assert_eq!(
+            render_cell(&o, &col("/metadata/name", ColumnKind::Text), now),
+            "w1"
+        );
+        assert_eq!(
+            render_cell(&o, &col("/status/phase", ColumnKind::Text), now),
+            "Ready"
+        );
+        assert_eq!(
+            render_cell(&o, &col("/spec/tags", ColumnKind::Text), now),
+            r#"["a","b"]"#
+        );
+        assert_eq!(
+            render_cell(&o, &col("/spec/count", ColumnKind::Number), now),
+            "42"
+        );
+        assert_eq!(
+            render_cell(&o, &col("/nope", ColumnKind::Text), now),
+            "<none>"
+        );
+
+        // A quantity and a number reached through a borrowed label string.
+        match sort_value(&o, &col("/spec/cpu", ColumnKind::Quantity), now) {
+            SortValue::Num(n) => assert_eq!(n, 0.25),
+            SortValue::Text(t) => panic!("quantity sorts numerically, got {t}"),
+        }
+        match sort_value(
+            &o,
+            &col("/metadata/labels/replicas", ColumnKind::Number),
+            now,
+        ) {
+            SortValue::Num(n) => assert_eq!(n, 12.0),
+            SortValue::Text(t) => panic!("number sorts numerically, got {t}"),
+        }
+        match sort_value(&o, &col("/metadata/name", ColumnKind::Text), now) {
+            SortValue::Text(t) => assert_eq!(t, "w1"),
+            SortValue::Num(n) => panic!("text sorts as text, got {n}"),
+        }
     }
 
     #[test]
@@ -1313,14 +1749,36 @@ mod tests {
             "metadata": {"name": "w1"},
             "spec": {"size": 3, "on": true, "tags": ["a"]}
         }));
-        assert_eq!(render_cell(&o, &col("/spec/size", ColumnKind::Text)), "3");
-        assert_eq!(render_cell(&o, &col("/spec/on", ColumnKind::Text)), "true");
         assert_eq!(
-            render_cell(&o, &col("/spec/tags", ColumnKind::Text)),
+            render_cell(
+                &o,
+                &col("/spec/size", ColumnKind::Text),
+                crate::columns::now_secs()
+            ),
+            "3"
+        );
+        assert_eq!(
+            render_cell(
+                &o,
+                &col("/spec/on", ColumnKind::Text),
+                crate::columns::now_secs()
+            ),
+            "true"
+        );
+        assert_eq!(
+            render_cell(
+                &o,
+                &col("/spec/tags", ColumnKind::Text),
+                crate::columns::now_secs()
+            ),
             "[\"a\"]"
         );
         assert_eq!(
-            render_cell(&o, &col("/spec/nope", ColumnKind::Text)),
+            render_cell(
+                &o,
+                &col("/spec/nope", ColumnKind::Text),
+                crate::columns::now_secs()
+            ),
             "<none>"
         );
     }
@@ -1338,13 +1796,28 @@ mod tests {
                 "junk": "not-a-time"
             }
         }));
-        assert_eq!(render_cell(&o, &col("/spec/past", ColumnKind::Time)), "1h");
         assert_eq!(
-            render_cell(&o, &col("/spec/future", ColumnKind::Time)),
+            render_cell(
+                &o,
+                &col("/spec/past", ColumnKind::Time),
+                crate::columns::now_secs()
+            ),
+            "1h"
+        );
+        assert_eq!(
+            render_cell(
+                &o,
+                &col("/spec/future", ColumnKind::Time),
+                crate::columns::now_secs()
+            ),
             "in 30d"
         );
         assert_eq!(
-            render_cell(&o, &col("/spec/junk", ColumnKind::Time)),
+            render_cell(
+                &o,
+                &col("/spec/junk", ColumnKind::Time),
+                crate::columns::now_secs()
+            ),
             "not-a-time"
         );
     }
@@ -1379,13 +1852,31 @@ mod tests {
             }
         }));
         // Lexically "1Gi" < "500m" — by value it must be the other way.
-        let q = |p: &str| num(sort_value(&o, &col(p, ColumnKind::Quantity)));
+        let q = |p: &str| {
+            num(sort_value(
+                &o,
+                &col(p, ColumnKind::Quantity),
+                crate::columns::now_secs(),
+            ))
+        };
         assert!(q("/spec/small") < q("/spec/big"));
         // Lexically "10" < "9".
-        let n = |p: &str| num(sort_value(&o, &col(p, ColumnKind::Number)));
+        let n = |p: &str| {
+            num(sort_value(
+                &o,
+                &col(p, ColumnKind::Number),
+                crate::columns::now_secs(),
+            ))
+        };
         assert!(n("/spec/nine") < n("/spec/ten"));
         // Ascending time = most recent first (smaller elapsed).
-        let t = |p: &str| num(sort_value(&o, &col(p, ColumnKind::Time)));
+        let t = |p: &str| {
+            num(sort_value(
+                &o,
+                &col(p, ColumnKind::Time),
+                crate::columns::now_secs(),
+            ))
+        };
         assert!(t("/spec/new") < t("/spec/old"));
         // Missing values sort last in ascending order.
         assert_eq!(q("/spec/missing"), f64::MAX);
@@ -1513,17 +2004,26 @@ mod tests {
                 }
             ]}
         }));
-        assert_eq!(render_cell(&obj, &view.columns[0]), "False");
-        assert_eq!(render_cell(&obj, &view.columns[1]), "DependencyNotReady");
-        assert_eq!(render_cell(&obj, &view.columns[2]), "waiting on source");
-        match sort_value(&obj, &view.columns[1]) {
+        assert_eq!(
+            render_cell(&obj, &view.columns[0], crate::columns::now_secs()),
+            "False"
+        );
+        assert_eq!(
+            render_cell(&obj, &view.columns[1], crate::columns::now_secs()),
+            "DependencyNotReady"
+        );
+        assert_eq!(
+            render_cell(&obj, &view.columns[2], crate::columns::now_secs()),
+            "waiting on source"
+        );
+        match sort_value(&obj, &view.columns[1], crate::columns::now_secs()) {
             SortValue::Text(t) => assert_eq!(t, "dependencynotready"),
             SortValue::Num(_) => panic!("reason sorts as text"),
         }
 
-        let spec = crate::columns::build_spec("widgets", None, Some(&view), false);
+        let spec = crate::columns::build_spec("example.com", "widgets", None, Some(&view), false);
         assert_eq!(spec.headers(), vec!["NAME", "A", "B", "C", "AGE"]);
-        let (cells, status_idx) = spec.cells(&obj);
+        let (cells, status_idx) = spec.cells(&obj, crate::columns::now_secs());
         assert_eq!(
             &cells[1..4],
             ["False", "DependencyNotReady", "waiting on source"]

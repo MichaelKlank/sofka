@@ -2,22 +2,189 @@
 //! resolution, and async watch streams that feed the in-memory store.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::Duration;
+use std::task::{Context as TaskContext, Poll};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use kube::api::{Api, ListParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
-use kube::core::DynamicObject;
-use kube::discovery::{ApiResource, Discovery, Scope};
+use kube::core::{DynamicObject, GroupVersionResource};
+use kube::discovery::ApiResource;
 use kube::runtime::{WatchStreamExt, watcher};
 use kube::{Client, Config, ResourceExt};
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 
+use crate::diagnostics::Op;
 use crate::store::{Msg, row_key};
+
+mod discovery;
+
+pub(crate) fn build_client(config: Config, allow_v1_client_cert: bool) -> Result<Client> {
+    let builder = crate::legacy_tls::client_builder(config, allow_v1_client_cert)?;
+    let layer =
+        tower::util::MapRequestLayer::new(|mut request: http::Request<kube::client::Body>| {
+            let watch = request.uri().query().is_some_and(|query| {
+                form_urlencoded::parse(query.as_bytes())
+                    .any(|(key, value)| key == "watch" && value == "true")
+            });
+            if watch {
+                // Watch responses can contain multiple gzip members, which the client cannot decode.
+                request.headers_mut().insert(
+                    http::header::ACCEPT_ENCODING,
+                    http::HeaderValue::from_static("identity"),
+                );
+            }
+            request
+        });
+    Ok(builder.with_layer(&layer).with_layer(&MeterLayer).build())
+}
+
+/// Times every Kubernetes API request into [`crate::diagnostics`] and, at
+/// `debug`, logs one line per request.
+///
+/// Latency is measured to response *headers*, not to the end of the body: a
+/// watch's body stays open for the life of the view, and a list's decode time
+/// belongs to us rather than to the API server.
+#[derive(Clone, Copy)]
+struct MeterLayer;
+
+impl<S> tower::Layer<S> for MeterLayer {
+    type Service = Meter<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        Meter { inner }
+    }
+}
+
+#[derive(Clone)]
+struct Meter<S> {
+    inner: S,
+}
+
+impl<S, B> tower::Service<http::Request<kube::client::Body>> for Meter<S>
+where
+    S: tower::Service<http::Request<kube::client::Body>, Response = http::Response<B>>,
+    S::Error: std::fmt::Display,
+    // kube's default stack is a `BoxService`, whose future is already pinned on
+    // the heap. Requiring `Unpin` inherits that and lets the wrapper project
+    // safely, so metering adds no allocation of its own.
+    S::Future: Unpin,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Metered<S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: http::Request<kube::client::Body>) -> Self::Future {
+        let uri = request.uri();
+        let path = uri.path();
+        let op = Op::classify(request.method(), path, uri.query());
+        crate::log_debug!(
+            "request.start",
+            op = op.as_str(),
+            method = request.method(),
+            path = path
+        );
+        Metered::new(self.inner.call(request), op)
+    }
+}
+
+/// The in-flight half of [`Meter`]: records the elapsed time once, either when
+/// the response arrives or when its caller cancels the request.
+struct Metered<F> {
+    inner: F,
+    op: Op,
+    start: Instant,
+    completed: bool,
+}
+
+impl<F> Metered<F> {
+    fn new(inner: F, op: Op) -> Self {
+        Self {
+            inner,
+            op,
+            start: Instant::now(),
+            completed: false,
+        }
+    }
+}
+
+impl<F, B, E> Future for Metered<F>
+where
+    F: Future<Output = Result<http::Response<B>, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        // Safe projection: every field is `Unpin`, so `Self` is too.
+        let this = self.get_mut();
+        let result = match Pin::new(&mut this.inner).poll(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(result) => result,
+        };
+        this.completed = true;
+        let elapsed = this.start.elapsed();
+        let ok = result
+            .as_ref()
+            .is_ok_and(|response| !response.status().is_server_error());
+        crate::diagnostics::record(this.op, elapsed, ok);
+        match &result {
+            Ok(response) => crate::log_debug!(
+                "request.done",
+                op = this.op.as_str(),
+                status = response.status().as_u16(),
+                ms = elapsed.as_millis()
+            ),
+            Err(e) => crate::log_warn!(
+                "request.failed",
+                op = this.op.as_str(),
+                ms = elapsed.as_millis(),
+                error = e
+            ),
+        }
+        Poll::Ready(result)
+    }
+}
+
+impl<F> Drop for Metered<F> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        let elapsed = self.start.elapsed();
+        crate::diagnostics::record(self.op, elapsed, false);
+        crate::log_warn!(
+            "request.cancelled",
+            op = self.op.as_str(),
+            ms = elapsed.as_millis()
+        );
+    }
+}
+
+/// Outcome of [`Cluster::probe_watch`].
+pub enum WatchProbe {
+    /// The resource is not in this cluster's discovery.
+    Unresolved,
+    Ran {
+        /// Time until the initial sync and watch headers arrive; `None` on failure.
+        synced: Option<Duration>,
+        /// Objects in the initial list.
+        objects: usize,
+        errors: usize,
+        last_error: Option<String>,
+    },
+}
 
 /// A resolvable Kubernetes resource type.
 #[derive(Clone)]
@@ -27,6 +194,10 @@ pub struct Kind {
 }
 
 impl Kind {
+    pub fn resource_key(&self) -> GroupVersionResource {
+        GroupVersionResource::gvr(&self.ar.group, &self.ar.version, &self.ar.plural)
+    }
+
     pub fn title(&self) -> String {
         if self.ar.group.is_empty() {
             self.ar.plural.clone()
@@ -75,10 +246,14 @@ pub struct Cluster {
     /// current context is unreachable at launch — the app then starts in the
     /// context picker instead of a resource view.
     pub connected: bool,
+    /// Explicit consent for v1 client certificates, retained for this run.
+    pub allow_v1_client_cert: bool,
     /// Per-cluster support for Kubernetes streaming-list watch startup:
     /// unknown, supported, or unsupported. Shared by all view watches so one
     /// negotiation failure avoids retrying the extension on every switch.
     streaming_lists: Arc<AtomicU8>,
+    pub discovery_warnings: Vec<String>,
+    pub discovery_fallback: Option<String>,
 }
 
 const STREAMING_UNKNOWN: u8 = 0;
@@ -99,7 +274,7 @@ fn sanitize_server_version(version: &str) -> String {
 }
 
 impl Cluster {
-    pub async fn connect() -> Result<Self> {
+    pub async fn connect(allow_v1_client_cert: bool) -> Result<Self> {
         let config = Config::infer()
             .await
             .context("loading kubeconfig (is KUBECONFIG / ~/.kube/config present?)")?;
@@ -107,11 +282,11 @@ impl Cluster {
         // default; pass it explicitly so shell-outs can't drift from us.
         let cli_context = current_context_name();
         let context = cli_context.clone().unwrap_or_else(|| "default".into());
-        Self::from_config(config, context, cli_context).await
+        Self::from_config(config, context, cli_context, allow_v1_client_cert).await
     }
 
     /// Connect using a specific kubeconfig context (for the `:ctx` switcher).
-    pub async fn connect_context(name: &str) -> Result<Self> {
+    pub async fn connect_context(name: &str, allow_v1_client_cert: bool) -> Result<Self> {
         let kubeconfig = Kubeconfig::read().context("reading kubeconfig")?;
         let opts = KubeConfigOptions {
             context: Some(name.to_string()),
@@ -121,17 +296,24 @@ impl Cluster {
         let config = Config::from_custom_kubeconfig(kubeconfig, &opts)
             .await
             .with_context(|| format!("building config for context '{name}'"))?;
-        Self::from_config(config, name.to_string(), Some(name.to_string())).await
+        Self::from_config(
+            config,
+            name.to_string(),
+            Some(name.to_string()),
+            allow_v1_client_cert,
+        )
+        .await
     }
 
     async fn from_config(
         config: Config,
         context: String,
         cli_context: Option<String>,
+        allow_v1_client_cert: bool,
     ) -> Result<Self> {
         let cluster_url = config.cluster_url.to_string();
         let default_namespace = config.default_namespace.clone();
-        let client = Client::try_from(config).context("building kube client")?;
+        let client = build_client(config, allow_v1_client_cert).context("building kube client")?;
         let version_client = client.clone();
 
         let cluster_name = cluster_name_for(&context).unwrap_or_default();
@@ -146,17 +328,35 @@ impl Cluster {
             registry: HashMap::new(),
             catalog: Vec::new(),
             connected: true,
+            allow_v1_client_cert,
             streaming_lists: Arc::new(AtomicU8::new(STREAMING_UNKNOWN)),
+            discovery_warnings: Vec::new(),
+            discovery_fallback: None,
         };
         // Version is useful metadata, not a connectivity prerequisite. Fetch
         // it alongside discovery so it adds no serial startup latency, and
         // keep the cluster usable if an unusual API proxy rejects `/version`.
         let version = tokio::time::timeout(VERSION_TIMEOUT, version_client.apiserver_version());
         let (discovery, version) = tokio::join!(cluster.discover(), version);
+        if let Err(e) = &discovery {
+            crate::log_error!(
+                "cluster.connect.failed",
+                context = cluster.context,
+                error = format!("{e:#}")
+            );
+        }
         discovery?;
         if let Ok(Ok(info)) = version {
             cluster.server_version = sanitize_server_version(&info.git_version);
         }
+        crate::log_info!(
+            "cluster.connected",
+            context = cluster.context,
+            cluster = cluster.cluster_name,
+            server = cluster.cluster_url,
+            k8s = cluster.server_version,
+            kinds = cluster.catalog.len()
+        );
         Ok(cluster)
     }
 
@@ -212,7 +412,10 @@ impl Cluster {
             registry: HashMap::new(),
             catalog: Vec::new(),
             connected: false,
+            allow_v1_client_cert: false,
             streaming_lists: Arc::new(AtomicU8::new(STREAMING_UNKNOWN)),
+            discovery_warnings: Vec::new(),
+            discovery_fallback: None,
         }
     }
 
@@ -242,56 +445,40 @@ impl Cluster {
         }
     }
 
-    /// Walk the discovery API and index every recommended resource by its
-    /// plural and kind. Built-in aliases are layered on top.
+    /// Index resource names and short names from API discovery.
     async fn discover(&mut self) -> Result<()> {
-        // Prefer the Aggregated Discovery API (K8s ≥1.26): two requests total,
-        // and the apiserver serves cached data for groups whose backing
-        // APIService is down. The per-group walk instead 503s on the first
-        // broken aggregated API (e.g. a dead metrics-server), which would make
-        // the whole cluster unconnectable. Servers without aggregated
-        // discovery answer the request with the legacy document, which
-        // deserializes as *empty* rather than failing — so fall back to the
-        // per-group walk on empty as well as on error.
-        let discovery = match Discovery::new(self.client.clone()).run_aggregated().await {
-            Ok(d) if d.groups().next().is_some() => d,
-            _ => Discovery::new(self.client.clone())
-                .run()
-                .await
-                .context("running API discovery")?,
-        };
+        // Aggregated discovery needs two requests and tolerates stale APIService
+        // entries. Legacy discovery is used when negotiation fails.
+        let discovered = discovery::discover(&self.client).await?;
+        self.discovery_warnings = discovered.skipped;
+        self.discovery_fallback = discovered.fallback;
+        self.register_resources(discovered.resources);
+        Ok(())
+    }
 
-        // Collect everything first, then insert bare keys in priority order so
-        // that e.g. core `pods` wins over `pods.metrics.k8s.io`.
-        let mut entries: Vec<(Kind, String, String)> = Vec::new(); // (kind, plural, kind_lc)
+    fn register_resources(&mut self, mut resources: Vec<discovery::Resource>) {
+        // Higher priority groups claim short names first. Alphabetical group
+        // order makes collisions between equal-priority groups deterministic.
+        resources.sort_by(|a, b| {
+            group_priority(&b.kind.ar.group)
+                .cmp(&group_priority(&a.kind.ar.group))
+                .then_with(|| a.kind.ar.group.cmp(&b.kind.ar.group))
+                .then_with(|| a.kind.ar.plural.cmp(&b.kind.ar.plural))
+        });
+        let mut entries = Vec::new();
         let mut catalog = Vec::new();
-        for group in discovery.groups() {
-            // All served versions of the group, most stable version per kind.
-            // NOT `recommended_resources()`: that only returns resources at
-            // the group's *preferred* version, silently dropping kinds served
-            // solely at other versions — e.g. a CRD group whose preferred
-            // version is v1 while half its kinds only exist at v1alpha1
-            // (netbird.io does this; kube-rs docs call it the "ApiGroup
-            // Common Pitfall").
-            for (ar, caps) in group.resources_by_stability() {
-                let namespaced = matches!(caps.scope, Scope::Namespaced);
-                let kind = Kind {
-                    ar: ar.clone(),
-                    namespaced,
-                };
-                let plural = ar.plural.to_lowercase();
-                let kind_lc = ar.kind.to_lowercase();
-                catalog.push(plural.clone());
-                // Group-qualified keys are unambiguous; insert directly. They
-                // join the catalog too, so completion can surface a kind whose
-                // bare plural is shadowed (or find it by its group name).
-                if !ar.group.is_empty() {
-                    let qualified = format!("{}.{}", plural, ar.group);
-                    self.registry.insert(qualified.clone(), kind.clone());
-                    catalog.push(qualified);
-                }
-                entries.push((kind, plural, kind_lc));
+        for resource in &resources {
+            let kind = &resource.kind;
+            let ar = &kind.ar;
+            let plural = ar.plural.to_lowercase();
+            let kind_lc = ar.kind.to_lowercase();
+            catalog.push(plural.clone());
+            if !ar.group.is_empty() {
+                let qualified = format!("{}.{}", plural, ar.group);
+                self.registry.insert(qualified.clone(), kind.clone());
+                catalog.push(qualified);
             }
+            entries.push((kind.clone(), plural, kind_lc));
         }
         // Lowest priority first; later inserts overwrite, so the highest
         // priority group ends up owning each bare plural/kind key.
@@ -313,7 +500,15 @@ impl Cluster {
                 self.registry.entry((*alias).to_string()).or_insert(k);
             }
         }
-        Ok(())
+        for resource in resources {
+            for alias in resource.short_names {
+                if !alias.is_empty() {
+                    self.registry
+                        .entry(alias.to_lowercase())
+                        .or_insert_with(|| resource.kind.clone());
+                }
+            }
+        }
     }
 
     pub fn resolve(&self, input: &str) -> Option<Kind> {
@@ -334,98 +529,123 @@ impl Cluster {
         generation: u64,
         tx: Sender<Msg>,
     ) -> JoinHandle<()> {
+        let api = watch_api(self.client.clone(), kind, namespace);
+        let mut cfg = watcher::Config::default().any_semantic();
+        if let Some(l) = labels {
+            cfg = cfg.labels(&l);
+        }
+        if let Some(f) = fields {
+            cfg = cfg.fields(&f);
+        }
+        spawn_watch_task(
+            api,
+            kind.ar.plural.clone(),
+            namespace.to_string(),
+            cfg,
+            Arc::clone(&self.streaming_lists),
+            generation,
+            tx,
+        )
+    }
+
+    /// Open the watch a launch would open, wait for its initial sync, and
+    /// report what happened. For `sofka info`, which has no session to count
+    /// watches over and so runs one instead.
+    ///
+    /// Discovery working says nothing about whether watches do: a proxy or
+    /// load balancer that closes long-lived connections passes every other
+    /// check and still leaves the TUI with an empty, never-syncing table.
+    pub async fn probe_watch(
+        &self,
+        resource: &str,
+        namespace: &str,
+        timeout: Duration,
+    ) -> WatchProbe {
+        let Some(kind) = self.resolve(resource) else {
+            return WatchProbe::Unresolved;
+        };
+        let ns = if kind.namespaced { namespace } else { "" };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+        let started = std::time::Instant::now();
+        let (headers_tx, mut headers_rx) = tokio::sync::watch::channel(false);
         let client = self.client.clone();
-        let ar = kind.ar.clone();
-        let namespaced = kind.namespaced;
-        let ns = namespace.to_string();
-        let streaming_lists = Arc::clone(&self.streaming_lists);
-
-        tokio::spawn(async move {
-            let api: Api<DynamicObject> = if namespaced && !ns.is_empty() {
-                Api::namespaced_with(client, &ns, &ar)
-            } else {
-                Api::all_with(client, &ar)
-            };
-
-            let mut cfg = watcher::Config::default().any_semantic();
-            if let Some(l) = labels {
-                cfg = cfg.labels(&l);
-            }
-            if let Some(f) = fields {
-                cfg = cfg.fields(&f);
-            }
-            let mut using_streaming =
-                streaming_lists.load(Ordering::Acquire) != STREAMING_UNSUPPORTED;
-            let mut initializing = true;
-            let mut stream = watcher(
-                api.clone(),
-                if using_streaming {
-                    cfg.clone().streaming_lists()
-                } else {
-                    cfg.clone()
-                },
-            )
-            .modify(|obj| obj.managed_fields_mut().clear())
-            .boxed();
-            if tx.send(Msg::Reset { generation }).await.is_err() {
-                return;
-            }
-
-            while let Some(event) = stream.next().await {
-                if using_streaming
-                    && initializing
-                    && event.as_ref().is_err_and(streaming_lists_unsupported)
-                {
-                    streaming_lists.store(STREAMING_UNSUPPORTED, Ordering::Release);
-                    using_streaming = false;
-                    stream = watcher(api.clone(), cfg.clone())
-                        .modify(|obj| obj.managed_fields_mut().clear())
-                        .boxed();
-                    continue;
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let client = client.clone();
+            let headers_tx = headers_tx.clone();
+            async move {
+                // A list clears evidence from an earlier streaming-list attempt.
+                headers_tx.send_replace(false);
+                let watch = request.uri().query().is_some_and(|q| {
+                    form_urlencoded::parse(q.as_bytes())
+                        .any(|(key, value)| key == "watch" && value == "true")
+                });
+                let response = client.send(request).await?;
+                if watch && response.status().is_success() {
+                    headers_tx.send_replace(true);
                 }
-                let msg = match event {
-                    Ok(watcher::Event::Apply(obj)) | Ok(watcher::Event::InitApply(obj)) => {
-                        Msg::Applied {
-                            generation,
-                            key: row_key(&obj),
-                            obj: Box::new(obj),
-                        }
+                Ok::<_, kube::Error>(response)
+            }
+        });
+        let client = Client::new(service, self.default_namespace.clone());
+        let task = spawn_watch_task(
+            watch_api(client, &kind, ns),
+            kind.ar.plural.clone(),
+            ns.to_string(),
+            watcher::Config::default().any_semantic(),
+            Arc::clone(&self.streaming_lists),
+            1,
+            tx,
+        );
+
+        let mut probe = WatchProbe::Ran {
+            synced: None,
+            objects: 0,
+            errors: 0,
+            last_error: None,
+        };
+        let WatchProbe::Ran {
+            synced,
+            objects,
+            errors,
+            last_error,
+        } = &mut probe
+        else {
+            unreachable!("just constructed")
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        while synced.is_none() || !*headers_rx.borrow() {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                changed = headers_rx.changed() => {
+                    if changed.is_err() {
+                        break;
                     }
-                    Ok(watcher::Event::Delete(obj)) => Msg::Deleted {
-                        generation,
-                        key: row_key(&obj),
-                    },
-                    Ok(watcher::Event::Init) => Msg::Reset { generation },
-                    Ok(watcher::Event::InitDone) => {
-                        initializing = false;
-                        if using_streaming {
-                            // Unsupported is sticky if two startup watches
-                            // negotiate concurrently and only one endpoint
-                            // rejects the extension.
-                            let _ = streaming_lists.compare_exchange(
-                                STREAMING_UNKNOWN,
-                                STREAMING_SUPPORTED,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            );
-                        }
-                        Msg::Synced { generation }
+                }
+                msg = rx.recv() => match msg {
+                    Some(Msg::Applied { .. }) => *objects += 1,
+                    Some(Msg::Synced { .. }) => *synced = Some(started.elapsed()),
+                    Some(Msg::Reset { .. }) => {
+                        *objects = 0;
+                        *synced = None;
                     }
-                    // The watcher heals a desync by re-listing on its own
-                    // (the stream continues with Init/…/InitDone), so the
-                    // "too old resource version: Expired" error is routine —
-                    // the sync dot already shows the re-list. No error flash.
-                    Err(e) if watch_error_is_benign(&e) => continue,
-                    Err(e) => Msg::Error {
-                        generation,
-                        error: e.to_string(),
-                    },
-                };
-                if tx.send(msg).await.is_err() {
-                    break; // UI gone
+                    Some(Msg::Error { error, .. }) => {
+                        *errors += 1;
+                        *last_error = Some(error);
+                        break;
+                    }
+                    Some(_) => {}
+                    None => break,
                 }
             }
-        })
+        }
+        if synced.is_some() && *headers_rx.borrow() && *errors == 0 {
+            *synced = Some(started.elapsed());
+        } else {
+            *synced = None;
+        }
+        task.abort();
+        let _ = task.await;
+        probe
     }
 
     /// List namespaces for the namespace switcher.
@@ -469,6 +689,122 @@ fn streaming_lists_unsupported(e: &watcher::Error) -> bool {
     }
 }
 
+fn watch_api(client: Client, kind: &Kind, namespace: &str) -> Api<DynamicObject> {
+    if kind.namespaced && !namespace.is_empty() {
+        Api::namespaced_with(client, namespace, &kind.ar)
+    } else {
+        Api::all_with(client, &kind.ar)
+    }
+}
+
+fn spawn_watch_task(
+    api: Api<DynamicObject>,
+    kind: String,
+    ns: String,
+    cfg: watcher::Config,
+    streaming_lists: Arc<AtomicU8>,
+    generation: u64,
+    tx: Sender<Msg>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut using_streaming = streaming_lists.load(Ordering::Acquire) != STREAMING_UNSUPPORTED;
+        let mut initializing = true;
+        // Distinct from `initializing`, which drives the streaming-list
+        // fallback and must keep its current lifetime: this only records
+        // that a full sync has happened, so a later re-list is a reconnect.
+        let mut synced_once = false;
+        let mut stream = watcher(
+            api.clone(),
+            if using_streaming {
+                cfg.clone().streaming_lists()
+            } else {
+                cfg.clone()
+            },
+        )
+        .modify(|obj| obj.managed_fields_mut().clear())
+        .boxed();
+        crate::log_info!(
+            "watch.start",
+            kind = kind,
+            ns = if ns.is_empty() { "*" } else { ns.as_str() },
+            generation = generation
+        );
+        if tx.send(Msg::Reset { generation }).await.is_err() {
+            return;
+        }
+
+        while let Some(event) = stream.next().await {
+            if using_streaming
+                && initializing
+                && event.as_ref().is_err_and(streaming_lists_unsupported)
+            {
+                streaming_lists.store(STREAMING_UNSUPPORTED, Ordering::Release);
+                using_streaming = false;
+                stream = watcher(api.clone(), cfg.clone())
+                    .modify(|obj| obj.managed_fields_mut().clear())
+                    .boxed();
+                continue;
+            }
+            let msg = match event {
+                Ok(watcher::Event::Apply(obj)) | Ok(watcher::Event::InitApply(obj)) => {
+                    Msg::Applied {
+                        generation,
+                        key: row_key(&obj),
+                        obj: Box::new(obj),
+                    }
+                }
+                Ok(watcher::Event::Delete(obj)) => Msg::Deleted {
+                    generation,
+                    key: row_key(&obj),
+                },
+                Ok(watcher::Event::Init) => {
+                    if synced_once {
+                        // The watcher healed a desync by re-listing. The
+                        // UI counts this as a reconnect off the same
+                        // message, so nothing extra crosses the channel.
+                        crate::log_info!("watch.relist", kind = kind, generation = generation);
+                    }
+                    Msg::Reset { generation }
+                }
+                Ok(watcher::Event::InitDone) => {
+                    initializing = false;
+                    synced_once = true;
+                    if using_streaming {
+                        // Unsupported is sticky if two startup watches
+                        // negotiate concurrently and only one endpoint
+                        // rejects the extension.
+                        let _ = streaming_lists.compare_exchange(
+                            STREAMING_UNKNOWN,
+                            STREAMING_SUPPORTED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                    }
+                    Msg::Synced { generation }
+                }
+                // The watcher heals a desync by re-listing on its own
+                // (the stream continues with Init/…/InitDone), so the
+                // "too old resource version: Expired" error is routine —
+                // the sync dot already shows the re-list. No error flash.
+                Err(e) if watch_error_is_benign(&e) => {
+                    crate::log_debug!("watch.desync", kind = kind, error = e);
+                    continue;
+                }
+                Err(e) => {
+                    crate::log_warn!("watch.error", kind = kind, error = e);
+                    Msg::Error {
+                        generation,
+                        error: e.to_string(),
+                    }
+                }
+            };
+            if tx.send(msg).await.is_err() {
+                break; // UI gone
+            }
+        }
+    })
+}
+
 /// Higher wins when two API groups expose the same bare plural/kind (e.g.
 /// core `pods` should beat `pods.metrics.k8s.io`).
 fn group_priority(group: &str) -> u8 {
@@ -489,27 +825,47 @@ fn current_context_name() -> Option<String> {
     kubeconfig.current_context
 }
 
-/// The current kubeconfig context, its cluster name, and API-server URL, read
-/// offline (no connection). For `--info`. `None` when there's no kubeconfig or
-/// no current context. The server URL never carries credentials.
-pub fn current_context_info() -> Option<(String, String, String)> {
-    let kubeconfig = kube::config::Kubeconfig::read().ok()?;
-    let context = kubeconfig.current_context.clone()?;
+/// A requested kubeconfig context (or the current one when none was requested),
+/// its cluster name, and API-server URL, read offline. For `sofka info` when no
+/// live connection is available. The server URL never carries credentials.
+pub fn context_info(requested: Option<&str>) -> Option<(String, String, String)> {
+    let kubeconfig = kube::config::Kubeconfig::read().ok();
+    context_info_from(kubeconfig.as_ref(), requested)
+}
+
+fn context_info_from(
+    kubeconfig: Option<&kube::config::Kubeconfig>,
+    requested: Option<&str>,
+) -> Option<(String, String, String)> {
+    let context = requested
+        .map(str::to_owned)
+        .or_else(|| kubeconfig.and_then(|config| config.current_context.clone()))?;
     let cluster_name = kubeconfig
-        .contexts
-        .iter()
-        .find(|c| c.name == context)
+        .and_then(|config| config.contexts.iter().find(|c| c.name == context))
         .and_then(|c| c.context.as_ref())
         .map(|c| c.cluster.clone())
         .unwrap_or_default();
     let server = kubeconfig
-        .clusters
-        .iter()
-        .find(|c| c.name == cluster_name)
+        .and_then(|config| config.clusters.iter().find(|c| c.name == cluster_name))
         .and_then(|c| c.cluster.as_ref())
         .and_then(|c| c.server.clone())
         .unwrap_or_default();
     Some((context, cluster_name, server))
+}
+
+/// The namespace a kubeconfig context pins, if any. For the offline
+/// diagnostics report, which has no live client to ask.
+pub fn context_namespace(context: &str) -> Option<String> {
+    let kubeconfig = kube::config::Kubeconfig::read().ok()?;
+    kubeconfig
+        .contexts
+        .iter()
+        .find(|c| c.name == context)?
+        .context
+        .as_ref()?
+        .namespace
+        .clone()
+        .filter(|ns| !ns.is_empty())
 }
 
 /// Public wrapper over [`cluster_name_for`] for resolving per-context config
@@ -590,9 +946,12 @@ impl Cluster {
             default_namespace: "default".into(),
             cli_context: Some("test".into()),
             connected: true,
+            allow_v1_client_cert: false,
             registry: HashMap::new(),
             catalog: Vec::new(),
             streaming_lists: Arc::new(AtomicU8::new(STREAMING_UNKNOWN)),
+            discovery_warnings: Vec::new(),
+            discovery_fallback: None,
         };
         cluster.register_kind("", "Pod", "pods", true);
         cluster.register_kind("apps", "Deployment", "deployments", true);
@@ -695,8 +1054,204 @@ impl Cluster {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    fn probe_cluster(streaming: bool, status: u16, delay: Duration) -> Cluster {
+        let mut cluster = Cluster::fake();
+        cluster.client = Client::new(
+            tower::service_fn(move |req: http::Request<kube::client::Body>| async move {
+                let query = req.uri().query().unwrap_or("");
+                let watch = query.contains("watch=true");
+                let initial = query.contains("sendInitialEvents=true");
+                let (code, body) = if initial && streaming {
+                    (200, concat!(
+                    "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"one\",\"resourceVersion\":\"1\"}}}\n",
+                    "{\"type\":\"BOOKMARK\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"resourceVersion\":\"1\",\"annotations\":{\"k8s.io/initial-events-end\":\"true\"}}}}\n"
+                ).to_string())
+                } else if initial {
+                    (400, r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"BadRequest","message":"streaming lists unsupported","code":400}"#.into())
+                } else if watch {
+                    tokio::time::sleep(delay).await;
+                    (
+                        status,
+                        if status == 200 {
+                            String::new()
+                        } else {
+                            serde_json::json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","message":"watch forbidden","code":status}).to_string()
+                        },
+                    )
+                } else {
+                    (200, r#"{"kind":"PodList","apiVersion":"v1","metadata":{"resourceVersion":"1"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"one","resourceVersion":"1"}}]}"#.into())
+                };
+                let keep_open = watch && code == 200;
+                let frames = futures_util::stream::iter([Ok::<_, std::io::Error>(
+                    hyper::body::Frame::data(hyper::body::Bytes::from(body)),
+                )])
+                .chain(futures_util::stream::poll_fn(move |_| {
+                    if keep_open {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(None)
+                    }
+                }));
+                Ok::<_, std::io::Error>(
+                    http::Response::builder()
+                        .status(code)
+                        .body(http_body_util::StreamBody::new(frames))
+                        .unwrap(),
+                )
+            }),
+            "default",
+        );
+        cluster
+    }
+
+    #[tokio::test]
+    async fn probe_requires_watch_headers_after_a_successful_list() {
+        let cluster = probe_cluster(false, 403, Duration::from_millis(20));
+        let probe = cluster
+            .probe_watch("pods", "default", Duration::from_secs(1))
+            .await;
+        assert!(
+            matches!(&probe, WatchProbe::Ran { synced: None, objects: 1, errors: 1, last_error: Some(error) } if error.contains("watch forbidden"))
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_bounds_the_wait_for_watch_headers() {
+        let cluster = probe_cluster(false, 200, Duration::from_secs(1));
+        let probe = cluster
+            .probe_watch("pods", "default", Duration::from_millis(30))
+            .await;
+        assert!(matches!(
+            probe,
+            WatchProbe::Ran {
+                synced: None,
+                objects: 1,
+                errors: 0,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_a_quiet_watch_after_the_fallback_list() {
+        let cluster = probe_cluster(false, 200, Duration::from_millis(20));
+        let probe = cluster
+            .probe_watch("pods", "default", Duration::from_secs(1))
+            .await;
+        assert!(
+            matches!(probe, WatchProbe::Ran { synced: Some(elapsed), objects: 1, errors: 0, .. } if elapsed >= Duration::from_millis(20))
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_a_complete_streaming_list() {
+        let cluster = probe_cluster(true, 403, Duration::ZERO);
+        let probe = cluster
+            .probe_watch("pods", "default", Duration::from_secs(1))
+            .await;
+        assert!(matches!(
+            probe,
+            WatchProbe::Ran {
+                synced: Some(_),
+                objects: 1,
+                errors: 0,
+                ..
+            }
+        ));
+    }
+
+    fn exec_latency() -> (u64, u64, f64) {
+        crate::diagnostics::latency_summary()
+            .into_iter()
+            .find(|summary| summary.op == Op::Exec)
+            .map(|summary| (summary.count, summary.errors, summary.max_ms))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn meter_records_completed_and_cancelled_requests_once() {
+        let _guard = crate::diagnostics::LATENCY_TEST_LOCK.lock().unwrap();
+        let before = exec_latency();
+        let waker = futures_util::task::noop_waker_ref();
+        let mut cx = TaskContext::from_waker(waker);
+
+        let mut completed = Metered::new(
+            std::future::ready(Ok::<_, std::io::Error>(http::Response::new(()))),
+            Op::Exec,
+        );
+        assert!(matches!(
+            Pin::new(&mut completed).poll(&mut cx),
+            Poll::Ready(Ok(_))
+        ));
+        drop(completed);
+        let after_completed = exec_latency();
+        assert_eq!(after_completed.0, before.0 + 1);
+        assert_eq!(after_completed.1, before.1);
+
+        let mut cancelled = Metered::new(
+            std::future::pending::<Result<http::Response<()>, std::io::Error>>(),
+            Op::Exec,
+        );
+        assert!(Pin::new(&mut cancelled).poll(&mut cx).is_pending());
+        std::thread::sleep(Duration::from_millis(2));
+        drop(cancelled);
+        let after_cancelled = exec_latency();
+        assert_eq!(after_cancelled.0, after_completed.0 + 1);
+        assert_eq!(after_cancelled.1, after_completed.1 + 1);
+        assert!(after_cancelled.2 >= 1.0, "max {}", after_cancelled.2);
+    }
+
+    #[test]
+    fn offline_context_info_prefers_the_requested_context() {
+        let kubeconfig: Kubeconfig = serde_yaml::from_str(
+            r#"
+current-context: dev
+contexts:
+  - name: dev
+    context: { cluster: dev-cluster }
+  - name: prod
+    context: { cluster: prod-cluster }
+clusters:
+  - name: dev-cluster
+    cluster: { server: https://dev.example }
+  - name: prod-cluster
+    cluster: { server: https://prod.example }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            context_info_from(Some(&kubeconfig), Some("prod")),
+            Some((
+                "prod".into(),
+                "prod-cluster".into(),
+                "https://prod.example".into()
+            ))
+        );
+        assert_eq!(
+            context_info_from(Some(&kubeconfig), None),
+            Some((
+                "dev".into(),
+                "dev-cluster".into(),
+                "https://dev.example".into()
+            ))
+        );
+        assert_eq!(
+            context_info_from(None, Some("prod")),
+            Some(("prod".into(), String::new(), String::new()))
+        );
+    }
+
+    #[tokio::test]
+    async fn client_accepts_socks5_proxy() {
+        let mut config = Config::new("https://127.0.0.1:6443".parse().unwrap());
+        config.proxy_url = Some("socks5://127.0.0.1:9090".parse().unwrap());
+
+        Client::try_from(config).expect("build client with a SOCKS5 proxy");
+    }
 
     #[test]
     fn expired_watch_errors_are_benign() {
@@ -900,28 +1455,72 @@ mod tests {
     /// entry), and the core group (pods). When `supports_aggregated` is
     /// false it behaves like a pre-1.26 server and answers the aggregated
     /// request with the legacy document.
-    async fn mock_apiserver(
+    pub(crate) async fn mock_apiserver(
         supports_aggregated: bool,
         include_broken: bool,
         serve_version: bool,
     ) -> String {
+        mock_apiserver_with_requests(MockOptions {
+            supports_aggregated,
+            include_broken,
+            serve_version,
+            ..MockOptions::default()
+        })
+        .await
+        .0
+    }
+
+    #[derive(Clone, Copy, Default)]
+    pub(crate) struct MockOptions {
+        pub supports_aggregated: bool,
+        pub include_broken: bool,
+        pub serve_version: bool,
+        pub core_unreadable: bool,
+        pub aggregated_unreadable: bool,
+    }
+
+    pub(crate) async fn mock_apiserver_opts(opts: MockOptions) -> String {
+        mock_apiserver_with_requests(opts).await.0
+    }
+
+    async fn mock_apiserver_with_requests(
+        opts: MockOptions,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let MockOptions {
+            supports_aggregated,
+            serve_version,
+            ..
+        } = opts;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock apiserver");
         let addr = listener.local_addr().expect("local addr");
 
-        fn route(path: &str, aggregated: bool, include_broken: bool) -> (&'static str, String) {
-            let broken_legacy = r#",{"name":"broken.example.com","versions":[{"groupVersion":"broken.example.com/v1beta1","version":"v1beta1"}],"preferredVersion":{"groupVersion":"broken.example.com/v1beta1","version":"v1beta1"}}"#;
+        fn route(path: &str, aggregated: bool, opts: MockOptions) -> (&'static str, String) {
+            let include_broken = opts.include_broken;
+            let broken_legacy = r#",{"name":"broken.example.com","versions":[{"groupVersion":"broken.example.com/v1beta1","version":"v1beta1"}],"preferredVersion":{"groupVersion":"broken.example.com/v1beta1","version":"v1beta1"}},{"name":"odd.example.com","versions":[{"groupVersion":"odd.example.com/v1alpha3","version":"v1alpha3"}],"preferredVersion":{"groupVersion":"odd.example.com/v1alpha3","version":"v1alpha3"}}"#;
             let broken_v2 = r#",{"metadata":{"name":"broken.example.com"},"versions":[{"version":"v1beta1","resources":[],"freshness":"Stale"}]}"#;
             // A mixed-version group modeled on the netbird.io operator: the
             // preferred version (v1) serves `widgets`, while `gadgets` is
             // only served at v1alpha1 — a preferred-version-only walk never
             // sees gadgets.
-            let mixed_v2 = r#",{"metadata":{"name":"mixed.example.com"},"versions":[{"version":"v1","resources":[{"resource":"widgets","responseKind":{"group":"mixed.example.com","version":"v1","kind":"Widget"},"scope":"Namespaced","singularResource":"widget","verbs":["get","list","watch"]}],"freshness":"Current"},{"version":"v1alpha1","resources":[{"resource":"gadgets","responseKind":{"group":"mixed.example.com","version":"v1alpha1","kind":"Gadget"},"scope":"Namespaced","singularResource":"gadget","verbs":["get","list","watch"]}],"freshness":"Current"}]}"#;
+            let mixed_v2 = r#",{"metadata":{"name":"mixed.example.com"},"versions":[{"version":"v1","resources":[{"resource":"widgets","responseKind":{"group":"mixed.example.com","version":"v1","kind":"Widget"},"scope":"Namespaced","singularResource":"widget","shortNames":["zz","po","pods","shared","native","cross"],"verbs":["get","list","watch"]}],"freshness":"Current"},{"version":"v1alpha1","resources":[{"resource":"gadgets","responseKind":{"group":"mixed.example.com","version":"v1alpha1","kind":"Gadget"},"scope":"Namespaced","singularResource":"gadget","shortNames":["gd","shared"],"verbs":["get","list","watch"]},{"resource":"widgets","responseKind":{"kind":"Widget"},"scope":"Namespaced","shortNames":["oldwidget"],"verbs":["get","list","watch"]}],"freshness":"Current"}]}"#;
             let mixed_legacy = r#",{"name":"mixed.example.com","versions":[{"groupVersion":"mixed.example.com/v1","version":"v1"},{"groupVersion":"mixed.example.com/v1alpha1","version":"v1alpha1"}],"preferredVersion":{"groupVersion":"mixed.example.com/v1","version":"v1"}}"#;
+            let capi_legacy = r#",{"name":"cluster.x-k8s.io","versions":[{"groupVersion":"cluster.x-k8s.io/v1beta1","version":"v1beta1"}],"preferredVersion":{"groupVersion":"cluster.x-k8s.io/v1beta1","version":"v1beta1"}}"#;
+            let capi_v2 = r#",{"metadata":{"name":"cluster.x-k8s.io"},"versions":[{"version":"v1beta1","freshness":"Current","resources":[{"resource":"machinedeployments","responseKind":{"kind":"MachineDeployment"},"scope":"Namespaced","shortNames":["md","cross"],"verbs":["get","list","watch"]},{"resource":"machinedrainrules","responseKind":{"kind":"MachineDrainRule"},"scope":"Namespaced","verbs":["get","list","watch"]}]}]}"#;
             match (path, aggregated) {
+                ("/apis", true) if opts.aggregated_unreadable => (
+                    "200 OK",
+                    r#"{"kind":"APIGroupDiscoveryList","apiVersion":"apidiscovery.k8s.io/v2","metadata":{},"items":[{"metadata":{"name":"apps"},"versions":"not-a-list"}]}"#.into(),
+                ),
+                ("/api/v1", _) if opts.core_unreadable => (
+                    "200 OK",
+                    r#"{"kind":"APIResourceList","apiVersion":"v1alpha3","groupVersion":"v1","resources":[]}"#.into(),
+                ),
                 ("/version", _) => (
                     "200 OK",
                     r#"{"major":"1","minor":"36","gitVersion":"v1.36.2-eks-bca9cf6","gitCommit":"abc123","gitTreeState":"clean","buildDate":"2026-08-20T00:00:00Z","goVersion":"go1.25.0","compiler":"gc","platform":"linux/amd64"}"#.into(),
@@ -929,18 +1528,18 @@ mod tests {
                 ("/apis", true) => (
                     "200 OK",
                     format!(
-                        r#"{{"kind":"APIGroupDiscoveryList","apiVersion":"apidiscovery.k8s.io/v2","metadata":{{}},"items":[{{"metadata":{{"name":"apps"}},"versions":[{{"version":"v1","resources":[{{"resource":"deployments","responseKind":{{"group":"apps","version":"v1","kind":"Deployment"}},"scope":"Namespaced","singularResource":"deployment","verbs":["get","list","watch"]}}],"freshness":"Current"}}]}}{mixed_v2}{}]}}"#,
+                        r#"{{"kind":"APIGroupDiscoveryList","apiVersion":"apidiscovery.k8s.io/v2","metadata":{{}},"items":[{{"metadata":{{"name":"apps"}},"versions":[{{"version":"v1","resources":[{{"resource":"deployments","responseKind":{{"group":"apps","version":"v1","kind":"Deployment"}},"scope":"Namespaced","singularResource":"deployment","verbs":["get","list","watch"]}}],"freshness":"Current"}}]}}{mixed_v2}{capi_v2}{}]}}"#,
                         if include_broken { broken_v2 } else { "" }
                     ),
                 ),
                 ("/api", true) => (
                     "200 OK",
-                    r#"{"kind":"APIGroupDiscoveryList","apiVersion":"apidiscovery.k8s.io/v2","metadata":{},"items":[{"metadata":{"name":""},"versions":[{"version":"v1","resources":[{"resource":"pods","responseKind":{"group":"","version":"v1","kind":"Pod"},"scope":"Namespaced","singularResource":"pod","verbs":["get","list","watch"]}],"freshness":"Current"}]}]}"#.into(),
+                    r#"{"kind":"APIGroupDiscoveryList","apiVersion":"apidiscovery.k8s.io/v2","metadata":{},"items":[{"metadata":{"name":""},"versions":[{"version":"v1","resources":[{"resource":"pods","responseKind":{"group":"","version":"v1","kind":"Pod"},"scope":"Namespaced","singularResource":"pod","shortNames":["native"],"verbs":["get","list","watch"]}],"freshness":"Current"}]}]}"#.into(),
                 ),
                 ("/apis", false) => (
                     "200 OK",
                     format!(
-                        r#"{{"kind":"APIGroupList","apiVersion":"v1","groups":[{{"name":"apps","versions":[{{"groupVersion":"apps/v1","version":"v1"}}],"preferredVersion":{{"groupVersion":"apps/v1","version":"v1"}}}}{mixed_legacy}{}]}}"#,
+                        r#"{{"kind":"APIGroupList","apiVersion":"v1","groups":[{{"name":"apps","versions":[{{"groupVersion":"apps/v1","version":"v1"}}],"preferredVersion":{{"groupVersion":"apps/v1","version":"v1"}}}}{mixed_legacy}{capi_legacy}{}]}}"#,
                         if include_broken { broken_legacy } else { "" }
                     ),
                 ),
@@ -948,21 +1547,29 @@ mod tests {
                     "200 OK",
                     r#"{"kind":"APIVersions","versions":["v1"],"serverAddressByClientCIDRs":[]}"#.into(),
                 ),
+                ("/apis/cluster.x-k8s.io/v1beta1", _) => (
+                    "200 OK",
+                    r#"{"kind":"APIResourceList","groupVersion":"cluster.x-k8s.io/v1beta1","resources":[{"name":"machinedeployments","kind":"MachineDeployment","singularName":"machinedeployment","namespaced":true,"shortNames":["md","cross"],"verbs":["get","list","watch"]},{"name":"machinedrainrules","kind":"MachineDrainRule","singularName":"machinedrainrule","namespaced":true,"verbs":["get","list","watch"]}]}"#.into(),
+                ),
                 ("/apis/apps/v1", _) => (
                     "200 OK",
                     r#"{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"apps/v1","resources":[{"name":"deployments","singularName":"deployment","namespaced":true,"kind":"Deployment","verbs":["get","list","watch"]}]}"#.into(),
                 ),
                 ("/api/v1", _) => (
                     "200 OK",
-                    r#"{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"v1","resources":[{"name":"pods","singularName":"pod","namespaced":true,"kind":"Pod","verbs":["get","list","watch"]}]}"#.into(),
+                    r#"{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"v1","resources":[{"name":"pods","singularName":"pod","shortNames":["native"],"namespaced":true,"kind":"Pod","verbs":["get","list","watch"]}]}"#.into(),
                 ),
                 ("/apis/mixed.example.com/v1", _) => (
                     "200 OK",
-                    r#"{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"mixed.example.com/v1","resources":[{"name":"widgets","singularName":"widget","namespaced":true,"kind":"Widget","verbs":["get","list","watch"]}]}"#.into(),
+                    r#"{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"mixed.example.com/v1","resources":[{"name":"widgets","singularName":"widget","shortNames":["zz","po","pods","shared","native","cross"],"namespaced":true,"kind":"Widget","verbs":["get","list","watch"]}]}"#.into(),
                 ),
                 ("/apis/mixed.example.com/v1alpha1", _) => (
                     "200 OK",
-                    r#"{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"mixed.example.com/v1alpha1","resources":[{"name":"gadgets","singularName":"gadget","namespaced":true,"kind":"Gadget","verbs":["get","list","watch"]}]}"#.into(),
+                    r#"{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"mixed.example.com/v1alpha1","resources":[{"name":"gadgets","singularName":"gadget","shortNames":["gd","shared"],"namespaced":true,"kind":"Gadget","verbs":["get","list","watch"]}]}"#.into(),
+                ),
+                ("/apis/odd.example.com/v1alpha3", _) => (
+                    "200 OK",
+                    r#"{"kind":"APIResourceList","apiVersion":"v1alpha3","groupVersion":"odd.example.com/v1alpha3","resources":[{"name":"oddities","singularName":"oddity","namespaced":true,"kind":"Oddity","verbs":["get","list","watch"]}]}"#.into(),
                 ),
                 ("/apis/broken.example.com/v1beta1", _) => (
                     "503 Service Unavailable",
@@ -977,6 +1584,7 @@ mod tests {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     break;
                 };
+                let recorded = Arc::clone(&recorded);
                 tokio::spawn(async move {
                     let (r, mut w) = sock.split();
                     let mut reader = BufReader::new(r);
@@ -991,6 +1599,7 @@ mod tests {
                             .nth(1)
                             .unwrap_or("")
                             .to_string();
+                        recorded.lock().unwrap().push(path.clone());
                         let mut wants_aggregated = false;
                         loop {
                             let mut header = String::new();
@@ -1013,11 +1622,8 @@ mod tests {
                         if path == "/version" && !serve_version {
                             continue;
                         }
-                        let (status, body) = route(
-                            &path,
-                            wants_aggregated && supports_aggregated,
-                            include_broken,
-                        );
+                        let (status, body) =
+                            route(&path, wants_aggregated && supports_aggregated, opts);
                         let response = format!(
                             "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
                             body.len()
@@ -1029,16 +1635,46 @@ mod tests {
                 });
             }
         });
-        format!("http://{addr}")
+        (format!("http://{addr}"), requests)
     }
 
-    async fn connect_mock(url: String) -> Result<Cluster> {
+    pub(crate) async fn connect_mock(url: String) -> Result<Cluster> {
         let mut config = Config::new(url.parse().expect("mock url"));
         // The client's default retry policy (15 attempts, exponential
         // backoff) turns the mock's deliberate 503 into a ~4-minute stall;
         // retrying is not what these tests exercise.
         config.default_retry = false;
-        Cluster::from_config(config, "test".into(), None).await
+        Cluster::from_config(config, "test".into(), None, false).await
+    }
+
+    #[tokio::test]
+    async fn short_names_do_not_need_extra_discovery_requests() {
+        for aggregated in [true, false] {
+            let (url, requests) = mock_apiserver_with_requests(MockOptions {
+                supports_aggregated: aggregated,
+                serve_version: true,
+                ..MockOptions::default()
+            })
+            .await;
+            let cluster = connect_mock(url).await.unwrap();
+            assert_eq!(cluster.resolve("md").unwrap().ar.kind, "MachineDeployment");
+            let mut requests = requests.lock().unwrap().clone();
+            requests.sort();
+            let mut expected = vec!["/api", "/apis", "/version"];
+            if !aggregated {
+                expected.extend([
+                    "/api",
+                    "/apis",
+                    "/api/v1",
+                    "/apis/apps/v1",
+                    "/apis/cluster.x-k8s.io/v1beta1",
+                    "/apis/mixed.example.com/v1",
+                    "/apis/mixed.example.com/v1alpha1",
+                ]);
+            }
+            expected.sort();
+            assert_eq!(requests, expected);
+        }
     }
 
     #[tokio::test]
@@ -1052,6 +1688,8 @@ mod tests {
             .expect("connect with broken APIService");
         assert!(cluster.resolve("deployments").is_some());
         assert!(cluster.resolve("pods").is_some());
+        assert!(cluster.discovery_warnings.is_empty());
+        assert!(cluster.discovery_fallback.is_none());
     }
 
     #[test]
@@ -1097,6 +1735,8 @@ mod tests {
             .expect("connect via legacy discovery walk");
         assert!(cluster.resolve("deployments").is_some());
         assert!(cluster.resolve("pods").is_some());
+        assert!(cluster.discovery_warnings.is_empty());
+        assert!(cluster.discovery_fallback.is_none());
     }
 
     /// Asserts every kind of the mixed-version group resolved: `widgets` at
@@ -1104,6 +1744,10 @@ mod tests {
     /// limited to each group's preferred version loses gadgets entirely
     /// (the netbird.io bug: `:sidecarprofiles.netbird.io` -> no match).
     fn assert_mixed_group(cluster: &Cluster) {
+        assert!(cluster.resolve("oldwidget").is_none());
+        assert!(cluster.resolve("statusalias").is_none());
+        assert_eq!(cluster.resolve("zz").unwrap().ar.version, "v1");
+        assert_eq!(cluster.resolve("gd").unwrap().ar.version, "v1alpha1");
         let widgets = cluster.resolve("widgets").expect("widgets resolves");
         assert_eq!(widgets.ar.version, "v1");
         let gadgets = cluster.resolve("gadgets").expect("gadgets resolves");
@@ -1131,13 +1775,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_walk_still_fails_on_broken_apiservice() {
-        // Documents the failure mode the aggregated path exists to avoid:
-        // the per-group walk hits the broken group's 503 and discovery fails
-        // (after ~4 minutes of client-side 503 retries with the default
-        // config). If kube-rs ever makes run() tolerant, this starts failing
-        // and the aggregated workaround can be simplified.
+    async fn legacy_walk_skips_unreadable_groups_with_warnings() {
         let url = mock_apiserver(false, true, true).await;
-        assert!(connect_mock(url).await.is_err());
+        let cluster = connect_mock(url)
+            .await
+            .expect("connect despite unreadable groups");
+        assert!(cluster.resolve("deployments").is_some());
+        assert!(cluster.resolve("pods").is_some());
+        assert!(cluster.resolve("oddities").is_none());
+        let warnings = &cluster.discovery_warnings;
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("API discovery could not read broken.example.com/v1beta1: ")),
+            "{warnings:?}"
+        );
+        let odd = warnings
+            .iter()
+            .find(|w| w.starts_with("API discovery could not read odd.example.com/v1alpha3: "))
+            .expect("v1alpha3 group is named");
+        assert!(odd.contains("expected v1"), "{odd}");
+        assert_eq!(odd.matches("expected v1").count(), 1, "{odd}");
+        assert!(cluster.discovery_fallback.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_walk_fails_when_the_core_group_is_unreadable() {
+        let url = mock_apiserver_opts(MockOptions {
+            supports_aggregated: false,
+            serve_version: true,
+            core_unreadable: true,
+            ..MockOptions::default()
+        })
+        .await;
+        let err = connect_mock(url)
+            .await
+            .err()
+            .expect("a cluster without a readable core group is unusable");
+        let text = format!("{err:#}");
+        assert!(text.contains("reading core API group v1"), "{text}");
+        assert!(text.contains("expected v1"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn failed_aggregated_discovery_is_reported_but_not_counted_as_skipped() {
+        let url = mock_apiserver_opts(MockOptions {
+            supports_aggregated: true,
+            serve_version: true,
+            aggregated_unreadable: true,
+            ..MockOptions::default()
+        })
+        .await;
+        let cluster = connect_mock(url).await.expect("legacy walk still connects");
+        assert!(cluster.resolve("deployments").is_some());
+        assert!(cluster.resolve("pods").is_some());
+        assert!(cluster.discovery_warnings.is_empty());
+        let note = cluster
+            .discovery_fallback
+            .as_deref()
+            .expect("the fallback reason is kept");
+        assert!(
+            note.starts_with("Aggregated API discovery failed: "),
+            "{note}"
+        );
+        assert!(
+            note.ends_with("Sofka read each API group separately."),
+            "{note}"
+        );
     }
 }

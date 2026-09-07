@@ -4,11 +4,16 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use kube::core::DynamicObject;
+use kube::core::{DynamicObject, GroupVersionResource};
 
 /// Identity of an asynchronous operation's claim on the shared status bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StatusClaim(pub(crate) u64);
+
+/// One remote directory read, or why there isn't one. Named because the
+/// tuple inside the `Result` would otherwise need a type-complexity waiver
+/// every time it is written out.
+pub type PvcListingResult = Result<(crate::pvcexplore::Listing, Option<String>), String>;
 
 /// Messages flowing from watch tasks to the UI loop. Tagged with a
 /// `generation` so messages from a superseded watch can be discarded.
@@ -46,11 +51,11 @@ pub enum Msg {
         generation: u64,
         counts: HashMap<String, usize>,
     },
-    /// CRD `additionalPrinterColumns` fallback for a custom-resource plural,
+    /// CRD `additionalPrinterColumns` fallback for an API resource,
     /// fetched off-thread (`None` = CRD had nothing usable for the version).
     PrinterColumns {
         generation: u64,
-        plural: String,
+        resource: GroupVersionResource,
         view: Box<Option<crate::views::View>>,
     },
     PulseData {
@@ -75,19 +80,24 @@ pub enum Msg {
     /// Findings for the explain-unhealthy view, gathered off-thread.
     Explain {
         generation: u64,
+        request: u64,
         claim: StatusClaim,
         title: String,
+        source: Option<Box<DynamicObject>>,
         findings: Vec<crate::explain::Finding>,
     },
     /// Reconciliation-chain findings for the GitOps view, gathered off-thread.
     Gitops {
         generation: u64,
+        request: u64,
         claim: StatusClaim,
         title: String,
+        source: Option<Box<DynamicObject>>,
         findings: Vec<crate::explain::Finding>,
     },
     /// Captured output of an `output = "popup"` plugin run.
     PluginOutput {
+        run: u64,
         generation: u64,
         claim: StatusClaim,
         title: String,
@@ -98,6 +108,7 @@ pub enum Msg {
     /// Completion notice for an `output = "background"` plugin run (single or
     /// bulk): how many jobs succeeded and the failures (label + reason).
     PluginBulkDone {
+        run: u64,
         generation: u64,
         claim: StatusClaim,
         name: String,
@@ -112,6 +123,10 @@ pub enum Msg {
         lines: Vec<String>,
         /// Set when describe failed and we fell back to YAML.
         warn: Option<String>,
+    },
+    DescribeRefresh {
+        generation: u64,
+        result: Result<Vec<String>, String>,
     },
     /// Live Event rows for the selected object.
     Events {
@@ -188,6 +203,39 @@ pub enum Msg {
         deleted: usize,
         failed: Vec<String>,
     },
+    /// Result of a `:pvc-clean` sweep for leftover PVC-explore helper pods.
+    PvcHelpersCleaned {
+        generation: u64,
+        claim: StatusClaim,
+        deleted: usize,
+        failed: Vec<String>,
+    },
+    /// The pod a PVC can be browsed through, resolved off-thread. `Ok(None)`
+    /// means nothing running mounts the claim — the cue to offer a helper pod.
+    PvcTarget {
+        generation: u64,
+        /// Matched against the browser's own counter so a resolve for a claim
+        /// the user has already navigated away from is dropped.
+        run: u64,
+        /// Namespace the resolve ran in, so a helper pod that arrives after
+        /// the browser moved on can still be deleted rather than leaked.
+        namespace: String,
+        /// Context it ran against. A `:ctx` switch bumps the generation *and*
+        /// swaps the client, so a late helper is only safe to delete when this
+        /// still names the cluster it was created in.
+        context: String,
+        claim: StatusClaim,
+        result: Result<Option<crate::pvcexplore::Mount>, String>,
+    },
+    /// One directory listing for the remote pane of the PVC browser.
+    PvcListing {
+        generation: u64,
+        run: u64,
+        path: String,
+        /// The listing, plus a warning when `ls` produced it but could not
+        /// stat every entry in it.
+        result: PvcListingResult,
+    },
     /// An assembled diagnostic bundle (`:bundle`), ready to preview and save.
     Bundle {
         generation: u64,
@@ -226,6 +274,13 @@ pub enum Msg {
     },
     Error {
         generation: u64,
+        error: String,
+    },
+    /// A generation-independent persistent UI-state write failed. The id lets
+    /// the UI acknowledge that it actually handled the notice; merely putting
+    /// it in the event channel is not delivery during shutdown.
+    StateWriteFailed {
+        id: u64,
         error: String,
     },
     /// A background action (delete, restart, scale, drain, helm op, …)
@@ -313,7 +368,25 @@ pub fn row_key(obj: &DynamicObject) -> String {
 /// contributor to RSS and to per-event cost. Nothing mutates an object once
 /// stored (`apply` replaces wholesale), so sharing is safe.
 pub type RowKey = Rc<str>;
-pub type Items = HashMap<RowKey, Arc<DynamicObject>>;
+pub type Items = FastMap<RowKey, Arc<DynamicObject>>;
+
+/// The hasher for maps keyed by cluster data — row keys, cell caches, sort
+/// keys. The default `SipHash` is chosen to make hash flooding infeasible for
+/// keys an attacker supplies; a filter keystroke rehashes every row key in the
+/// store, so that costs real frame time here.
+///
+/// `foldhash`'s randomized state keeps a per-process seed, so a collision set
+/// cannot be precomputed against the binary. What it drops is the guarantee
+/// against an adversary who can both observe timing and choose keys — and here
+/// the keys are `namespace/name` of objects the API server already accepted,
+/// read by a user who is authenticated to that cluster and is watching those
+/// objects deliberately. Anything that could flood these maps could already
+/// exhaust them by simply creating objects.
+///
+/// Config, theme and registry maps keep the standard hasher: they are built
+/// once from local files and never sit in a hot path.
+pub type FastMap<K, V> = HashMap<K, V, foldhash::fast::RandomState>;
+pub type FastSet<T> = std::collections::HashSet<T, foldhash::fast::RandomState>;
 
 /// How a store operation affected the rows currently visible to the UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -378,7 +451,7 @@ impl Store {
             self.pending = None;
             true
         } else {
-            self.pending = Some(HashMap::new());
+            self.pending = Some(Items::default());
             false
         }
     }
@@ -455,6 +528,10 @@ impl Store {
         self.items.get(key).map(AsRef::as_ref)
     }
 
+    pub(crate) fn shared(&self, key: &str) -> Option<Arc<DynamicObject>> {
+        self.items.get(key).cloned()
+    }
+
     pub fn key(&self, key: &str) -> Option<&RowKey> {
         self.items.get_key_value(key).map(|(key, _)| key)
     }
@@ -508,7 +585,7 @@ mod tests {
         store.remove("default/gone");
         advanced(&store, &mut last, "remove (no such key)");
 
-        let mut seeded = Items::new();
+        let mut seeded = Items::default();
         seeded.insert(Rc::from("default/b"), Arc::new(pod("b")));
         store.seed(seeded);
         advanced(&store, &mut last, "seed");

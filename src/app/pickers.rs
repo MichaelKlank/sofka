@@ -67,16 +67,29 @@ impl App {
     /// then the remaining namespaces alphabetically. With a filter active,
     /// everything is fuzzy-matched (favourites/recents lose their pinning so
     /// the best textual match wins).
-    pub fn filtered_namespaces(&self) -> Vec<String> {
+    pub fn filtered_namespaces(&self) -> Rc<Vec<String>> {
+        if let Some(m) = self.picker_memos.borrow().namespaces.as_ref()
+            && m.filter == self.ns_filter
+            && m.context == self.cluster.context
+            && m.ns_list == self.ns_list
+            && m.favorites == self.namespace_favorites
+            && m.recents
+                .iter()
+                .map(String::as_str)
+                .eq(self.recent_namespaces_for_context())
+        {
+            return Rc::clone(&m.value);
+        }
+
         let mut out = vec!["<all>".to_string()];
         let rest = self.ns_list.iter().filter(|n| n.as_str() != "<all>");
         if !self.ns_filter.is_empty() {
             let mut scored: Vec<(i64, &String)> = rest
-                .filter_map(|n| self.matcher.fuzzy_match(n, &self.ns_filter).map(|s| (s, n)))
+                .filter_map(|n| self.matcher.score(n, &self.ns_filter).map(|s| (s, n)))
                 .collect();
             scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
             out.extend(scored.into_iter().map(|(_, n)| n.clone()));
-            return out;
+            return self.remember_namespaces(out);
         }
 
         let available: std::collections::HashSet<&str> = rest.map(String::as_str).collect();
@@ -90,8 +103,8 @@ impl App {
         }
         // Then session recents that still exist and aren't already favourites.
         for r in self.recent_namespaces_for_context() {
-            if available.contains(r.as_str()) && seen.insert(r.clone()) {
-                out.push(r);
+            if available.contains(r) && seen.insert(r.to_string()) {
+                out.push(r.to_string());
             }
         }
         // Then everything else (ns_list is already sorted).
@@ -100,15 +113,32 @@ impl App {
                 out.push(n.clone());
             }
         }
-        out
+        self.remember_namespaces(out)
     }
 
-    /// The recent namespaces for the current context, newest first.
-    fn recent_namespaces_for_context(&self) -> Vec<String> {
+    fn remember_namespaces(&self, out: Vec<String>) -> Rc<Vec<String>> {
+        let value = Rc::new(out);
+        self.picker_memos.borrow_mut().namespaces = Some(NamespaceMemo {
+            filter: self.ns_filter.clone(),
+            context: self.cluster.context.clone(),
+            ns_list: self.ns_list.clone(),
+            favorites: self.namespace_favorites.clone(),
+            recents: self
+                .recent_namespaces_for_context()
+                .map(str::to_string)
+                .collect(),
+            value: Rc::clone(&value),
+        });
+        value
+    }
+
+    /// The recent namespaces for the current context, newest first. Borrowed:
+    /// every caller only reads them.
+    fn recent_namespaces_for_context(&self) -> impl Iterator<Item = &str> + Clone {
         self.recent_namespaces
             .get(&self.cluster.context)
-            .map(|dq| dq.iter().cloned().collect())
-            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|dq| dq.iter().map(String::as_str))
     }
 
     /// Whether `n` is a configured favourite namespace.
@@ -151,10 +181,14 @@ impl App {
         {
             return;
         }
-        if let Some(path) = self.namespace_memory_path.clone()
-            && let Err(e) = self.namespace_memory.save(&path)
-        {
-            self.flash_warn(&format!("failed to save namespace state: {e}"));
+        if let Some(path) = self.namespace_memory_path.clone() {
+            let result = match &self.state_writer {
+                Some(writer) => writer.save_namespace(self.namespace_memory.clone(), path),
+                None => self.namespace_memory.save(&path),
+            };
+            if let Err(e) = result {
+                self.flash_warn(&format!("failed to save namespace state: {e}"));
+            }
         }
     }
 
@@ -178,24 +212,41 @@ impl App {
     /// Entries for the sort picker: the default ordering is always pinned
     /// first; column headers are fuzzy-matched against the type-to-filter
     /// buffer (see `filtered_namespaces` for the same pattern).
-    pub fn filtered_sort_entries(&self) -> Vec<String> {
-        let mut out = vec![DEFAULT_SORT_LABEL.to_string()];
+    pub fn filtered_sort_entries(&self) -> Rc<Vec<String>> {
         let headers = self.display_headers();
+        if let Some(m) = self.picker_memos.borrow().sort_entries.as_ref()
+            && m.filter == self.sort_picker_filter
+            && Rc::ptr_eq(&m.headers, &headers)
+        {
+            return Rc::clone(&m.value);
+        }
+
+        let mut out = vec![DEFAULT_SORT_LABEL.to_string()];
         if self.sort_picker_filter.is_empty() {
-            out.extend(headers);
-            return out;
+            out.extend(headers.iter().cloned());
+            return self.remember_sort_entries(headers, out);
         }
         let mut scored: Vec<(i64, String)> = headers
-            .into_iter()
+            .iter()
             .filter_map(|h| {
                 self.matcher
-                    .fuzzy_match(&h, &self.sort_picker_filter)
-                    .map(|s| (s, h))
+                    .score(h, &self.sort_picker_filter)
+                    .map(|s| (s, h.clone()))
             })
             .collect();
         scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         out.extend(scored.into_iter().map(|(_, h)| h));
-        out
+        self.remember_sort_entries(headers, out)
+    }
+
+    fn remember_sort_entries(&self, headers: Rc<[String]>, out: Vec<String>) -> Rc<Vec<String>> {
+        let value = Rc::new(out);
+        self.picker_memos.borrow_mut().sort_entries = Some(SortEntryMemo {
+            filter: self.sort_picker_filter.clone(),
+            headers,
+            value: Rc::clone(&value),
+        });
+        value
     }
 
     pub(super) fn key_sort_picker(&mut self, key: KeyEvent) {
@@ -216,6 +267,12 @@ impl App {
             }
             KeyCode::Down => list_step(&mut self.sort_picker_state, len, true),
             KeyCode::Up => list_step(&mut self.sort_picker_state, len, false),
+            KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
+                list_step(&mut self.sort_picker_state, len, true)
+            }
+            KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+                list_step(&mut self.sort_picker_state, len, false)
+            }
             KeyCode::Enter => {
                 if let Some(entry) = self
                     .sort_picker_state
@@ -302,21 +359,37 @@ impl App {
     /// Entries for the copy picker: the captured `(header, value)` pairs,
     /// fuzzy-matched against both the header and the value (so typing part
     /// of an IP finds it as readily as typing the column name).
-    pub fn filtered_copy_entries(&self) -> Vec<(String, String)> {
+    pub fn filtered_copy_entries(&self) -> Rc<Vec<(String, String)>> {
+        if let Some(m) = self.picker_memos.borrow().copy_entries.as_ref()
+            && m.filter == self.copy_picker_filter
+            && m.fields == self.copy_picker_fields
+        {
+            return Rc::clone(&m.value);
+        }
         if self.copy_picker_filter.is_empty() {
-            return self.copy_picker_fields.clone();
+            return self.remember_copy_entries(self.copy_picker_fields.clone());
         }
         let mut scored: Vec<(i64, (String, String))> = self
             .copy_picker_fields
             .iter()
             .filter_map(|(h, v)| {
                 self.matcher
-                    .fuzzy_match(&format!("{h} {v}"), &self.copy_picker_filter)
+                    .score(&format!("{h} {v}"), &self.copy_picker_filter)
                     .map(|s| (s, (h.clone(), v.clone())))
             })
             .collect();
         scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.0.cmp(&b.1.0)));
-        scored.into_iter().map(|(_, e)| e).collect()
+        self.remember_copy_entries(scored.into_iter().map(|(_, e)| e).collect())
+    }
+
+    fn remember_copy_entries(&self, out: Vec<(String, String)>) -> Rc<Vec<(String, String)>> {
+        let value = Rc::new(out);
+        self.picker_memos.borrow_mut().copy_entries = Some(CopyEntryMemo {
+            filter: self.copy_picker_filter.clone(),
+            fields: self.copy_picker_fields.clone(),
+            value: Rc::clone(&value),
+        });
+        value
     }
 
     pub(super) fn key_copy_picker(&mut self, key: KeyEvent) {
@@ -337,6 +410,12 @@ impl App {
             }
             KeyCode::Down => list_step(&mut self.copy_picker_state, len, true),
             KeyCode::Up => list_step(&mut self.copy_picker_state, len, false),
+            KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
+                list_step(&mut self.copy_picker_state, len, true)
+            }
+            KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+                list_step(&mut self.copy_picker_state, len, false)
+            }
             KeyCode::Enter => {
                 if let Some((header, value)) = self
                     .copy_picker_state
@@ -443,6 +522,7 @@ impl App {
     }
 
     pub(super) fn set_namespace(&mut self, sel: String) {
+        self.save_history_filter();
         self.namespace = normalize_ns(&sel);
         self.drop_owner_scope();
         self.note_recent_namespace(&sel);
@@ -503,21 +583,33 @@ impl App {
 
     /// Contexts for the switcher, fuzzy-matched against the type-to-filter
     /// buffer (see `filtered_namespaces` for the same pattern).
-    pub fn filtered_contexts(&self) -> Vec<String> {
+    pub fn filtered_contexts(&self) -> Rc<Vec<String>> {
+        if let Some(m) = self.picker_memos.borrow().contexts.as_ref()
+            && m.filter == self.ctx_filter
+            && m.ctx_list == self.ctx_list
+        {
+            return Rc::clone(&m.value);
+        }
         if self.ctx_filter.is_empty() {
-            return self.ctx_list.clone();
+            return self.remember_contexts(self.ctx_list.clone());
         }
         let mut scored: Vec<(i64, &String)> = self
             .ctx_list
             .iter()
-            .filter_map(|c| {
-                self.matcher
-                    .fuzzy_match(c, &self.ctx_filter)
-                    .map(|s| (s, c))
-            })
+            .filter_map(|c| self.matcher.score(c, &self.ctx_filter).map(|s| (s, c)))
             .collect();
         scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
-        scored.into_iter().map(|(_, c)| c.clone()).collect()
+        self.remember_contexts(scored.into_iter().map(|(_, c)| c.clone()).collect())
+    }
+
+    fn remember_contexts(&self, out: Vec<String>) -> Rc<Vec<String>> {
+        let value = Rc::new(out);
+        self.picker_memos.borrow_mut().contexts = Some(ContextMemo {
+            filter: self.ctx_filter.clone(),
+            ctx_list: self.ctx_list.clone(),
+            value: Rc::clone(&value),
+        });
+        value
     }
 
     /// Contexts type-to-filter like the namespace picker. Existing action keys
@@ -677,21 +769,45 @@ impl App {
         if name == self.cluster.context && self.cluster.connected {
             return;
         }
+        // Re-selecting the target of the live connection is also a no-op. A
+        // bookmark, workspace, or query may be waiting for it to land, and a
+        // replacement connection would otherwise invalidate that destination.
+        if self
+            .context_switch_target
+            .as_ref()
+            .is_some_and(|(generation, target)| *generation == self.generation && target == &name)
+        {
+            return;
+        }
+        // One deferred navigation at a time. Whatever asked for this switch
+        // owns what lands when it completes, so anything armed by an earlier
+        // switch is dropped here rather than left to fire on a later one.
+        // Below both no-op returns, deliberately: a re-select that starts no
+        // switch must not disarm one already in flight. Callers that arm a new
+        // deferred action clear its competing slots after this returns.
+        self.pending_resource_query = None;
+        self.pending_bookmark = None;
+        self.pending_workspace = None;
         // Stop the current context's watches and clear stale rows while we
         // reconnect; the new watch starts when the connection lands. The rows
         // are stashed first — if the switch fails we stay on this context,
         // where they're still valid (a successful switch drops the cache).
         // Bump first: this switch's own progress flash belongs to the new
         // generation, and the bump clears any left over from the old one.
+        // The browser (and any helper pod it created) belongs to the context
+        // being left: nothing in the new one can serve it.
+        self.leave_pvc_explore();
         self.bump_generation();
+        self.context_switch_target = Some((self.generation, name.clone()));
         self.set_flash(format!("switching to {name}…"));
         self.stash_view_snapshot();
         self.store.clear();
         self.invalidate_rows();
         let tx = self.tx.clone();
         let genr = self.generation;
+        let allow_v1_client_cert = self.cluster.allow_v1_client_cert;
         tokio::spawn(async move {
-            let result = Cluster::connect_context(&name)
+            let result = Cluster::connect_context(&name, allow_v1_client_cert)
                 .await
                 .map(Box::new)
                 .map_err(|e| e.to_string());
@@ -712,12 +828,14 @@ impl App {
         let resolved = self.config.resolve(&name, &cluster.cluster_name);
         self.user_aliases = resolved.config.aliases;
         self.namespace_favorites = resolved.config.favorite_namespaces;
+        self.remember_sort = resolved.config.remember_sort.unwrap_or(true);
         self.plugins = resolved.config.plugins;
         self.bookmarks = resolved.config.bookmarks;
         self.workspaces = resolved.config.workspaces;
         self.guardrails = resolved.config.guardrails;
         self.debug = resolved.config.debug;
         self.bundle_cfg = resolved.config.bundle;
+        self.pvc_cfg = resolved.config.pvc_explore;
         self.logs_cfg = resolved.config.logs;
         self.fleet_cfg = resolved.config.fleet;
         // Tracked debuggers belong to the previous cluster/context.
@@ -726,6 +844,7 @@ impl App {
         plugin_warnings.extend(crate::config::bookmark_warnings(&self.bookmarks));
         plugin_warnings.extend(crate::config::workspace_warnings(&self.workspaces));
         plugin_warnings.extend(crate::config::guardrail_warnings(&self.guardrails));
+        plugin_warnings.extend(crate::config::pvc_explore_warnings(&self.pvc_cfg));
         let (palette_keys, key_warnings) =
             crate::config::compile_palette_keys(&resolved.config.keys);
         self.palette_keys = palette_keys;
@@ -779,23 +898,24 @@ impl App {
         self.apply_context_skin(resolved.skin_override);
         self.flash = format!("context: {name}");
         self.flash_err = false;
-        if let Some(w) = resolved
+        let first_warning = resolved
             .warnings
             .first()
             .or(view_warnings.first())
             .or(plugin_warnings.first())
             .or(threshold_warnings.first())
             .or(provider_warnings.first())
-        {
-            self.flash_warn(w);
-        }
+            .cloned();
         // Keep `:config` in sync with the layers just resolved for this context.
         self.config_warnings = resolved.warnings;
         self.config_warnings.extend(plugin_warnings);
         self.config_warnings.extend(threshold_warnings);
         // A bookmark/workspace that requested this context lands on its own
         // view(s); a plain switch lands on the context's default resource.
-        if self.pending_workspace.is_some() {
+        if let Some(mut query) = self.pending_resource_query.take() {
+            query.context = None;
+            self.apply_resource_query(query);
+        } else if self.pending_workspace.is_some() {
             self.apply_pending_workspace();
         } else if self.pending_bookmark.is_some() {
             self.apply_pending_bookmark();
@@ -806,6 +926,10 @@ impl App {
                 .unwrap_or_else(|| "pods".into());
             self.switch_kind(&kind);
         }
+        if let Some(w) = &first_warning {
+            self.flash_warn(w);
+        }
+        self.flash_discovery_warnings();
         // Saved forwards for the new context. Running ones from the previous
         // context are deliberately left alone (kubectl pinned their context
         // at spawn); autostart only adds what's missing here.

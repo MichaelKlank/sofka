@@ -15,15 +15,12 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures_util::StreamExt;
-use fuzzy_matcher::FuzzyMatcher;
-use fuzzy_matcher::skim::SkimMatcherV2;
 use k8s_openapi::api::core::v1::Pod;
 use kube::Client;
 use kube::api::{
-    Api, DeleteParams, EvictParams, ListParams, LogParams, Patch, PatchParams, PostParams,
-    PropagationPolicy,
+    Api, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams, PropagationPolicy,
 };
-use kube::core::{DynamicObject, TypeMeta};
+use kube::core::{DynamicObject, GroupVersionResource, TypeMeta};
 use kube::discovery::ApiResource;
 use kube::runtime::{utils::Backoff, watcher};
 use ratatui::widgets::{ListState, TableState};
@@ -35,6 +32,7 @@ use crate::k8s::{Cluster, Kind};
 use crate::store::{Msg, Pulse, RowKey, StatusClaim, Store, StoreMutation, XrayItem, row_key};
 
 pub(crate) use guardrails::ConfirmLevel;
+pub use pvcexplore::{Pane, PvcExplore, PvcIntent};
 
 impl App {
     /// Mark the row ordering stale without touching the store — the shape of a
@@ -44,6 +42,11 @@ impl App {
     #[cfg(feature = "bench")]
     pub fn bench_invalidate_rows(&self) {
         self.invalidate_rows();
+    }
+
+    #[cfg(feature = "bench")]
+    pub fn bench_refresh_view_spec(&mut self) {
+        self.refresh_view_spec();
     }
 }
 
@@ -189,6 +192,13 @@ pub enum Mode {
     Fleet,
     /// Global fuzzy-find results picker (`:find <text>`).
     Find,
+    /// Split-pane PVC browser (`x` on a PVC): local files on the left, the
+    /// volume's contents on the right.
+    PvcExplore,
+    /// Port-forward target picker (`f` on a pod/service): lists the object's
+    /// declared ports for single-select, plus a "Custom…" entry that falls
+    /// through to the typed prompt.
+    PortForwardPicker,
 }
 
 /// A request for the run loop to suspend the TUI and run an interactive
@@ -203,6 +213,8 @@ pub enum Suspend {
 /// a quit (or panic-unwind) never leaves an orphaned `kubectl` holding the
 /// local port open.
 pub struct PortForward {
+    context: String,
+    cluster_url: String,
     ns: String,
     target: String,
     ports: String,
@@ -222,6 +234,19 @@ impl Drop for PortForward {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
     }
+}
+
+/// Spawns a background `kubectl port-forward` child. Overridable in tests
+/// so the unit suite doesn't require `kubectl` on PATH.
+type PortForwardSpawner = fn(&[String]) -> std::io::Result<tokio::process::Child>;
+
+fn default_pf_spawner(argv: &[String]) -> std::io::Result<tokio::process::Child> {
+    tokio::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
 }
 
 /// How dependents are handled on delete (kubectl `--cascade`, k9s propagation
@@ -266,13 +291,17 @@ enum ConfirmAction {
     Edit { argv: Vec<String> },
     /// Shell into a pod, once a guardrail confirmation is satisfied.
     Exec { ns: String, name: String },
-    /// Upload a local file into a pod (`kubectl cp`), once a guardrail
-    /// confirmation is satisfied. Upload only — a download doesn't mutate
-    /// the pod, so it never needs confirming.
+    /// Copy a file between a pod and the local filesystem (`kubectl cp`),
+    /// once its confirmation is satisfied. An upload is confirmed because a
+    /// guardrail asked; a download because it would overwrite a local file.
+    /// The direction has to travel with the action — running a download as an
+    /// upload would write into the cluster, past every check the upload path
+    /// makes.
     Transfer {
         ns: String,
         pod: String,
         container: Option<String>,
+        upload: bool,
         src: String,
         dest: String,
     },
@@ -307,10 +336,29 @@ enum ConfirmAction {
     },
     /// Delete the node debugger pods sofka launched this session (`:debug-clean`).
     CleanupDebuggers,
+    /// Create a temporary pod that mounts a PVC nothing else mounts, so it can
+    /// be browsed or shelled into.
+    PvcHelper {
+        ns: String,
+        claim: String,
+        intent: PvcIntent,
+    },
+    /// Shell into the pod a PVC is reachable through, once the `shell`
+    /// guardrail is satisfied.
+    PvcShell {
+        ns: String,
+        pod: String,
+        container: String,
+        path: String,
+        claim: String,
+    },
+    /// Delete the PVC-explore helper pods left behind by earlier sessions.
+    /// `None` sweeps every namespace, matching an all-namespaces view.
+    PvcClean { scope: Option<String> },
     /// Run a confirmed plugin (`confirm`/`dangerous`) once accepted — one job
     /// (label, argv) per target, so a bulk run confirms once.
     Plugin {
-        jobs: Vec<(String, Vec<String>)>,
+        jobs: Vec<crate::plugins::Job>,
         name: String,
         mode: PluginMode,
         timeout: u64,
@@ -331,6 +379,8 @@ pub enum PluginMode {
     Terminal,
     /// Captured off-thread into a scrollable document view.
     Popup,
+    /// Versioned JSON report rendered as a searchable document.
+    Report,
     /// Detached; a notification flashes on completion.
     Background,
 }
@@ -414,6 +464,8 @@ enum PromptKind {
 #[derive(Default)]
 pub struct Scrollable {
     pub title: String,
+    /// Mask sensitive header and status values while this document is visible.
+    pub redact_header: bool,
     pub lines: VecDeque<String>,
     /// Vertical scroll offset in rendered display rows. `usize` on purpose: a
     /// paused wrapped log buffer can far exceed `u16`.
@@ -534,6 +586,8 @@ enum PaletteAction {
     Info,
     Fleet,
     Rightsize,
+    PvcExplore,
+    PvcClean,
     Find,
     Diff,
     Events,
@@ -654,6 +708,19 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         action: PaletteAction::Rightsize,
         names: &["rightsize", "sizing", "vpa"],
+    },
+    PaletteCommand {
+        action: PaletteAction::PvcExplore,
+        // Both names stay prefixed. A bare "pvc" is the kubectl alias for
+        // the PVC list, and a palette command outranks a kind, so claiming it
+        // would stop `:pvc` navigating; bare "explore"/"browse" are words a
+        // user plugin may already have taken, and the palette reserves what
+        // it names.
+        names: &["pvc-explore", "pvc-browse"],
+    },
+    PaletteCommand {
+        action: PaletteAction::PvcClean,
+        names: &["pvc-clean", "pvc-cleanup"],
     },
     PaletteCommand {
         action: PaletteAction::Quit,
@@ -832,6 +899,7 @@ impl Scrollable {
             .as_ref()
             .map(|viewport| (viewport.width, viewport.height));
         self.lines = lines;
+        self.scroll_h(0);
         self.revision = self.revision.wrapping_add(1);
         self.viewport = None;
         if let Some((width, height)) = dimensions {
@@ -1156,12 +1224,65 @@ impl SortKey {
         use std::cmp::Ordering;
         match (self, other) {
             (SortKey::Num(a), SortKey::Num(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-            (SortKey::Text(a), SortKey::Text(b)) => a.cmp(b),
+            (SortKey::Text(a), SortKey::Text(b)) => natural_cmp(a, b),
             // Mixed kinds shouldn't occur within one column; keep it stable.
             (SortKey::Num(_), SortKey::Text(_)) => Ordering::Less,
             (SortKey::Text(_), SortKey::Num(_)) => Ordering::Greater,
         }
     }
+}
+
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let (mut ai, mut bi) = (0, 0);
+
+    while ai < a.len() && bi < b.len() {
+        if a[ai].is_ascii_digit() && b[bi].is_ascii_digit() {
+            let a_end = digit_run_end(a, ai);
+            let b_end = digit_run_end(b, bi);
+            let a_sig = significant_digits(&a[ai..a_end]);
+            let b_sig = significant_digits(&b[bi..b_end]);
+            let ord = a_sig.len().cmp(&b_sig.len()).then_with(|| a_sig.cmp(b_sig));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            ai = a_end;
+            bi = b_end;
+        } else {
+            let ord = a[ai].cmp(&b[bi]);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            ai += 1;
+            bi += 1;
+        }
+    }
+
+    match (ai == a.len(), bi == b.len()) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (true, true) => a.len().cmp(&b.len()).then_with(|| a.cmp(b)),
+        (false, false) => unreachable!(),
+    }
+}
+
+fn digit_run_end(bytes: &[u8], start: usize) -> usize {
+    let mut end = start;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    end
+}
+
+fn significant_digits(digits: &[u8]) -> &[u8] {
+    let first = digits
+        .iter()
+        .position(|digit| *digit != b'0')
+        .unwrap_or(digits.len());
+    &digits[first..]
 }
 
 /// Maximum previous object revisions retained for the session diff.
@@ -1174,7 +1295,7 @@ const PREV_REVISIONS_MAX: usize = 256;
 /// drilling away and back keeps the baseline.
 #[derive(Default)]
 pub(super) struct PrevRevisions {
-    map: HashMap<(String, String), Arc<DynamicObject>>,
+    map: crate::store::FastMap<(String, String), Arc<DynamicObject>>,
     order: VecDeque<(String, String)>,
 }
 
@@ -1205,21 +1326,117 @@ struct FilterCache {
     parsed: crate::filter::ParsedFilter,
 }
 
+/// Highlight positions per row name for the active filter's pattern.
+///
+/// The filter pass already ran the matcher over every row; without this the
+/// renderer ran it again for every *visible* row on every redraw, which is
+/// the same scoring work repeated at frame rate for a result that only
+/// changes when the filter or the name does.
+#[derive(Default)]
+struct HighlightCache {
+    /// The filter these entries were matched against — the whole string, so
+    /// that `api` and `"api"` (a fuzzy and a literal needle of the same text,
+    /// which highlight differently) cannot share entries. Anything else
+    /// empties the map, invalidating every entry at once.
+    filter: String,
+    /// Match positions per name. `None` — the name did not match — is a real
+    /// answer and is cached too, so a filter that excludes most rows does not
+    /// re-run the matcher over them every frame.
+    rows: crate::store::FastMap<Box<str>, Option<Rc<[usize]>>>,
+}
+
+/// The display header list, valid for the view spec and column toggles it was
+/// built from.
+///
+/// `display_headers` is asked for the header list from a dozen places — the
+/// renderer, sorting, mouse hit-testing, the copy picker, bookmarks — several
+/// times per frame, and each call used to build a fresh `Vec<String>` of owned
+/// headers only to read one entry out of it.
+struct HeaderCache {
+    /// Whether the namespace column is added before the view columns.
+    namespace: bool,
+    /// Bumped whenever the view spec is rebuilt.
+    spec_rev: u64,
+    headers: Rc<[String]>,
+}
+
+/// Memoized picker lists.
+///
+/// Every one of these is fuzzy-scored and sorted from scratch on each draw,
+/// and again on each keystroke by the input handlers that ask it for a length,
+/// a selection or a lookup — several full rebuilds per frame while a picker is
+/// open.
+///
+/// Each memo is keyed on the inputs themselves rather than on a revision
+/// counter someone has to remember to bump: comparing them is a handful of
+/// string compares against no allocation, and a new writer to `ns_list` or the
+/// favourites cannot leave a stale list on screen.
+#[derive(Default)]
+struct PickerMemos {
+    namespaces: Option<NamespaceMemo>,
+    contexts: Option<ContextMemo>,
+    sort_entries: Option<SortEntryMemo>,
+    copy_entries: Option<CopyEntryMemo>,
+}
+
+struct NamespaceMemo {
+    filter: String,
+    context: String,
+    ns_list: Vec<String>,
+    favorites: Vec<String>,
+    recents: Vec<String>,
+    value: Rc<Vec<String>>,
+}
+
+struct ContextMemo {
+    filter: String,
+    ctx_list: Vec<String>,
+    value: Rc<Vec<String>>,
+}
+
+struct SortEntryMemo {
+    filter: String,
+    /// The header list this was built from. Held as the same handle
+    /// `display_headers` returns, so a hit is a pointer comparison.
+    headers: Rc<[String]>,
+    value: Rc<Vec<String>>,
+}
+
+struct CopyEntryMemo {
+    filter: String,
+    fields: Vec<(String, String)>,
+    value: Rc<Vec<(String, String)>>,
+}
+
+/// Names are only inserted when they are drawn, so this holds a screenful in
+/// practice. The bound is here for the pathological case — a session left on
+/// one filter while rows churn through it — and clearing costs one redraw's
+/// worth of rematching.
+const HIGHLIGHT_CACHE_LIMIT: usize = 4096;
+
 /// Lazily-rebuilt cache of the display-ordered, filtered row keys. Recomputing
 /// the sort + fuzzy filter on every `rows()` call (per frame, per keystroke) is
 /// wasteful on large clusters; we rebuild only when the store or filter changes.
 #[derive(Default)]
 struct RowsCache {
+    filter_second: i64,
+    time_sensitive: bool,
     dirty: bool,
     keys: Vec<RowKey>,
-    cells: HashMap<RowKey, CellCacheEntry>,
+    cells: crate::store::FastMap<RowKey, CellCacheEntry>,
+    column_widths: Option<TableWidthCache>,
     /// Computed primary sort keys, valid per (sort header, resourceVersion) —
     /// a rebuild touches every object, but only changed rows re-extract.
-    sort_keys: HashMap<RowKey, SortKeyEntry>,
+    sort_keys: crate::store::FastMap<RowKey, SortKeyEntry>,
     /// Helm view only: the latest-revision dedup, paired with the store
     /// version it was computed from. A rebuild staled by a filter keystroke or
     /// a sort toggle leaves the store untouched, so the dedup still holds.
-    helm_latest: Option<(u64, HashSet<RowKey>)>,
+    helm_latest: Option<(u64, crate::store::FastSet<RowKey>)>,
+}
+
+struct TableWidthCache {
+    headers: Rc<[String]>,
+    needed: Vec<u16>,
 }
 
 struct CellCacheEntry {
@@ -1227,6 +1444,7 @@ struct CellCacheEntry {
     resource_version: Option<String>,
     cells: Vec<String>,
     status_idx: Option<usize>,
+    helm_updated: Option<i64>,
     /// Per-cell character-presence masks, and their union across the row.
     /// See [`subseq_mask`]: a cheap necessary condition for a fuzzy
     /// subsequence match, used to skip cells (and whole rows) without paying
@@ -1269,6 +1487,13 @@ impl TableCellCache<'_> {
             .get(key)
             .map(|entry| (entry.cells.as_slice(), entry.status_idx))
     }
+
+    pub(crate) fn helm_updated(&self, key: &str) -> Option<i64> {
+        self.cache
+            .cells
+            .get(key)
+            .and_then(|entry| entry.helm_updated)
+    }
 }
 
 /// Maximum root views kept in the `[`/`]` history.
@@ -1292,6 +1517,7 @@ const VIEW_CACHE_MAX_OBJECTS: usize = 10_000;
 /// filter terms).
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ViewKey {
+    resource: GroupVersionResource,
     kind_plural: String,
     namespace: String,
     labels: Option<String>,
@@ -1299,12 +1525,12 @@ struct ViewKey {
 }
 
 /// One root view for the `[`/`]` history: which kind was listed in which
-/// namespace. Drill-down state (selectors, filter, scope) is deliberately not
-/// kept — history replays root views; the breadcrumb stack handles drills.
+/// namespace, including its filter. The breadcrumb stack handles drill scopes.
 #[derive(Clone, PartialEq, Eq)]
 struct ViewEntry {
     kind_plural: String,
     namespace: String,
+    filter: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1349,6 +1575,14 @@ struct Frame {
     selected: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SortOrigin {
+    Unset,
+    Configured,
+    Selected { header: String, desc: bool },
+    Cleared,
+}
+
 pub struct App {
     pub cluster: Cluster,
     pub store: Store,
@@ -1364,8 +1598,14 @@ pub struct App {
 
     pub generation: u64,
     gen_flag: Arc<AtomicU64>,
+    /// Context currently being connected to, paired with the generation that
+    /// owns its eventual result.
+    context_switch_target: Option<(u64, String)>,
     pub tasks: Vec<JoinHandle<()>>,
     pub tx: Sender<Msg>,
+    /// Ordered off-thread persistence for small UI state files. `None` keeps
+    /// unit tests and degraded startup on the synchronous fallback.
+    pub state_writer: Option<crate::state_writer::StateWriter>,
     stack: Vec<Frame>,
     /// Scope of the running watch, so its rows can be stashed under the right
     /// key when the user navigates away.
@@ -1393,21 +1633,34 @@ pub struct App {
     /// Column index (into the displayed headers) to sort the table by, or
     /// `None` for the natural namespace/name order.
     pub sort_column: Option<usize>,
+    sort_origin: SortOrigin,
     pub sort_desc: bool,
-    /// Horizontal column scroll: how many columns after the anchored
-    /// NAMESPACE/NAME prefix are hidden off the left edge (←/→ in the
-    /// table). Clamped by `draw_table`, since the header set can change
-    /// underneath it; reset when the view spec is rebuilt.
+    /// Horizontal offset in terminal cells after NAMESPACE/NAME.
+    /// The renderer clamps this when the viewport or columns change.
     pub col_offset: usize,
+    pub col_scroll_max: usize,
     pub filter: String,
+    pub faults_only: bool,
     /// Parsed form of `filter`, refreshed lazily when the string changes so
     /// neither row matching nor rendering reparses it per frame.
     filter_cache: RefCell<FilterCache>,
+    /// Fuzzy highlight positions per visible row name, valid for the needle
+    /// they were matched against.
+    highlight_cache: RefCell<HighlightCache>,
+    /// Memoized `display_headers()`, rebuilt when the spec or the column
+    /// toggles change.
+    header_cache: RefCell<Option<HeaderCache>>,
+    /// Memoized picker lists, each valid for the inputs it was built from.
+    picker_memos: RefCell<PickerMemos>,
+    /// Bumped on every view-spec rebuild, so caches derived from the spec can
+    /// tell that it moved.
+    spec_rev: u64,
     /// Server-side selectors (`-l`/`-f` filter terms) the running watch was
     /// started with. Compared against the parsed filter to know when a
     /// restart is needed and to mark the filter as server-side in the UI.
     applied_filter_labels: Option<String>,
     applied_filter_fields: Option<String>,
+    pending_resource_query: Option<crate::filter::ResourceQuery>,
     pub command: String,
     pub cmd_suggestions: Vec<Suggestion>,
     pub cmd_sel: usize,
@@ -1434,6 +1687,9 @@ pub struct App {
     pub last_action_error: Option<String>,
 
     pub detail: Scrollable,
+    pub(super) describe_source: Option<(crate::store::StatusClaim, Vec<String>)>,
+    pub describe_refresh_task: Option<tokio::task::JoinHandle<()>>,
+    pub(super) describe_refresh_generation: u64,
     /// Search query for the help view (`?`), which has no backing
     /// [`Scrollable`] — its lines are built at render time.
     pub help_filter: String,
@@ -1490,6 +1746,9 @@ pub struct App {
     pub user_aliases: HashMap<String, String>,
     /// User-defined shell-out plugins.
     pub plugins: Vec<crate::config::Plugin>,
+    pub(super) plugin_task: Option<crate::plugins::Task>,
+    pub(super) plugin_run: u64,
+    pub(super) plugin_claim: Option<StatusClaim>,
     /// Saved navigation commands (`[[bookmarks]]`), re-applied on context
     /// switch and `:reload`.
     pub bookmarks: Vec<crate::config::Bookmark>,
@@ -1528,6 +1787,7 @@ pub struct App {
     /// Remembered sort per kind (`S`/`I`/header click), restored on every
     /// view start. Persisted to `sort_memory_path` on every change.
     pub sort_memory: crate::sortmem::SortMemory,
+    pub remember_sort: bool,
     /// Where remembered sorts persist (`<state-dir>/sort.toml`, set at
     /// startup); `None` (tests) keeps them in memory only.
     pub sort_memory_path: Option<std::path::PathBuf>,
@@ -1549,8 +1809,17 @@ pub struct App {
     pub journal: crate::journal::Journal,
     /// Count of watch/stream errors seen this session, for `:info` diagnostics.
     pub watch_errors: u64,
+    /// Times a watch re-listed after a completed sync this session. Routine in
+    /// small numbers (the API server ages resource versions out); a climbing
+    /// count next to a flat error count is the signature of a flaky connection
+    /// rather than a broken one, which is why `:info` reports them apart.
+    pub watch_reconnects: u64,
     /// The most recent error message, for `:info` diagnostics.
     pub last_error: Option<String>,
+    /// The most recent failure to persist a small UI-state file (namespace,
+    /// sort, fleet marks). Kept apart from [`Self::last_error`], which `:info`
+    /// reports under watch health — a disk problem is not a watch problem.
+    pub last_state_write_error: Option<String>,
     /// Whether the Metrics API has ever returned data this session.
     pub metrics_seen: bool,
     /// The metrics poll's most recent failure (`None` while it works), for
@@ -1582,10 +1851,29 @@ pub struct App {
     pub transfer_menu_state: ListState,
     pub transfer_target: Option<(String, String, Option<String>)>,
 
+    /// Split-pane PVC browser state (`x` on a PVC row, `:pvc-explore`).
+    pub pvc: PvcExplore,
+    /// `[pvc_explore]` helper-pod defaults.
+    pub pvc_cfg: crate::config::PvcExploreConfig,
+
+    /// Where a confirm/guardrail overlay returns to once it is answered. Only
+    /// the PVC browser sets it away from the table: every other guarded action
+    /// is launched from the table and returns there.
+    pub(super) confirm_return: Mode,
+
     /// Background `kubectl port-forward` processes started with `f`/`F`.
     /// Viewed/stopped via `:pf`; killed automatically on drop.
     pub port_forwards: Vec<PortForward>,
+    /// Injectable spawner for `kubectl port-forward` children. Tests override
+    /// this to avoid depending on `kubectl` being on PATH.
+    pf_spawner: PortForwardSpawner,
     pub pf_state: ListState,
+    /// Port-forward picker (`f`): the declared ports of the selected object,
+    /// each as a `LOCAL:REMOTE` string, plus a trailing "Custom…" entry.
+    pub pf_picker_items: Vec<String>,
+    pub pf_picker_state: ListState,
+    /// The `(ns, name)` target the port-forward picker is acting on.
+    pub(super) pf_picker_target: Option<(String, String)>,
     /// Saved `[[forwards]]` from config: shown in `:pf` even while stopped,
     /// startable with one keystroke, autostarted on connect when configured.
     pub forwards_cfg: Vec<crate::config::Forward>,
@@ -1645,6 +1933,9 @@ pub struct App {
     pub explain_title: String,
     /// The object the explain view is investigating, kept so `r` can re-gather.
     pub explain_source: Option<DynamicObject>,
+    /// Latest Explain request, independent of the table watch generation.
+    explain_request: u64,
+    explain_claim: Option<StatusClaim>,
     /// Parent of the explain view. Kept separately because an evidence view
     /// (logs/events) temporarily uses `return_mode` to return to Explain.
     explain_return: Mode,
@@ -1654,6 +1945,9 @@ pub struct App {
     pub gitops_state: ListState,
     pub gitops_title: String,
     pub gitops_source: Option<DynamicObject>,
+    /// Latest GitOps request, independent of the table watch generation.
+    gitops_request: u64,
+    gitops_claim: Option<StatusClaim>,
     /// Session-local per-object state-change history, fed by the table watch.
     pub timeline: crate::timeline::Timeline,
     /// Table geometry from the last frame, for mouse hit-testing. A RefCell
@@ -1697,7 +1991,7 @@ pub struct App {
     /// return so the cursor lands back on the same object.
     return_selection: Option<String>,
     pub should_quit: bool,
-    matcher: SkimMatcherV2,
+    matcher: crate::fuzzy::Fuzzy,
     rows_cache: RefCell<RowsCache>,
     /// Scratch buffer for the fuzzy filter's "namespace name" haystack, reused
     /// across rows so the filter pass doesn't allocate a `String` per object.
@@ -1714,9 +2008,9 @@ pub struct App {
     /// Compiled warning/critical coloring thresholds from config, re-resolved
     /// on context switch and `:reload`.
     pub thresholds: crate::thresholds::Compiled,
-    /// CRD printer-column fallbacks fetched per plural for this cluster
+    /// CRD printer-column fallbacks fetched per API resource for this cluster
     /// (`None` = fetched, nothing usable). Cleared on context switch.
-    crd_views: HashMap<String, Option<crate::views::View>>,
+    crd_views: HashMap<GroupVersionResource, Option<crate::views::View>>,
     /// Wide mode (`w`): show wide-only columns.
     pub wide: bool,
     /// Compact mode (`ctrl-e`): collapse the header to one line and hide the
@@ -1742,8 +2036,10 @@ impl App {
             scope_label: None,
             generation: 0,
             gen_flag: Arc::new(AtomicU64::new(0)),
+            context_switch_target: None,
             tasks: Vec::new(),
             tx,
+            state_writer: None,
             stack: Vec::new(),
             watch_key: None,
             view_cache: HashMap::new(),
@@ -1755,15 +2051,23 @@ impl App {
             table_page_rows: 10,
             marked: HashSet::new(),
             sort_column: None,
+            sort_origin: SortOrigin::Unset,
             sort_desc: false,
             col_offset: 0,
+            col_scroll_max: 0,
             filter: String::new(),
+            faults_only: false,
             filter_cache: RefCell::new(FilterCache {
                 raw: String::new(),
                 parsed: crate::filter::parse(""),
             }),
+            highlight_cache: RefCell::new(HighlightCache::default()),
+            header_cache: RefCell::new(None),
+            picker_memos: RefCell::new(PickerMemos::default()),
+            spec_rev: 0,
             applied_filter_labels: None,
             applied_filter_fields: None,
+            pending_resource_query: None,
             command: String::new(),
             cmd_suggestions: Vec::new(),
             cmd_sel: 0,
@@ -1778,6 +2082,9 @@ impl App {
             status_claim: None,
             last_action_error: None,
             detail: Scrollable::empty(),
+            describe_source: None,
+            describe_refresh_task: None,
+            describe_refresh_generation: 0,
             help_filter: String::new(),
             help_return: Mode::Table,
             help_scroll: 0,
@@ -1803,6 +2110,9 @@ impl App {
             all_contexts: Vec::new(),
             user_aliases: HashMap::new(),
             plugins: Vec::new(),
+            plugin_task: None,
+            plugin_run: 0,
+            plugin_claim: None,
             bookmarks: Vec::new(),
             pending_bookmark: None,
             workspaces: Vec::new(),
@@ -1819,6 +2129,7 @@ impl App {
             fleet_marks: crate::fleet::FleetMarks::default(),
             fleet_marks_path: None,
             sort_memory: crate::sortmem::SortMemory::default(),
+            remember_sort: true,
             sort_memory_path: None,
             namespace_memory: crate::nsmem::NamespaceMemory::default(),
             namespace_memory_path: None,
@@ -1828,7 +2139,9 @@ impl App {
             pending_bundle: None,
             journal: crate::journal::Journal::default(),
             watch_errors: 0,
+            watch_reconnects: 0,
             last_error: None,
+            last_state_write_error: None,
             metrics_seen: false,
             metrics_error: None,
             rbac_allowed: None,
@@ -1841,8 +2154,15 @@ impl App {
             flux_menu_state: ListState::default(),
             transfer_menu_state: ListState::default(),
             transfer_target: None,
+            pvc: PvcExplore::default(),
+            pvc_cfg: crate::config::PvcExploreConfig::default(),
+            confirm_return: Mode::Table,
             port_forwards: Vec::new(),
+            pf_spawner: default_pf_spawner,
             forwards_cfg: Vec::new(),
+            pf_picker_items: Vec::new(),
+            pf_picker_state: ListState::default(),
+            pf_picker_target: None,
             notify_cfg: crate::config::NotifyConfig::default(),
             palette_keys: crate::config::PaletteKeys::default(),
             pf_state: ListState::default(),
@@ -1872,11 +2192,15 @@ impl App {
             explain_state: ListState::default(),
             explain_title: String::new(),
             explain_source: None,
+            explain_request: 0,
+            explain_claim: None,
             explain_return: Mode::Table,
             gitops_items: Vec::new(),
             gitops_state: ListState::default(),
             gitops_title: String::new(),
             gitops_source: None,
+            gitops_request: 0,
+            gitops_claim: None,
             timeline: crate::timeline::Timeline::default(),
             table_hit: RefCell::new(None),
             notify_tasks: HashMap::new(),
@@ -1898,13 +2222,16 @@ impl App {
             return_mode: Mode::Table,
             return_selection: None,
             should_quit: false,
-            matcher: SkimMatcherV2::default(),
+            matcher: crate::fuzzy::Fuzzy::new(),
             hay_buf: RefCell::new(String::new()),
             rows_cache: RefCell::new(RowsCache {
+                filter_second: 0,
+                time_sensitive: false,
                 dirty: true,
                 keys: Vec::new(),
-                cells: HashMap::new(),
-                sort_keys: HashMap::new(),
+                cells: crate::store::FastMap::default(),
+                column_widths: None,
+                sort_keys: crate::store::FastMap::default(),
                 helm_latest: None,
             }),
             log_provider: None,
@@ -1914,7 +2241,7 @@ impl App {
             crd_views: HashMap::new(),
             wide: false,
             compact: false,
-            spec: crate::columns::build_spec("", None, None, false),
+            spec: crate::columns::build_spec("", "", None, None, false),
         }
     }
 
@@ -1932,6 +2259,31 @@ impl App {
     /// renderer keeps the picker underneath it and esc/enter return there.
     pub fn prompt_over_contexts(&self) -> bool {
         matches!(self.prompt_kind, Some(PromptKind::RenameContext { .. }))
+    }
+
+    /// Where a confirm dialog returns to. Not every `Mode::Confirm` goes
+    /// through `begin_guarded` (`:debug-clean` sets it directly), so a stale
+    /// `confirm_return` must never send us to a browser that isn't open.
+    pub(super) fn overlay_return(&self) -> Mode {
+        if self.confirm_return == Mode::PvcExplore && self.pvc.active {
+            Mode::PvcExplore
+        } else {
+            Mode::Table
+        }
+    }
+
+    /// Whether the open dialog belongs to the PVC browser, so the renderer
+    /// keeps the two panes underneath it.
+    pub fn over_pvc_browser(&self) -> bool {
+        self.pvc.active && self.confirm_return == Mode::PvcExplore
+    }
+
+    /// Whether the active prompt is a guardrail confirmation raised from the
+    /// PVC browser, so esc/enter return to the browser instead of the table.
+    pub(super) fn prompt_over_pvc(&self) -> bool {
+        self.pvc.active
+            && self.confirm_return == Mode::PvcExplore
+            && matches!(self.prompt_kind, Some(PromptKind::GuardConfirm { .. }))
     }
 
     /// Whether the logs view is showing the external log provider (enables
@@ -1952,7 +2304,7 @@ mod explain;
 mod find;
 mod fleet;
 mod gitops;
-mod guardrails;
+pub(crate) mod guardrails;
 mod helpers;
 mod input;
 mod journal;
@@ -1963,6 +2315,8 @@ mod navigation;
 mod notify;
 mod overlays;
 mod pickers;
+mod plugins;
+mod pvcexplore;
 mod rightsize;
 mod rows;
 mod snapshot;
@@ -1975,3 +2329,8 @@ pub use pickers::DEFAULT_SORT_LABEL;
 
 #[cfg(test)]
 mod tests;
+
+/// Built-ins retain ownership of their command names when loading packages.
+pub(crate) fn plugin_command_reserved(name: &str) -> bool {
+    name == "plugin-cancel" || PALETTE_COMMANDS.iter().any(|c| c.names.contains(&name))
+}

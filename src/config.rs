@@ -84,6 +84,8 @@ pub struct Config {
     pub debug: DebugConfig,
     /// Diagnostic-bundle (`:bundle`) options — see [`BundleConfig`].
     pub bundle: BundleConfig,
+    /// Helper-pod defaults for the PVC browser — see [`PvcExploreConfig`].
+    pub pvc_explore: PvcExploreConfig,
     /// Log-view options — see [`LogsConfig`].
     pub logs: LogsConfig,
     /// Cross-context fleet dashboard (`:fleet`) — see [`FleetConfig`].
@@ -96,11 +98,15 @@ pub struct Config {
     /// behavior (text selection) everywhere. Document views release capture
     /// on their own regardless — see [`crate::app::App::wants_mouse_capture`].
     pub mouse: Option<bool>,
+    /// Save and restore sort choices per kind. Defaults to true.
+    pub remember_sort: Option<bool>,
     /// How `:notify` events are delivered — see [`NotifyConfig`].
     pub notify: NotifyConfig,
     /// Command-palette completion key rebinds — see [`KeysConfig`]. Compiled
     /// and validated by [`compile_palette_keys`].
     pub keys: KeysConfig,
+    /// Structured application logging — see [`LoggingConfig`].
+    pub logging: LoggingConfig,
 }
 
 /// Delivery for `:notify` events, besides the status-line flash.
@@ -370,7 +376,7 @@ pub struct FleetConfig {
 /// [logs]
 /// tail = 300         # initial lines fetched per stream
 /// buffer = 5000      # max lines retained while following (bounded tail)
-/// since = "1h"       # optional: only logs newer than this (overrides tail)
+/// since = "1h"       # optional: only logs newer than this, within the tail limit
 /// fullscreen = false # open log views fullscreen (F toggles; k9s fullScreenLogs)
 /// ```
 #[derive(Debug, Clone, Deserialize)]
@@ -382,7 +388,7 @@ pub struct LogsConfig {
     /// dropped (keeps a chatty pod from growing memory without bound).
     pub buffer: usize,
     /// Optional lookback (`30m`, `4h`, `2d`): stream only logs newer than this.
-    /// When set it replaces `tail` (Kubernetes accepts one or the other).
+    /// The initial request also keeps the configured `tail` limit.
     pub since: Option<String>,
     /// Start log views fullscreen — the pane takes the whole frame, without
     /// header or borders (k9s `fullScreenLogs`). `F` toggles per session.
@@ -398,6 +404,73 @@ impl Default for LogsConfig {
             fullscreen: false,
         }
     }
+}
+
+/// Structured application logging — sofka's own diagnostics, not pod logs
+/// (those are [`LogsConfig`]).
+///
+/// ```toml
+/// [logging]
+/// level = "info"           # off (default) | error | warn | info | debug | trace
+/// # file = "/tmp/sofka.log"  # default: <state-dir>/logs/sofka.log
+/// max_size_mb = 8          # rotate to <file>.1 past this size
+/// ```
+///
+/// `SOFKA_LOG=debug` overrides `level` for one run, which is how you turn
+/// logging on for a session without editing config. Every value written is
+/// redacted first (see [`crate::redact`]), so the log can be attached to a bug
+/// report as-is.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LoggingConfig {
+    /// `off` | `error` | `warn` | `info` | `debug` | `trace`.
+    pub level: String,
+    /// Log file. Defaults to `<state-dir>/logs/sofka.log`.
+    pub file: Option<PathBuf>,
+    /// Size at which the log rotates to `<file>.1`.
+    pub max_size_mb: u64,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: "off".into(),
+            file: None,
+            max_size_mb: 8,
+        }
+    }
+}
+
+impl LoggingConfig {
+    /// Where the log goes, config first and the state directory otherwise.
+    pub fn path(&self) -> PathBuf {
+        self.file
+            .clone()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(crate::diagnostics::default_log_path)
+    }
+
+    /// Rotation threshold in bytes, floored at 64KiB — a smaller cap would
+    /// rotate faster than a session can be read back.
+    pub fn max_bytes(&self) -> u64 {
+        self.max_size_mb.saturating_mul(1024 * 1024).max(64 * 1024)
+    }
+}
+
+/// Validate `[logging]`: an unparseable level (in config or `SOFKA_LOG`) warns
+/// and leaves logging off rather than guessing at a verbosity.
+pub fn logging_warnings(cfg: &LoggingConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if crate::applog::Level::parse(&cfg.level).is_none() {
+        warnings.push(format!(
+            "logging: level '{}' is not off/error/warn/info/debug/trace; logging disabled",
+            cfg.level
+        ));
+    }
+    if cfg.file.as_ref().is_some_and(|p| p.as_os_str().is_empty()) {
+        warnings.push("logging: file is empty; using the default log path".into());
+    }
+    warnings
 }
 
 /// Options for the `:bundle` diagnostic-bundle export.
@@ -428,6 +501,64 @@ impl Default for BundleConfig {
             max_pods: 3,
         }
     }
+}
+
+/// Fallback TTL for a PVC-explore helper pod when [`PvcExploreConfig::ttl`] is
+/// unreadable. Also the default itself.
+pub const PVC_DEFAULT_TTL_SECS: u64 = 1_800;
+
+/// Defaults for the PVC browser (`x` on a PVC, `:pvc-explore`).
+///
+/// A claim that some running pod already mounts is browsed through that pod
+/// and none of this applies. When nothing mounts it, sofka offers to create a
+/// short-lived pod that does — these are that pod's image and lifetime.
+///
+/// ```toml
+/// [pvc_explore]
+/// image = "busybox:1.37"   # helper-pod image; needs a shell and `ls`
+/// ttl = "30m"              # helper pod self-destructs after this
+/// ```
+///
+/// The image needs `sh`, `ls`, and — for transfers, which go through
+/// `kubectl cp` — `tar`. busybox has all three.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PvcExploreConfig {
+    /// Image for the helper pod.
+    pub image: String,
+    /// How long the helper pod lives before it deletes itself, as a duration
+    /// like `"30m"`. Set on the pod as both a `sleep` and
+    /// `activeDeadlineSeconds`, so it expires even if sofka never gets to
+    /// delete it. Validated by [`pvc_explore_warnings`].
+    pub ttl: String,
+}
+
+impl Default for PvcExploreConfig {
+    fn default() -> Self {
+        Self {
+            image: "busybox:1.37".into(),
+            ttl: "30m".into(),
+        }
+    }
+}
+
+/// Validate `[pvc_explore]`: an empty image or an unparseable/absurd TTL.
+pub fn pvc_explore_warnings(cfg: &PvcExploreConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    if cfg.image.trim().is_empty() {
+        out.push("pvc_explore: image is empty — helper pods cannot be created".into());
+    }
+    match crate::providers::parse_lookback(&cfg.ttl) {
+        Err(e) => out.push(format!("pvc_explore: ttl: {e}; using 30m")),
+        Ok(secs) if secs <= 0 => {
+            out.push(format!(
+                "pvc_explore: ttl {:?} must be positive; using 30m",
+                cfg.ttl
+            ));
+        }
+        Ok(_) => {}
+    }
+    out
 }
 
 /// Defaults for `:debug`, which attaches an ephemeral debug container to the
@@ -707,6 +838,10 @@ pub struct DrillConfig {
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct ViewColumnConfig {
+    /// Built-in metric source. Use exactly one of path, metric, or builtin.
+    pub metric: Option<String>,
+    /// Existing built-in column, such as READY or AGE.
+    pub builtin: Option<String>,
     /// Column header (displayed uppercased).
     pub name: String,
     /// JSON Pointer to the cell value, e.g. `/status/phase`.
@@ -785,8 +920,32 @@ pub struct Skin {
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Plugin {
+    /// Inline configuration ignores unknown fields. Package validation rejects them.
+    #[serde(flatten)]
+    pub(crate) unknown_fields: std::collections::BTreeMap<String, toml::Value>,
     /// Key chord that triggers the plugin (see [`crate::keys::KeyChord`]).
+    #[serde(default)]
     pub key: String,
+    /// Optional command-palette name, independent of the executable.
+    pub palette: Option<String>,
+    #[serde(default)]
+    pub requires: Vec<String>,
+    pub install: Option<String>,
+    #[serde(default)]
+    pub inputs: std::collections::BTreeMap<String, crate::plugins::Input>,
+    /// `context` runs once without requiring a selected row; default `selection`.
+    pub target: Option<String>,
+    /// Declare traffic generation even when no Kubernetes objects are mutated.
+    #[serde(default)]
+    pub network_load: bool,
+    /// Remote port (or an input placeholder) to forward for the selected pod/service.
+    pub port_forward: Option<String>,
+    #[serde(skip)]
+    pub package_dir: Option<PathBuf>,
+    /// Set for a package sofka ships, whose adapter is this binary. Such a
+    /// plugin speaks the request/report protocol without a package directory.
+    #[serde(skip)]
+    pub bundled: bool,
     pub name: String,
     pub command: String,
     #[serde(default)]
@@ -958,8 +1117,8 @@ pub fn workspace_warnings(workspaces: &[Workspace]) -> Vec<String> {
 /// A declarative safety policy: match dangerous actions by context, namespace,
 /// resource, and action, then require extra confirmation, deny them, or cap a
 /// bulk selection. Gates `delete`, `force-delete`, `drain`, `restart`,
-/// `shell`, `debug`, and `node-debug` today. Empty match lists mean "any";
-/// glob `*` supported.
+/// `shell`, `debug`, `node-debug`, `transfer`, `pvc-explore`, and
+/// `pvc-upload` today. Empty match lists mean "any"; glob `*` supported.
 ///
 /// ```toml
 /// [[guardrails]]
@@ -988,7 +1147,8 @@ pub struct Guardrail {
     /// Resource plurals/kinds this applies to (globs). Empty = any.
     pub resources: Vec<String>,
     /// Actions this applies to: `delete`, `force-delete`, `drain`, `restart`,
-    /// `shell`, `debug`, `node-debug`, `transfer`. Empty = any.
+    /// `shell`, `debug`, `node-debug`, `transfer`, `pvc-explore` (creating or
+    /// sweeping a PVC-explore helper pod), `pvc-upload`. Empty = any.
     pub actions: Vec<String>,
     /// Block the action outright.
     pub deny: bool,
@@ -1059,14 +1219,16 @@ pub fn bookmark_warnings(bookmarks: &[Bookmark]) -> Vec<String> {
 pub fn plugin_warnings(plugins: &[Plugin]) -> Vec<String> {
     let mut warns = Vec::new();
     for p in plugins {
-        if let Err(e) = crate::keys::KeyChord::parse(&p.key) {
+        if !(p.key.is_empty() && p.palette.is_some())
+            && let Err(e) = crate::keys::KeyChord::parse(&p.key)
+        {
             warns.push(format!("plugin {:?}: invalid key — {e}", p.name));
         }
         if let Some(o) = &p.output
-            && !matches!(o.as_str(), "terminal" | "popup" | "background")
+            && !matches!(o.as_str(), "terminal" | "popup" | "background" | "report")
         {
             warns.push(format!(
-                "plugin {:?}: unknown output {o:?} (expected terminal/popup/background) — using terminal",
+                "plugin {:?}: unknown output {o:?} (expected terminal/popup/background/report) — using terminal",
                 p.name
             ));
         }
@@ -1206,13 +1368,30 @@ impl ConfigLoader {
 
         // A type mismatch introduced by an override drops back to the base
         // config (validated at load time) rather than losing everything.
-        let config = merged.try_into().unwrap_or_else(|e| {
+        let mut config: Config = merged.try_into().unwrap_or_else(|e| {
             warnings.push(format!("ignoring cluster overrides: {e}"));
             self.base
                 .clone()
                 .and_then(|b| b.try_into().ok())
                 .unwrap_or_default()
         });
+        if let Some(dir) = &self.dir {
+            crate::plugins::load_packages(&dir.join("plugins"), &mut config.plugins, &mut warnings);
+        }
+        // Last, so an inline entry or a user package of the same name wins and
+        // a user can replace a shipped plugin without editing sofka.
+        for bundled in crate::plugins::bundled() {
+            match bundled {
+                Ok(p) => {
+                    if !config.plugins.iter().any(|old| {
+                        old.name == p.name || (p.palette.is_some() && old.palette == p.palette)
+                    }) {
+                        config.plugins.push(p);
+                    }
+                }
+                Err(e) => warnings.push(e),
+            }
+        }
         let skin_override = overlay
             .get("skin")
             .and_then(|s| s.get("name"))
@@ -1555,6 +1734,46 @@ mod tests {
         assert!(cfg.plugins.is_empty());
         assert!(cfg.default_resource.is_none());
         assert!(cfg.providers.logs.is_none());
+    }
+
+    #[test]
+    fn logging_defaults_to_off_under_the_state_dir() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.logging.level, "off");
+        assert!(logging_warnings(&cfg.logging).is_empty());
+        assert_eq!(cfg.logging.path(), crate::diagnostics::default_log_path());
+        assert_eq!(cfg.logging.max_bytes(), 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parses_logging_section() {
+        let toml = r#"
+            [logging]
+            level = "debug"
+            file = "/tmp/sofka-test.log"
+            max_size_mb = 2
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.logging.level, "debug");
+        assert_eq!(cfg.logging.path(), PathBuf::from("/tmp/sofka-test.log"));
+        assert_eq!(cfg.logging.max_bytes(), 2 * 1024 * 1024);
+        assert!(logging_warnings(&cfg.logging).is_empty());
+    }
+
+    #[test]
+    fn logging_bad_level_warns_and_empty_file_falls_back() {
+        let cfg: Config = toml::from_str("[logging]\nlevel = \"chatty\"\nfile = \"\"\n").unwrap();
+        let warnings = logging_warnings(&cfg.logging);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("chatty"), "{warnings:?}");
+        assert!(warnings[1].contains("file is empty"), "{warnings:?}");
+        assert_eq!(cfg.logging.path(), crate::diagnostics::default_log_path());
+    }
+
+    #[test]
+    fn logging_rotation_floor_survives_a_zero() {
+        let cfg: Config = toml::from_str("[logging]\nmax_size_mb = 0\n").unwrap();
+        assert_eq!(cfg.logging.max_bytes(), 64 * 1024);
     }
 
     #[test]

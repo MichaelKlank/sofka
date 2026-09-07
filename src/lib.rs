@@ -10,6 +10,8 @@
 
 pub mod altscroll;
 pub mod app;
+pub mod applog;
+pub mod atomicfile;
 #[cfg(feature = "bench")]
 pub mod benchsupport;
 pub mod bundle;
@@ -19,17 +21,25 @@ pub mod diagnostics;
 pub mod explain;
 pub mod filter;
 pub mod fleet;
+pub mod fuzzy;
 pub mod gitops;
 pub mod helm;
 pub mod journal;
 pub mod k8s;
 pub mod keys;
+mod legacy_tls;
 pub mod logfilter;
 pub mod nsmem;
+pub mod plugins;
 pub mod providers;
+pub mod pvcexplore;
+pub mod redact;
 pub mod rightsize;
+pub mod sanitize;
+mod server_tls;
 pub mod snapshot;
 pub mod sortmem;
+pub mod state_writer;
 pub mod store;
 pub mod text;
 pub mod theme;

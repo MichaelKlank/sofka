@@ -1,5 +1,17 @@
 use super::*;
 
+const DEFAULT_RESOURCES: [&str; 9] = [
+    "pods",
+    "services",
+    "deployments",
+    "statefulsets",
+    "daemonsets",
+    "secrets",
+    "configmaps",
+    "ingresses",
+    "persistentvolumeclaims",
+];
+
 impl App {
     /// Trigger a workspace bound to `key`. Returns whether one matched.
     pub(super) fn try_workspace_key(&mut self, key: KeyEvent) -> bool {
@@ -39,8 +51,10 @@ impl App {
         if let Some(ctx) = ws.context.clone()
             && ctx != self.cluster.context
         {
-            self.pending_workspace = Some(ws);
             self.switch_context(ctx);
+            self.pending_resource_query = None;
+            self.pending_bookmark = None;
+            self.pending_workspace = Some(ws);
             return;
         }
         self.start_workspace(ws);
@@ -63,11 +77,11 @@ impl App {
         }
     }
 
-    /// `Tab`/`Shift-Tab`: move to the next/previous view of the active
-    /// workspace (wrapping). No-op when no workspace is active.
-    pub(super) fn cycle_workspace(&mut self, forward: bool) -> bool {
+    /// `Tab`/`Shift-Tab`: cycle the active workspace, or common resources in
+    /// the current namespace when no workspace is open.
+    pub(super) fn cycle_views(&mut self, forward: bool) -> bool {
         let Some(ws) = &self.active_workspace else {
-            return false;
+            return self.cycle_default_resources(forward);
         };
         let len = ws.views.len();
         if len == 0 {
@@ -83,6 +97,27 @@ impl App {
         }
         self.apply_active_view();
         true
+    }
+
+    fn cycle_default_resources(&mut self, forward: bool) -> bool {
+        let len = DEFAULT_RESOURCES.len();
+        let current = DEFAULT_RESOURCES
+            .iter()
+            .position(|resource| *resource == self.kind_plural)
+            .unwrap_or(if forward { len - 1 } else { 0 });
+        for offset in 1..=len {
+            let index = if forward {
+                (current + offset) % len
+            } else {
+                (current + len - offset) % len
+            };
+            let resource = DEFAULT_RESOURCES[index];
+            if self.cluster.resolve(resource).is_some() {
+                self.switch_kind(resource);
+                return true;
+            }
+        }
+        false
     }
 
     /// Apply the active workspace's current view and set the status line.
