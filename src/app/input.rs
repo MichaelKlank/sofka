@@ -1245,11 +1245,7 @@ impl App {
     }
 
     pub(super) fn key_help(&mut self, key: KeyEvent) {
-        // The help text runs past the bottom of any terminal, so it scrolls
-        // with the same keys as the document views (j/k, arrows, ctrl-f/b,
-        // space, g/G). `help_max_scroll` is set by the renderer, which is the
-        // only place the wrapped line count is known.
-        let page = 10u16;
+        let page = self.help_viewport_h.max(1);
         match key.code {
             // Esc backs out of an active search first, then closes help.
             KeyCode::Esc if !self.help_filter.is_empty() => {

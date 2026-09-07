@@ -2133,7 +2133,18 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
         Line::from(""),
         bind(":q / ctrl-c", "quit"),
-        bind("?", "global help — close to return to the previous screen"),
+        Line::from(""),
+        Line::from(Span::styled("  Help view", theme::title())),
+        bind("j/k · ↑/↓", "scroll one line"),
+        bind("ctrl-f · PgDn", "next page (space also moves forward)"),
+        bind("ctrl-b · PgUp", "previous page"),
+        bind("g/G · Home/End", "go to the top/bottom"),
+        bind("/", "filter help bindings"),
+        bind(
+            "esc",
+            "clear the filter, or close help if no filter is active",
+        ),
+        bind("q · ?", "close help and return to the previous screen"),
     ];
     // Config-defined plugins, with their (possibly modified) key chords.
     if !app.plugins.is_empty() {
@@ -2202,10 +2213,9 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         let title = format!(" Help · /{} [{}] ", app.help_filter, shown.len());
         (shown, title)
     };
-    // The bindings list is taller than any terminal, so help scrolls: record
-    // the clamp for the key handler, then render from the current offset. The
-    // title carries a hint whenever there is more below the fold.
+    // Record the content height for paging and clamp the offset after layout changes.
     let inner_h = area.height.saturating_sub(2);
+    app.help_viewport_h = inner_h;
     let max_scroll = (lines.len() as u16).saturating_sub(inner_h);
     app.help_max_scroll = max_scroll;
     let scroll = app.help_scroll.min(max_scroll);

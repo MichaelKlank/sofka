@@ -76,10 +76,18 @@ viewport.
 `ctrl-f` / `ctrl-b` page forward or back, with `PgDn` / `PgUp` as aliases.
 `/` searches like vim: the whole document stays on screen and every match is
 highlighted. `n` / `N` go to the next or previous match. `w` wraps. `c` copies
-the document. `esc` backs out - the first press clears an active search. In the
-`?` help panel, `/` filters instead and narrows to matching keybinds, and the
-panel scrolls with `j` / `k`, `↑` / `↓`, `ctrl-f` / `ctrl-b`, `space`, `g` / `G`
-and `Home` / `End`.
+the document. `esc` backs out - the first press clears an active search.
+
+## Help panel (`?`)
+
+`j` / `k` and `↑` / `↓` scroll one line. `ctrl-f`, `PgDn`, and `space` move
+forward one page. `ctrl-b` and `PgUp` move back one page. The page size is the
+number of visible content rows. `g` / `Home` go to the top; `G` / `End` go to
+the bottom.
+
+`/` filters the bindings. Opening help, starting a filter, and clearing a filter
+reset the scroll position to the top. `esc` clears an active filter first, then
+closes help. `q` or `?` closes help and returns to the previous screen.
 
 ## Explain view (`X`)
 
