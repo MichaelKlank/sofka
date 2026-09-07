@@ -133,8 +133,10 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   warning instead of findings from an old snapshot. Only the latest requested
   report can update the findings. Closing the view with `esc` or `q` cancels
   pending results and clears the report progress message. Navigation to
-  evidence, a target resource, or a palette destination also cancels pending
-  results.
+  a target resource or a palette destination also cancels pending results.
+  Temporary Events and Logs views keep the parent report active. New findings
+  update that report without changing the evidence view. Refresh keeps the
+  previous findings until new results arrive.
 - **Session-local timeline** (`T` / `:timeline`) - a per-object timestamped log
   of every state change the watch saw: generation bumps, replica and readiness
   changes, pod phase, restarts, waiting reasons, condition flips. Computed from

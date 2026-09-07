@@ -34,7 +34,6 @@ impl App {
     /// `r` in the explain view — re-gather the evidence for the same object.
     pub(super) fn refresh_explain(&mut self) {
         if self.explain_source.is_some() {
-            self.explain_items.clear();
             self.spawn_explain();
         }
     }
@@ -163,7 +162,7 @@ impl App {
             KeyCode::Char('l') => self.explain_logs(),
             _ => {}
         }
-        if self.mode != Mode::Explain {
+        if !matches!(self.mode, Mode::Explain | Mode::Events | Mode::Logs) {
             self.cancel_explain_request();
         }
     }

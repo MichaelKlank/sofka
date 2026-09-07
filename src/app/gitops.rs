@@ -38,7 +38,6 @@ impl App {
     /// `r` in the GitOps view — re-gather for the same object.
     pub(super) fn refresh_gitops(&mut self) {
         if self.gitops_source.is_some() {
-            self.gitops_items.clear();
             self.spawn_gitops();
         }
     }

@@ -14870,7 +14870,18 @@ async fn health_refresh_keys_preserve_the_newest_error_over_older_success() {
             .lock()
             .unwrap()
             .insert(path.into(), (200, old_success));
+        let previous = if gitops {
+            app.gitops_items.clone()
+        } else {
+            app.explain_items.clone()
+        };
         app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        let pending = if gitops {
+            &app.gitops_items
+        } else {
+            &app.explain_items
+        };
+        assert_eq!(pending, &previous, "refresh retains the last report");
         let old_reply = take_health_report(&mut rx, gitops).await;
         responses.lock().unwrap().insert(path.into(), (403, json!({"kind":"Status","apiVersion":"v1","status":"Failure","code":403,"reason":"Forbidden","message":"latest access denied"})));
         app.handle_key(press(KeyCode::Char('r'))).unwrap();
@@ -14943,7 +14954,7 @@ async fn report_navigation_keeps_its_destination_after_a_late_reply() {
         };
         app.handle_key(press(key)).unwrap();
         assert_eq!(app.mode, destination);
-        if destination != Mode::Command {
+        if destination == Mode::Table {
             let current = if gitops {
                 app.gitops_request
             } else {
@@ -15037,6 +15048,89 @@ async fn palette_navigation_cancels_pending_health_reports() {
                 assert_ne!(title, "cancelled report");
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn explain_evidence_views_keep_pending_findings_and_refresh_history() {
+    for refresh in [false, true] {
+        for key in ['E', 'l'] {
+            for reply_before_return in [false, true] {
+                let root = expression_workload(true);
+                let (mut app, mut rx, responses, _) =
+                    health_report_app("deployments", root.clone());
+                let path = "/apis/apps/v1/namespaces/default/deployments/web";
+                responses
+                    .lock()
+                    .unwrap()
+                    .insert(path.into(), (200, root.clone()));
+                open_health_report_key(&mut app, false);
+                let mut reply = take_health_report(&mut rx, false).await;
+                let previous = if refresh {
+                    app.handle_msg(reply);
+                    let previous = app.explain_items.clone();
+                    assert!(!previous.is_empty());
+                    let mut updated = root;
+                    updated["status"]["readyReplicas"] = json!(0);
+                    responses
+                        .lock()
+                        .unwrap()
+                        .insert(path.into(), (200, updated));
+                    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+                    assert_eq!(app.explain_items, previous);
+                    reply = take_health_report(&mut rx, false).await;
+                    previous
+                } else {
+                    Vec::new()
+                };
+                let request = app.explain_request;
+                app.handle_key(press(KeyCode::Char(key))).unwrap();
+                let evidence_mode = if key == 'E' { Mode::Events } else { Mode::Logs };
+                assert_eq!(app.mode, evidence_mode);
+                assert_eq!(app.explain_request, request);
+                if reply_before_return {
+                    app.handle_msg(reply);
+                    assert_eq!(app.mode, evidence_mode);
+                    app.handle_key(press(KeyCode::Esc)).unwrap();
+                } else {
+                    app.handle_key(press(KeyCode::Esc)).unwrap();
+                    assert_eq!(app.explain_items, previous);
+                    app.handle_msg(reply);
+                }
+                assert_eq!(app.mode, Mode::Explain);
+                assert!(!app.explain_items.is_empty());
+                if refresh {
+                    assert_ne!(app.explain_items, previous);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn palette_exit_from_evidence_cancels_the_parent_report() {
+    for key in ['E', 'l'] {
+        let root = expression_workload(true);
+        let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+        responses.lock().unwrap().insert(
+            "/apis/apps/v1/namespaces/default/deployments/web".into(),
+            (200, root),
+        );
+        open_health_report_key(&mut app, false);
+        let reply = take_health_report(&mut rx, false).await;
+        let request = app.explain_request;
+        app.handle_key(press(KeyCode::Char(key))).unwrap();
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for key in "timeline".chars() {
+            app.handle_key(press(KeyCode::Char(key))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.mode, Mode::Timeline);
+        assert_ne!(app.explain_request, request);
+        assert!(app.explain_claim.is_none());
+        app.handle_msg(reply);
+        assert_eq!(app.mode, Mode::Timeline);
+        assert!(app.explain_items.is_empty());
     }
 }
 
