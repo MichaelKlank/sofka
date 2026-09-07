@@ -199,8 +199,12 @@ impl App {
     fn eval_cmp(&self, o: &DynamicObject, cmp: &crate::filter::Cmp, now: i64) -> bool {
         use crate::filter::CmpValue;
         match &cmp.value {
-            CmpValue::Cpu(want) => cmp.op.eval(self.metrics_for(o).0.cmp(want)),
-            CmpValue::Mem(want) => cmp.op.eval(self.metrics_for(o).1.cmp(want)),
+            CmpValue::Cpu(want) => self
+                .metrics_for(o)
+                .is_some_and(|(cpu, _)| cmp.op.eval(cpu.cmp(want))),
+            CmpValue::Mem(want) => self
+                .metrics_for(o)
+                .is_some_and(|(_, mem)| cmp.op.eval(mem.cmp(want))),
             CmpValue::Duration(want) => match crate::columns::age_secs(o, now) {
                 Some(age) => cmp.op.eval(age.cmp(want)),
                 None => false,
@@ -740,14 +744,34 @@ impl App {
     }
 
     /// Latest (cpu_millicores, mem_bytes) for an object from the metrics map.
-    pub(super) fn metrics_for(&self, o: &DynamicObject) -> (i64, i64) {
+    pub(crate) fn metrics_for(&self, o: &DynamicObject) -> Option<(i64, i64)> {
         let name = o.metadata.name.clone().unwrap_or_default();
         let key = if self.kind_plural == "pods" {
             format!("{}/{}", o.metadata.namespace.as_deref().unwrap_or(""), name)
         } else {
             name
         };
-        self.metrics.get(&key).copied().unwrap_or((0, 0))
+        self.metrics.get(&key).copied()
+    }
+
+    pub(super) fn metric_cells(&self, obj: &DynamicObject) -> Vec<String> {
+        let metrics = self.metrics_for(obj);
+        let cpu = metrics.map(|(cpu, _)| cpu);
+        let mem = metrics.map(|(_, mem)| mem);
+        let mut cells = vec![
+            crate::columns::fmt_cpu_sample(cpu),
+            crate::columns::fmt_mem_sample(mem),
+        ];
+        if self.node_capacity_columns() {
+            let (alloc_cpu, alloc_mem) = crate::columns::node_allocatable(obj);
+            cells.push(crate::columns::fmt_pct(
+                cpu.and_then(|cpu| crate::columns::usage_pct(cpu, alloc_cpu)),
+            ));
+            cells.push(crate::columns::fmt_pct(
+                mem.and_then(|mem| crate::columns::usage_pct(mem, alloc_mem)),
+            ));
+        }
+        cells
     }
 
     /// Latest pod count for a node from the pods poll; `None` before the
@@ -789,28 +813,36 @@ impl App {
             ),
             // Unknown timestamps sort last (oldest-unknown) in ascending order.
             "AGE" => SortKey::Num(crate::columns::age_secs(o, now).unwrap_or(i64::MAX) as f64),
-            "CPU" => SortKey::Num(self.metrics_for(o).0 as f64),
-            "MEM" => SortKey::Num(self.metrics_for(o).1 as f64),
+            "CPU" => SortKey::Num(
+                self.metrics_for(o)
+                    .map(|(cpu, _)| cpu as f64)
+                    .unwrap_or(-1.0),
+            ),
+            "MEM" => SortKey::Num(
+                self.metrics_for(o)
+                    .map(|(_, mem)| mem as f64)
+                    .unwrap_or(-1.0),
+            ),
             // Unknown counts (poll hasn't landed) sort below every real count.
             "PODS" if self.node_capacity_columns() => {
                 SortKey::Num(self.node_pods_for(o).map(|c| c as f64).unwrap_or(-1.0))
             }
             // Unknown allocatable sorts below every real percentage.
             "%CPU" if self.node_capacity_columns() => SortKey::Num(
-                crate::columns::usage_pct(
-                    self.metrics_for(o).0,
-                    crate::columns::node_allocatable(o).0,
-                )
-                .map(|p| p as f64)
-                .unwrap_or(-1.0),
+                self.metrics_for(o)
+                    .and_then(|(cpu, _)| {
+                        crate::columns::usage_pct(cpu, crate::columns::node_allocatable(o).0)
+                    })
+                    .map(|p| p as f64)
+                    .unwrap_or(-1.0),
             ),
             "%MEM" if self.node_capacity_columns() => SortKey::Num(
-                crate::columns::usage_pct(
-                    self.metrics_for(o).1,
-                    crate::columns::node_allocatable(o).1,
-                )
-                .map(|p| p as f64)
-                .unwrap_or(-1.0),
+                self.metrics_for(o)
+                    .and_then(|(_, mem)| {
+                        crate::columns::usage_pct(mem, crate::columns::node_allocatable(o).1)
+                    })
+                    .map(|p| p as f64)
+                    .unwrap_or(-1.0),
             ),
             // Humanized time cells ("5d23h") must sort by the underlying
             // timestamp, never the rendered string. Negated epoch seconds so
@@ -953,18 +985,7 @@ impl App {
             values.push(self.node_pods_cell(obj));
         }
         if self.metrics_columns() {
-            let (cpu, mem) = self.metrics_for(obj);
-            values.push(crate::columns::fmt_cpu(cpu));
-            values.push(crate::columns::fmt_mem(mem));
-            if self.node_capacity_columns() {
-                let (alloc_cpu, alloc_mem) = crate::columns::node_allocatable(obj);
-                values.push(crate::columns::fmt_pct(crate::columns::usage_pct(
-                    cpu, alloc_cpu,
-                )));
-                values.push(crate::columns::fmt_pct(crate::columns::usage_pct(
-                    mem, alloc_mem,
-                )));
-            }
+            values.extend(self.metric_cells(obj));
         }
         self.display_headers()
             .iter()

@@ -50,7 +50,6 @@ impl App {
         let headers: Vec<String> = self.display_headers().to_vec();
         let show_ns = self.show_namespace_column();
         let metrics_cols = self.metrics_columns();
-        let pods_view = self.kind_plural == "pods";
 
         let objs = self.rows();
         self.ensure_table_cell_cache(&objs);
@@ -80,30 +79,7 @@ impl App {
                     cells.push(self.node_pods_cell(obj));
                 }
                 if metrics_cols {
-                    let name = obj.metadata.name.as_deref().unwrap_or_default();
-                    let key = if pods_view {
-                        format!(
-                            "{}/{}",
-                            obj.metadata.namespace.as_deref().unwrap_or_default(),
-                            name
-                        )
-                    } else {
-                        name.to_string()
-                    };
-                    let (cpu, mem) = self.metrics.get(&key).copied().unwrap_or((0, 0));
-                    cells.push(crate::columns::fmt_cpu(cpu));
-                    cells.push(crate::columns::fmt_mem(mem));
-                    // Nodes also carry %CPU/%MEM headers — the capture must
-                    // stay one cell per column.
-                    if self.node_capacity_columns() {
-                        let (alloc_cpu, alloc_mem) = crate::columns::node_allocatable(obj);
-                        cells.push(crate::columns::fmt_pct(crate::columns::usage_pct(
-                            cpu, alloc_cpu,
-                        )));
-                        cells.push(crate::columns::fmt_pct(crate::columns::usage_pct(
-                            mem, alloc_mem,
-                        )));
-                    }
+                    cells.extend(self.metric_cells(obj));
                 }
                 cells
             })

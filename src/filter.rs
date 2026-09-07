@@ -101,6 +101,12 @@ pub enum CmpValue {
 }
 
 impl ParsedFilter {
+    pub fn uses_metrics(&self) -> bool {
+        matches!(self, Self::Structured(s) if s.terms.iter().any(|term| {
+            matches!(term, Term::Cmp(Cmp { value: CmpValue::Cpu(_) | CmpValue::Mem(_), .. }))
+        }))
+    }
+
     pub fn labels(&self) -> Option<&str> {
         match self {
             ParsedFilter::Fuzzy(_) => None,
