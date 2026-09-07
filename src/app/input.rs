@@ -16,6 +16,7 @@ impl App {
         };
         let run = self.plugin_run;
         let result = self.handle_key_inner(key);
+        self.check_describe_refresh();
         let overlay = matches!(
             self.mode,
             Mode::Command
@@ -28,6 +29,9 @@ impl App {
                 | Mode::SortPicker
                 | Mode::CopyPicker
         );
+        if before == Mode::Detail && self.mode != Mode::Detail && !overlay {
+            self.describe_source = None;
+        }
         if self.should_quit || (self.plugin_run == run && self.mode != before && !overlay) {
             self.stop_plugins();
         }
@@ -226,6 +230,7 @@ impl App {
                     // Dropping the filter also drops its server-side
                     // selectors, so the watch must widen back out.
                     self.sync_filter_selectors();
+                    self.save_history_filter();
                 } else if !self.pop_frame() {
                     // at root, nothing to pop
                 }
@@ -315,6 +320,7 @@ impl App {
             }
             // k9s: 0 = all namespaces.
             KeyCode::Char('0') => {
+                self.save_history_filter();
                 self.namespace.clear();
                 self.drop_owner_scope();
                 self.remember_namespace();
@@ -430,6 +436,26 @@ impl App {
         self.cancel_gitops_request();
         self.help_return = Mode::Table;
         self.palette_return = Mode::Table;
+        let query_head = typed.split_whitespace().next().unwrap_or("");
+        let owns_command = PALETTE_COMMANDS
+            .iter()
+            .any(|c| c.names.contains(&query_head))
+            || self
+                .plugins
+                .iter()
+                .any(|p| p.palette.as_deref() == Some(query_head));
+        if (self.cluster.resolve(query_head).is_some() || !owns_command)
+            && (typed.contains(" /")
+                || typed
+                    .split_whitespace()
+                    .any(|s| matches!(s, "-n" | "--namespace" | "--context")))
+        {
+            match crate::filter::ResourceQuery::parse(&typed) {
+                Ok(query) => self.apply_resource_query(query),
+                Err(error) => self.flash_warn(&format!("query: {error}")),
+            }
+            return;
+        }
         // `:kind namespace` switches both at once (`:deploy social`,
         // `:cephclusters all`); only the first word selects the kind.
         let (head, ns_arg) = match typed.split_once(char::is_whitespace) {
@@ -900,13 +926,15 @@ impl App {
                 self.filter.clear();
                 self.mode = Mode::Table;
                 self.sync_filter_selectors();
+                self.save_history_filter();
             }
             KeyCode::Enter => {
-                self.mode = Mode::Table;
                 if let Some(err) = self.filter_error() {
                     self.flash_warn(&format!("filter: {err}"));
                 } else {
+                    self.mode = Mode::Table;
                     self.sync_filter_selectors();
+                    self.save_history_filter();
                 }
             }
             KeyCode::Backspace => {
@@ -940,6 +968,8 @@ impl App {
                 } else if self.mode == Mode::Events {
                     self.stop_event_stream();
                 }
+                self.stop_describe_refresh();
+                self.describe_source = None;
                 self.mode = self.return_mode;
                 if self.return_mode == Mode::Table {
                     self.restore_selection();
@@ -956,6 +986,7 @@ impl App {
             // when no search is active.
             KeyCode::Char('n') if detail => target.step_match(true),
             KeyCode::Char('N') if detail => target.step_match(false),
+            KeyCode::Char('r') if self.mode == Mode::Detail => self.toggle_describe_refresh(),
             // Copy the document to the clipboard (k9s `c`), same as the logs
             // view: an active search copies only the matching lines.
             KeyCode::Char('c') if detail => {

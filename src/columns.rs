@@ -4,6 +4,10 @@
 //! hand-written renderer per resource, known kinds get curated columns and
 //! everything else falls back to NAME/AGE pulled from metadata.
 
+#[path = "columns_metrics.rs"]
+mod metrics;
+pub use metrics::MetricColumn;
+
 use std::borrow::Cow;
 use std::cell::OnceCell;
 
@@ -401,6 +405,9 @@ pub struct ViewSpec {
 struct SpecColumn {
     header: String,
     source: SpecSource,
+    original_header: String,
+    width: Option<u16>,
+    align: Option<crate::views::Align>,
     is_status: bool,
     wide: bool,
 }
@@ -414,6 +421,9 @@ fn spec_curated(c: &Column) -> SpecColumn {
     SpecColumn {
         header: c.header.to_string(),
         source: SpecSource::Curated(c.extract),
+        original_header: c.header.into(),
+        width: None,
+        align: None,
         is_status: c.is_status,
         wide: c.wide,
     }
@@ -428,7 +438,27 @@ fn spec_user(uc: &crate::views::UserColumn) -> SpecColumn {
         ),
         wide: uc.wide,
         source: SpecSource::User(uc.clone()),
+        original_header: uc.header.clone(),
+        width: uc.width,
+        align: uc.align,
     }
+}
+
+fn column_supported(group: &str, plural: &str, column: &crate::views::UserColumn) -> bool {
+    match column.kind {
+        crate::views::ColumnKind::Metric(metric) => metric.supported(group, plural),
+        crate::views::ColumnKind::Builtin => columns_for(group, plural)
+            .iter()
+            .any(|c| c.header == column.pointer),
+        _ => true,
+    }
+}
+
+pub fn view_warnings(group: &str, plural: &str, user: Option<&crate::views::View>) -> Vec<String> {
+    user.into_iter().flat_map(|v| &v.columns)
+        .filter(|c| !column_supported(group, plural, c))
+        .map(|c| format!("view {group}/{plural}: column {} is not available for this resource; column skipped", c.header))
+        .collect()
 }
 
 /// Resolve the columns for a view. `user` is the explicit view configured for
@@ -458,12 +488,41 @@ pub fn build_spec(
             }
         }
     };
+    let explicit_layout = view.is_some_and(|v| {
+        v.columns.iter().any(|c| {
+            column_supported(group, plural, c)
+                && matches!(
+                    c.kind,
+                    crate::views::ColumnKind::Metric(_) | crate::views::ColumnKind::Builtin
+                )
+        })
+    });
+    let user_column = |uc: &crate::views::UserColumn| {
+        if !column_supported(group, plural, uc) {
+            return None;
+        }
+        if uc.kind == crate::views::ColumnKind::Builtin {
+            let c = columns_for(group, plural)
+                .iter()
+                .find(|c| c.header == uc.pointer)?;
+            let mut sc = spec_curated(c);
+            sc.header = uc.header.clone();
+            sc.wide = uc.wide;
+            sc.width = uc.width;
+            sc.align = uc.align;
+            Some(sc)
+        } else {
+            Some(spec_user(uc))
+        }
+    };
     if let Some(v) = view {
-        if v.replace && !v.columns.is_empty() {
-            cols = v.columns.iter().map(spec_user).collect();
+        if v.replace && v.columns.iter().any(|c| column_supported(group, plural, c)) {
+            cols = v.columns.iter().filter_map(user_column).collect();
         } else {
             for uc in &v.columns {
-                let sc = spec_user(uc);
+                let Some(sc) = user_column(uc) else {
+                    continue;
+                };
                 match cols.iter().position(|c| c.header == sc.header) {
                     // A matching header replaces the curated column in place.
                     Some(i) => cols[i] = sc,
@@ -480,6 +539,36 @@ pub fn build_spec(
             }
         }
     }
+    if (!explicit_layout || !view.is_some_and(|v| v.replace))
+        && group.is_empty()
+        && matches!(plural, "pods" | "nodes")
+    {
+        let mut defaults = Vec::new();
+        if plural == "nodes" {
+            defaults.push(("PODS", MetricColumn::NodePods));
+        }
+        defaults.extend([("CPU", MetricColumn::Cpu), ("MEM", MetricColumn::Memory)]);
+        if plural == "nodes" {
+            defaults.extend([
+                ("%CPU", MetricColumn::NodeCpuUtilization),
+                ("%MEM", MetricColumn::NodeMemoryUtilization),
+            ]);
+        }
+        for (header, metric) in defaults {
+            if cols.iter().any(|c| c.header == header || matches!(&c.source, SpecSource::User(uc) if uc.kind == crate::views::ColumnKind::Metric(metric))) {
+                continue;
+            }
+            cols.push(spec_user(&crate::views::UserColumn {
+                header: header.into(),
+                pointer: String::new(),
+                kind: crate::views::ColumnKind::Metric(metric),
+                wide: false,
+                width: None,
+                align: None,
+                condition_field: None,
+            }));
+        }
+    }
     cols.retain(|c| wide || !c.wide);
     let status_idx = cols.iter().position(|c| c.is_status);
     ViewSpec {
@@ -491,6 +580,27 @@ pub fn build_spec(
 }
 
 impl ViewSpec {
+    pub fn metric_at(&self, idx: usize) -> Option<MetricColumn> {
+        match &self.columns.get(idx)?.source {
+            SpecSource::User(uc) => match uc.kind {
+                crate::views::ColumnKind::Metric(metric) => Some(metric),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    pub fn metric(&self, header: &str) -> Option<MetricColumn> {
+        self.metric_at(self.header_index(header)?)
+    }
+
+    pub fn canonical_header(&self, idx: usize) -> Option<&str> {
+        if self.metric_at(idx).is_some() {
+            return None;
+        }
+        Some(&self.columns.get(idx)?.original_header)
+    }
+
     pub fn headers(&self) -> Vec<String> {
         self.columns.iter().map(|c| c.header.clone()).collect()
     }
@@ -540,7 +650,7 @@ impl ViewSpec {
                 Some(crate::views::render_cell(obj, uc, now))
             }
             SpecSource::User(_) => None,
-            SpecSource::Curated(_) => volatile_cell(obj, plural, &col.header, now),
+            SpecSource::Curated(_) => volatile_cell(obj, plural, &col.original_header, now),
         }
     }
 
@@ -555,7 +665,7 @@ impl ViewSpec {
     ) -> Option<String> {
         let col = self.columns.get(idx)?;
         if matches!(plural, "helm" | "helmhistory")
-            && col.header == "UPDATED"
+            && col.original_header == "UPDATED"
             && matches!(col.source, SpecSource::Curated(_))
         {
             Some(helm_updated(helm_time, now))
@@ -572,10 +682,9 @@ impl ViewSpec {
             .position(|c| c.header.eq_ignore_ascii_case(header))
     }
 
-    /// The single cell at `idx` for one object. Filter comparisons read one
-    /// column of every object — extracting the full row per object per
-    /// rebuild is what this avoids. Curated JSON/name cells borrow from
-    /// `obj`; user columns and computed curated cells remain owned.
+    /// The single cell at `idx` for one object, without rendering the rest
+    /// of the row. Curated JSON/name cells borrow from `obj`; user columns
+    /// and computed curated cells remain owned.
     pub fn cell_at<'a>(
         &self,
         obj: &'a DynamicObject,
@@ -614,7 +723,7 @@ impl ViewSpec {
             SpecSource::Curated(extract) => {
                 let ctx = CellContext::new(obj, now);
                 let v = extract(&ctx);
-                if is_numeric_header(&self.group, &self.plural, header) {
+                if is_numeric_header(&self.group, &self.plural, &col.original_header) {
                     crate::views::SortValue::Num(parse_leading_num(&v))
                 } else {
                     crate::views::SortValue::Text(v.to_lowercase().to_string())
@@ -626,18 +735,12 @@ impl ViewSpec {
     /// Configured fixed width for the column at `idx`, when it's a user
     /// column that set one.
     pub fn width_at(&self, idx: usize) -> Option<u16> {
-        match &self.columns.get(idx)?.source {
-            SpecSource::User(uc) => uc.width,
-            SpecSource::Curated(_) => None,
-        }
+        self.columns.get(idx)?.width
     }
 
     /// Configured alignment for the column at `idx`.
     pub fn align_at(&self, idx: usize) -> Option<crate::views::Align> {
-        match &self.columns.get(idx)?.source {
-            SpecSource::User(uc) => uc.align,
-            SpecSource::Curated(_) => None,
-        }
+        self.columns.get(idx)?.align
     }
 }
 
@@ -3090,7 +3193,9 @@ mod tests {
         let spec = build_spec("", "pods", Some(&v), None, false);
         assert_eq!(
             spec.headers(),
-            vec!["NAME", "READY", "STATUS", "RESTARTS", "NODE-IP", "AGE"]
+            vec![
+                "NAME", "READY", "STATUS", "RESTARTS", "NODE-IP", "AGE", "CPU", "MEM"
+            ]
         );
         let o = obj(json!({
             "apiVersion": "v1", "kind": "Pod",
@@ -3114,7 +3219,7 @@ mod tests {
             true,
         );
         let spec = build_spec("", "pods", Some(&v), None, true);
-        assert_eq!(spec.headers(), vec!["NAME", "PHASE"]);
+        assert_eq!(spec.headers(), vec!["NAME", "PHASE", "CPU", "MEM"]);
     }
 
     #[test]
@@ -3122,12 +3227,14 @@ mod tests {
         let narrow = build_spec("", "pods", None, None, false);
         assert_eq!(
             narrow.headers(),
-            vec!["NAME", "READY", "STATUS", "RESTARTS", "AGE"]
+            vec!["NAME", "READY", "STATUS", "RESTARTS", "AGE", "CPU", "MEM"]
         );
         let wide = build_spec("", "pods", None, None, true);
         assert_eq!(
             wide.headers(),
-            vec!["NAME", "READY", "STATUS", "RESTARTS", "IP", "NODE", "AGE"]
+            vec![
+                "NAME", "READY", "STATUS", "RESTARTS", "IP", "NODE", "AGE", "CPU", "MEM"
+            ]
         );
     }
 
@@ -3145,7 +3252,7 @@ mod tests {
         let spec = build_spec("", "pods", None, Some(&crd), false);
         assert_eq!(
             spec.headers(),
-            vec!["NAME", "READY", "STATUS", "RESTARTS", "AGE"]
+            vec!["NAME", "READY", "STATUS", "RESTARTS", "AGE", "CPU", "MEM"]
         );
         // Explicit user view outranks printer columns.
         let user = view(

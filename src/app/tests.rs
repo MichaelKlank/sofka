@@ -392,7 +392,7 @@ fn mock_cluster(url: &str) -> Cluster {
     // this test is about the app's fallback, not the client's retries.
     config.default_retry = false;
     let mut cluster = Cluster::fake();
-    cluster.client = crate::k8s::build_client(config).expect("mock client");
+    cluster.client = crate::k8s::build_client(config, false).expect("mock client");
     cluster.cluster_url = url.into();
     cluster
 }
@@ -777,6 +777,49 @@ fn helm_release_secret_deployed_at(
         },
         "data": { "release": wire_b64 },
     })
+}
+
+#[tokio::test]
+async fn discovered_short_names_select_resources_in_the_palette() {
+    for aggregated in [true, false] {
+        let url = crate::k8s::tests::mock_apiserver(aggregated, aggregated, true).await;
+        let cluster = crate::k8s::tests::connect_mock(url).await.unwrap();
+        let (tx, _rx) = mpsc::channel(1024);
+        let mut app = App::new(cluster, tx);
+        for (alias, plural) in [
+            ("md", "machinedeployments"),
+            ("zz", "widgets"),
+            ("gd", "gadgets"),
+            ("po", "pods"),
+            ("pods", "pods"),
+            ("shared", "gadgets"),
+            ("cross", "machinedeployments"),
+            ("native", "pods"),
+            ("MD", "machinedeployments"),
+        ] {
+            for ch in format!(":{alias}").chars() {
+                app.handle_key(press(KeyCode::Char(ch))).unwrap();
+            }
+            assert_eq!(
+                app.cluster
+                    .resolve(&app.cmd_suggestions[0].label)
+                    .unwrap()
+                    .ar
+                    .plural,
+                plural,
+                "alias {alias}, aggregated={aggregated}"
+            );
+            app.handle_key(press(KeyCode::Enter)).unwrap();
+            assert_eq!(app.kind_plural, plural);
+        }
+        app.cluster
+            .add_aliases(&HashMap::from([("md".into(), "widgets".into())]));
+        for ch in ":md".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.kind_plural, "widgets");
+    }
 }
 
 #[tokio::test]
@@ -5740,6 +5783,63 @@ async fn crd_plural_outranks_builtin_command() {
 }
 
 #[tokio::test]
+async fn palette_completion_accepts_minus_chords() {
+    let (mut app, _rx) = test_app();
+    let config: crate::config::Config = toml::from_str(
+        r#"
+        [keys]
+        palette_next = "ctrl--"
+        palette_prev = "alt--"
+        "#,
+    )
+    .unwrap();
+    let (palette_keys, warnings) = crate::config::compile_palette_keys(&config.keys);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    app.palette_keys = palette_keys;
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    assert_eq!(app.mode, Mode::Command);
+    assert!(app.cmd_suggestions.len() > 1);
+    assert_eq!(app.cmd_sel, 0);
+    app.handle_key(ctrl(KeyCode::Char('-'))).unwrap();
+    assert_eq!(app.cmd_sel, 1);
+    app.handle_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::ALT))
+        .unwrap();
+    assert_eq!(app.cmd_sel, 0);
+    assert!(app.command.is_empty());
+}
+
+#[tokio::test]
+async fn palette_shifted_minus_uses_the_resulting_character() {
+    for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+        let (mut app, _rx) = test_app();
+        let config: crate::config::Config = toml::from_str(
+            r#"
+            [keys]
+            palette_next = ["shift--", "_"]
+            "#,
+        )
+        .unwrap();
+        let (palette_keys, warnings) = crate::config::compile_palette_keys(&config.keys);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("bind the resulting character"));
+        app.palette_keys = palette_keys;
+
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        app.handle_key(press(KeyCode::Char('-'))).unwrap();
+        assert_eq!(app.command, "-");
+        app.handle_key(ctrl(KeyCode::Char('u'))).unwrap();
+        assert!(app.command.is_empty());
+        assert!(app.cmd_suggestions.len() > 1);
+        assert_eq!(app.cmd_sel, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('_'), modifiers))
+            .unwrap();
+        assert_eq!(app.cmd_sel, 1);
+        assert!(app.command.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn palette_completion_keys_are_rebindable() {
     let (mut app, _rx) = test_app();
     let keys_cfg: crate::config::Config = toml::from_str(
@@ -6480,6 +6580,540 @@ async fn sort_choice_is_remembered_per_kind_across_view_switches() {
     app.switch_kind("deployments");
     app.switch_kind("pods");
     assert_eq!(app.sort_column, None);
+}
+
+#[tokio::test]
+async fn wildcard_sort_is_the_fallback_for_resource_views() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."*"]
+        sort = "AGE:desc"
+        [views.pods]
+        [views.services]
+        sort = "NAME:asc"
+        "#,
+    );
+    for (resource, header, desc) in [
+        ("pods", "AGE", true),
+        ("deployments", "AGE", true),
+        ("services", "NAME", false),
+    ] {
+        palette(&mut app, resource);
+        assert_eq!(app.kind_plural, resource);
+        assert_eq!(
+            app.sort_column,
+            app.display_headers().iter().position(|h| h == header)
+        );
+        assert!(app.sort_column.is_some());
+        assert_eq!(app.sort_desc, desc);
+    }
+
+    palette(&mut app, "pods");
+    app.handle_key(press(KeyCode::Char('I'))).unwrap();
+    palette(&mut app, "services");
+    palette(&mut app, "pods");
+    assert!(!app.sort_desc, "saved choice has priority over the default");
+}
+
+#[tokio::test]
+async fn wildcard_sort_skips_missing_columns() {
+    let (mut app, _rx) = test_app();
+    install_views(&mut app, "[views.\"*\"]\nsort = \"RESTARTS:desc\"\n");
+    palette(&mut app, "services");
+    assert_eq!(app.sort_column, None);
+    assert!(!app.flash_err);
+    palette(&mut app, "pods");
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "RESTARTS")
+    );
+    assert!(app.sort_column.is_some());
+    assert!(app.sort_desc);
+}
+
+#[tokio::test]
+async fn wildcard_sort_applies_when_wide_columns_appear() {
+    for remember in [true, false] {
+        let (mut app, _rx) = test_app();
+        app.remember_sort = remember;
+        install_views(&mut app, "[views.\"*\"]\nsort = \"IP:desc\"\n");
+        palette(&mut app, "pods");
+        assert_eq!(app.sort_column, None);
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        assert_eq!(
+            app.sort_column,
+            app.display_headers().iter().position(|h| h == "IP")
+        );
+        assert!(app.sort_column.is_some());
+        assert!(app.sort_desc);
+
+        app.handle_key(press(KeyCode::Char('I'))).unwrap();
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        assert_eq!(app.sort_column, None);
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        assert!(!app.sort_desc);
+    }
+}
+
+#[tokio::test]
+async fn temporary_wide_sort_keeps_its_column_and_direction_until_cleared_or_navigation() {
+    for remember in [true, false] {
+        for desc in [true, false] {
+            let (mut app, _rx) = test_app();
+            app.remember_sort = remember;
+            app.sort_memory.set("pods", "NAME", false);
+            install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+            palette(&mut app, "pods");
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            select_sort_with_keys(&mut app, "IP");
+            if desc {
+                app.handle_key(press(KeyCode::Char('I'))).unwrap();
+            }
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            assert_eq!(app.sort_column, None);
+            assert!(!app.sort_desc);
+            assert_eq!(
+                app.sort_origin,
+                SortOrigin::Selected {
+                    header: "IP".into(),
+                    desc
+                }
+            );
+            app.handle_key(ctrl(KeyCode::Char('r'))).unwrap();
+            assert_eq!(app.sort_column, None);
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            assert_eq!(
+                app.sort_column,
+                app.display_headers().iter().position(|h| h == "IP")
+            );
+            assert_eq!(app.sort_desc, desc);
+            assert_eq!(
+                app.sort_memory.get("pods"),
+                Some(if remember {
+                    ("IP".into(), desc)
+                } else {
+                    ("NAME".into(), false)
+                })
+            );
+
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            clear_sort_with_keys(&mut app);
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            assert_eq!(app.sort_column, None);
+            assert_eq!(app.sort_origin, SortOrigin::Cleared);
+            palette(&mut app, "services");
+            palette(&mut app, "pods");
+            assert_eq!(
+                app.sort_column,
+                app.display_headers().iter().position(|h| h == "AGE")
+            );
+            assert!(app.sort_desc);
+        }
+    }
+}
+
+fn select_sort_with_keys(app: &mut App, header: &str) {
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    for c in header.chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == header)
+    );
+    assert!(app.sort_column.is_some());
+}
+
+#[tokio::test]
+async fn new_sort_selection_replaces_a_hidden_temporary_sort() {
+    let (mut app, _rx) = test_app();
+    app.remember_sort = false;
+    install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+    palette(&mut app, "pods");
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    select_sort_with_keys(&mut app, "IP");
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.sort_column, None);
+    select_sort_with_keys(&mut app, "NAME");
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.sort_column, Some(0));
+    assert!(!app.sort_desc);
+    assert_eq!(app.sort_memory.get("pods"), None);
+}
+
+#[tokio::test]
+async fn bookmark_sort_waits_for_a_hidden_column_without_using_sort_memory() {
+    for remember in [true, false] {
+        let (mut app, _rx) = test_app();
+        app.remember_sort = remember;
+        app.sort_memory.set("pods", "NAME", false);
+        install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+        app.bookmarks = vec![crate::config::Bookmark {
+            key: Some("ctrl-y".into()),
+            name: "pods by IP".into(),
+            resource: "pods".into(),
+            sort: Some("IP:desc".into()),
+            ..Default::default()
+        }];
+        app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+        assert_eq!(app.sort_column, None);
+        app.handle_key(ctrl(KeyCode::Char('r'))).unwrap();
+        assert_eq!(app.sort_column, None);
+        for _ in 0..2 {
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            assert_eq!(
+                app.sort_column,
+                app.display_headers().iter().position(|h| h == "IP")
+            );
+            assert!(app.sort_column.is_some());
+            assert!(app.sort_desc);
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            assert_eq!(app.sort_column, None);
+        }
+        assert_eq!(app.sort_memory.get("pods"), Some(("NAME".into(), false)));
+    }
+}
+
+#[tokio::test]
+async fn temporary_printer_sort_waits_when_its_column_is_removed_then_restored() {
+    let (mut app, _rx) = test_app();
+    app.remember_sort = false;
+    app.sort_memory.set("certificates", "NAME", false);
+    install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+    palette(&mut app, "certificates");
+    deliver_ready_printer_column(&mut app);
+    select_sort_with_keys(&mut app, "READY");
+    app.handle_key(press(KeyCode::Char('I'))).unwrap();
+    app.handle_msg(Msg::PrinterColumns {
+        generation: app.generation,
+        resource: app.cluster.resolve("certificates").unwrap().resource_key(),
+        view: Box::new(None),
+    });
+    assert_eq!(app.sort_column, None);
+    deliver_ready_printer_column(&mut app);
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "READY")
+    );
+    assert!(app.sort_desc);
+    assert_eq!(
+        app.sort_memory.get("certificates"),
+        Some(("NAME".into(), false))
+    );
+}
+
+#[tokio::test]
+async fn wildcard_sort_applies_when_printer_columns_arrive_without_replacing_user_sort() {
+    for choose_name in [false, true] {
+        let (mut app, _rx) = test_app();
+        app.remember_sort = false;
+        install_views(&mut app, "[views.\"*\"]\nsort = \"READY:desc\"\n");
+        palette(&mut app, "certificates");
+        assert_eq!(app.sort_column, None);
+        if choose_name {
+            app.handle_key(press(KeyCode::Char('S'))).unwrap();
+            for c in "name".chars() {
+                app.handle_key(press(KeyCode::Char(c))).unwrap();
+            }
+            app.handle_key(press(KeyCode::Enter)).unwrap();
+        }
+        let crd = json!({"spec": {"versions": [{
+            "name": "v1", "served": true, "storage": true,
+            "additionalPrinterColumns": [
+                {"name": "Ready", "type": "string", "jsonPath": ".status.ready"}
+            ]
+        }]}});
+        app.handle_msg(Msg::PrinterColumns {
+            generation: app.generation,
+            resource: app.cluster.resolve("certificates").unwrap().resource_key(),
+            view: Box::new(crate::views::printer_columns_view(&crd, "v1")),
+        });
+        let header = if choose_name { "NAME" } else { "READY" };
+        assert_eq!(
+            app.sort_column,
+            app.display_headers().iter().position(|h| h == header)
+        );
+        assert!(app.sort_column.is_some());
+        assert_eq!(app.sort_desc, !choose_name);
+    }
+}
+
+#[tokio::test]
+async fn saved_printer_sort_replaces_config_default_but_not_a_new_user_choice() {
+    for (remember, invert) in [(true, false), (true, true), (false, false), (false, true)] {
+        let (mut app, _rx) = test_app();
+        app.remember_sort = remember;
+        app.sort_memory.set("certificates", "READY", false);
+        install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+        palette(&mut app, "certificates");
+        assert_eq!(app.sort_column, Some(1));
+        assert_eq!(app.sort_origin, SortOrigin::Configured);
+        if invert {
+            app.handle_key(press(KeyCode::Char('I'))).unwrap();
+            assert!(matches!(app.sort_origin, SortOrigin::Selected { .. }));
+        }
+        let crd = json!({"spec": {"versions": [{
+            "name": "v1", "served": true, "storage": true,
+            "additionalPrinterColumns": [
+                {"name": "Ready", "type": "string", "jsonPath": ".status.ready"}
+            ]
+        }]}});
+        app.handle_msg(Msg::PrinterColumns {
+            generation: app.generation,
+            resource: app.cluster.resolve("certificates").unwrap().resource_key(),
+            view: Box::new(crate::views::printer_columns_view(&crd, "v1")),
+        });
+        let header = if remember && !invert { "READY" } else { "AGE" };
+        assert_eq!(
+            app.sort_column,
+            app.display_headers().iter().position(|h| h == header)
+        );
+        assert_eq!(app.sort_desc, !remember && !invert);
+    }
+}
+
+#[tokio::test]
+async fn saved_wide_sort_replaces_config_default_when_its_column_appears() {
+    let (mut app, _rx) = test_app();
+    app.sort_memory.set("pods", "IP", false);
+    install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+    palette(&mut app, "pods");
+    assert_eq!(app.sort_origin, SortOrigin::Configured);
+    assert!(app.sort_desc);
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "IP")
+    );
+    assert!(app.sort_column.is_some());
+    assert!(matches!(app.sort_origin, SortOrigin::Selected { .. }));
+    assert!(!app.sort_desc);
+}
+
+#[tokio::test]
+async fn cleared_sort_survives_column_changes_and_watch_refresh_until_navigation() {
+    for remember in [true, false] {
+        for view_key in ["*", "certificates"] {
+            for header in ["AGE", "READY"] {
+                let (mut app, _rx) = test_app();
+                app.remember_sort = remember;
+                app.sort_memory.set("certificates", "READY", false);
+                install_views(
+                    &mut app,
+                    &format!("[views.\"{view_key}\"]\nsort = \"{header}:desc\"\n"),
+                );
+                palette(&mut app, "certificates");
+                clear_sort_with_keys(&mut app);
+                deliver_ready_printer_column(&mut app);
+                assert_eq!(app.sort_column, None);
+                assert!(!app.sort_desc);
+                for key in [
+                    press(KeyCode::Char('w')),
+                    press(KeyCode::Char('w')),
+                    ctrl(KeyCode::Char('r')),
+                ] {
+                    app.handle_key(key).unwrap();
+                    assert_eq!(app.sort_column, None);
+                    assert_eq!(app.sort_origin, SortOrigin::Cleared);
+                }
+                assert_eq!(
+                    app.sort_memory.get("certificates"),
+                    (!remember).then(|| ("READY".into(), false))
+                );
+
+                palette(&mut app, "services");
+                palette(&mut app, "certificates");
+                assert_eq!(
+                    app.sort_column,
+                    app.display_headers().iter().position(|h| h == header)
+                );
+                assert!(app.sort_column.is_some());
+                assert!(app.sort_desc);
+            }
+        }
+    }
+}
+
+fn clear_sort_with_keys(app: &mut App) {
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    while app.sort_picker_state.selected().unwrap() > 0 {
+        app.handle_key(press(KeyCode::Up)).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.sort_column, None);
+}
+
+fn deliver_ready_printer_column(app: &mut App) {
+    let crd = json!({"spec": {"versions": [{
+        "name": "v1", "served": true, "storage": true,
+        "additionalPrinterColumns": [
+            {"name": "Ready", "type": "string", "jsonPath": ".status.ready"}
+        ]
+    }]}});
+    app.handle_msg(Msg::PrinterColumns {
+        generation: app.generation,
+        resource: app.cluster.resolve("certificates").unwrap().resource_key(),
+        view: Box::new(crate::views::printer_columns_view(&crd, "v1")),
+    });
+}
+
+#[tokio::test]
+async fn enabling_sort_memory_does_not_replace_a_cleared_sort_in_the_active_view() {
+    let dir = std::env::temp_dir().join(format!("sofka-sort-clear-reload-{}", std::process::id()));
+    write_config(&dir, "remember_sort = false\n");
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+    app.sort_memory.set("certificates", "READY", false);
+    palette(&mut app, "reload");
+    palette(&mut app, "certificates");
+    clear_sort_with_keys(&mut app);
+    write_config(&dir, "remember_sort = true\n");
+    palette(&mut app, "reload");
+    assert!(app.remember_sort);
+    deliver_ready_printer_column(&mut app);
+    assert_eq!(app.sort_column, None);
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.sort_column, None);
+    palette(&mut app, "services");
+    palette(&mut app, "certificates");
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "READY")
+    );
+    assert!(!app.sort_desc);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn bookmark_sort_keeps_priority_over_delayed_saved_and_configured_sorts() {
+    for remember in [true, false] {
+        let (mut app, _rx) = test_app();
+        app.remember_sort = remember;
+        install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+        app.sort_memory.set("certificates", "READY", false);
+        palette(&mut app, "certificates");
+        clear_sort_with_keys(&mut app);
+        app.sort_memory.set("certificates", "READY", false);
+        app.bookmarks = vec![crate::config::Bookmark {
+            key: Some("ctrl-y".into()),
+            name: "sorted certificates".into(),
+            resource: "certificates".into(),
+            sort: Some("NAME:desc".into()),
+            ..Default::default()
+        }];
+        app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+        deliver_ready_printer_column(&mut app);
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        assert_eq!(app.sort_column, Some(0));
+        assert!(app.sort_desc);
+        assert!(matches!(app.sort_origin, SortOrigin::Selected { .. }));
+        assert_eq!(
+            app.sort_memory.get("certificates"),
+            Some(("READY".into(), false))
+        );
+    }
+}
+
+#[tokio::test]
+async fn sort_can_be_selected_again_after_clearing_with_memory_disabled() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    for mouse in [true, false] {
+        let (mut app, _rx) = test_app();
+        app.remember_sort = false;
+        install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+        app.sort_memory.set("certificates", "READY", false);
+        palette(&mut app, "certificates");
+        clear_sort_with_keys(&mut app);
+        if mouse {
+            let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
+            term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let hit = app.table_hit.borrow().clone().unwrap();
+            let (column, _, _) = hit.cols.iter().find(|(_, _, idx)| *idx == 0).unwrap();
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: *column,
+                row: hit.header_y,
+                modifiers: KeyModifiers::NONE,
+            })
+            .unwrap();
+        } else {
+            app.handle_key(press(KeyCode::Char('S'))).unwrap();
+            for c in "name".chars() {
+                app.handle_key(press(KeyCode::Char(c))).unwrap();
+            }
+            app.handle_key(press(KeyCode::Enter)).unwrap();
+        }
+        app.handle_key(press(KeyCode::Char('I'))).unwrap();
+        deliver_ready_printer_column(&mut app);
+        assert_eq!(app.sort_column, Some(0));
+        assert!(app.sort_desc);
+        assert!(matches!(app.sort_origin, SortOrigin::Selected { .. }));
+        assert_eq!(
+            app.sort_memory.get("certificates"),
+            Some(("READY".into(), false))
+        );
+    }
+}
+
+#[tokio::test]
+async fn disabled_sort_memory_keeps_changes_local_and_preserves_saved_state() {
+    let dir = std::env::temp_dir().join(format!("sofka-sort-option-{}", std::process::id()));
+    write_config(&dir, "remember_sort = false\n");
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+    let path = dir.join("sort.toml");
+    app.sort_memory.set("pods", "NAME", false);
+    app.sort_memory.save(&path).unwrap();
+    app.sort_memory_path = Some(path.clone());
+    let saved = std::fs::read(&path).unwrap();
+
+    palette(&mut app, "reload");
+    assert!(!app.remember_sort);
+    palette(&mut app, "pods");
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "AGE")
+    );
+    assert!(app.sort_desc);
+    app.handle_key(press(KeyCode::Char('I'))).unwrap();
+    assert!(!app.sort_desc);
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    for c in "rst".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "RESTARTS")
+    );
+    palette(&mut app, "services");
+    palette(&mut app, "pods");
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "AGE")
+    );
+    assert!(app.sort_desc);
+    assert_eq!(app.sort_memory.get("pods"), Some(("NAME".into(), false)));
+    assert_eq!(std::fs::read(&path).unwrap(), saved);
+
+    write_config(&dir, "");
+    palette(&mut app, "reload");
+    assert!(app.remember_sort, "sort memory is enabled by default");
+    palette(&mut app, "services");
+    palette(&mut app, "pods");
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "NAME")
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[tokio::test]
@@ -10531,6 +11165,649 @@ fn row_names(app: &App) -> Vec<String> {
         .collect()
 }
 
+fn type_resource_query(app: &mut App, query: &str) {
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in query.chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+}
+
+fn selector_api(streaming: bool) -> (Cluster, mpsc::UnboundedReceiver<http::Uri>) {
+    use futures_util::stream;
+    use hyper::body::{Bytes, Frame};
+    use std::convert::Infallible;
+
+    let (seen, requests) = mpsc::unbounded_channel();
+    let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+        let uri = request.uri().clone();
+        seen.send(uri.clone()).ok();
+        async move {
+            let query: HashMap<_, _> = form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
+                .into_owned()
+                .collect();
+            let initial = query.contains_key("sendInitialEvents");
+            let watch = query.get("watch").is_some_and(|s| s == "true");
+            let table = uri.path().starts_with("/api/v1/") && uri.path().ends_with("/pods");
+            let invalid_field = query
+                .get("fieldSelector")
+                .is_some_and(|s| s.contains("spec.unsupported"));
+            let status = if !table {
+                404
+            } else if invalid_field || (initial && !streaming) {
+                400
+            } else {
+                200
+            };
+            let body = if status != 200 {
+                json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"BadRequest","code":status,
+                    "message": if invalid_field { "field label not supported: spec.unsupported" } else { "sendInitialEvents is not supported" }}).to_string()
+            } else {
+                let namespace = uri
+                    .path()
+                    .split("/namespaces/")
+                    .nth(1)
+                    .and_then(|s| s.split('/').next())
+                    .unwrap_or("prod");
+                let api = json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"api","namespace":namespace,"resourceVersion":"10","labels":{"app":"api","env":"prod"}},"spec":{"nodeName":"node-3"},"status":{"phase":"Running"}});
+                let unrelated = json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"other","namespace":namespace,"resourceVersion":"10"},"spec":{"nodeName":"node-4"}});
+                let items =
+                    if query.contains_key("labelSelector") || query.contains_key("fieldSelector") {
+                        vec![api]
+                    } else {
+                        vec![api, unrelated]
+                    };
+                if initial {
+                    let mut body = items
+                        .into_iter()
+                        .map(|object| json!({"type":"ADDED","object":object}).to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    body.push('\n');
+                    body.push_str(&json!({"type":"BOOKMARK","object":{"apiVersion":"v1","kind":"Pod","metadata":{"resourceVersion":"10","annotations":{"k8s.io/initial-events-end":"true"}}}}).to_string());
+                    body.push('\n');
+                    body
+                } else if watch {
+                    String::new()
+                } else {
+                    json!({"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"10"},"items":items}).to_string()
+                }
+            };
+            let frames = stream::iter([Ok::<_, Infallible>(Frame::data(Bytes::from(body)))]);
+            let frames = if watch && status == 200 {
+                frames.chain(stream::pending()).boxed()
+            } else {
+                frames.boxed()
+            };
+            Ok::<_, Infallible>(
+                http::Response::builder()
+                    .status(status)
+                    .body(http_body_util::StreamBody::new(frames))
+                    .unwrap(),
+            )
+        }
+    });
+    let mut cluster = Cluster::fake();
+    cluster.client = kube::Client::new(service, "default");
+    (cluster, requests)
+}
+
+async fn next_selector_request(requests: &mut mpsc::UnboundedReceiver<http::Uri>) -> http::Uri {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let uri = requests.recv().await.expect("request channel closed");
+            if uri.path().starts_with("/api/v1/") && uri.path().ends_with("/pods") {
+                return uri;
+            }
+        }
+    })
+    .await
+    .expect("pod API request timeout")
+}
+
+async fn sync_selector_view(app: &mut App, rx: &mut Receiver<Msg>) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let msg = rx.recv().await.expect("watch channel closed");
+            let done = matches!(&msg, Msg::Synced { generation } if *generation == app.generation);
+            app.handle_msg(msg);
+            if done {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("filtered view sync timeout");
+}
+
+#[tokio::test]
+async fn selectors_reach_streaming_list_and_watch_requests_from_keys() {
+    for streaming in [true, false] {
+        let (cluster, mut requests) = selector_api(streaming);
+        let (tx, mut rx) = mpsc::channel(1024);
+        let mut app = App::new(cluster, tx);
+        type_resource_query(
+            &mut app,
+            "pods -n prod /-l 'app in (api, worker),env=prod' -f spec.nodeName=node-3 status=Running",
+        );
+        sync_selector_view(&mut app, &mut rx).await;
+        assert_eq!(row_names(&app), ["api"]);
+        for step in 0..if streaming { 1 } else { 3 } {
+            let uri = next_selector_request(&mut requests).await;
+            let query: HashMap<_, _> = form_urlencoded::parse(uri.query().unwrap().as_bytes())
+                .into_owned()
+                .collect();
+            assert_eq!(uri.path(), "/api/v1/namespaces/prod/pods");
+            assert_eq!(
+                query.get("labelSelector").map(String::as_str),
+                Some("app in (api, worker),env=prod")
+            );
+            assert_eq!(
+                query.get("fieldSelector").map(String::as_str),
+                Some("spec.nodeName=node-3")
+            );
+            assert_eq!(query.contains_key("sendInitialEvents"), step == 0);
+            assert_eq!(
+                query.get("watch").map(String::as_str) == Some("true"),
+                step != 1
+            );
+        }
+        app.handle_key(ctrl(KeyCode::Char('r'))).unwrap();
+        sync_selector_view(&mut app, &mut rx).await;
+        let uri = next_selector_request(&mut requests).await;
+        assert!(uri.query().unwrap().contains("fieldSelector="));
+        if !streaming {
+            next_selector_request(&mut requests).await;
+        }
+        app.handle_key(press(KeyCode::Char('0'))).unwrap();
+        sync_selector_view(&mut app, &mut rx).await;
+        let uri = next_selector_request(&mut requests).await;
+        assert_eq!(uri.path(), "/api/v1/pods");
+        assert!(uri.query().unwrap().contains("labelSelector="));
+        if !streaming {
+            next_selector_request(&mut requests).await;
+        }
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        sync_selector_view(&mut app, &mut rx).await;
+        let uri = next_selector_request(&mut requests).await;
+        assert!(!uri.query().unwrap().contains("Selector="));
+        assert_eq!(row_names(&app), ["api", "other"]);
+    }
+}
+
+#[tokio::test]
+async fn unsupported_fields_remain_scoped_and_show_api_error() {
+    let (cluster, mut requests) = selector_api(true);
+    let (tx, mut rx) = mpsc::channel(1024);
+    let mut app = App::new(cluster, tx);
+    type_resource_query(&mut app, "pods /-l app=api -f spec.unsupported=x");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let msg = rx.recv().await.unwrap();
+            let done =
+                matches!(&msg, Msg::Error { generation, .. } if *generation == app.generation);
+            app.handle_msg(msg);
+            if done {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(app.flash_err);
+    assert!(
+        app.flash.contains("field label not supported"),
+        "{}",
+        app.flash
+    );
+    assert_eq!(
+        app.applied_filter_fields.as_deref(),
+        Some("spec.unsupported=x")
+    );
+    for _ in 0..2 {
+        let uri = next_selector_request(&mut requests).await;
+        let query: HashMap<_, _> = form_urlencoded::parse(uri.query().unwrap().as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(
+            query.get("fieldSelector").map(String::as_str),
+            Some("spec.unsupported=x")
+        );
+        assert_eq!(
+            query.get("labelSelector").map(String::as_str),
+            Some("app=api")
+        );
+    }
+    assert!(row_names(&app).is_empty());
+}
+
+/// Column comparisons read the same per-row cell cache the fuzzy path fills,
+/// so a row whose cell changed must not be answered from the previous
+/// rendering.
+#[tokio::test]
+async fn column_comparisons_see_updated_cells_not_cached_ones() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let pod = |state: serde_json::Value| {
+        json!({"apiVersion":"v1","kind":"Pod",
+        "metadata":{"name":"api","namespace":"prod","resourceVersion":"1"},
+        "status":{"phase":"Running","containerStatuses":[
+            {"name":"api","ready":true,"restartCount":0,"state":state}]}})
+    };
+    apply(&mut app, pod(json!({"running":{}})));
+    type_filter(&mut app, "status=Running");
+    assert_eq!(row_names(&app), ["api"]);
+
+    // Same object, new state. A cell answered from the cache would keep it.
+    apply(
+        &mut app,
+        pod(json!({"waiting":{"reason":"CrashLoopBackOff"}})),
+    );
+    assert_eq!(row_names(&app), Vec::<String>::new());
+    retype_filter(&mut app, "status=CrashLoopBackOff");
+    assert_eq!(row_names(&app), ["api"]);
+}
+
+#[tokio::test]
+async fn boolean_groups_short_circuit_and_match_operational_queries() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for (name, phase, restarts) in [
+        ("api", "Running", 1),
+        ("worker", "Pending", 7),
+        ("canary", "Running", 9),
+    ] {
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":name,"namespace":"prod"},
+            "spec":{"nodeName":"node-3"},
+            "status":{"phase":phase,"containerStatuses":[{"restartCount":restarts,"state":{"running":{}}}]}}),
+        );
+    }
+    type_filter(&mut app, "(status=Pending || restarts>=5) && !canary");
+    assert_eq!(row_names(&app), ["worker"]);
+    retype_filter(&mut app, "!(status=Pending || restarts>=5)");
+    assert_eq!(row_names(&app), ["api"]);
+    retype_filter(&mut app, "api || worker && restarts>=5");
+    assert_eq!(row_names(&app), ["api", "worker"]);
+    retype_filter(
+        &mut app,
+        "spec.nodeName=node-3 metadata.namespace=prod status.phase=Pending",
+    );
+    assert_eq!(row_names(&app), ["worker"]);
+    retype_filter(&mut app, "-l env=prod (api || worker)");
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("env=prod"));
+    assert_eq!(app.filter_location(), " ·server+local");
+    assert_eq!(
+        row_names(&app),
+        Vec::<String>::new(),
+        "new API watch starts empty"
+    );
+}
+
+#[tokio::test]
+async fn unavailable_metrics_are_unknown_even_under_negation() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for name in ["unknown", "zero", "busy"] {
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":name,"namespace":"default"}}),
+        );
+    }
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::from([
+            ("default/zero".into(), (0, 0)),
+            ("default/busy".into(), (600, 2 * 1024 * 1024 * 1024)),
+        ]),
+        containers: HashMap::new(),
+    });
+    for query in [
+        "cpu<500m",
+        "memory<1Gi",
+        "cpu=0",
+        "!(cpu>=500m)",
+        "!(memory>=1Gi)",
+    ] {
+        retype_filter(&mut app, query);
+        assert_eq!(row_names(&app), ["zero"], "{query}");
+    }
+    retype_filter(&mut app, "cpu>500m || memory>1Gi");
+    assert_eq!(row_names(&app), ["busy"]);
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::from([
+            ("default/zero".into(), (900, 0)),
+            ("default/busy".into(), (100, 0)),
+        ]),
+        containers: HashMap::new(),
+    });
+    assert_eq!(
+        row_names(&app),
+        ["zero"],
+        "poll changes membership without a watch event"
+    );
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::new(),
+        containers: HashMap::new(),
+    });
+    assert!(
+        row_names(&app).is_empty(),
+        "metrics removal invalidates membership"
+    );
+    retype_filter(&mut app, "name=unknown || cpu>500m");
+    assert_eq!(
+        row_names(&app),
+        ["unknown"],
+        "a known true OR branch can match"
+    );
+}
+
+#[tokio::test]
+async fn saved_selector_is_on_the_first_watch_and_visible_in_ui() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (cluster, mut requests) = selector_api(true);
+    let (tx, mut rx) = mpsc::channel(1024);
+    let mut app = App::new(cluster, tx);
+    app.bookmarks = vec![crate::config::Bookmark {
+        name: "API".into(),
+        key: Some("ctrl-a".into()),
+        resource: "pods".into(),
+        namespace: Some("prod".into()),
+        filter: Some("-l app=api status=Running".into()),
+        ..Default::default()
+    }];
+    app.handle_key(ctrl(KeyCode::Char('a'))).unwrap();
+    sync_selector_view(&mut app, &mut rx).await;
+    let uri = next_selector_request(&mut requests).await;
+    assert!(uri.query().unwrap().contains("labelSelector=app%3Dapi"));
+    assert_eq!(row_names(&app), ["api"]);
+    let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(screen.contains("/-l app=api status=Running"));
+    assert!(screen.contains("server+local"));
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    assert_eq!(app.filter, "-l app=api status=Running");
+    app.handle_key(ctrl(KeyCode::Char('u'))).unwrap();
+    assert_eq!(app.filter_location(), " ·pending ⏎");
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    sync_selector_view(&mut app, &mut rx).await;
+    assert_eq!(row_names(&app), ["api", "other"]);
+    assert_eq!(app.filter_location(), " ·local");
+}
+
+#[tokio::test]
+async fn palette_query_scopes_first_watch_and_supports_history() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    let generation = app.generation;
+    type_resource_query(
+        &mut app,
+        "pods -n prod --context test /-l app in (api, worker) -f spec.nodeName=node-3 && !canary status=Running",
+    );
+    assert_eq!(
+        app.generation,
+        generation + 1,
+        "no unfiltered initial watch"
+    );
+    assert_eq!(app.namespace, "prod");
+    assert_eq!(
+        app.applied_filter_labels.as_deref(),
+        Some("app in (api, worker)")
+    );
+    assert_eq!(
+        app.applied_filter_fields.as_deref(),
+        Some("spec.nodeName=node-3")
+    );
+    assert_eq!(app.filter_location(), " ·server+local");
+    for (name, phase) in [
+        ("api", "Running"),
+        ("canary", "Running"),
+        ("worker", "Pending"),
+    ] {
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1", "kind":"Pod", "metadata":{"name":name,"namespace":"prod"}, "status":{"phase":phase}}),
+        );
+    }
+    assert_eq!(row_names(&app), ["api"]);
+    app.handle_key(press(KeyCode::Char('['))).unwrap();
+    assert_eq!(app.kind_plural, "deployments");
+    app.handle_key(press(KeyCode::Char(']'))).unwrap();
+    assert_eq!(
+        app.applied_filter_fields.as_deref(),
+        Some("spec.nodeName=node-3")
+    );
+    app.handle_key(press(KeyCode::Char('0'))).unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(
+        app.applied_filter_fields.as_deref(),
+        Some("spec.nodeName=node-3")
+    );
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert!(app.filter.is_empty());
+    assert!(!app.filter_server_side());
+}
+
+/// Land an async context switch the way `Msg::ContextSwitched` does.
+fn land_context(app: &mut App, name: &str) {
+    let mut cluster = Cluster::fake();
+    cluster.context = name.into();
+    app.handle_msg(Msg::ContextSwitched {
+        generation: app.generation,
+        name: name.into(),
+        result: Ok(Box::new(cluster)),
+    });
+}
+
+/// Choose `name` in the context switcher, through the switcher's own keys.
+fn pick_context(app: &mut App, name: &str) {
+    let mut list = vec![app.cluster.context.clone(), name.to_string()];
+    list.sort();
+    list.dedup();
+    app.mode = Mode::Contexts;
+    app.handle_msg(Msg::Contexts {
+        generation: app.generation,
+        list,
+    });
+    for c in name.chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+}
+
+/// A bookmark on a chord, so `handle_key` is what triggers it.
+fn bind_bookmark(app: &mut App, resource: &str, context: &str) {
+    app.bookmarks = vec![crate::config::Bookmark {
+        key: Some("ctrl-y".into()),
+        name: "bm".into(),
+        resource: resource.into(),
+        context: Some(context.into()),
+        ..Default::default()
+    }];
+}
+
+/// The no-op branch of a context re-select starts no switch, so it must not
+/// disarm a navigation that an in-flight one still owns.
+#[tokio::test]
+async fn a_noop_context_reselect_keeps_an_inflight_navigation() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    let home = app.cluster.context.clone();
+    bind_bookmark(&mut app, "services", "west");
+
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    assert!(
+        app.pending_bookmark.is_some(),
+        "chord did not arm the bookmark"
+    );
+    let inflight = app.generation;
+
+    // Re-selecting the context we are already on does nothing at all.
+    pick_context(&mut app, &home);
+    assert_eq!(app.generation, inflight);
+    assert!(
+        app.pending_bookmark.is_some(),
+        "in-flight bookmark disarmed"
+    );
+
+    land_context(&mut app, "west");
+    assert_eq!(app.kind_plural, "services");
+}
+
+/// Re-selecting the destination of an in-flight context switch must not start
+/// a replacement generation that loses the navigation waiting behind it.
+#[tokio::test]
+async fn reselecting_inflight_context_target_keeps_deferred_navigation() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    bind_bookmark(&mut app, "services", "west");
+
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    let inflight = app.generation;
+    assert!(app.pending_bookmark.is_some());
+
+    pick_context(&mut app, "west");
+    assert_eq!(app.generation, inflight, "replacement switch was started");
+    assert!(
+        app.pending_bookmark.is_some(),
+        "deferred bookmark was discarded"
+    );
+
+    land_context(&mut app, "west");
+    assert_eq!(app.kind_plural, "services");
+}
+
+#[tokio::test]
+async fn deferred_navigation_to_same_inflight_target_replaces_predecessor() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    bind_bookmark(&mut app, "services", "west");
+
+    type_resource_query(&mut app, "pods --context west /status=Running");
+    let inflight = app.generation;
+    assert!(app.pending_resource_query.is_some());
+
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    assert_eq!(app.generation, inflight);
+    assert!(
+        app.pending_resource_query.is_none(),
+        "displaced query stays armed"
+    );
+    assert!(app.pending_bookmark.is_some());
+
+    land_context(&mut app, "west");
+    assert_eq!(app.kind_plural, "services");
+}
+
+/// Deferred navigations are mutually exclusive: a bookmark, workspace or
+/// palette query that starts a context switch owns what lands when it
+/// completes, and must not leave an earlier one armed to fire later.
+#[tokio::test]
+async fn a_deferred_navigation_disarms_the_one_it_replaces() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    bind_bookmark(&mut app, "services", "west");
+
+    // The bookmark defers behind an async switch to its own context.
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    assert!(app.pending_bookmark.is_some());
+
+    // Before it lands, the user asks for something else somewhere else.
+    type_resource_query(&mut app, "pods -n prod --context east /-l app=api");
+    assert!(
+        app.pending_bookmark.is_none(),
+        "displaced bookmark stays armed"
+    );
+    assert!(app.pending_resource_query.is_some());
+
+    land_context(&mut app, "east");
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("app=api"));
+
+    // A later, unrelated switch must not resurrect the displaced bookmark.
+    pick_context(&mut app, "west");
+    land_context(&mut app, "west");
+    assert!(app.pending_bookmark.is_none());
+    assert_ne!(
+        app.kind_plural, "services",
+        "stale bookmark fired on a later switch"
+    );
+}
+
+#[tokio::test]
+async fn palette_query_waits_for_context_and_rejects_invalid_input() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    let generation = app.generation;
+    type_resource_query(&mut app, "pods -n prod /cpu>oops");
+    assert_eq!(app.generation, generation);
+    assert_eq!(app.kind_plural, "deployments");
+    assert!(app.flash_err);
+    type_resource_query(&mut app, "pods -n prod --context west /-l app=api");
+    assert!(app.pending_resource_query.is_some());
+    let mut cluster = Cluster::fake();
+    cluster.context = "west".into();
+    app.handle_msg(Msg::ContextSwitched {
+        generation: app.generation,
+        name: "west".into(),
+        result: Ok(Box::new(cluster)),
+    });
+    assert_eq!(app.cluster.context, "west");
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.namespace, "prod");
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("app=api"));
+    assert!(app.pending_resource_query.is_none());
+}
+
+#[tokio::test]
+async fn malformed_filter_stays_editable_without_widening_watch() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    type_filter(&mut app, "-l app=api");
+    let generation = app.generation;
+    retype_filter(&mut app, "-l app in (");
+    assert_eq!(app.mode, Mode::Filter);
+    assert_eq!(app.generation, generation);
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("app=api"));
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert!(!app.filter_server_side());
+}
+
+#[tokio::test]
+async fn age_filter_rechecks_rows_as_time_passes_without_watch_updates() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Pod", "metadata":{
+            "name":"old", "namespace":"default", "creationTimestamp":"2020-01-01T00:00:00Z"
+        }}),
+    );
+    type_filter(&mut app, "age>2h");
+    assert_eq!(row_names(&app), ["old"]);
+    // Model the previous second's membership; no dirty bit or watch event.
+    {
+        let mut cache = app.rows_cache.borrow_mut();
+        cache.keys.clear();
+        cache.filter_second -= 1;
+        assert!(!cache.dirty);
+    }
+    assert_eq!(row_names(&app), ["old"]);
+}
+
 #[tokio::test]
 async fn legacy_fuzzy_filter_with_spaces_is_one_pattern() {
     let (mut app, _rx) = test_app();
@@ -10946,10 +12223,10 @@ async fn local_filter_edits_never_restart_the_watch() {
 }
 
 #[tokio::test]
-async fn drill_clears_server_selector_and_pop_restores_it() {
+async fn drill_preserves_server_selector_and_pop_restores_it() {
     let (mut app, _rx) = test_app();
     app.switch_kind("deployments");
-    type_filter(&mut app, "-l env=prod");
+    type_filter(&mut app, "-l env=prod -f metadata.namespace=default");
     assert_eq!(app.applied_filter_labels.as_deref(), Some("env=prod"));
 
     apply(
@@ -10962,26 +12239,58 @@ async fn drill_clears_server_selector_and_pop_restores_it() {
     );
     app.table_state.select(Some(0));
 
-    // Drill: like the fuzzy filter, the filter (and with it the server-side
-    // selector) is cleared for the child view; the drill's own selector takes
-    // over.
+    // Drill combines the persistent query selector with the child scope.
     app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.kind_plural, "pods");
-    assert!(app.filter.is_empty());
-    assert_eq!(app.applied_filter_labels, None);
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("env=prod"));
+    assert_eq!(
+        app.watch_key.as_ref().unwrap().labels.as_deref(),
+        Some("app=web,env=prod")
+    );
     assert_eq!(app.labels.as_deref(), Some("app=web"));
+    assert_eq!(
+        app.watch_key.as_ref().unwrap().fields.as_deref(),
+        Some("metadata.namespace=default")
+    );
 
     // Pop: the saved frame restores the filter, and the rewatch re-applies
     // its selector server-side.
-    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Esc)).unwrap(); // clear child filter
+    app.handle_key(press(KeyCode::Esc)).unwrap(); // return to parent
     assert_eq!(app.kind_plural, "deployments");
-    assert_eq!(app.filter, "-l env=prod");
+    assert_eq!(app.filter, "-l env=prod -f metadata.namespace=default");
+    assert_eq!(
+        app.applied_filter_fields.as_deref(),
+        Some("metadata.namespace=default")
+    );
     assert_eq!(app.applied_filter_labels.as_deref(), Some("env=prod"));
     assert_eq!(app.labels, None);
 }
 
 #[tokio::test]
-async fn root_switch_and_history_clear_server_selector_like_fuzzy() {
+async fn namespace_picker_and_history_preserve_both_selectors() {
+    let (mut app, _rx) = test_app();
+    type_resource_query(&mut app, "pods -n prod /-l app=api -f spec.nodeName=node-3");
+    app.ns_list = vec!["<all>".into(), "prod".into(), "qa".into()];
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    for c in "qa".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.namespace, "qa");
+    for (key, namespace) in [('[', "prod"), (']', "qa")] {
+        app.handle_key(press(KeyCode::Char(key))).unwrap();
+        assert_eq!(app.namespace, namespace);
+        assert_eq!(app.applied_filter_labels.as_deref(), Some("app=api"));
+        assert_eq!(
+            app.applied_filter_fields.as_deref(),
+            Some("spec.nodeName=node-3")
+        );
+    }
+}
+
+#[tokio::test]
+async fn root_switch_clears_filter_and_history_restores_it() {
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
     type_filter(&mut app, "-l app=api");
@@ -10993,11 +12302,11 @@ async fn root_switch_and_history_clear_server_selector_like_fuzzy() {
     assert!(app.filter.is_empty());
     assert_eq!(app.applied_filter_labels, None);
 
-    // History replay lands on the root view without the old filter.
+    // History restores the complete root query.
     app.handle_key(press(KeyCode::Char('['))).unwrap();
     assert_eq!(app.kind_plural, "pods");
-    assert!(app.filter.is_empty());
-    assert_eq!(app.applied_filter_labels, None);
+    assert_eq!(app.filter, "-l app=api");
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("app=api"));
 }
 
 #[tokio::test]
@@ -16662,4 +17971,879 @@ async fn quoted_filter_folds_unicode_column_text() {
     assert_eq!(row_names(&app), ["event-1"]);
     retype_filter(&mut app, "!\"kube\"");
     assert_eq!(row_names(&app), ["event-2"]);
+}
+
+#[tokio::test]
+async fn boolean_groups_preserve_literal_and_regex_terms() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for name in [
+        "auth-api-0",
+        "auth-api-canary",
+        "web-1",
+        "api-gateway-runtime-hash",
+    ] {
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1","kind":"Pod",
+            "metadata":{"name":name,"namespace":"default"}}),
+        );
+    }
+    for query in [
+        r#"("auth" || /^web/) && !/canary/"#,
+        r#"("auth"||/^web/)&&!("canary")"#,
+        r#"(/^(auth-api-0|web-1)$/)"#,
+        r#"(name=missing||/^(auth-api-0|web-1)$/)"#,
+        r#"(/a"b/ || /^(auth-api-0|web-1)$/)"#,
+    ] {
+        retype_filter(&mut app, query);
+        assert_eq!(app.filter_error(), None, "{query}");
+        assert_eq!(row_names(&app), ["auth-api-0", "web-1"], "{query}");
+    }
+    retype_filter(&mut app, r#"("auth" && cpu>500m)"#);
+    assert!(row_names(&app).is_empty());
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::from([("default/auth-api-0".into(), (600, 0))]),
+        containers: HashMap::new(),
+    });
+    assert_eq!(row_names(&app), ["auth-api-0"]);
+}
+
+#[tokio::test]
+async fn invalid_local_query_keeps_pending_context_destination() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    type_resource_query(&mut app, "pods --context west /-l app=api");
+    let generation = app.generation;
+    type_resource_query(&mut app, "missing-resource /status=Running");
+    assert!(app.flash_err);
+    assert_eq!(app.generation, generation);
+    assert!(app.pending_resource_query.is_some());
+    land_context(&mut app, "west");
+    assert_eq!(app.cluster.context, "west");
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("app=api"));
+}
+
+#[tokio::test]
+async fn local_bookmark_rejects_original_context_connection_result() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    let home = app.cluster.context.clone();
+    bind_bookmark(&mut app, "services", &home);
+    type_resource_query(&mut app, "pods --context west /-l app=api");
+    let generation = app.generation;
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    assert_ne!(app.generation, generation);
+    let mut cluster = Cluster::fake();
+    cluster.context = "west".into();
+    app.handle_msg(Msg::ContextSwitched {
+        generation,
+        name: "west".into(),
+        result: Ok(Box::new(cluster)),
+    });
+    assert_eq!(app.cluster.context, home);
+    assert_eq!(app.kind_plural, "services");
+    assert!(app.context_switch_target.is_none());
+    assert!(app.pending_resource_query.is_none());
+}
+
+#[tokio::test]
+async fn local_query_clears_canceled_bookmark_destination() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    bind_bookmark(&mut app, "services", "west");
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    type_resource_query(&mut app, "pods /status=Running");
+    assert!(app.context_switch_target.is_none());
+    assert!(app.pending_bookmark.is_none());
+    assert!(app.pending_resource_query.is_none());
+    assert!(app.pending_workspace.is_none());
+}
+
+#[tokio::test]
+async fn local_query_clears_canceled_workspace_destination() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    app.workspaces = vec![crate::config::Workspace {
+        key: Some("ctrl-w".into()),
+        name: "ops".into(),
+        context: Some("west".into()),
+        views: vec![crate::config::WorkspaceView {
+            name: "services".into(),
+            resource: "services".into(),
+            ..Default::default()
+        }],
+    }];
+    app.handle_key(ctrl(KeyCode::Char('w'))).unwrap();
+    let generation = app.generation;
+    type_resource_query(&mut app, "pods /status=Running");
+    assert!(app.context_switch_target.is_none());
+    assert!(app.pending_workspace.is_none());
+    app.handle_msg(Msg::ContextSwitched {
+        generation,
+        name: "west".into(),
+        result: Err("connection failed".into()),
+    });
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.filter, "status=Running");
+    assert!(!app.flash_err);
+}
+
+#[tokio::test]
+async fn bundled_plugin_receives_v1_consent_only_when_enabled() {
+    for allow in [false, true] {
+        let (mut app, _rx) = app_with_pod();
+        app.cluster.allow_v1_client_cert = allow;
+        app.plugins = crate::plugins::bundled()
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        plugin_command(&mut app, "sanitize");
+        let Some(ConfirmAction::Plugin { jobs, .. }) = app.confirm_action.as_ref() else {
+            panic!("expected plugin confirmation");
+        };
+        assert!(!jobs.is_empty());
+        for job in jobs {
+            assert_eq!(
+                job.argv.iter().any(|arg| arg == "--allow-v1-client-cert"),
+                allow
+            );
+        }
+        app.handle_key(press(KeyCode::Char('n'))).unwrap();
+        assert_eq!(app.mode, Mode::Table);
+    }
+}
+
+#[tokio::test]
+async fn refresh_key_reads_pods_through_a_configured_ca_server_certificate() {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let pem = include_bytes!("../../tests/fixtures/tls/proxy-ca.pem");
+    let der = CertificateDer::from_pem_slice(pem).unwrap();
+    let tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![der.clone()],
+            PrivateKeyDer::from_pem_slice(include_bytes!("../../tests/fixtures/tls/server.key"))
+                .unwrap(),
+        )
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = kube::Config::new(
+        format!("https://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap(),
+    );
+    config.root_cert = Some(vec![der.to_vec()]);
+    config.tls_server_name = Some("localhost".into());
+    config.default_retry = false;
+    let (request_tx, mut requests) = mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let acceptor = acceptor.clone();
+            let request_tx = request_tx.clone();
+            connections.spawn(async move {
+                let Ok(mut stream) = acceptor.accept(socket).await else { return };
+                let mut bytes = Vec::new();
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    let Ok(byte) = stream.read_u8().await else { return };
+                    bytes.push(byte);
+                    assert!(bytes.len() < 16384);
+                }
+                let request = String::from_utf8(bytes).unwrap();
+                if !request.lines().next().unwrap().contains("/pods?") {
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
+                    return;
+                }
+                request_tx.send(request).unwrap();
+                let body = concat!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                    "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"proxy-pod\",\"namespace\":\"default\",\"resourceVersion\":\"1\"}}}\n",
+                    "{\"type\":\"BOOKMARK\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"resourceVersion\":\"1\",\"annotations\":{\"k8s.io/initial-events-end\":\"true\"}}}}\n",
+                );
+                stream.write_all(body.as_bytes()).await.unwrap();
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    let (mut app, mut rx) = test_app();
+    app.cluster.client = crate::k8s::build_client(config, false).unwrap();
+    app.kind = app.cluster.resolve("pods");
+    app.kind_plural = "pods".into();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    sync_selector_view(&mut app, &mut rx).await;
+    assert_eq!(row_names(&app), ["proxy-pod"]);
+    let request = requests.recv().await.unwrap().to_ascii_lowercase();
+    assert!(request.contains("watch=true"), "{request}");
+    assert!(request.contains("accept-encoding: identity"), "{request}");
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn namespace_views_follow_navigation_bookmarks_and_wide_mode() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [[views."v1/pods".columns]]
+        name = "OWNER"
+        path = "/metadata/ownerReferences/0/kind"
+
+        [views."pods@matlab"]
+        sort = "TENANT:desc"
+        [[views."pods@matlab".columns]]
+        name = "TENANT"
+        path = "/metadata/annotations/ops.example.com~1tenant"
+        [[views."pods@matlab".columns]]
+        name = "MODEL"
+        path = "/metadata/annotations/ops.example.com~1model"
+        wide = true
+
+        [views."pods@python"]
+        replace = true
+        [[views."pods@python".columns]]
+        name = "NAME"
+        path = "/metadata/name"
+
+        [[views."nodes@matlab".columns]]
+        name = "WRONG"
+        path = "/metadata/name"
+    "#,
+    );
+    // Startup sets the CLI namespace before it opens the resource.
+    app.namespace = "matlab".into();
+    app.switch_kind("pods");
+    assert!(app.display_headers().contains(&"TENANT".to_string()));
+    assert!(!app.display_headers().contains(&"OWNER".to_string()));
+    assert_eq!(app.display_headers()[app.sort_column.unwrap()], "TENANT");
+    assert!(app.sort_desc);
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "job", "namespace": "matlab",
+                "annotations": {"ops.example.com/tenant": "team-a"}}
+        }),
+    );
+    let rows = app.rows();
+    app.ensure_table_cell_cache(&rows);
+    let index = app
+        .display_headers()
+        .iter()
+        .position(|h| h == "TENANT")
+        .unwrap();
+    assert_eq!(
+        app.table_cell_cache().get(&row_key(rows[0])).unwrap().0[index],
+        "team-a"
+    );
+    drop(rows);
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert!(app.display_headers().contains(&"MODEL".to_string()));
+    assert_eq!(app.display_headers()[app.sort_column.unwrap()], "TENANT");
+
+    palette(&mut app, "pods all");
+    assert!(app.all_namespaces());
+    assert!(app.display_headers().contains(&"OWNER".to_string()));
+    assert!(!app.display_headers().contains(&"TENANT".to_string()));
+    app.handle_key(press(KeyCode::Char('['))).unwrap();
+    assert_eq!(app.namespace, "matlab");
+    assert!(app.display_headers().contains(&"TENANT".to_string()));
+
+    app.bookmarks = vec![crate::config::Bookmark {
+        key: Some("z".into()),
+        name: "batch".into(),
+        resource: "pods".into(),
+        namespace: Some("python".into()),
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.namespace, "python");
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "CPU", "MEM"]);
+    assert!(app.sort_column.is_none());
+    palette(&mut app, "pods other");
+    assert!(app.display_headers().contains(&"OWNER".to_string()));
+    palette(&mut app, "nodes matlab");
+    assert!(!app.display_headers().contains(&"WRONG".to_string()));
+}
+
+#[tokio::test]
+async fn namespace_view_picker_keeps_the_user_sort() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."pods@matlab"]
+        sort = "TENANT:desc"
+        [[views."pods@matlab".columns]]
+        name = "TENANT"
+        path = "/metadata/name"
+    "#,
+    );
+    palette(&mut app, "pods other");
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let header = app.display_headers()[app.sort_column.unwrap()].clone();
+    let desc = app.sort_desc;
+    app.ns_list = vec!["<all>".into(), "matlab".into(), "other".into()];
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    for c in "matlab".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.namespace, "matlab");
+    assert!(app.display_headers().contains(&"TENANT".to_string()));
+    assert_eq!(app.display_headers()[app.sort_column.unwrap()], header);
+    assert_eq!(app.sort_desc, desc);
+}
+
+#[tokio::test]
+async fn namespace_view_navigation_settings_fall_back_separately() {
+    for (namespace, expected_node, expected_target) in [
+        ("matlab", "batch-node", "secrets"),
+        ("other", "base-node", "pods"),
+        ("all", "base-node", "pods"),
+    ] {
+        let (mut app, _rx) = test_app();
+        install_views(
+            &mut app,
+            r#"
+            [views.certificates]
+            node = "/status/baseNode"
+            drill = { kind = "pods", labels = "cert={name}" }
+            [views."certificates@matlab"]
+            node = "/status/batchNode"
+            drill = { kind = "secrets", labels = "cert={name}" }
+            [[views."cert-manager.io/v1/certificates@matlab".columns]]
+            name = "EXTRA"
+            path = "/metadata/name"
+        "#,
+        );
+        palette(&mut app, &format!("certificates {namespace}"));
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "cert-manager.io/v1", "kind": "Certificate",
+                "metadata": {"name": "tls", "namespace": "matlab"},
+                "status": {"baseNode": "base-node", "batchNode": "batch-node"}
+            }),
+        );
+        app.table_state.select(Some(0));
+        app.handle_key(press(KeyCode::Char('o'))).unwrap();
+        assert_eq!(app.kind_plural, "nodes");
+        assert_eq!(app.fields, Some(format!("metadata.name={expected_node}")));
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "cert-manager.io/v1", "kind": "Certificate",
+                "metadata": {"name": "tls", "namespace": "matlab"}
+            }),
+        );
+        app.table_state.select(Some(0));
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.kind_plural, expected_target);
+        assert_eq!(app.labels.as_deref(), Some("cert=tls"));
+    }
+}
+
+fn describe_refresh_app() -> (App, Receiver<Msg>) {
+    let (mut app, rx) = test_app();
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Pod",
+        "metadata":{"name":"web", "namespace":"default"}}),
+    );
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    let claim = app.claim_status("describing web");
+    app.describe_source = Some((
+        claim,
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf 'Events:\nnew event\n'".into(),
+        ],
+    ));
+    app.handle_msg(Msg::Detail {
+        generation: app.generation,
+        claim,
+        title: "web describe".into(),
+        lines: vec!["Events:".into(), "old event".into()],
+        warn: None,
+    });
+    (app, rx)
+}
+
+#[tokio::test]
+async fn describe_refresh_toggle_updates_and_rejects_stopped_results() {
+    let (mut app, mut rx) = describe_refresh_app();
+    assert!(app.describe_refresh_task.is_none());
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "event".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    let scroll = app.detail.scroll;
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert!(app.describe_refresh_task.is_some());
+    let generation = app.describe_refresh_generation;
+    let msg = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    app.handle_msg(msg);
+    assert_eq!(app.detail.lines[1], "new event");
+    assert_eq!(app.detail.filter, "event");
+    assert_eq!(app.detail.scroll, scroll);
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert!(app.describe_refresh_task.is_none());
+    app.handle_msg(Msg::DescribeRefresh {
+        generation,
+        result: Ok(vec!["late".into()]),
+    });
+    assert_eq!(app.detail.lines[1], "new event");
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.describe_refresh_task.is_none());
+    assert!(app.describe_source.is_none());
+}
+
+#[tokio::test]
+async fn describe_refresh_failure_keeps_document_and_search_accepts_updates() {
+    let (mut app, _rx) = describe_refresh_app();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    let generation = app.describe_refresh_generation;
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    app.handle_msg(Msg::DescribeRefresh {
+        generation,
+        result: Ok(vec!["updated".into()]),
+    });
+    assert_eq!(app.mode, Mode::DocFilter);
+    assert_eq!(app.detail.lines[0], "updated");
+    app.handle_msg(Msg::DescribeRefresh {
+        generation,
+        result: Err("request failed".into()),
+    });
+    assert_eq!(app.detail.lines[0], "updated");
+    assert!(app.describe_refresh_task.is_none());
+    assert!(app.flash.contains("request failed"));
+}
+
+#[tokio::test]
+async fn describe_refresh_is_unavailable_in_yaml_and_stops_on_palette_navigation() {
+    let (mut app, _rx) = describe_refresh_app();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    assert!(app.describe_refresh_task.is_none());
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert!(app.describe_source.is_none());
+    assert!(app.describe_refresh_task.is_none());
+}
+
+#[tokio::test]
+async fn describe_refresh_repeats_for_the_original_resource() {
+    let (mut app, mut rx) = describe_refresh_app();
+    let (_, argv) = app.describe_source.as_mut().unwrap();
+    *argv = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "printf '%s' \"$1\"".into(),
+        "describe".into(),
+        "web".into(),
+    ];
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Pod",
+        "metadata":{"name":"another", "namespace":"default"}}),
+    );
+    app.table_state.select(Some(0));
+    assert_eq!(
+        app.selected_ref().unwrap().metadata.name.as_deref(),
+        Some("another")
+    );
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    for _ in 0..2 {
+        let msg = tokio::time::timeout(Duration::from_secs(8), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_msg(msg);
+        assert_eq!(app.detail.lines[0], "web");
+    }
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+}
+
+#[tokio::test]
+async fn describe_refresh_does_not_replace_plugin_output_or_yaml_fallback() {
+    let (mut app, _rx) = describe_refresh_app();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    let generation = app.describe_refresh_generation;
+    let claim = app.claim_status("plugin");
+    app.handle_msg(Msg::PluginOutput {
+        run: app.plugin_run,
+        generation: app.generation,
+        claim,
+        title: "plugin".into(),
+        lines: vec!["report".into()],
+        warn: None,
+    });
+    app.handle_msg(Msg::DescribeRefresh {
+        generation,
+        result: Ok(vec!["late".into()]),
+    });
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert_eq!(app.detail.lines[0], "report");
+    assert!(app.describe_refresh_task.is_none());
+    assert!(app.describe_source.is_none());
+
+    let (mut app, _rx) = describe_refresh_app();
+    let claim = app.describe_source.as_ref().unwrap().0;
+    app.handle_msg(Msg::Detail {
+        generation: app.generation,
+        claim,
+        title: "web YAML".into(),
+        lines: vec!["fallback".into()],
+        warn: Some("describe failed".into()),
+    });
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert!(app.describe_refresh_task.is_none());
+    assert!(app.describe_source.is_none());
+    assert_eq!(app.detail.lines[0], "fallback");
+}
+
+#[tokio::test]
+async fn describe_refresh_clamps_horizontal_scroll_when_content_shrinks() {
+    for viewport in [false, true] {
+        let (mut app, _rx) = describe_refresh_app();
+        if viewport {
+            app.detail.set_viewport(4, 2);
+        }
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        assert_eq!(app.detail.hscroll, 5);
+        app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        let generation = app.describe_refresh_generation;
+
+        app.handle_msg(Msg::DescribeRefresh {
+            generation,
+            result: Ok(vec!["another wide event".into()]),
+        });
+        assert_eq!(app.detail.hscroll, 5);
+
+        app.handle_msg(Msg::DescribeRefresh {
+            generation,
+            result: Ok(vec!["ok".into()]),
+        });
+        assert_eq!(app.detail.hscroll, 1);
+
+        app.handle_msg(Msg::DescribeRefresh {
+            generation,
+            result: Ok(vec![]),
+        });
+        assert_eq!(app.detail.hscroll, 0);
+        app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn configured_metric_columns_keep_order_values_and_live_filters() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/pods"]
+        replace = true
+        columns = [
+            { name = "NAME", builtin = "NAME" },
+            { name = "READY", builtin = "READY" },
+            { name = "CPU", metric = "cpu" },
+            { name = "CPU/R", metric = "cpu-request" },
+            { name = "LOAD", metric = "cpu-request-utilization" },
+            { name = "MEM/R", metric = "memory-request" },
+            { name = "LIMIT", metric = "memory-limit-utilization", wide = true },
+            { name = "AGE", builtin = "AGE" },
+        ]
+    "#,
+    );
+    palette(&mut app, "pods");
+    for name in ["api", "worker"] {
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": name, "namespace": "default"},
+                "spec": {
+                    "containers": [
+                        {"name": "app", "resources": {"requests": {"cpu": "4", "memory": "1Gi"}, "limits": {"memory": "2Gi"}}},
+                        {"name": "reloader", "resources": {"requests": {"cpu": "100m"}}}
+                    ],
+                    "initContainers": [
+                        {"name": "proxy", "restartPolicy": "Always", "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}}},
+                        {"name": "setup", "resources": {"requests": {"cpu": "20", "memory": "8Gi"}}}
+                    ]
+                },
+                "status": {"phase": "Running", "containerStatuses": [
+                    {"name": "app", "ready": true, "restartCount": 0},
+                    {"name": "reloader", "ready": true, "restartCount": 0}
+                ], "initContainerStatuses": [{"name": "proxy", "ready": true, "restartCount": 0}]}
+            }),
+        );
+    }
+    let metrics = |app: &mut App, api| {
+        app.handle_msg(Msg::Metrics {
+            generation: app.generation,
+            data: HashMap::from([
+                ("default/api".into(), (api, 0)),
+                ("default/worker".into(), (420, 0)),
+            ]),
+            containers: HashMap::new(),
+        });
+    };
+    metrics(&mut app, 4200);
+    let (headers, rows) = app.snapshot_table();
+    assert_eq!(
+        headers,
+        ["NAME", "READY", "CPU", "CPU/R", "LOAD", "MEM/R", "AGE"]
+    );
+    assert_eq!(
+        &rows[0][..6],
+        ["api", "3/3", "4200m", "4200m", "100%", "1.1Gi"]
+    );
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    let (headers, rows) = app.snapshot_table();
+    assert_eq!(headers[6], "LIMIT");
+    assert_eq!(rows[0][6], "-");
+    let fields = app.selected_row_fields();
+    assert!(fields.contains(&("LOAD".into(), "100%".into())));
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(180, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let mut found_red = false;
+    for y in 0..buffer.area.height {
+        let line: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect();
+        if line.contains("api")
+            && let Some(x) = line.find("100%")
+        {
+            // The table prefix can contain a multi-byte border or marker.
+            let x = line[..x].chars().count() as u16;
+            found_red = buffer[(x, y)].fg == crate::theme::red();
+        }
+    }
+    assert!(found_red);
+    type_filter(&mut app, "load>=75%");
+    assert_eq!(row_names(&app), ["api"]);
+    metrics(&mut app, 0);
+    assert!(row_names(&app).is_empty());
+    retype_filter(&mut app, "cpu/r>4 mem/r>=1Gi");
+    assert_eq!(row_names(&app), ["api", "worker"]);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    for c in "LOAD".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(row_names(&app), ["api", "worker"]);
+    metrics(&mut app, 4200);
+    assert_eq!(row_names(&app), ["worker", "api"]);
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::new(),
+        containers: HashMap::new(),
+    });
+    let (_, rows) = app.snapshot_table();
+    assert_eq!(rows[0][2], "-");
+    assert_eq!(rows[0][3], "4200m");
+    assert_eq!(rows[0][4], "-");
+}
+
+#[tokio::test]
+async fn configured_node_metrics_filter_and_refresh_by_source() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/nodes"]
+        replace = true
+        columns = [
+            { name = "NAME", builtin = "NAME" },
+            { name = "COUNT", metric = "node-pods" },
+            { name = "LOAD", metric = "node-cpu-utilization" },
+            { name = "USED", metric = "memory" },
+        ]
+    "#,
+    );
+    palette(&mut app, "nodes");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": "node"}, "status": {"allocatable": {"cpu": "2"}}}),
+    );
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::from([("node".into(), (1000, 1024 * 1024 * 1024))]),
+        containers: HashMap::new(),
+    });
+    type_filter(&mut app, "count>0 load>=50 used>=1Gi");
+    assert!(row_names(&app).is_empty());
+    app.handle_msg(Msg::NodePods {
+        generation: app.generation,
+        counts: HashMap::from([("node".into(), 3)]),
+    });
+    assert_eq!(row_names(&app), ["node"]);
+    let (headers, rows) = app.snapshot_table();
+    assert_eq!(headers, ["NAME", "COUNT", "LOAD", "USED"]);
+    assert_eq!(rows[0], ["node", "3", "50%", "1.0Gi"]);
+    app.handle_msg(Msg::NodePods {
+        generation: app.generation,
+        counts: HashMap::new(),
+    });
+    assert!(row_names(&app).is_empty());
+}
+
+#[tokio::test]
+async fn metric_layout_keeps_hidden_columns_hidden_and_avoids_duplicate_defaults() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/pods"]
+        replace = true
+        columns = [
+            { name = "NAME", builtin = "NAME" },
+            { name = "CPU", metric = "cpu", wide = true },
+        ]
+    "#,
+    );
+    palette(&mut app, "pods");
+    assert_eq!(app.display_headers().to_vec(), ["NAME"]);
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "CPU"]);
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/pods"]
+        columns = [{ name = "CPU", path = "/spec/containers/0/resources/requests/cpu", type = "quantity" }]
+    "#,
+    );
+    palette(&mut app, "nodes");
+    palette(&mut app, "pods");
+    assert_eq!(
+        app.display_headers()
+            .iter()
+            .filter(|h| h.as_str() == "CPU")
+            .count(),
+        1
+    );
+    assert!(app.display_headers().contains(&"MEM".into()));
+}
+
+#[tokio::test]
+async fn metric_overlay_retains_defaults_and_filters_percent_headers() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/pods"]
+        columns = [{ name = "%CPU/R", metric = "cpu-request-utilization" }]
+    "#,
+    );
+    palette(&mut app, "pods");
+    assert_eq!(
+        app.display_headers().to_vec(),
+        [
+            "NAME", "READY", "STATUS", "RESTARTS", "%CPU/R", "AGE", "CPU", "MEM"
+        ]
+    );
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "api", "namespace": "default"}, "spec": {"containers": [{"resources": {"requests": {"cpu": "1"}}}]}}),
+    );
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::from([("default/api".into(), (900, 0))]),
+        containers: HashMap::new(),
+    });
+    type_filter(&mut app, "%cpu/r>=90%");
+    assert_eq!(row_names(&app), ["api"]);
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::from([("default/api".into(), (800, 0))]),
+        containers: HashMap::new(),
+    });
+    assert!(row_names(&app).is_empty());
+}
+
+#[tokio::test]
+async fn unsupported_column_sources_warn_and_keep_a_usable_view() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/nodes"]
+        replace = true
+        columns = [
+            { name = "READY", builtin = "READY" },
+            { name = "CPU/R", metric = "cpu-request" },
+        ]
+    "#,
+    );
+    palette(&mut app, "nodes");
+    assert!(app.display_headers().contains(&"NAME".into()));
+    assert!(!app.display_headers().contains(&"CPU/R".into()));
+    assert_eq!(app.config_warnings.len(), 2);
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.config_warnings.len(), 2);
+}
+
+#[tokio::test]
+async fn builtin_aliases_keep_numeric_sort_and_elapsed_values() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/pods"]
+        replace = true
+        columns = [
+            { name = "NAME", builtin = "NAME" },
+            { name = "RETRY", builtin = "RESTARTS" },
+            { name = "CREATED", builtin = "AGE" },
+        ]
+    "#,
+    );
+    palette(&mut app, "pods");
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "RETRY", "CREATED"]);
+    for (name, restarts) in [("api", 10), ("worker", 2)] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": name, "namespace": "default", "creationTimestamp": "2025-01-01T00:00:00Z"}, "status": {"containerStatuses": [{"name": "app", "restartCount": restarts}]}}),
+        );
+    }
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    for c in "RETRY".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(row_names(&app), ["worker", "api"]);
+    let now = "2025-01-01T00:01:00Z"
+        .parse::<Timestamp>()
+        .unwrap()
+        .as_second();
+    assert_eq!(app.snapshot_table_at(now).1[0][2], "1m");
+    assert_eq!(app.snapshot_table_at(now + 60).1[0][2], "2m");
 }

@@ -16,6 +16,8 @@ readonly          = false  # true disables every mutating action (delete, edit,
                            # scale, shell, plugins, …); --readonly/--write win
 mouse             = true   # false keeps the terminal's native mouse behavior
                            # (text selection) instead of scroll/click/sort
+remember_sort     = true   # save and restore sort choices per resource kind
+                           # false makes sort changes temporary
 
 # Namespaces pinned to the top of the `n` switcher (★); session recents (·)
 # follow them.
@@ -23,6 +25,32 @@ favorite_namespaces = ["kube-system", "monitoring"]
 
 [aliases]
 dep = "deployments"
+```
+
+`remember_sort` is enabled by default. Set it to `false` to stop saving and
+restoring sort choices from `S`, `I`, and column header clicks. Existing saved
+choices stay on disk and become available again when you enable the option.
+The option supports cluster and context overrides and `:reload`. A reload
+keeps the active sort; the option controls later sort changes and view starts.
+
+To use an initial sort for all resource tables, set a global default:
+
+```toml
+remember_sort = false
+
+[views."*"]
+sort = "AGE:desc"
+```
+
+A resource-specific sort has priority over this default. Tables without the
+specified column ignore the global sort. See [Views](views.md) for details.
+
+CRD short names are discovered automatically. To override a short name, add it
+under `[aliases]`. Use a group-qualified target when resource names overlap:
+
+```toml
+[aliases]
+md = "machinedeployments.cluster.x-k8s.io"
 ```
 
 ## Skins
@@ -50,24 +78,24 @@ switches live, `:skin gruvbox-dark` applies directly.
 
 Each of these is documented where the feature itself is:
 
-| Section               | What it does                                | Docs                                                       |
-| --------------------- | ------------------------------------------- | ---------------------------------------------------------- |
-| `[views]`             | custom columns and navigation per resource  | [Views and thresholds](views.md)                           |
-| `[thresholds]`        | RESTARTS/CPU/MEM/utilization coloring bands | [Views and thresholds](views.md#thresholds)                |
-| `[[plugins]]`         | shell-out commands bound to key chords      | [Plugins](plugins.md)                                      |
-| `[[bookmarks]]`       | saved navigation commands                   | [Plugins](plugins.md#bookmarks)                            |
-| `[[workspaces]]`      | named sets of views for one task            | [Plugins](plugins.md#workspaces)                           |
-| `[[forwards]]`        | saved port-forwards, optionally autostarted | [Plugins](plugins.md#saved-forwards)                       |
-| `[[guardrails]]`      | enforced rules on destructive actions       | [Safety](safety.md#guardrails)                             |
-| `[logs]`              | log tail, follow buffer, `since` lookback   | [Log controls](debugging.md#log-controls)                  |
-| `[notify]`            | bell and desktop notification delivery      | [Notifications](debugging.md#notifications)                |
-| `[keys]`              | palette completion key rebinds              | [Key reference](keys.md#palette-completion-keys)           |
-| `[debug]`             | ephemeral and node debug images             | [Debug containers](debugging.md#debug-containers-and-pods) |
-| `[bundle]`            | redaction and size caps for `:bundle`       | [Diagnostic bundles](debugging.md#diagnostic-bundles)      |
-| `[pvc_explore]`       | helper pod image and TTL for PVC explore    | [PVC explore](features.md#pvc-explore)                     |
-| `[providers.metrics]` | Prometheus/VictoriaMetrics for `:rightsize` | [Providers](providers.md#right-sizing-metrics-provider)    |
-| `[providers.logs]`    | VictoriaLogs backend for `L`                | [Providers](providers.md#log-provider-victorialogs)        |
-| `[fleet]`             | contexts in the cross-cluster dashboard     | [Providers](providers.md#fleet-dashboard)                  |
+| Section               | What it does                                             | Docs                                                       |
+| --------------------- | -------------------------------------------------------- | ---------------------------------------------------------- |
+| `[views]`             | columns (path, built-in, metric) and navigation per view | [Views and thresholds](views.md)                           |
+| `[thresholds]`        | RESTARTS/CPU/MEM/utilization coloring bands              | [Views and thresholds](views.md#thresholds)                |
+| `[[plugins]]`         | shell-out commands bound to key chords                   | [Plugins](plugins.md)                                      |
+| `[[bookmarks]]`       | saved navigation commands                                | [Plugins](plugins.md#bookmarks)                            |
+| `[[workspaces]]`      | named sets of views for one task                         | [Plugins](plugins.md#workspaces)                           |
+| `[[forwards]]`        | saved port-forwards, optionally autostarted              | [Plugins](plugins.md#saved-forwards)                       |
+| `[[guardrails]]`      | enforced rules on destructive actions                    | [Safety](safety.md#guardrails)                             |
+| `[logs]`              | log tail, follow buffer, `since` lookback                | [Log controls](debugging.md#log-controls)                  |
+| `[notify]`            | bell and desktop notification delivery                   | [Notifications](debugging.md#notifications)                |
+| `[keys]`              | palette completion key rebinds                           | [Key reference](keys.md#palette-completion-keys)           |
+| `[debug]`             | ephemeral and node debug images                          | [Debug containers](debugging.md#debug-containers-and-pods) |
+| `[bundle]`            | redaction and size caps for `:bundle`                    | [Diagnostic bundles](debugging.md#diagnostic-bundles)      |
+| `[pvc_explore]`       | helper pod image and TTL for PVC explore                 | [PVC explore](features.md#pvc-explore)                     |
+| `[providers.metrics]` | Prometheus/VictoriaMetrics for `:rightsize`              | [Providers](providers.md#right-sizing-metrics-provider)    |
+| `[providers.logs]`    | VictoriaLogs backend for `L`                             | [Providers](providers.md#log-provider-victorialogs)        |
+| `[fleet]`             | contexts in the cross-cluster dashboard                  | [Providers](providers.md#fleet-dashboard)                  |
 
 ## Per-cluster and per-context overrides
 

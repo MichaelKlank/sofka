@@ -10,7 +10,7 @@ use kube::discovery::ApiResource;
 use serde_json::Value;
 
 use crate::store::AdjacentItem;
-use crate::views::{View, key_plural, lookup_keys};
+use crate::views::{View, key_namespace, key_plural, lookup_keys};
 
 /// Which way a connection runs, as the row shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -311,11 +311,16 @@ const BUILTIN_CHILDREN: &[(&str, &[&str])] = &[
     ("karpenter.sh/nodeclaims", &["nodes"]),
 ];
 
-/// Every reference whose source is `ar`: built-in rows keyed like the view
-/// keys, then the `refs` of every configured view for the kind. Additive
-/// across keys — a specific view's rows don't hide a broader key's.
-pub fn rules_for(views: &HashMap<String, View>, ar: &ApiResource) -> Vec<RefRule> {
-    let keys = lookup_keys(ar);
+/// Every reference whose source is `ar` in `namespace`: built-in rows keyed
+/// like the view keys, then the `refs` of every configured view for the kind,
+/// `@namespace`-qualified views included. Additive across keys — a specific
+/// view's rows don't hide a broader key's.
+pub fn rules_for(
+    views: &HashMap<String, View>,
+    ar: &ApiResource,
+    namespace: Option<&str>,
+) -> Vec<RefRule> {
+    let keys = lookup_keys(ar, namespace);
     let mut rules: Vec<RefRule> = BUILTIN_REFS
         .iter()
         .filter(|b| keys.iter().any(|k| k == b.from))
@@ -331,8 +336,12 @@ pub fn rules_for(views: &HashMap<String, View>, ar: &ApiResource) -> Vec<RefRule
 
 /// The plurals to scan for a row's children, built-in and configured, each
 /// once.
-pub fn children_for(views: &HashMap<String, View>, ar: &ApiResource) -> Vec<String> {
-    let keys = lookup_keys(ar);
+pub fn children_for(
+    views: &HashMap<String, View>,
+    ar: &ApiResource,
+    namespace: Option<&str>,
+) -> Vec<String> {
+    let keys = lookup_keys(ar, namespace);
     let builtin = BUILTIN_CHILDREN
         .iter()
         .filter(|(from, _)| keys.iter().any(|k| k == from))
@@ -537,6 +546,7 @@ pub fn plan(
 ) -> Plan {
     let ns = obj.metadata.namespace.clone().unwrap_or_default();
     let scope_ns = if ns.is_empty() { table_ns } else { ns.as_str() };
+    let row_ns = (!ns.is_empty()).then_some(ns.as_str());
     let mut plan = Plan::default();
 
     for o in obj.metadata.owner_references.iter().flatten() {
@@ -551,7 +561,7 @@ pub fn plan(
             }
         }
     }
-    plan.children = children_for(views, &source.ar)
+    plan.children = children_for(views, &source.ar, row_ns)
         .iter()
         .filter_map(|p| kinds.by_name(p))
         .collect();
@@ -559,7 +569,7 @@ pub fn plan(
     let value = serde_json::to_value(obj).unwrap_or(Value::Null);
     // A rule whose target kind isn't served here — a class from a CSI driver
     // that isn't installed — simply contributes nothing.
-    for rule in rules_for(views, &source.ar) {
+    for rule in rules_for(views, &source.ar, row_ns) {
         let Some(target) = kinds.by_name(&rule.kind) else {
             continue;
         };
@@ -585,8 +595,11 @@ pub fn plan(
         let Some(from) = resolve_view_key(kinds, &rule.from) else {
             continue;
         };
-        let scope = match rule.reverse {
-            Reverse::Namespace if from.namespaced => scope_ns.to_string(),
+        // A rule declared under `kind@namespace` describes that namespace's
+        // objects only, so that's where its usages are looked for.
+        let scope = match (key_namespace(&rule.from), rule.reverse) {
+            (Some(pinned), _) if from.namespaced => pinned.to_string(),
+            (None, Reverse::Namespace) if from.namespaced => scope_ns.to_string(),
             _ => String::new(),
         };
         plan.backward.push(Backward { rule, from, scope });
@@ -800,7 +813,7 @@ mod tests {
     #[test]
     fn builtin_rules_are_keyed_like_views() {
         let views = HashMap::new();
-        let pods = rules_for(&views, &ar("", "Pod", "pods"));
+        let pods = rules_for(&views, &ar("", "Pod", "pods"), None);
         assert!(
             pods.iter()
                 .any(|r| r.kind == "nodes" && r.relation == "runs on")
@@ -808,8 +821,12 @@ mod tests {
         assert!(pods.iter().any(|r| r.kind == "persistentvolumeclaims"));
         // A same-named plural in another group gets nothing: PodMetrics
         // shares `pods` but has no spec to point into.
-        assert!(rules_for(&views, &ar("metrics.k8s.io", "PodMetrics", "pods")).is_empty());
-        let pv = rules_for(&views, &ar("", "PersistentVolume", "persistentvolumes"));
+        assert!(rules_for(&views, &ar("metrics.k8s.io", "PodMetrics", "pods"), None).is_empty());
+        let pv = rules_for(
+            &views,
+            &ar("", "PersistentVolume", "persistentvolumes"),
+            None,
+        );
         let claim = pv
             .iter()
             .find(|r| r.kind == "persistentvolumeclaims")
@@ -819,10 +836,10 @@ mod tests {
             Some("/spec/claimRef/namespace")
         );
         assert_eq!(
-            children_for(&views, &ar("apps", "Deployment", "deployments")),
+            children_for(&views, &ar("apps", "Deployment", "deployments"), None),
             ["replicasets"]
         );
-        assert!(children_for(&views, &ar("", "Secret", "secrets")).is_empty());
+        assert!(children_for(&views, &ar("", "Secret", "secrets"), None).is_empty());
     }
 
     #[test]
@@ -849,7 +866,7 @@ mod tests {
         );
         assert!(warnings.is_empty(), "{warnings:?}");
         let claims = ar("karpenter.sh", "NodeClaim", "nodeclaims");
-        let rules = rules_for(&views, &claims);
+        let rules = rules_for(&views, &claims, None);
         // The built-in node row and the configured class row both apply.
         assert!(rules.iter().any(|r| r.kind == "nodes"));
         let class = rules.iter().find(|r| r.kind == "ec2nodeclasses").unwrap();
@@ -858,15 +875,72 @@ mod tests {
             ("shaped by", Reverse::Cluster)
         );
         // Built-in `nodes` and the configured copy of it collapse to one.
-        assert_eq!(children_for(&views, &claims), ["nodes", "ec2nodeclasses"]);
+        assert_eq!(
+            children_for(&views, &claims, None),
+            ["nodes", "ec2nodeclasses"]
+        );
 
-        let pods = rules_for(&views, &ar("", "Pod", "pods"));
+        let pods = rules_for(&views, &ar("", "Pod", "pods"), None);
         let team = pods.iter().find(|r| r.kind == "teams").unwrap();
         assert_eq!(
             (team.relation.as_str(), team.reverse),
             ("references", Reverse::Namespace)
         );
         assert!(all_rules(&views).iter().any(|r| r.kind == "teams"));
+    }
+
+    #[test]
+    fn namespaced_view_keys_apply_to_that_namespace_only() {
+        let (views, warnings) = crate::views::compile(
+            &toml::from_str::<crate::config::Config>(
+                r#"
+                [[views."pods@prod".refs]]
+                path = "/metadata/annotations/example.com~1owner"
+                kind = "teams"
+                reverse = "cluster"
+                "#,
+            )
+            .unwrap()
+            .views,
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let pods = ar("", "Pod", "pods");
+        assert!(
+            rules_for(&views, &pods, Some("prod"))
+                .iter()
+                .any(|r| r.kind == "teams")
+        );
+        assert!(
+            rules_for(&views, &pods, Some("dev"))
+                .iter()
+                .all(|r| r.kind != "teams")
+        );
+        assert!(
+            rules_for(&views, &pods, None)
+                .iter()
+                .all(|r| r.kind != "teams")
+        );
+
+        // Read backwards from a team, the rule's pods are listed in prod
+        // whatever `reverse` says: that's the only namespace it describes.
+        let mut kinds = cluster();
+        kinds.0.push(kind("example.com", "Team", "teams", false));
+        let team = obj(
+            json!({"apiVersion": "example.com/v1", "kind": "Team", "metadata": {"name": "core"}}),
+        );
+        let plan = self::plan(
+            &views,
+            &kinds,
+            &kind("example.com", "Team", "teams", false),
+            &team,
+            "dev",
+        );
+        let pods_rule = plan
+            .backward
+            .iter()
+            .find(|b| b.from.plural == "pods")
+            .unwrap();
+        assert_eq!(pods_rule.scope, "prod");
     }
 
     #[test]
@@ -879,6 +953,8 @@ mod tests {
         // A key naming another group must not resolve to the core kind.
         assert!(resolve_view_key(&kinds, "metrics.k8s.io/pods").is_none());
         assert!(resolve_view_key(&kinds, "nope").is_none());
+        // A namespace suffix is not part of the plural.
+        assert!(resolve_view_key(&kinds, "v1/pods@prod").is_some());
     }
 
     #[test]
@@ -1002,7 +1078,7 @@ mod tests {
         assert!(!owned_by(&pod, Some("s-2")));
         assert!(!owned_by(&pod, None));
 
-        let mounts = rules_for(&HashMap::new(), &ar("", "Pod", "pods"))
+        let mounts = rules_for(&HashMap::new(), &ar("", "Pod", "pods"), None)
             .into_iter()
             .find(|r| r.path.contains("persistentVolumeClaim"))
             .unwrap();
@@ -1021,6 +1097,7 @@ mod tests {
         let bound = rules_for(
             &HashMap::new(),
             &ar("", "PersistentVolume", "persistentvolumes"),
+            None,
         )
         .into_iter()
         .find(|r| r.namespace_path.is_some())

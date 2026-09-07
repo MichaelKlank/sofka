@@ -6,9 +6,19 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 
 - **Connect** to the current kubeconfig context, including exec credential
   plugins (GKE, EKS, and friends).
+- **Optional v1 client certificates** through `--allow-v1-client-cert`, disabled
+  by default. See [certificate compatibility](debugging.md#x509-v1-client-certificates).
+- **Teleport local proxy certificates** work when the server certificate exactly
+  matches a configured CA. Hostname, date, usage, and TLS signature checks remain
+  enabled. See [proxy certificates](debugging.md#teleport-local-kubernetes-proxy-certificates).
 - **API discovery** of every resource type on the cluster, with k9s-style short
   aliases (`po`, `dp`, `svc`, `no`, `cm`, `sts`, `ds`, `ks`, `hr`, …) and correct
   precedence - core `pods` wins over `pods.metrics.k8s.io`.
+  Discovered short names also work for custom resources, such as `:md` for
+  MachineDeployments. Exact aliases appear before fuzzy resource matches.
+  Resource names and built-in aliases take priority over discovered short names.
+  Shared short names use group priority, then alphabetical group and resource
+  order. User aliases override discovered aliases.
 - **Live watch** of any kind through `kube::runtime::watcher`, streamed into an
   in-memory store. Watch requests use uncompressed responses to avoid gzip
   stream errors. List requests retain gzip compression.
@@ -43,10 +53,14 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   NAME and NAMESPACE stay fixed. Other columns keep their widths while you
   scroll. Arrows in the title show where more content is available. When all
   columns fit, Left and Right do nothing.
-- **Custom views** - define columns for any resource in the config file. An
+- **Custom views** - define columns for any resource in the config file.
+  Select and order built-in columns, live CPU/MEM usage, pod request and limit
+  totals, and utilization percentages. Metric columns support numeric sorting,
+  structured filters, and threshold colors. An
   unknown custom resource picks up its CRD `additionalPrinterColumns`
   automatically. `w` toggles wide-only columns (kubectl `-o wide`), including
-  node labels. See
+  node labels. Add `@<namespace>` to a view key to select columns for one
+  namespace. See
   [Views and thresholds](views.md).
 - **Drill-down navigation** with a breadcrumb stack: workload/service → pods,
   cronjob → its jobs, node → its pods, pod → containers, namespace → re-scope,
@@ -69,16 +83,17 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   `reload`, `config`, `info`). `:` and `?` open the palette and help from every
   navigation screen, then close back to the screen where they were opened.
 - **Filtering** (`/`) with matched-character highlighting: fuzzy text, `"text"`
-  exact match, `/re/` regular expression (both case-insensitive), `!text`
-  inverse match (`!"text"` and `!/re/` too), `-l`/`-f` label and field selectors
-  (evaluated server-side on ⏎), and typed column comparisons
-  (`status=CrashLoopBackOff`, `cpu>500m`, `memory>1Gi`, `restarts>=5`,
-  `age<2h`). Space-separated terms AND together. Quoted terms and `/re/` terms keep
-  their spaces. Quotes inside `/re/` are part of the regular expression.
-  Quoted text matches Unicode lowercase equivalents in column cells.
-  Fuzzy matching is deliberately loose — `khc` finds `kube-httpcache-0` — so a
-  short needle like `auth` also matches names that merely contain
-  `a`…`u`…`t`…`h`. Quote it (`"auth"`) to match only a contiguous run.
+  contiguous match, `/re/` regular expression (both case-insensitive), `!text`
+  inverse match (also `!"text"` and `!/re/`), `-l`/`-f` label and field selectors (evaluated server-side on
+  ⏎), and typed column comparisons (`status=CrashLoopBackOff`, `cpu>500m`,
+  `memory>1Gi`, `restarts>=5`, `age<2h`). Structured terms AND together with
+  spaces or `&&`; `||` combines alternatives, parentheses group expressions,
+  and `!(...)` negates a group. Quote values containing spaces. Selectors
+  survive refresh, namespace changes, drill-down, and view history. The title
+  shows local, server-side, mixed, or pending evaluation; `/` edits and Esc
+  clears. Palette queries combine scope and filtering:
+  `:pods -n prod --context west /-l app=api status=Running`.
+  See [filter grammar and selectors](filtering.md).
 - **Toggle faults** (`Ctrl+Z`, pods only) shows pending, failed, unknown,
   terminating, and running pods that are not ready. Completed pods are hidden.
   The table title shows `[faults]` while the filter is on. It works with the
@@ -105,6 +120,9 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   session recents (·) above the rest, plus a context switcher (`:ctx`). The
   last namespace picked in each context is remembered across restarts
   (`<state-dir>/namespaces.toml`); `-n`/`-A` override it for a session.
+- **Default sort** - `[views."*"].sort` sets a global initial sort, with
+  resource-specific overrides. Sort choices are saved per kind by default.
+  Set `remember_sort = false` to make user sort changes temporary.
 - **Mouse support** - the wheel scrolls every view (one notch is three steps of
   that view's own up/down), clicking a row selects it, clicking a column header
   sorts by it (click again to flip). Document views (YAML/describe, diff,
@@ -270,6 +288,12 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   `kubectl apply`s - sofka diffs against the previous revision this session's
   watch saw, so "what just changed?" has an answer. The last revision of up to
   256 changed objects is kept in memory.
+
+In the describe view, `r` turns automatic refresh on or off. Refresh is off
+when the view opens. When on, it runs `kubectl describe` immediately and then
+5 seconds after each result. This updates the full document, including events.
+The resource, scroll position, and search stay the same. Refresh stops when
+you leave the view or a request fails. A failed request keeps the last result.
 
 ## PVC explore
 

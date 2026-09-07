@@ -17,6 +17,38 @@ fn node_pods_watch_forbidden(error: &watcher::Error) -> bool {
 impl App {
     // ----- navigation ----------------------------------------------------
 
+    pub(super) fn apply_resource_query(&mut self, query: crate::filter::ResourceQuery) {
+        if let Some(context) = &query.context
+            && (context != &self.cluster.context || !self.cluster.connected)
+        {
+            let context = context.clone();
+            self.switch_context(context);
+            self.pending_bookmark = None;
+            self.pending_workspace = None;
+            self.pending_resource_query = Some(query);
+            return;
+        }
+        let Some(kind) = self.cluster.resolve(&query.resource) else {
+            self.flash_warn(&format!("No resource matches '{}'", query.resource));
+            return;
+        };
+        self.save_history_filter();
+        if let Some(ns) = &query.namespace {
+            self.namespace = normalize_ns(ns);
+            self.note_recent_namespace(ns);
+            self.remember_namespace();
+        }
+        self.set_root_view(kind);
+        self.filter = query.filter;
+        self.record_history();
+        self.start_watch();
+        self.set_flash(format!(
+            "Viewing {} in {}",
+            self.kind_plural,
+            self.namespace_label()
+        ));
+    }
+
     /// Switch the active resource kind by user input. Pushes the current view
     /// so `esc` can return.
     pub fn switch_kind(&mut self, input: &str) {
@@ -28,6 +60,7 @@ impl App {
     pub fn switch_kind_ns(&mut self, input: &str, ns: Option<&str>) {
         match self.cluster.resolve(input) {
             Some(kind) => {
+                self.save_history_filter();
                 if let Some(ns) = ns {
                     self.namespace = normalize_ns(ns);
                     self.note_recent_namespace(ns);
@@ -148,6 +181,16 @@ impl App {
 
     // ----- view history (`[` / `]`) ---------------------------------------
 
+    pub(super) fn save_history_filter(&mut self) {
+        if self.stack.is_empty()
+            && let Some(entry) = self.history.get_mut(self.history_pos)
+            && entry.kind_plural == self.kind_plural
+            && entry.namespace == self.namespace
+        {
+            entry.filter = self.filter.clone();
+        }
+    }
+
     /// Record the current root view (kind + namespace). Called after every
     /// root switch; navigating with `[`/`]` bypasses this so hopping through
     /// history doesn't rewrite it. A new entry truncates the forward tail.
@@ -158,6 +201,7 @@ impl App {
         let entry = ViewEntry {
             kind_plural: self.kind_plural.clone(),
             namespace: self.namespace.clone(),
+            filter: self.filter.clone(),
         };
         if self.history.get(self.history_pos) == Some(&entry) {
             return;
@@ -175,6 +219,7 @@ impl App {
             self.flash_warn("already at oldest view");
             return;
         }
+        self.save_history_filter();
         self.history_pos -= 1;
         self.apply_history_entry();
     }
@@ -184,6 +229,7 @@ impl App {
             self.flash_warn("already at newest view");
             return;
         }
+        self.save_history_filter();
         self.history_pos += 1;
         self.apply_history_entry();
     }
@@ -199,6 +245,7 @@ impl App {
         self.namespace = entry.namespace;
         let title = kind.title();
         self.set_root_view(kind);
+        self.filter = entry.filter;
         self.flash = format!(
             "history {}/{}: {title} in {}",
             self.history_pos + 1,
@@ -210,6 +257,7 @@ impl App {
     }
 
     pub(super) fn push_frame(&mut self) {
+        self.save_history_filter();
         if self.kind.is_none() {
             return;
         }
@@ -264,6 +312,13 @@ impl App {
                 parsed.fields().map(str::to_string),
             )
         };
+        // This watch replaces any pending context connection. Its result
+        // becomes stale when the generation changes below.
+        if self.context_switch_target.take().is_some() {
+            self.pending_resource_query = None;
+            self.pending_bookmark = None;
+            self.pending_workspace = None;
+        }
         self.applied_filter_labels = filter_labels;
         self.applied_filter_fields = filter_fields;
         self.clear_progress_flash();
@@ -783,6 +838,8 @@ impl App {
     }
 
     pub(super) fn bump_generation(&mut self) {
+        self.stop_describe_refresh();
+        self.describe_source = None;
         self.stop_event_stream();
         self.clear_progress_flash();
         self.stop_plugins();
@@ -800,6 +857,7 @@ impl App {
     /// being involved at all.
     pub fn handle_msg(&mut self, msg: Msg) {
         self.handle_msg_inner(msg);
+        self.check_describe_refresh();
         let overlay = matches!(
             self.mode,
             Mode::PvcExplore
@@ -936,14 +994,18 @@ impl App {
                         let headers = self.display_headers();
                         headers.get(i).cloned()
                     })
-                    .is_some_and(|h| matches!(h.as_str(), "CPU" | "MEM" | "%CPU" | "%MEM"));
+                    .is_some_and(|h| self.spec.metric(&h).is_some());
                 if !data.is_empty() || !containers.is_empty() {
                     self.metrics_seen = true;
                 }
                 self.metrics_error = None;
                 self.metrics = data;
                 self.container_metrics = containers;
-                if sort_uses_metrics || self.parsed_filter().uses_metrics() {
+                if sort_uses_metrics
+                    || self
+                        .parsed_filter()
+                        .uses_metrics(&|key| self.spec.metric(key).is_some())
+                {
                     self.invalidate_rows();
                 }
             }
@@ -951,9 +1013,15 @@ impl App {
                 let sort_uses_pods = self
                     .sort_column
                     .and_then(|i| self.display_headers().get(i).cloned())
-                    .is_some_and(|h| h == "PODS");
+                    .is_some_and(|h| {
+                        self.spec.metric(&h) == Some(crate::columns::MetricColumn::NodePods)
+                    });
                 self.node_pods = Some(counts);
-                if sort_uses_pods {
+                if sort_uses_pods
+                    || self.parsed_filter().uses_metrics(&|key| {
+                        self.spec.metric(key) == Some(crate::columns::MetricColumn::NodePods)
+                    })
+                {
                     self.invalidate_rows();
                 }
             }
@@ -976,6 +1044,7 @@ impl App {
                     // A remembered sort on a printer column only becomes
                     // resolvable now that the CRD's columns are known.
                     self.apply_remembered_sort();
+                    self.apply_view_sort();
                 }
             }
             Msg::FindResults {
@@ -1111,6 +1180,8 @@ impl App {
                 lines,
                 warn,
             } if generation == self.generation && run == self.plugin_run => {
+                self.stop_describe_refresh();
+                self.describe_source = None;
                 self.plugin_task = None;
                 self.plugin_claim = None;
                 self.detail = Scrollable {
@@ -1233,6 +1304,15 @@ impl App {
                 lines,
                 warn,
             } if generation == self.generation => {
+                self.stop_describe_refresh();
+                if warn.is_some()
+                    || self
+                        .describe_source
+                        .as_ref()
+                        .is_none_or(|(id, _)| *id != claim)
+                {
+                    self.describe_source = None;
+                }
                 self.detail = Scrollable {
                     title,
                     lines: lines.into(),
@@ -1244,6 +1324,21 @@ impl App {
                     // The "describing X…" progress flash has served its
                     // purpose once the document arrives.
                     None => self.clear_claimed_status(claim),
+                }
+            }
+            Msg::DescribeRefresh { generation, result }
+                if generation == self.describe_refresh_generation
+                    && self.describe_refresh_task.is_some()
+                    && (self.mode == Mode::Detail
+                        || (self.mode == Mode::DocFilter
+                            && self.doc_filter_return == Mode::Detail)) =>
+            {
+                match result {
+                    Ok(lines) => self.detail.replace_lines(lines.into()),
+                    Err(error) => {
+                        self.stop_describe_refresh();
+                        self.flash_warn(&error);
+                    }
                 }
             }
             Msg::Events {
@@ -1407,17 +1502,23 @@ impl App {
                 generation,
                 name,
                 result,
-            } if generation == self.generation => match result {
-                Ok(cluster) => self.apply_context_switch(name, cluster),
-                Err(e) => {
-                    self.flash_warn(&format!("context switch failed: {e}"));
-                    // Never connected anywhere yet — put the picker back up
-                    // instead of stranding the user on an empty table.
-                    if !self.cluster.connected {
-                        self.open_contexts();
+            } if generation == self.generation => {
+                self.context_switch_target = None;
+                match result {
+                    Ok(cluster) => self.apply_context_switch(name, cluster),
+                    Err(e) => {
+                        self.pending_resource_query = None;
+                        self.pending_bookmark = None;
+                        self.pending_workspace = None;
+                        self.flash_warn(&format!("context switch failed: {e}"));
+                        // Never connected anywhere yet — put the picker back up
+                        // instead of stranding the user on an empty table.
+                        if !self.cluster.connected {
+                            self.open_contexts();
+                        }
                     }
                 }
-            },
+            }
             _ => {} // stale generation, drop
         }
         if preserve_selection {

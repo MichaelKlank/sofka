@@ -43,9 +43,7 @@ impl App {
         });
     }
 
-    /// The current table as plain (unstyled) columns + rows — the same layout
-    /// the table renders (NAMESPACE prepended across namespaces, CPU/MEM
-    /// appended for pods/nodes, volatile cells resolved), minus the coloring.
+    /// The current table as plain columns and rows, with live values.
     pub(super) fn snapshot_table(&self) -> (Vec<String>, Vec<Vec<String>>) {
         self.snapshot_table_at(crate::columns::now_secs())
     }
@@ -53,7 +51,6 @@ impl App {
     pub(super) fn snapshot_table_at(&self, now: i64) -> (Vec<String>, Vec<Vec<String>>) {
         let headers: Vec<String> = self.display_headers().to_vec();
         let show_ns = self.show_namespace_column();
-        let metrics_cols = self.metrics_columns();
 
         let objs = self.rows();
         self.ensure_table_cell_cache_at(&objs, now);
@@ -71,17 +68,13 @@ impl App {
                 if let Some((base_cells, _)) = cache.get(&rk) {
                     let helm_updated = cache.helm_updated(&rk);
                     for (i, cell) in base_cells.iter().enumerate() {
-                        match spec.volatile_cached(obj, &self.kind_plural, i, now, helm_updated) {
+                        match self.live_cell(obj, i).or_else(|| {
+                            spec.volatile_cached(obj, &self.kind_plural, i, now, helm_updated)
+                        }) {
                             Some(v) => cells.push(v),
                             None => cells.push(cell.to_string()),
                         }
                     }
-                }
-                if self.node_capacity_columns() {
-                    cells.push(self.node_pods_cell(obj));
-                }
-                if metrics_cols {
-                    cells.extend(self.metric_cells(obj));
                 }
                 cells
             })

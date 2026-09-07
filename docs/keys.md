@@ -7,8 +7,15 @@ pickers keep both characters available as input.
 
 ## Table views
 
+Use `:resource -n namespace --context context /filter` to apply a complete query.
+Scope options precede the slash. Structured filter terms combine with spaces or
+`&&`, with `||` for OR and `!(...)` for group negation. `/` edits the active filter
+and Esc clears it. See [filtering](filtering.md)
+for the grammar and selector persistence rules.
+
 | Key                                           | Action                                                                                                                                                        |
 | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `:resource -n ns --context ctx /filter`       | query resource, namespace, context, and filter together                                                                                                       |
 | `:<resource>`                                 | command palette - fuzzy over kinds and built-in commands                                                                                                      |
 | `:<resource> <ns>`                            | switch kind and namespace at once (`:deploy social`; `all`/`*` = all namespaces; the namespace tab-completes)                                                 |
 | `[` / `]`                                     | view history - back / forward through visited kind+namespace views                                                                                            |
@@ -17,7 +24,7 @@ pickers keep both characters available as input.
 | `esc`                                         | go back / pop the view stack / clear filter / clear marks                                                                                                     |
 | `j`/`k`, `↓`/`↑`, `g`/`G`                     | navigate                                                                                                                                                      |
 | `ctrl-f` / `ctrl-b`, `PgDn` / `PgUp`          | page forward / back - one screenful at a time                                                                                                                 |
-| `S` / `I`                                     | sort-column picker (fuzzy; ⏎ on the active column inverts) / invert sort direction — remembered per kind across views and restarts                            |
+| `S` / `I`                                     | sort-column picker (fuzzy; ⏎ on the active column inverts) / invert sort direction; saved per kind by default (`remember_sort = false` disables this)         |
 | `ctrl-e`                                      | compact mode: collapse the header + footer (for tiled/multiplexed panes)                                                                                      |
 | `space`                                       | mark/unmark row for bulk actions                                                                                                                              |
 | `/`                                           | filter: fuzzy text · `"exact"` · `/regex/` · `!inverse` · `-l`/`-f` selectors (server-side on ⏎) · `status=X` `cpu>500m` `age<2h`                             |
@@ -98,6 +105,12 @@ viewport.
 highlighted. `n` / `N` go to the next or previous match. `w` wraps. `c` copies
 the document. `esc` backs out - the first press clears an active search. In the
 `?` help panel, `/` filters instead and narrows to matching keybinds.
+
+In the describe view, `r` turns automatic refresh on or off. Refresh is off
+when the view opens. When on, it runs `kubectl describe` immediately and then
+5 seconds after each result. This updates the full document, including events.
+The resource, scroll position, and search stay the same. Refresh stops when
+you leave the view or a request fails. A failed request keeps the last result.
 
 ## Explain view (`X`)
 

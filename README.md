@@ -90,6 +90,7 @@ sofka [RESOURCE] [-n NAMESPACE] [-A] [--context NAME] [--kubeconfig PATH] [--rea
   -A, --all-namespaces
   --context         kubeconfig context to start in (default: current context)
   --kubeconfig      kubeconfig file to use (sets $KUBECONFIG for the session)
+  --allow-v1-client-cert  allow X.509 v1 client certificates for this run
   --readonly        disable every mutating action for the session
   --write           force write mode, overriding any config `readonly`
 ```

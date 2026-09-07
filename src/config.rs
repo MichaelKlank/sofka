@@ -98,6 +98,8 @@ pub struct Config {
     /// behavior (text selection) everywhere. Document views release capture
     /// on their own regardless — see [`crate::app::App::wants_mouse_capture`].
     pub mouse: Option<bool>,
+    /// Save and restore sort choices per kind. Defaults to true.
+    pub remember_sort: Option<bool>,
     /// How `:notify` events are delivered — see [`NotifyConfig`].
     pub notify: NotifyConfig,
     /// Command-palette completion key rebinds — see [`KeysConfig`]. Compiled
@@ -796,6 +798,10 @@ pub struct DrillConfig {
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct ViewColumnConfig {
+    /// Built-in metric source. Use exactly one of path, metric, or builtin.
+    pub metric: Option<String>,
+    /// Existing built-in column, such as READY or AGE.
+    pub builtin: Option<String>,
     /// Column header (displayed uppercased).
     pub name: String,
     /// JSON Pointer to the cell value, e.g. `/status/phase`.

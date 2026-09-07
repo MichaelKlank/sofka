@@ -89,17 +89,45 @@ impl App {
         cells: &mut crate::store::FastMap<RowKey, CellCacheEntry>,
         now: i64,
     ) -> bool {
-        use crate::filter::{ParsedFilter, Term};
+        use crate::filter::ParsedFilter;
         match parsed {
             ParsedFilter::Fuzzy(pat) => {
                 pat.text().is_empty() || self.pattern_match_row(o, pat, key, cells, now)
             }
-            ParsedFilter::Structured(s) => s.terms.iter().all(|t| match t {
-                Term::Text { negate, pat } => {
-                    negate ^ self.pattern_match_row(o, pat, key, cells, now)
+            ParsedFilter::Structured(s) => s
+                .terms
+                .iter()
+                .all(|t| self.eval_term(o, key, t, cells, now) == Some(true)),
+        }
+    }
+
+    fn eval_term(
+        &self,
+        o: &DynamicObject,
+        key: &RowKey,
+        term: &crate::filter::Term,
+        cells: &mut crate::store::FastMap<RowKey, CellCacheEntry>,
+        now: i64,
+    ) -> Option<bool> {
+        use crate::filter::Term;
+        match term {
+            Term::Text { negate, pat } => {
+                Some(negate ^ self.pattern_match_row(o, pat, key, cells, now))
+            }
+            Term::Cmp(cmp) => self.eval_cmp(o, key, cmp, cells, now),
+            Term::All(terms) | Term::Not(terms) | Term::Any(terms) => {
+                let any = matches!(term, Term::Any(_));
+                let inverse = matches!(term, Term::Not(_));
+                let mut result = Some(!any);
+                for t in terms {
+                    match self.eval_term(o, key, t, cells, now) {
+                        Some(value) if value == any => return Some(value ^ inverse),
+                        None => result = None,
+                        _ => {}
+                    }
                 }
-                Term::Cmp(cmp) => self.eval_cmp(o, cmp, now),
-            }),
+                result.map(|v| v ^ inverse)
+            }
         }
     }
 
@@ -162,6 +190,12 @@ impl App {
     }
 
     /// The cached cells for `key`, rendering them if absent or stale.
+    ///
+    /// Every object of every rebuild reaches this, so the hit path does no
+    /// work beyond one lookup: the revision is compared borrowed rather than
+    /// cloned, and `entry` hashes the key once instead of probing before and
+    /// after the staleness check. Cloning the `Rc<str>` key to hold that
+    /// entry is a refcount bump, not a copy of the key text.
     fn cell_entry<'c>(
         &self,
         key: &RowKey,
@@ -169,28 +203,34 @@ impl App {
         cells: &'c mut crate::store::FastMap<RowKey, CellCacheEntry>,
         now: i64,
     ) -> &'c CellCacheEntry {
-        let resource_version = o.metadata.resource_version.clone();
-        let stale = cells
-            .get(key)
-            .is_none_or(|e| e.plural != self.kind_plural || e.resource_version != resource_version);
-        if stale {
-            let (rendered, status_idx, helm_updated) = self.spec.cells_with_helm_time(o, now);
-            let cell_masks: Vec<u64> = rendered.iter().map(|c| subseq_mask(c)).collect();
-            let row_mask = cell_masks.iter().fold(0u64, |a, m| a | m);
-            cells.insert(
-                key.clone(),
-                CellCacheEntry {
-                    plural: self.kind_plural.clone(),
-                    resource_version,
-                    cells: rendered,
-                    status_idx,
-                    helm_updated,
-                    cell_masks,
-                    row_mask,
-                },
-            );
+        use std::collections::hash_map::Entry;
+        let rv = o.metadata.resource_version.as_deref();
+        let fresh = |e: &CellCacheEntry| {
+            e.plural == self.kind_plural && e.resource_version.as_deref() == rv
+        };
+        let slot = match cells.entry(key.clone()) {
+            Entry::Occupied(e) if fresh(e.get()) => return e.into_mut(),
+            slot => slot,
+        };
+        let (rendered, status_idx, helm_updated) = self.spec.cells_with_helm_time(o, now);
+        let cell_masks: Vec<u64> = rendered.iter().map(|c| subseq_mask(c)).collect();
+        let row_mask = cell_masks.iter().fold(0u64, |a, m| a | m);
+        let built = CellCacheEntry {
+            plural: self.kind_plural.clone(),
+            resource_version: o.metadata.resource_version.clone(),
+            cells: rendered,
+            status_idx,
+            helm_updated,
+            cell_masks,
+            row_mask,
+        };
+        match slot {
+            Entry::Occupied(mut e) => {
+                e.insert(built);
+                e.into_mut()
+            }
+            Entry::Vacant(e) => e.insert(built),
         }
-        cells.get(key).expect("just inserted")
     }
 
     /// What fuzzy terms match against: "namespace name". Helm rows are backed
@@ -213,49 +253,124 @@ impl App {
     /// read the live metrics snapshot, `age` the creation timestamp; any
     /// other key names a displayed column (numeric values compare by the
     /// cell's leading number, text case-insensitively).
-    fn eval_cmp(&self, o: &DynamicObject, cmp: &crate::filter::Cmp, now: i64) -> bool {
+    fn eval_cmp(
+        &self,
+        o: &DynamicObject,
+        key: &RowKey,
+        cmp: &crate::filter::Cmp,
+        cells: &mut crate::store::FastMap<RowKey, CellCacheEntry>,
+        now: i64,
+    ) -> Option<bool> {
         use crate::filter::CmpValue;
-        match &cmp.value {
-            CmpValue::Cpu(want) => self
-                .metrics_for(o)
-                .is_some_and(|(cpu, _)| cmp.op.eval(cpu.cmp(want))),
-            CmpValue::Mem(want) => self
-                .metrics_for(o)
-                .is_some_and(|(_, mem)| cmp.op.eval(mem.cmp(want))),
-            CmpValue::Duration(want) => match crate::columns::age_secs(o, now) {
-                Some(age) => cmp.op.eval(age.cmp(want)),
-                None => false,
-            },
-            CmpValue::Num(want) => match self.column_cell(o, &cmp.key, now) {
-                Some(cell) => cmp
-                    .op
-                    .eval(crate::columns::parse_leading_num(&cell).total_cmp(want)),
-                None => false,
-            },
+        if let Some(metric) = self.spec.metric(&cmp.key) {
+            let actual = self.metric_value(o, metric)? as f64;
+            let wanted = match &cmp.value {
+                CmpValue::Cpu(v) | CmpValue::Mem(v) => *v as f64,
+                CmpValue::Num(v) | CmpValue::Quantity { value: v, .. } => {
+                    if metric.cpu() && !metric.percentage() {
+                        v * 1000.0
+                    } else {
+                        *v
+                    }
+                }
+                CmpValue::Str(v) if metric.percentage() => v.strip_suffix('%')?.parse().ok()?,
+                _ => return None,
+            };
+            return wanted
+                .is_finite()
+                .then(|| cmp.op.eval(actual.total_cmp(&wanted)));
+        }
+        let ordering = match &cmp.value {
+            CmpValue::Cpu(want) => self.row_metrics(o, key)?.0.cmp(want),
+            CmpValue::Mem(want) => self.row_metrics(o, key)?.1.cmp(want),
+            CmpValue::Duration(want) => crate::columns::age_secs(o, now)?.cmp(want),
+            CmpValue::Quantity { text, .. } => {
+                let cell = self.column_cell(o, key, &cmp.key, cells, now)?;
+                crate::filter::cmp_folded_lower(&cell, text)
+            }
+            CmpValue::Num(want) => {
+                let cell = self.column_cell(o, key, &cmp.key, cells, now)?;
+                crate::filter::cell_number(&cell)?.total_cmp(want)
+            }
             // `want` was folded once at parse time. ASCII cells compare through
             // an allocation-free byte iterator; non-ASCII cells use
             // whole-string lowercasing for context-sensitive Unicode mappings.
-            CmpValue::Str(want) => match self.column_cell(o, &cmp.key, now) {
-                Some(cell) => cmp.op.eval(crate::filter::cmp_folded_lower(&cell, want)),
-                None => false,
-            },
-        }
+            CmpValue::Str(want) => {
+                let cell = self.column_cell(o, key, &cmp.key, cells, now)?;
+                crate::filter::cmp_folded_lower(&cell, want)
+            }
+        };
+        Some(cmp.op.eval(ordering))
+    }
+
+    fn row_metrics(&self, o: &DynamicObject, key: &RowKey) -> Option<(i64, i64)> {
+        let metric_key = match self.kind_plural.as_str() {
+            "pods" => key.as_ref(),
+            "nodes" => o.metadata.name.as_deref()?,
+            _ => return None,
+        };
+        self.metrics.get(metric_key).copied()
     }
 
     /// The displayed cell a comparison key names (case-insensitive column
     /// header), plus NAMESPACE and a `/status/phase` fallback for kinds
-    /// without a STATUS column. Extracts only the named column — this runs
-    /// per object per rebuild when a structured filter is active.
-    fn column_cell<'o>(&self, o: &'o DynamicObject, key: &str, now: i64) -> Option<Cow<'o, str>> {
-        if key.eq_ignore_ascii_case("namespace") || key.eq_ignore_ascii_case("ns") {
-            // Borrowed: the namespace is already a `String` on the object, and
-            // this runs per object per rebuild.
-            return Some(o.metadata.namespace.as_deref().unwrap_or("").into());
+    /// without a STATUS column. Runs per object per rebuild whenever a
+    /// structured filter is active, so the object-borrowing keys are matched
+    /// before anything renders and the rest read through the row cache.
+    fn column_cell<'c>(
+        &self,
+        o: &'c DynamicObject,
+        row: &RowKey,
+        key: &str,
+        cells: &'c mut crate::store::FastMap<RowKey, CellCacheEntry>,
+        now: i64,
+    ) -> Option<Cow<'c, str>> {
+        // One match, not a chain of comparisons: these keys borrow straight
+        // from the object and never render a cell, and this runs per object
+        // per rebuild.
+        match key {
+            "namespace" | "ns" | "metadata.namespace" => {
+                return Some(o.metadata.namespace.as_deref().unwrap_or("").into());
+            }
+            "metadata.name" => return o.metadata.name.as_deref().map(Cow::Borrowed),
+            "spec.nodename" => {
+                return o
+                    .data
+                    .pointer("/spec/nodeName")
+                    .and_then(|v| v.as_str())
+                    .map(Cow::Borrowed);
+            }
+            "status.phase" => {
+                return o
+                    .data
+                    .pointer("/status/phase")
+                    .and_then(|v| v.as_str())
+                    .map(Cow::Borrowed);
+            }
+            _ => {}
         }
         if let Some(i) = self.spec.header_index(key) {
-            return self.spec.cell_at(o, i, now);
+            if let Some(value) = self.live_cell(o, i) {
+                return Some(Cow::Owned(value));
+            }
+            // Time-derived cells (AGE, a running Job's DURATION, a CronJob's
+            // LAST-SCHEDULE, user `time` columns) drift without a new
+            // resourceVersion, so the row cache cannot answer for them.
+            if let Some(cell) = self.spec.volatile(o, &self.kind_plural, i, now) {
+                return Some(Cow::Owned(cell));
+            }
+            // Through the cell cache, not `cell_at`: one curated cell can cost
+            // a full `containerStatuses` walk and three `String`s (READY,
+            // STATUS and RESTARTS share one summary), and `cell_at` pays that
+            // again for every object on every keystroke. The cached row is
+            // keyed by resourceVersion, so the rows the watch did not touch
+            // are already rendered — and rendering the whole row on a miss
+            // costs one summary, the same walk the single cell needed.
+            return Some(Cow::Borrowed(
+                self.cell_entry(row, o, cells, now).cells.get(i)?.as_str(),
+            ));
         }
-        if key.eq_ignore_ascii_case("status") {
+        if key == "status" {
             let phase = phase(o);
             return (!phase.is_empty()).then_some(Cow::Owned(phase));
         }
@@ -266,6 +381,19 @@ impl App {
     /// filter — i.e. the active filter is (partly) server-side.
     pub fn filter_server_side(&self) -> bool {
         self.applied_filter_labels.is_some() || self.applied_filter_fields.is_some()
+    }
+
+    pub fn filter_location(&self) -> &'static str {
+        if self.filter_selectors_pending() {
+            return " ·pending ⏎";
+        }
+        if !self.filter_server_side() {
+            return " ·local";
+        }
+        match &*self.parsed_filter() {
+            crate::filter::ParsedFilter::Structured(s) if !s.terms.is_empty() => " ·server+local",
+            _ => " ·server",
+        }
     }
 
     /// Parse error of the current filter input, if any.
@@ -334,9 +462,18 @@ impl App {
 
     pub(super) fn ensure_rows_cache(&self) {
         let mut cache = self.rows_cache.borrow_mut();
-        if !cache.dirty {
+        let now = crate::columns::now_secs();
+        if !cache.dirty && (!cache.time_sensitive || cache.filter_second == now) {
             return;
         }
+        let parsed = self.parsed_filter();
+        cache.time_sensitive = match &*parsed {
+            crate::filter::ParsedFilter::Structured(s) => {
+                s.terms.iter().any(crate::filter::Term::time_sensitive)
+            }
+            _ => false,
+        };
+        cache.filter_second = now;
         cache.column_widths = None;
 
         let headers = self.display_headers();
@@ -346,7 +483,7 @@ impl App {
         // CPU/MEM (and the node capacity percentages and pod counts) sort by
         // live poll snapshots, which move without a new resourceVersion, so
         // those keys can never be cached.
-        let volatile_sort = matches!(sort_header, Some("CPU" | "MEM" | "%CPU" | "%MEM" | "PODS"));
+        let volatile_sort = sort_header.is_some_and(|h| self.spec.metric(h).is_some());
         // The aggregated Helm release list (`helm list` semantics) shows only
         // the latest revision per release; `helmhistory` (one release's full
         // history) shows every revision, so it skips this.
@@ -366,12 +503,10 @@ impl App {
         }
         // Parsed once, not once per object: the filter check used to re-borrow
         // the filter cache and re-compare the raw filter string for every row.
-        let parsed = self.parsed_filter();
         // One clock reading for the whole rebuild. Every AGE cell, DURATION
         // cell and `age >` comparison in this pass is measured against the
         // same instant, so a rebuild that crosses a second boundary cannot
         // sort two rows against two different "now"s.
-        let now = crate::columns::now_secs();
         // Disjoint field borrows so the filter can warm the cell cache while
         // the sort-key cache is also held.
         let RowsCache {
@@ -631,38 +766,22 @@ impl App {
     /// for from a dozen places, several times per frame, and each answer used
     /// to be a freshly built list of owned header strings.
     pub fn display_headers(&self) -> Rc<[String]> {
-        let shape = (
-            self.show_namespace_column(),
-            self.node_capacity_columns(),
-            self.metrics_columns(),
-        );
+        let namespace = self.show_namespace_column();
         if let Some(c) = self.header_cache.borrow().as_ref()
-            && c.shape == shape
+            && c.namespace == namespace
             && c.spec_rev == self.spec_rev
         {
             return Rc::clone(&c.headers);
         }
 
-        let (ns, caps, metrics) = shape;
         let mut h = self.spec.headers();
-        if ns {
+        if namespace {
             h.insert(0, "NAMESPACE".into());
-        }
-        if caps {
-            h.push("PODS".into());
-        }
-        if metrics {
-            h.push("CPU".into());
-            h.push("MEM".into());
-        }
-        if caps {
-            h.push("%CPU".into());
-            h.push("%MEM".into());
         }
 
         let headers: Rc<[String]> = Rc::from(h);
         *self.header_cache.borrow_mut() = Some(HeaderCache {
-            shape,
+            namespace,
             spec_rev: self.spec_rev,
             headers: Rc::clone(&headers),
         });
@@ -697,14 +816,30 @@ impl App {
 
     /// Rebuild the active column layout from the current kind, user views,
     /// printer-column fallback, and wide mode. An active sort stays pinned to
-    /// its column *header* — indices shift when columns appear/disappear (wide
-    /// toggle, printer columns arriving) — and resets if the column is gone.
+    /// its column header as indices change. A selected sort waits while its
+    /// column is hidden and returns when that column is available again.
     /// Cached cells are laid out for the old spec, so they're always dropped.
     pub(super) fn refresh_view_spec(&mut self) {
-        let sort_header = self
-            .sort_column
-            .and_then(|i| self.display_headers().get(i).cloned());
+        let sort = match &self.sort_origin {
+            SortOrigin::Selected { header, desc } => Some((header.clone(), *desc)),
+            _ => self.sort_column.and_then(|i| {
+                self.display_headers()
+                    .get(i)
+                    .cloned()
+                    .map(|h| (h, self.sort_desc))
+            }),
+        };
         let resource = self.kind.as_ref().map(Kind::resource_key);
+        let warnings = crate::columns::view_warnings(
+            self.kind.as_ref().map_or("", |kind| kind.ar.group.as_str()),
+            &self.kind_plural,
+            self.active_user_view(),
+        );
+        for warning in warnings {
+            if !self.config_warnings.contains(&warning) {
+                self.config_warnings.push(warning);
+            }
+        }
         let spec = crate::columns::build_spec(
             self.kind.as_ref().map_or("", |kind| kind.ar.group.as_str()),
             &self.kind_plural,
@@ -717,15 +852,18 @@ impl App {
         );
         self.spec = spec;
         self.spec_rev = self.spec_rev.wrapping_add(1);
-        if let Some(h) = sort_header {
+        if let Some((h, desc)) = sort {
             self.sort_column = self.display_headers().iter().position(|x| *x == h);
-            if self.sort_column.is_none() {
-                self.sort_desc = false;
-            }
+            self.sort_desc = self.sort_column.is_some() && desc;
         }
         self.clear_rows_cache();
         self.col_offset = 0;
         self.col_scroll_max = 0;
+    }
+
+    pub(super) fn view_namespace(&self) -> Option<&str> {
+        self.kind.as_ref().filter(|kind| kind.namespaced)?;
+        (!self.all_namespaces()).then_some(self.namespace.as_str())
     }
 
     /// The user-configured view matching the current kind, if any. Synthetic
@@ -736,25 +874,38 @@ impl App {
         if kind.ar.plural.to_lowercase() != self.kind_plural {
             return None;
         }
-        crate::views::lookup(&self.user_views, &kind.ar)
+        crate::views::lookup(&self.user_views, &kind.ar, self.view_namespace())
     }
 
     /// Apply a view's configured initial sort, unless a sort is already
     /// active (a refresh must not clobber the user's choice).
     pub(super) fn apply_view_sort(&mut self) {
-        if self.sort_column.is_some() {
+        if self.sort_column.is_some()
+            || matches!(
+                self.sort_origin,
+                SortOrigin::Selected { .. } | SortOrigin::Cleared
+            )
+        {
             return;
         }
-        let Some((header, desc)) = self.active_user_view().and_then(|v| v.sort.clone()) else {
+        let specific_sort = self.active_user_view().and_then(|v| v.sort.clone());
+        let is_specific = specific_sort.is_some();
+        let Some((header, desc)) =
+            specific_sort.or_else(|| self.user_views.get("*").and_then(|v| v.sort.clone()))
+        else {
             return;
         };
         match self.display_headers().iter().position(|h| *h == header) {
             Some(i) => {
                 self.sort_column = Some(i);
                 self.sort_desc = desc;
+                self.sort_origin = SortOrigin::Configured;
                 self.invalidate_rows();
             }
-            None => self.flash_warn(&format!("view sort column '{header}' not found")),
+            None if is_specific => {
+                self.flash_warn(&format!("view sort column '{header}' not found"));
+            }
+            None => {}
         }
     }
 
@@ -765,6 +916,7 @@ impl App {
         // A remembered sort on a wide-only column comes back the moment its
         // column does.
         self.apply_remembered_sort();
+        self.apply_view_sort();
         self.flash = format!("wide columns: {}", if self.wide { "on" } else { "off" });
         self.flash_err = false;
     }
@@ -803,24 +955,21 @@ impl App {
         self.metrics.get(&key).copied()
     }
 
-    pub(super) fn metric_cells(&self, obj: &DynamicObject) -> Vec<String> {
-        let metrics = self.metrics_for(obj);
-        let cpu = metrics.map(|(cpu, _)| cpu);
-        let mem = metrics.map(|(_, mem)| mem);
-        let mut cells = vec![
-            crate::columns::fmt_cpu_sample(cpu),
-            crate::columns::fmt_mem_sample(mem),
-        ];
-        if self.node_capacity_columns() {
-            let (alloc_cpu, alloc_mem) = crate::columns::node_allocatable(obj);
-            cells.push(crate::columns::fmt_pct(
-                cpu.and_then(|cpu| crate::columns::usage_pct(cpu, alloc_cpu)),
-            ));
-            cells.push(crate::columns::fmt_pct(
-                mem.and_then(|mem| crate::columns::usage_pct(mem, alloc_mem)),
-            ));
+    pub(crate) fn metric_value(
+        &self,
+        obj: &DynamicObject,
+        metric: crate::columns::MetricColumn,
+    ) -> Option<i64> {
+        let group = self.kind.as_ref().map_or("", |k| k.ar.group.as_str());
+        if !metric.supported(group, &self.kind_plural) {
+            return None;
         }
-        cells
+        metric.value(obj, self.metrics_for(obj), self.node_pods_for(obj))
+    }
+
+    pub(crate) fn live_cell(&self, obj: &DynamicObject, idx: usize) -> Option<String> {
+        let metric = self.spec.metric_at(idx)?;
+        Some(metric.format(self.metric_value(obj, metric)))
     }
 
     /// Latest pod count for a node from the pods poll; `None` before the
@@ -843,6 +992,18 @@ impl App {
 
     /// Comparable value of `header`'s cell for object `o`.
     pub(super) fn column_sort_key(&self, o: &DynamicObject, header: &str, now: i64) -> SortKey {
+        if let Some(metric) = self.spec.metric(header) {
+            return SortKey::Num(
+                self.metric_value(o, metric)
+                    .map(|v| v as f64)
+                    .unwrap_or(-1.0),
+            );
+        }
+        let source_header = self
+            .spec
+            .header_index(header)
+            .and_then(|i| self.spec.canonical_header(i))
+            .unwrap_or(header);
         // User/printer columns sort by their declared type (quantity, number,
         // time…), and win over the curated special cases so an overlay that
         // redefines a header sorts by its own values.
@@ -851,7 +1012,7 @@ impl App {
         {
             return SortKey::from(v);
         }
-        match header {
+        match source_header {
             "NAMESPACE" => SortKey::Text(
                 o.metadata
                     .namespace
@@ -862,37 +1023,6 @@ impl App {
             ),
             // Unknown timestamps sort last (oldest-unknown) in ascending order.
             "AGE" => SortKey::Num(crate::columns::age_secs(o, now).unwrap_or(i64::MAX) as f64),
-            "CPU" => SortKey::Num(
-                self.metrics_for(o)
-                    .map(|(cpu, _)| cpu as f64)
-                    .unwrap_or(-1.0),
-            ),
-            "MEM" => SortKey::Num(
-                self.metrics_for(o)
-                    .map(|(_, mem)| mem as f64)
-                    .unwrap_or(-1.0),
-            ),
-            // Unknown counts (poll hasn't landed) sort below every real count.
-            "PODS" if self.node_capacity_columns() => {
-                SortKey::Num(self.node_pods_for(o).map(|c| c as f64).unwrap_or(-1.0))
-            }
-            // Unknown allocatable sorts below every real percentage.
-            "%CPU" if self.node_capacity_columns() => SortKey::Num(
-                self.metrics_for(o)
-                    .and_then(|(cpu, _)| {
-                        crate::columns::usage_pct(cpu, crate::columns::node_allocatable(o).0)
-                    })
-                    .map(|p| p as f64)
-                    .unwrap_or(-1.0),
-            ),
-            "%MEM" if self.node_capacity_columns() => SortKey::Num(
-                self.metrics_for(o)
-                    .and_then(|(_, mem)| {
-                        crate::columns::usage_pct(mem, crate::columns::node_allocatable(o).1)
-                    })
-                    .map(|p| p as f64)
-                    .unwrap_or(-1.0),
-            ),
             // Humanized time cells ("5d23h") must sort by the underlying
             // timestamp, never the rendered string. Negated epoch seconds so
             // ascending = most recent first, matching AGE; unknowns last.
@@ -930,6 +1060,7 @@ impl App {
     pub(super) fn reset_sort(&mut self) {
         self.sort_column = None;
         self.sort_desc = false;
+        self.sort_origin = SortOrigin::Unset;
     }
 
     /// Record the active sort for the current kind (and persist it), so the
@@ -938,14 +1069,21 @@ impl App {
     /// kind's entry is forgotten instead. View switches call `reset_sort`
     /// directly and must NOT land here — a switch isn't a sort choice.
     pub(super) fn remember_sort(&mut self) {
-        if self.kind_plural.is_empty() {
+        let header = self
+            .sort_column
+            .and_then(|i| self.display_headers().get(i).cloned());
+        self.sort_origin = match &header {
+            Some(header) => SortOrigin::Selected {
+                header: header.clone(),
+                desc: self.sort_desc,
+            },
+            None => SortOrigin::Cleared,
+        };
+        if !self.remember_sort || self.kind_plural.is_empty() {
             return;
         }
         let kind = self.kind_plural.clone();
-        match self
-            .sort_column
-            .and_then(|i| self.display_headers().get(i).cloned())
-        {
+        match header {
             Some(h) => self.sort_memory.set(&kind, &h, self.sort_desc),
             None if self.sort_memory.clear(&kind) => {}
             None => return, // nothing was remembered; skip the disk write
@@ -961,14 +1099,20 @@ impl App {
         }
     }
 
-    /// Restore the remembered sort for the current kind, unless a sort is
-    /// already active (a bookmark's sort spec, or a header repinned across a
-    /// spec refresh, must win). A remembered header missing from the current
+    /// Restore the remembered sort for the current kind. It can replace a
+    /// configured default, but an active user or bookmark sort has priority.
+    /// A remembered header missing from the current
     /// layout is left in memory untouched: CRD printer columns arrive after
     /// the watch starts (see `Msg::PrinterColumns`, which retries this), and
     /// a wide-only column simply stays dormant until `w`.
     pub(super) fn apply_remembered_sort(&mut self) {
-        if self.sort_column.is_some() {
+        if !self.remember_sort
+            || matches!(
+                self.sort_origin,
+                SortOrigin::Selected { .. } | SortOrigin::Cleared
+            )
+            || (self.sort_column.is_some() && self.sort_origin != SortOrigin::Configured)
+        {
             return;
         }
         let Some((header, desc)) = self.sort_memory.get(&self.kind_plural) else {
@@ -977,6 +1121,7 @@ impl App {
         if let Some(i) = self.display_headers().iter().position(|h| *h == header) {
             self.sort_column = Some(i);
             self.sort_desc = desc;
+            self.sort_origin = SortOrigin::Selected { header, desc };
             self.invalidate_rows();
         }
     }
@@ -1013,11 +1158,8 @@ impl App {
         self.selected_ref().cloned()
     }
 
-    /// `(header, value)` pairs for the selected row, mirroring the table's
-    /// displayed columns (NAMESPACE prefix, view-spec cells with volatile
-    /// overrides, PODS/CPU/MEM suffixes) — but with the full cell values,
-    /// never the width-truncated text the renderer shows. Empty cells are
-    /// dropped: there is nothing to copy from them.
+    /// Full `(header, value)` pairs for the selected row, in display order.
+    /// Live values replace cached cells. Empty cells are excluded.
     pub fn selected_row_fields(&self) -> Vec<(String, String)> {
         let Some(obj) = self.selected_ref() else {
             return Vec::new();
@@ -1030,16 +1172,13 @@ impl App {
         let (cells, _, helm_updated) = self.spec.cells_with_helm_time(obj, now);
         for (i, cell) in cells.into_iter().enumerate() {
             values.push(
-                self.spec
-                    .volatile_cached(obj, &self.kind_plural, i, now, helm_updated)
+                self.live_cell(obj, i)
+                    .or_else(|| {
+                        self.spec
+                            .volatile_cached(obj, &self.kind_plural, i, now, helm_updated)
+                    })
                     .unwrap_or(cell),
             );
-        }
-        if self.node_capacity_columns() {
-            values.push(self.node_pods_cell(obj));
-        }
-        if self.metrics_columns() {
-            values.extend(self.metric_cells(obj));
         }
         self.display_headers()
             .iter()

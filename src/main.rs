@@ -45,6 +45,10 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     kubeconfig: Option<PathBuf>,
 
+    /// Allow X.509 v1 client certificates for this run. Does not disable server checks.
+    #[arg(long)]
+    allow_v1_client_cert: bool,
+
     /// Disable every action that could modify the cluster (delete, edit,
     /// scale, shell, plugins, …). Overrides the config `readonly` option,
     /// including per-cluster/per-context overrides, for the whole session.
@@ -120,7 +124,7 @@ async fn run_main(args: Args) -> Result<()> {
     // never load config, connect, or touch the terminal.
     if let Some(name) = &args.plugin_adapter {
         return match name.as_str() {
-            "sanitize" => sofka::sanitize::run().await,
+            "sanitize" => sofka::sanitize::run(args.allow_v1_client_cert).await,
             other => Err(anyhow::anyhow!("unknown core plugin adapter '{other}'")),
         };
     }
@@ -156,8 +160,8 @@ async fn run_main(args: Args) -> Result<()> {
     // with the error, since there is no picker to fall back to.
     eprintln!("Connecting to cluster…");
     let connect = match args.context.as_deref() {
-        Some(name) => Cluster::connect_context(name).await,
-        None => Cluster::connect().await,
+        Some(name) => Cluster::connect_context(name, args.allow_v1_client_cert).await,
+        None => Cluster::connect(args.allow_v1_client_cert).await,
     };
     let (mut cluster, connect_error) = match connect {
         Ok(c) => (c, None),
@@ -173,6 +177,7 @@ async fn run_main(args: Args) -> Result<()> {
             )
         }
     };
+    cluster.allow_v1_client_cert = args.allow_v1_client_cert;
     // Per-cluster/per-context override files merge over the base config.
     let resolved = loader.resolve(&cluster.context, &cluster.cluster_name);
     for w in &resolved.warnings {
@@ -256,6 +261,7 @@ async fn run_main(args: Args) -> Result<()> {
     let sort_memory_path = sortmem::SortMemory::default_path();
     app.sort_memory = sortmem::SortMemory::load(&sort_memory_path);
     app.sort_memory_path = Some(sort_memory_path);
+    app.remember_sort = cfg.remember_sort.unwrap_or(true);
     // The last namespace picked per context persists too, so a relaunch (or
     // a `:ctx` switch back) lands where you left off.
     let namespace_memory_path = nsmem::NamespaceMemory::default_path();
@@ -780,5 +786,31 @@ async fn run(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v1_client_cert_requires_an_explicit_cli_flag() {
+        assert!(
+            !Args::try_parse_from(["sofka"])
+                .unwrap()
+                .allow_v1_client_cert
+        );
+        for mode in ["--check", "--snapshot"] {
+            let args = Args::try_parse_from(["sofka", mode, "--allow-v1-client-cert"]).unwrap();
+            assert!(args.allow_v1_client_cert);
+        }
+        let args = Args::try_parse_from([
+            "sofka",
+            "--plugin-adapter",
+            "sanitize",
+            "--allow-v1-client-cert",
+        ])
+        .unwrap();
+        assert!(args.allow_v1_client_cert);
     }
 }

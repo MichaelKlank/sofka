@@ -20,6 +20,8 @@ use serde_json::Value;
 /// How a custom column's value is rendered and sorted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColumnKind {
+    Metric(crate::columns::MetricColumn),
+    Builtin,
     #[default]
     Text,
     /// Text that also drives the row's status coloring.
@@ -149,10 +151,17 @@ pub const BUILTIN_DRILLS: &[&str] = &[
 ];
 
 /// The plural a view key names: the last segment of `apiVersion/plural`,
-/// `group/plural`, or a bare plural. A key that is a lowercased kind (`pod`)
-/// isn't a plural and won't match anything here.
+/// `group/plural`, or a bare plural, without any `@namespace` suffix. A key
+/// that is a lowercased kind (`pod`) isn't a plural and won't match anything
+/// here.
 pub(crate) fn key_plural(key: &str) -> &str {
-    key.rsplit('/').next().unwrap_or(key)
+    let last = key.rsplit('/').next().unwrap_or(key);
+    last.split('@').next().unwrap_or(last)
+}
+
+/// The namespace a view key is qualified with (`pods@prod` → `prod`), if any.
+pub(crate) fn key_namespace(key: &str) -> Option<&str> {
+    key.rsplit('/').next()?.split_once('@').map(|(_, ns)| ns)
 }
 
 /// The `{…}` tokens in a template that aren't in [`DRILL_PLACEHOLDERS`].
@@ -193,9 +202,10 @@ const NODE_REFS: &[(&str, &str)] = &[
 fn setting<'a, T: ?Sized>(
     views: &'a HashMap<String, View>,
     ar: &ApiResource,
+    namespace: Option<&str>,
     pick: impl Fn(&'a View) -> Option<&'a T>,
 ) -> Option<&'a T> {
-    lookup_keys(ar)
+    lookup_keys(ar, namespace)
         .into_iter()
         .find_map(|k| views.get(&k).and_then(&pick))
 }
@@ -203,17 +213,25 @@ fn setting<'a, T: ?Sized>(
 /// Where `enter` drills for a kind, per `[views."…"].drill`. Kinds with a
 /// built-in drill-down (workloads to pods, CRDs to their resources, …) never
 /// consult this.
-pub fn drill_for<'a>(views: &'a HashMap<String, View>, ar: &ApiResource) -> Option<&'a Drill> {
-    setting(views, ar, |v| v.drill.as_ref())
+pub fn drill_for<'a>(
+    views: &'a HashMap<String, View>,
+    ar: &ApiResource,
+    namespace: Option<&str>,
+) -> Option<&'a Drill> {
+    setting(views, ar, namespace, |v| v.drill.as_ref())
 }
 
 /// The pointer to a kind's node name: an explicit `[views."…"].node` wins over
 /// the built-in table.
-pub fn node_pointer<'a>(views: &'a HashMap<String, View>, ar: &ApiResource) -> Option<&'a str> {
-    if let Some(pointer) = setting(views, ar, |v| v.node.as_deref()) {
+pub fn node_pointer<'a>(
+    views: &'a HashMap<String, View>,
+    ar: &ApiResource,
+    namespace: Option<&str>,
+) -> Option<&'a str> {
+    if let Some(pointer) = setting(views, ar, namespace, |v| v.node.as_deref()) {
         return Some(pointer);
     }
-    lookup_keys(ar).into_iter().find_map(|key| {
+    lookup_keys(ar, None).into_iter().find_map(|key| {
         NODE_REFS
             .iter()
             .find(|(row, _)| *row == key)
@@ -236,6 +254,21 @@ pub fn compile(
     let mut views = HashMap::new();
     let mut warnings = Vec::new();
     for (key, cfg) in raw {
+        if let Some((resource, namespace)) = key.split_once('@')
+            && (resource.is_empty()
+                || namespace.is_empty()
+                || namespace.len() > 63
+                || !namespace.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+                || !namespace.ends_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+                || !namespace
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-'))
+        {
+            warnings.push(format!(
+                "views.\"{key}\": invalid namespace suffix; view ignored"
+            ));
+            continue;
+        }
         let mut columns = Vec::new();
         for c in &cfg.columns {
             let header = c.name.trim().to_uppercase();
@@ -243,7 +276,7 @@ pub fn compile(
                 warnings.push(format!("views.\"{key}\": column with empty name skipped"));
                 continue;
             }
-            let kind = match c.kind.as_deref() {
+            let mut kind = match c.kind.as_deref() {
                 None | Some("text") => ColumnKind::Text,
                 Some("status") => ColumnKind::Status,
                 Some("number") => ColumnKind::Number,
@@ -258,6 +291,41 @@ pub fn compile(
                     ColumnKind::Text
                 }
             };
+            let sources = usize::from(!c.path.is_empty())
+                + usize::from(c.metric.is_some())
+                + usize::from(c.builtin.is_some());
+            if sources != 1 {
+                warnings.push(format!("views.\"{key}\": column {header}: set exactly one of path, metric, or builtin; column skipped"));
+                continue;
+            }
+            if columns
+                .iter()
+                .any(|column: &UserColumn| column.header == header)
+            {
+                warnings.push(format!(
+                    "views.\"{key}\": duplicate column {header}; column skipped"
+                ));
+                continue;
+            }
+            if c.kind.is_some() && (c.metric.is_some() || c.builtin.is_some()) {
+                warnings.push(format!("views.\"{key}\": column {header}: type applies only to path columns; column skipped"));
+                continue;
+            }
+            let mut pointer = c.path.trim().to_string();
+            if let Some(metric) = &c.metric {
+                let Some(metric) = crate::columns::MetricColumn::parse(metric) else {
+                    warnings.push(format!("views.\"{key}\": column {header}: unknown metric '{metric}'; column skipped"));
+                    continue;
+                };
+                kind = ColumnKind::Metric(metric);
+            } else if let Some(builtin) = &c.builtin {
+                pointer = builtin.trim().to_uppercase();
+                if pointer.is_empty() {
+                    warnings.push(format!("views.\"{key}\": column {header}: builtin must name a column; column skipped"));
+                    continue;
+                }
+                kind = ColumnKind::Builtin;
+            }
             // A condition column's path is the condition *type* name, not a
             // pointer — conditions are found by name because their array
             // order isn't guaranteed by anything.
@@ -269,7 +337,9 @@ pub fn compile(
                     ));
                     continue;
                 }
-            } else if !c.path.starts_with('/') {
+            } else if !matches!(kind, ColumnKind::Metric(_) | ColumnKind::Builtin)
+                && !c.path.starts_with('/')
+            {
                 warnings.push(format!(
                     "views.\"{key}\": column {header}: path '{}' is not a JSON Pointer \
                      (must start with '/', e.g. /status/phase); column skipped",
@@ -292,7 +362,7 @@ pub fn compile(
             };
             columns.push(UserColumn {
                 header,
-                pointer: c.path.trim().to_string(),
+                pointer,
                 kind,
                 wide: c.wide,
                 width: c.width,
@@ -323,7 +393,10 @@ pub fn compile(
             None => None,
         };
         let drill = cfg.drill.as_ref().and_then(|d| {
-            let key_lc = key.to_lowercase();
+            let key_lc = key
+                .split_once('@')
+                .map_or(key.as_str(), |(resource, _)| resource)
+                .to_lowercase();
             let plural = key_plural(&key_lc);
             if BUILTIN_DRILLS.contains(&plural) {
                 warnings.push(format!(
@@ -456,7 +529,8 @@ fn parse_sort(key: &str, s: &str, warnings: &mut Vec<String>) -> Option<(String,
 
 /// The keys a resource's view can be configured under, most specific first:
 /// `apiVersion/plural`, `group/plural`, plural, then lowercased kind.
-pub(crate) fn lookup_keys(ar: &ApiResource) -> Vec<String> {
+/// Try all namespace-qualified keys before the unqualified keys.
+pub(crate) fn lookup_keys(ar: &ApiResource, namespace: Option<&str>) -> Vec<String> {
     let plural = ar.plural.to_lowercase();
     let mut keys = vec![format!("{}/{plural}", ar.api_version.to_lowercase())];
     if !ar.group.is_empty() {
@@ -464,12 +538,26 @@ pub(crate) fn lookup_keys(ar: &ApiResource) -> Vec<String> {
     }
     keys.push(plural);
     keys.push(ar.kind.to_lowercase());
+    if let Some(namespace) = namespace.filter(|ns| !ns.is_empty()) {
+        let mut qualified: Vec<_> = keys
+            .iter()
+            .map(|key| format!("{key}@{namespace}"))
+            .collect();
+        qualified.extend(keys);
+        return qualified;
+    }
     keys
 }
 
 /// Find the view for a resource, most specific key first.
-pub fn lookup<'a>(views: &'a HashMap<String, View>, ar: &ApiResource) -> Option<&'a View> {
-    lookup_keys(ar).into_iter().find_map(|k| views.get(&k))
+pub fn lookup<'a>(
+    views: &'a HashMap<String, View>,
+    ar: &ApiResource,
+    namespace: Option<&str>,
+) -> Option<&'a View> {
+    lookup_keys(ar, namespace)
+        .into_iter()
+        .find_map(|k| views.get(&k))
 }
 
 /// Resolve a JSON Pointer against the object as served by the API:
@@ -640,6 +728,9 @@ fn extract_string_map<'a>(
 
 /// Render one custom column's cell. Missing values read as `<none>`.
 pub fn render_cell(obj: &DynamicObject, col: &UserColumn, now: i64) -> String {
+    if matches!(col.kind, ColumnKind::Metric(_)) {
+        return "-".into();
+    }
     if col.kind == ColumnKind::Condition {
         return condition_status(obj, &col.pointer).unwrap_or_else(|| "<none>".into());
     }
@@ -740,7 +831,11 @@ pub fn sort_value(obj: &DynamicObject, col: &UserColumn, now: i64) -> SortValue 
         ),
         // Condition is handled above (its "pointer" is a condition name, not
         // something `extract` understands).
-        ColumnKind::Text | ColumnKind::Status | ColumnKind::Condition => SortValue::Text(
+        ColumnKind::Text
+        | ColumnKind::Status
+        | ColumnKind::Condition
+        | ColumnKind::Metric(_)
+        | ColumnKind::Builtin => SortValue::Text(
             v.as_ref()
                 .map(Extracted::render)
                 .unwrap_or_default()
@@ -955,6 +1050,28 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
+    #[test]
+    fn column_sources_validate_without_discarding_other_columns() {
+        let cfg: crate::config::Config = toml::from_str(
+            r#"
+            [views."v1/pods"]
+            columns = [
+                { name = "NAME", builtin = "NAME" },
+                { name = "CPU", metric = "cpu" },
+                { name = "CPU", metric = "memory" },
+                { name = "BOTH", path = "/spec/cpu", metric = "cpu" },
+                { name = "UNKNOWN", metric = "cpus" },
+                { name = "BAD", builtin = "" },
+                { name = "TYPED", metric = "memory", type = "text" },
+            ]
+        "#,
+        )
+        .unwrap();
+        let (views, warnings) = compile(&cfg.views);
+        assert_eq!(views["v1/pods"].columns.len(), 2);
+        assert_eq!(warnings.len(), 5);
+    }
+
     fn col(pointer: &str, kind: ColumnKind) -> UserColumn {
         UserColumn {
             header: "COL".into(),
@@ -1128,6 +1245,101 @@ mod tests {
     }
 
     #[test]
+    fn namespace_view_keys_use_two_precedence_groups() {
+        let ar = ApiResource {
+            group: "example.com".into(),
+            version: "v1".into(),
+            api_version: "example.com/v1".into(),
+            kind: "Widget".into(),
+            plural: "widgets".into(),
+        };
+        let keys = [
+            "example.com/v1/widgets@batch",
+            "example.com/widgets@batch",
+            "widgets@batch",
+            "widget@batch",
+            "example.com/v1/widgets",
+            "example.com/widgets",
+            "widgets",
+            "widget",
+        ];
+        let mut views: HashMap<_, _> = keys
+            .iter()
+            .map(|key| {
+                (
+                    key.to_string(),
+                    View {
+                        sort: Some((key.to_string(), false)),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        for key in keys {
+            assert_eq!(
+                lookup(&views, &ar, Some("batch"))
+                    .unwrap()
+                    .sort
+                    .as_ref()
+                    .unwrap()
+                    .0,
+                key
+            );
+            views.remove(key);
+        }
+        assert!(lookup(&views, &ar, Some("batch")).is_none());
+        let (views, warnings) = compile_toml(
+            r#"
+            [views."widgets@batch"]
+            sort = "NAME"
+            [views.widgets]
+            sort = "AGE"
+        "#,
+        );
+        assert!(warnings.is_empty());
+        for namespace in [None, Some(""), Some("other")] {
+            assert_eq!(
+                lookup(&views, &ar, namespace).unwrap().sort,
+                Some(("AGE".into(), false))
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_namespace_suffixes_warn_and_skip_the_view() {
+        for key in [
+            "pods@",
+            "@batch",
+            "pods@a@b",
+            "pods@Batch",
+            "pods@-batch",
+            "pods@batch-",
+            "pods@a.b",
+            "pods@a_b",
+            "pods@all namespaces",
+        ] {
+            let (views, warnings) = compile_toml(&format!("[views.\"{key}\"]"));
+            assert!(views.is_empty(), "{key}");
+            assert_eq!(warnings.len(), 1, "{key}");
+            assert!(warnings[0].contains("invalid namespace suffix"));
+        }
+        let key = format!("pods@{}", "a".repeat(64));
+        let (views, warnings) = compile_toml(&format!("[views.\"{key}\"]"));
+        assert!(views.is_empty());
+        assert_eq!(warnings.len(), 1);
+        let (_, warnings) = compile_toml(
+            r#"[views."pods@batch"]
+            drill = { kind = "secrets" }
+        "#,
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("drill is ignored"))
+        );
+    }
+
+    #[test]
     fn lookup_prefers_most_specific_key() {
         let ar = ApiResource {
             group: "cert-manager.io".into(),
@@ -1143,22 +1355,22 @@ mod tests {
         let mut views = HashMap::new();
         views.insert("certificate".to_string(), mk("by-kind"));
         assert_eq!(
-            lookup(&views, &ar).unwrap().sort,
+            lookup(&views, &ar, None).unwrap().sort,
             Some(("BY-KIND".into(), false))
         );
         views.insert("certificates".to_string(), mk("by-plural"));
         assert_eq!(
-            lookup(&views, &ar).unwrap().sort,
+            lookup(&views, &ar, None).unwrap().sort,
             Some(("BY-PLURAL".into(), false))
         );
         views.insert("cert-manager.io/certificates".to_string(), mk("by-group"));
         assert_eq!(
-            lookup(&views, &ar).unwrap().sort,
+            lookup(&views, &ar, None).unwrap().sort,
             Some(("BY-GROUP".into(), false))
         );
         views.insert("cert-manager.io/v1/certificates".to_string(), mk("by-gvr"));
         assert_eq!(
-            lookup(&views, &ar).unwrap().sort,
+            lookup(&views, &ar, None).unwrap().sort,
             Some(("BY-GVR".into(), false))
         );
     }
@@ -1178,20 +1390,23 @@ mod tests {
         };
         let views = HashMap::new();
         assert_eq!(
-            node_pointer(&views, &ar("", "Pod", "pods")),
+            node_pointer(&views, &ar("", "Pod", "pods"), None),
             Some("/spec/nodeName")
         );
         let claims = ar("karpenter.sh", "NodeClaim", "nodeclaims");
-        assert_eq!(node_pointer(&views, &claims), Some("/status/nodeName"));
+        assert_eq!(
+            node_pointer(&views, &claims, None),
+            Some("/status/nodeName")
+        );
         // A kind the table doesn't list names no node until config says where.
         let pools = ar("karpenter.sh", "NodePool", "nodepools");
-        assert_eq!(node_pointer(&views, &pools), None);
+        assert_eq!(node_pointer(&views, &pools, None), None);
         // Rows are scoped to their group: a same-named plural elsewhere
         // (or PodMetrics, whose plural is also `pods`) gets nothing.
         let other_claims = ar("example.com", "NodeClaim", "nodeclaims");
-        assert_eq!(node_pointer(&views, &other_claims), None);
+        assert_eq!(node_pointer(&views, &other_claims, None), None);
         let pod_metrics = ar("metrics.k8s.io", "PodMetrics", "pods");
-        assert_eq!(node_pointer(&views, &pod_metrics), None);
+        assert_eq!(node_pointer(&views, &pod_metrics, None), None);
 
         let (configured, warnings) = compile_toml(
             r#"
@@ -1205,10 +1420,13 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         // Config overrides a shipped row and adds a kind without one.
         assert_eq!(
-            node_pointer(&configured, &claims),
+            node_pointer(&configured, &claims, None),
             Some("/status/providerID")
         );
-        assert_eq!(node_pointer(&configured, &pools), Some("/status/host"));
+        assert_eq!(
+            node_pointer(&configured, &pools, None),
+            Some("/status/host")
+        );
     }
 
     #[test]
@@ -1232,8 +1450,8 @@ mod tests {
             "#,
         );
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(lookup(&views, &widgets).unwrap().node, None);
-        assert_eq!(node_pointer(&views, &widgets), Some("/status/host"));
+        assert_eq!(lookup(&views, &widgets, None).unwrap().node, None);
+        assert_eq!(node_pointer(&views, &widgets, None), Some("/status/host"));
     }
 
     #[test]
@@ -1254,7 +1472,7 @@ mod tests {
             node = "status.host"
             "#,
         );
-        assert_eq!(node_pointer(&views, &pods), Some("/status/hostName"));
+        assert_eq!(node_pointer(&views, &pods, None), Some("/status/hostName"));
         // A path that isn't a pointer is dropped with a warning, like columns.
         assert_eq!(views["widgets"].node, None);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
@@ -1281,7 +1499,7 @@ mod tests {
         );
         assert!(warnings.is_empty(), "{warnings:?}");
         // Found on the broader key even though the narrower one matches first.
-        let drill = drill_for(&views, &pools).expect("drill configured");
+        let drill = drill_for(&views, &pools, None).expect("drill configured");
         assert_eq!(drill.kind, "nodeclaims");
         let pool = obj(json!({"metadata": {"name": "default"}}));
         assert_eq!(
@@ -1297,7 +1515,10 @@ mod tests {
             "#,
         );
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(drill_for(&views, &pools).unwrap().labels_for(&pool), None);
+        assert_eq!(
+            drill_for(&views, &pools, None).unwrap().labels_for(&pool),
+            None
+        );
     }
 
     #[test]

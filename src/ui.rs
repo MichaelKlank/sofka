@@ -404,7 +404,11 @@ fn draw_compact_header(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(app.flash.clone(), style));
     }
 
-    let (synced, sync_color) = sync_indicator(app.mode, app.doc_filter_return, app.store.synced);
+    let (synced, sync_color) = if app.describe_refresh_task.is_some() {
+        ("● refresh", theme::sky())
+    } else {
+        sync_indicator(app.mode, app.doc_filter_return, app.store.synced)
+    };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(10), Constraint::Length(10)])
@@ -558,14 +562,18 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
 
 fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let show_ns = app.show_namespace_column();
-    let metrics_cols = app.metrics_columns();
     let headers = app.display_headers();
     let sort_col = app.sort_column;
     let sort_arrow = if app.sort_desc { " ↓" } else { " ↑" };
-    // Offset from a displayed column index back to the view spec's (the spec
-    // doesn't know about the prepended NAMESPACE or appended CPU/MEM).
+    // The namespace column is added before the view columns.
     let ns_off = usize::from(show_ns);
-    let name_col = usize::from(show_ns);
+    let name_col = (0..headers.len())
+        .find(|i| {
+            i.checked_sub(ns_off)
+                .and_then(|si| app.view_spec().canonical_header(si))
+                == Some("NAME")
+        })
+        .unwrap_or(ns_off);
     // Per-column custom alignment, precomputed so cells don't re-borrow app.
     let aligns: Vec<Option<Alignment>> = (0..headers.len())
         .map(|i| {
@@ -608,13 +616,27 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     // Column indices (fixed for the whole table) for the columns that get
     // their own visibility treatment below, computed once rather than
     // string-compared per cell.
-    let age_idx = headers.iter().position(|h| h == "AGE");
-    let ready_idx = headers.iter().position(|h| h == "READY");
-    let restarts_idx = headers.iter().position(|h| h == "RESTARTS");
-    let cpu_idx = headers.iter().position(|h| h == "CPU");
-    let mem_idx = headers.iter().position(|h| h == "MEM");
-    let pct_cpu_idx = headers.iter().position(|h| h == "%CPU");
-    let pct_mem_idx = headers.iter().position(|h| h == "%MEM");
+    let age_idx = (0..headers.len()).find(|i| {
+        i.checked_sub(ns_off)
+            .and_then(|si| app.view_spec().canonical_header(si))
+            == Some("AGE")
+    });
+    let ready_idx = (0..headers.len()).find(|i| {
+        i.checked_sub(ns_off)
+            .and_then(|si| app.view_spec().canonical_header(si))
+            == Some("READY")
+    });
+    let restarts_idx = (0..headers.len()).find(|i| {
+        i.checked_sub(ns_off)
+            .and_then(|si| app.view_spec().canonical_header(si))
+            == Some("RESTARTS")
+    });
+    let metric_columns: Vec<_> = (0..headers.len())
+        .map(|i| {
+            i.checked_sub(ns_off)
+                .and_then(|si| app.view_spec().metric_at(si))
+        })
+        .collect();
 
     let count = app.row_count();
     let visible_rows = area.height.saturating_sub(3).max(1) as usize;
@@ -662,6 +684,14 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                 .and_then(|si| app.view_spec().width_at(si))
             {
                 ColWidth::Exact(w)
+            } else if let Some(metric) = metric_columns[i] {
+                ColWidth::Exact(match metric {
+                    columns::MetricColumn::NodePods
+                    | columns::MetricColumn::NodeCpuUtilization
+                    | columns::MetricColumn::NodeMemoryUtilization => 5,
+                    _ if metric.percentage() => 7,
+                    _ => 8,
+                })
             } else {
                 match h.as_str() {
                     // NAME is the column you actually read — its weight takes
@@ -754,33 +784,13 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                 style_idx = status_idx.map(|i| i + 1);
             }
             for (i, cell) in base_cells.iter().enumerate() {
-                if let Some(value) =
-                    spec.volatile_cached(obj, &app.kind_plural, i, now, helm_updated)
+                if let Some(value) = app
+                    .live_cell(obj, i)
+                    .or_else(|| spec.volatile_cached(obj, &app.kind_plural, i, now, helm_updated))
                 {
                     cells.push(TableCellText::Owned(value));
                 } else {
                     cells.push(TableCellText::Borrowed(cell.as_str()));
-                }
-            }
-            if app.node_capacity_columns() {
-                cells.push(TableCellText::Owned(app.node_pods_cell(obj)));
-            }
-            let mut metrics_raw = None;
-            let mut node_pcts: (Option<i64>, Option<i64>) = (None, None);
-            if metrics_cols {
-                metrics_raw = app.metrics_for(obj);
-                let cpu = metrics_raw.map(|(cpu, _)| cpu);
-                let mem = metrics_raw.map(|(_, mem)| mem);
-                cells.push(TableCellText::Owned(columns::fmt_cpu_sample(cpu)));
-                cells.push(TableCellText::Owned(columns::fmt_mem_sample(mem)));
-                if app.node_capacity_columns() {
-                    let (alloc_cpu, alloc_mem) = columns::node_allocatable(obj);
-                    node_pcts = (
-                        cpu.and_then(|cpu| columns::usage_pct(cpu, alloc_cpu)),
-                        mem.and_then(|mem| columns::usage_pct(mem, alloc_mem)),
-                    );
-                    cells.push(TableCellText::Owned(columns::fmt_pct(node_pcts.0)));
-                    cells.push(TableCellText::Owned(columns::fmt_pct(node_pcts.1)));
                 }
             }
             // Combined colorer: the whole row takes a k9s-style status tint
@@ -842,23 +852,23 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                             .map(theme::severity_fg)
                             .unwrap_or(row_color);
                         c.into_cell_aligned(align).style(Style::default().fg(color))
-                    } else if Some(i) == cpu_idx {
-                        let color = metrics_raw
-                            .and_then(|(cpu, _)| thresholds.cpu.severity(cpu))
-                            .map(theme::severity_fg)
-                            .unwrap_or(row_color);
-                        c.into_cell_aligned(align).style(Style::default().fg(color))
-                    } else if Some(i) == mem_idx {
-                        let color = metrics_raw
-                            .and_then(|(_, mem)| thresholds.memory.severity(mem))
-                            .map(theme::severity_fg)
-                            .unwrap_or(row_color);
-                        c.into_cell_aligned(align).style(Style::default().fg(color))
-                    } else if Some(i) == pct_cpu_idx {
-                        let color = util_color(node_pcts.0, thresholds.utilization);
-                        c.into_cell_aligned(align).style(Style::default().fg(color))
-                    } else if Some(i) == pct_mem_idx {
-                        let color = util_color(node_pcts.1, thresholds.utilization);
+                    } else if let Some(metric) = metric_columns[i] {
+                        let value = app.metric_value(obj, metric);
+                        let color = if metric.percentage() {
+                            util_color(value, thresholds.utilization)
+                        } else if metric == columns::MetricColumn::NodePods {
+                            row_color
+                        } else {
+                            let band = if metric.cpu() {
+                                thresholds.cpu
+                            } else {
+                                thresholds.memory
+                            };
+                            value
+                                .and_then(|v| band.severity(v))
+                                .map(theme::severity_fg)
+                                .unwrap_or(row_color)
+                        };
                         c.into_cell_aligned(align).style(Style::default().fg(color))
                     } else {
                         c.into_cell_aligned(align)
@@ -901,14 +911,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(theme::teal())
         };
         title.push(Span::styled(format!(" /{}", app.filter), style));
-        title.push(Span::styled(
-            if app.filter_server_side() {
-                " ·server"
-            } else {
-                " ·local"
-            },
-            theme::dim(),
-        ));
+        title.push(Span::styled(app.filter_location(), theme::dim()));
     }
     title.push(Span::raw(" "));
 
@@ -2189,7 +2192,11 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         ),
         bind(
             "/",
-            "filter: fuzzy · \"exact\" · /regex/ · !inverse · -l/-f selectors (server-side on ⏎) · col=val cpu>500m age<2h",
+            "filter: fuzzy · \"exact\" · /regex/ · !inverse · -l/-f selectors (server-side on ⏎) · col=val cpu>500m age<2h · && || !(...)",
+        ),
+        bind(
+            ":resource -n ns --context ctx /filter",
+            "query resource, namespace, context and filter together",
         ),
         bind(
             "ctrl-u · ctrl-w",
@@ -2201,6 +2208,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("  Inspect", theme::title())),
         bind("y · d", "view YAML · describe (kubectl)"),
+        bind("r (describe)", "turn automatic refresh on/off (5s)"),
         bind("l · p", "logs (workload = all pods) · previous logs"),
         bind(
             "shift-l · :vlogs",
@@ -3822,8 +3830,8 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
                     "  ⏎ apply server-side",
                     Style::default().fg(theme::yellow()),
                 ));
-            } else if app.filter_server_side() {
-                spans.push(Span::styled("  ·server", theme::dim()));
+            } else {
+                spans.push(Span::styled(app.filter_location(), theme::dim()));
             }
             Line::from(spans)
         }
@@ -3872,6 +3880,18 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
                 "  j/k:scroll  ^f/^b:page  h/l:← →  g/G:top/bottom  /:search  n/N:next/prev  w:wrap  c:copy  x:decode  esc:back"
             } else {
                 "  j/k:scroll  ^f/^b:page  h/l:← →  g/G:top/bottom  /:search  n/N:next/prev  w:wrap  c:copy  esc:back"
+            };
+            let hint = if app.mode == Mode::Detail && app.describe_source.is_some() {
+                format!(
+                    "{hint}  r:refresh {}",
+                    if app.describe_refresh_task.is_some() {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                )
+            } else {
+                hint.to_string()
             };
             Line::from(Span::styled(hint, theme::dim()))
         }
@@ -3974,7 +3994,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Style::default().fg(theme::subtext0())
     };
-    let (synced, sync_color) = sync_indicator(app.mode, app.doc_filter_return, app.store.synced);
+    let (synced, sync_color) = if app.describe_refresh_task.is_some() {
+        ("● refresh", theme::sky())
+    } else {
+        sync_indicator(app.mode, app.doc_filter_return, app.store.synced)
+    };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(10), Constraint::Length(12)])
