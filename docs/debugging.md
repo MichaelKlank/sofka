@@ -187,7 +187,9 @@ sofka info --offline    # no connection: build, config, logging, directories
 `:info` reports the running session's watch error and reconnect counts. A
 headless report has no session to count, so it opens one watch instead - the
 same resource and namespace a launch would - and reports whether it establishes,
-how long the initial sync took, and how many objects it returned. Discovery
+how long the initial sync and watch connection took, and how many objects the
+initial list returned. A successful list alone does not count as an established
+watch. The probe also waits for successful watch response headers. Discovery
 working says nothing about whether watches do: a proxy that closes long-lived
 connections passes every other check in this report and still leaves the TUI
 with an empty table. The probe gives up after 5s, which is itself the answer
@@ -250,6 +252,10 @@ Every value is redacted on the way in - bearer tokens, kubeconfig credentials,
 log can be attached to a bug report as it is. Writing happens on its own thread
 behind a bounded queue: a stalled filesystem drops lines (counted in `:info`)
 rather than stalling the UI.
+
+Concurrent sessions can use the same log file. Writer threads use `<file>.lock`
+to coordinate writes and rotation. Each writer opens the current file and reads
+its size while it holds the lock. Keep the lock file in place while sessions run.
 
 If a kind is missing, check the discovery line first. When sofka cannot read an
 API group, it shows a warning at startup:

@@ -131,6 +131,12 @@ pub fn text(input: &str) -> Cow<'_, str> {
 /// the word "password" in prose).
 fn key_value_span(bytes: &[u8], after_key: usize) -> Option<(usize, usize)> {
     let mut i = after_key;
+    while bytes
+        .get(i)
+        .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'))
+    {
+        i += 1;
+    }
     // The rest of a quoted key ("client-secret": …) and any padding before
     // the separator, but never a newline: a key at end of line has no value.
     while matches!(bytes.get(i), Some(b'"' | b'\'' | b' ' | b'\t')) {
@@ -146,7 +152,14 @@ fn key_value_span(bytes: &[u8], after_key: usize) -> Option<(usize, usize)> {
     match bytes.get(i) {
         Some(&q @ (b'"' | b'\'')) => {
             let start = i + 1;
-            let end = memchr::memchr(q, &bytes[start..]).map_or(bytes.len(), |n| start + n);
+            let mut end = start;
+            while end < bytes.len() {
+                match bytes[end] {
+                    b'\\' => end = (end + 2).min(bytes.len()),
+                    c if c == q => break,
+                    _ => end += 1,
+                }
+            }
             (end > start).then_some((start, end))
         }
         Some(_) => {
@@ -245,6 +258,52 @@ mod tests {
         assert_eq!(
             red(r#"{"client-secret": "s3cr3t", "user": "ana"}"#),
             format!(r#"{{"client-secret": "{REDACTED}", "user": "ana"}}"#)
+        );
+    }
+
+    #[test]
+    fn redacts_credential_keys_with_suffixes() {
+        for key in [
+            "token_value",
+            "passwordText",
+            "client-secret.data",
+            "API_KEY_1",
+        ] {
+            assert_eq!(
+                red(&format!("{key}=private123 next=1")),
+                format!("{key}={REDACTED} next=1")
+            );
+        }
+        assert_eq!(
+            red("https://api.example/?token_value=private123&limit=5"),
+            format!("https://api.example/?token_value={REDACTED}&limit=5")
+        );
+    }
+
+    #[test]
+    fn redacts_escaped_quotes_and_keeps_the_next_field() {
+        for secret in [
+            r#"abc\"private123"#,
+            r"abc\\",
+            r#"abc\\\"private123"#,
+            "пароль",
+        ] {
+            let input = format!(r#"{{"password":"{secret}","user":"ana"}}"#);
+            let output = red(&input);
+            assert_eq!(
+                output,
+                format!(r#"{{"password":"{REDACTED}","user":"ana"}}"#)
+            );
+            let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(parsed["user"], "ana");
+        }
+        assert_eq!(
+            red(r"password='abc\'private123' next=1"),
+            format!("password='{REDACTED}' next=1")
+        );
+        assert_eq!(
+            red(r#"password="abc\"private123"#),
+            format!("password=\"{REDACTED}")
         );
     }
 

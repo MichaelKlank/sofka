@@ -20,7 +20,7 @@
 
 use std::fmt::{Display, Write as _};
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -271,12 +271,13 @@ fn push_value(out: &mut String, raw: &str) {
     out.push('"');
 }
 
-/// The log file and its rotation. Size is tracked rather than `stat`-ed: this
-/// runs per line, and the writer is the only thing appending to the file.
+/// The log file and its rotation. All sessions use the same lock file.
+/// Only writer threads wait for this lock.
 struct Writer {
     path: PathBuf,
     max_bytes: u64,
-    file: BufWriter<File>,
+    file: File,
+    lock: File,
     size: u64,
 }
 
@@ -285,21 +286,44 @@ impl Writer {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(PathBuf::from(lock_path))?;
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         let size = file.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(Self {
             path: path.to_path_buf(),
             max_bytes: max_bytes.max(1),
-            file: BufWriter::new(file),
+            file,
+            lock,
             size,
         })
     }
 
     fn write(&mut self, line: &str) -> std::io::Result<()> {
+        // The lock file stays in place when any session rotates the log.
+        self.lock.lock()?;
+        let result = self.write_locked(line);
+        let unlocked = self.lock.unlock();
+        result.and(unlocked)
+    }
+
+    fn write_locked(&mut self, line: &str) -> std::io::Result<()> {
+        // Another session can have replaced the file since the previous line.
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        self.size = file.metadata()?.len();
+        self.file = file;
         if self.size + line.len() as u64 > self.max_bytes && self.size > 0 {
             self.rotate()?;
         }
         self.file.write_all(line.as_bytes())?;
+        self.file.flush()?;
         self.size += line.len() as u64;
         Ok(())
     }
@@ -316,16 +340,14 @@ impl Writer {
             .create(true)
             .append(true)
             .open(&self.path)?;
-        self.file = BufWriter::new(file);
+        self.file = file;
         self.size = 0;
         Ok(())
     }
 }
 
-/// Writer thread: block for work, drain whatever else queued up behind it,
-/// then flush. Batching keeps a burst to one `write` syscall; flushing at the
-/// end of every batch keeps the file complete whenever the app is idle, which
-/// is when someone is reading it.
+/// Drain the queue on the writer thread. Each line is flushed while the
+/// rotation lock is held, so other sessions see its size before they write.
 fn run_writer(writer: &mut Writer, rx: Receiver<Entry>) {
     while let Ok(entry) = rx.recv() {
         let mut ack = handle(writer, entry);
@@ -457,6 +479,35 @@ mod tests {
     }
 
     #[test]
+    fn redaction_preserves_logfmt_fields() {
+        let line = format_line(
+            Level::Warn,
+            "request.failed",
+            &[
+                (
+                    "server",
+                    &"https://api.example/?token_value=private123&limit=5",
+                ),
+                (
+                    "error",
+                    &r#"{"password":"abc\"private456","status":"denied"}"#,
+                ),
+                ("attempt", &2),
+            ],
+        );
+        assert!(
+            !line.contains("private123") && !line.contains("private456"),
+            "{line}"
+        );
+        assert!(
+            line.contains("limit=5") && line.ends_with(" attempt=2\n"),
+            "{line}"
+        );
+        assert!(line.contains(r#"\"status\":\"denied\""#), "{line}");
+        assert_eq!(line.lines().count(), 1);
+    }
+
+    #[test]
     fn disabled_level_emits_nothing() {
         // The global sink is never initialised in tests, so `emit` is inert;
         // what matters here is that the gate itself is closed by default.
@@ -465,6 +516,53 @@ mod tests {
         assert_eq!(level(), Level::Off);
         let status = status();
         assert!(status.path.is_none() && status.written == 0 && status.dropped == 0);
+    }
+
+    #[test]
+    fn a_second_writer_uses_the_current_file_after_rotation() {
+        let dir = std::env::temp_dir().join(format!("sofka-shared-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("sofka.log");
+        let mut first = Writer::open(&path, 10).unwrap();
+        let mut second = Writer::open(&path, 10).unwrap();
+        first.write("session-a\n").unwrap();
+        first.write("rotate-a\n").unwrap();
+        first.write("rotate-a\n").unwrap();
+        second.write("b\n").unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().ends_with("b\n"));
+        assert!(std::fs::metadata(&path).unwrap().len() <= 10);
+        drop((first, second));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_writers_keep_complete_lines_and_respect_the_size_limit() {
+        let dir = std::env::temp_dir().join(format!("sofka-concurrent-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("sofka.log");
+        let first = Writer::open(&path, 128).unwrap();
+        let second = Writer::open(&path, 128).unwrap();
+        std::thread::scope(|scope| {
+            for (mut writer, prefix) in [(first, 'a'), (second, 'b')] {
+                scope.spawn(move || {
+                    for n in 0..100 {
+                        writer.write(&format!("{prefix}{n:03}\n")).unwrap();
+                    }
+                });
+            }
+        });
+        for file in [&path, &dir.join("sofka.log.1")] {
+            let text = std::fs::read_to_string(file).unwrap();
+            assert!(text.len() <= 128);
+            for line in text.lines() {
+                assert!(
+                    line.len() == 4 && matches!(line.as_bytes()[0], b'a' | b'b'),
+                    "{line}"
+                );
+                assert!(line[1..].bytes().all(|b| b.is_ascii_digit()), "{line}");
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

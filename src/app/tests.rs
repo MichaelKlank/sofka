@@ -12391,6 +12391,28 @@ async fn info_view_redacts_credentials_in_cluster_identity() {
 }
 
 #[tokio::test]
+async fn info_redacts_complete_credentials_through_the_keyboard() {
+    let (mut app, _rx) = test_app();
+    app.cluster.cluster_url = "https://api.example/?token_value=private123&limit=5".into();
+    app.last_error = Some(r#"{"password":"abc\"private456","status":"denied"}"#.into());
+    for ch in ":info".chars() {
+        app.handle_key(press(KeyCode::Char(ch))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Detail);
+    let text = info_text(&app);
+    assert!(
+        !text.contains("private123") && !text.contains("private456"),
+        "{text}"
+    );
+    assert!(
+        text.contains("limit=5") && text.contains(r#""status":"denied""#),
+        "{text}"
+    );
+    assert!(text.contains(crate::redact::REDACTED), "{text}");
+}
+
+#[tokio::test]
 async fn watch_relist_after_sync_counts_as_a_reconnect() {
     let (mut app, _rx) = test_app();
     let generation = app.generation;

@@ -177,7 +177,7 @@ pub enum WatchProbe {
     /// The resource is not in this cluster's discovery.
     Unresolved,
     Ran {
-        /// Time to the initial sync; `None` means it never synced.
+        /// Time until the initial sync and watch headers arrive; `None` on failure.
         synced: Option<Duration>,
         /// Objects in the initial list.
         objects: usize,
@@ -529,127 +529,23 @@ impl Cluster {
         generation: u64,
         tx: Sender<Msg>,
     ) -> JoinHandle<()> {
-        let client = self.client.clone();
-        let ar = kind.ar.clone();
-        let namespaced = kind.namespaced;
-        let ns = namespace.to_string();
-        let streaming_lists = Arc::clone(&self.streaming_lists);
-
-        tokio::spawn(async move {
-            let api: Api<DynamicObject> = if namespaced && !ns.is_empty() {
-                Api::namespaced_with(client, &ns, &ar)
-            } else {
-                Api::all_with(client, &ar)
-            };
-
-            let mut cfg = watcher::Config::default().any_semantic();
-            if let Some(l) = labels {
-                cfg = cfg.labels(&l);
-            }
-            if let Some(f) = fields {
-                cfg = cfg.fields(&f);
-            }
-            let mut using_streaming =
-                streaming_lists.load(Ordering::Acquire) != STREAMING_UNSUPPORTED;
-            let mut initializing = true;
-            // Distinct from `initializing`, which drives the streaming-list
-            // fallback and must keep its current lifetime: this only records
-            // that a full sync has happened, so a later re-list is a reconnect.
-            let mut synced_once = false;
-            let mut stream = watcher(
-                api.clone(),
-                if using_streaming {
-                    cfg.clone().streaming_lists()
-                } else {
-                    cfg.clone()
-                },
-            )
-            .modify(|obj| obj.managed_fields_mut().clear())
-            .boxed();
-            crate::log_info!(
-                "watch.start",
-                kind = ar.plural,
-                ns = if ns.is_empty() { "*" } else { ns.as_str() },
-                generation = generation
-            );
-            if tx.send(Msg::Reset { generation }).await.is_err() {
-                return;
-            }
-
-            while let Some(event) = stream.next().await {
-                if using_streaming
-                    && initializing
-                    && event.as_ref().is_err_and(streaming_lists_unsupported)
-                {
-                    streaming_lists.store(STREAMING_UNSUPPORTED, Ordering::Release);
-                    using_streaming = false;
-                    stream = watcher(api.clone(), cfg.clone())
-                        .modify(|obj| obj.managed_fields_mut().clear())
-                        .boxed();
-                    continue;
-                }
-                let msg = match event {
-                    Ok(watcher::Event::Apply(obj)) | Ok(watcher::Event::InitApply(obj)) => {
-                        Msg::Applied {
-                            generation,
-                            key: row_key(&obj),
-                            obj: Box::new(obj),
-                        }
-                    }
-                    Ok(watcher::Event::Delete(obj)) => Msg::Deleted {
-                        generation,
-                        key: row_key(&obj),
-                    },
-                    Ok(watcher::Event::Init) => {
-                        if synced_once {
-                            // The watcher healed a desync by re-listing. The
-                            // UI counts this as a reconnect off the same
-                            // message, so nothing extra crosses the channel.
-                            crate::log_info!(
-                                "watch.relist",
-                                kind = ar.plural,
-                                generation = generation
-                            );
-                        }
-                        Msg::Reset { generation }
-                    }
-                    Ok(watcher::Event::InitDone) => {
-                        initializing = false;
-                        synced_once = true;
-                        if using_streaming {
-                            // Unsupported is sticky if two startup watches
-                            // negotiate concurrently and only one endpoint
-                            // rejects the extension.
-                            let _ = streaming_lists.compare_exchange(
-                                STREAMING_UNKNOWN,
-                                STREAMING_SUPPORTED,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            );
-                        }
-                        Msg::Synced { generation }
-                    }
-                    // The watcher heals a desync by re-listing on its own
-                    // (the stream continues with Init/…/InitDone), so the
-                    // "too old resource version: Expired" error is routine —
-                    // the sync dot already shows the re-list. No error flash.
-                    Err(e) if watch_error_is_benign(&e) => {
-                        crate::log_debug!("watch.desync", kind = ar.plural, error = e);
-                        continue;
-                    }
-                    Err(e) => {
-                        crate::log_warn!("watch.error", kind = ar.plural, error = e);
-                        Msg::Error {
-                            generation,
-                            error: e.to_string(),
-                        }
-                    }
-                };
-                if tx.send(msg).await.is_err() {
-                    break; // UI gone
-                }
-            }
-        })
+        let api = watch_api(self.client.clone(), kind, namespace);
+        let mut cfg = watcher::Config::default().any_semantic();
+        if let Some(l) = labels {
+            cfg = cfg.labels(&l);
+        }
+        if let Some(f) = fields {
+            cfg = cfg.fields(&f);
+        }
+        spawn_watch_task(
+            api,
+            kind.ar.plural.clone(),
+            namespace.to_string(),
+            cfg,
+            Arc::clone(&self.streaming_lists),
+            generation,
+            tx,
+        )
     }
 
     /// Open the watch a launch would open, wait for its initial sync, and
@@ -671,7 +567,35 @@ impl Cluster {
         let ns = if kind.namespaced { namespace } else { "" };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
         let started = std::time::Instant::now();
-        let task = self.spawn_watch(&kind, ns, None, None, 1, tx);
+        let (headers_tx, mut headers_rx) = tokio::sync::watch::channel(false);
+        let client = self.client.clone();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let client = client.clone();
+            let headers_tx = headers_tx.clone();
+            async move {
+                // A list clears evidence from an earlier streaming-list attempt.
+                headers_tx.send_replace(false);
+                let watch = request.uri().query().is_some_and(|q| {
+                    form_urlencoded::parse(q.as_bytes())
+                        .any(|(key, value)| key == "watch" && value == "true")
+                });
+                let response = client.send(request).await?;
+                if watch && response.status().is_success() {
+                    headers_tx.send_replace(true);
+                }
+                Ok::<_, kube::Error>(response)
+            }
+        });
+        let client = Client::new(service, self.default_namespace.clone());
+        let task = spawn_watch_task(
+            watch_api(client, &kind, ns),
+            kind.ar.plural.clone(),
+            ns.to_string(),
+            watcher::Config::default().any_semantic(),
+            Arc::clone(&self.streaming_lists),
+            1,
+            tx,
+        );
 
         let mut probe = WatchProbe::Ran {
             synced: None,
@@ -689,21 +613,38 @@ impl Cluster {
             unreachable!("just constructed")
         };
         let deadline = tokio::time::Instant::now() + timeout;
-        while synced.is_none() {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(Msg::Applied { .. })) => *objects += 1,
-                Ok(Some(Msg::Synced { .. })) => *synced = Some(started.elapsed()),
-                Ok(Some(Msg::Error { error, .. })) => {
-                    *errors += 1;
-                    *last_error = Some(error);
+        while synced.is_none() || !*headers_rx.borrow() {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                changed = headers_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
                 }
-                Ok(Some(_)) => {}
-                // The watch task ended without syncing, or the deadline passed.
-                Ok(None) | Err(_) => break,
+                msg = rx.recv() => match msg {
+                    Some(Msg::Applied { .. }) => *objects += 1,
+                    Some(Msg::Synced { .. }) => *synced = Some(started.elapsed()),
+                    Some(Msg::Reset { .. }) => {
+                        *objects = 0;
+                        *synced = None;
+                    }
+                    Some(Msg::Error { error, .. }) => {
+                        *errors += 1;
+                        *last_error = Some(error);
+                        break;
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
             }
         }
-        // Nothing consumes this stream after the report; don't leave it open.
+        if synced.is_some() && *headers_rx.borrow() && *errors == 0 {
+            *synced = Some(started.elapsed());
+        } else {
+            *synced = None;
+        }
         task.abort();
+        let _ = task.await;
         probe
     }
 
@@ -746,6 +687,122 @@ fn streaming_lists_unsupported(e: &watcher::Error) -> bool {
         watcher::Error::WatchError(status) => unsupported_status(status),
         _ => false,
     }
+}
+
+fn watch_api(client: Client, kind: &Kind, namespace: &str) -> Api<DynamicObject> {
+    if kind.namespaced && !namespace.is_empty() {
+        Api::namespaced_with(client, namespace, &kind.ar)
+    } else {
+        Api::all_with(client, &kind.ar)
+    }
+}
+
+fn spawn_watch_task(
+    api: Api<DynamicObject>,
+    kind: String,
+    ns: String,
+    cfg: watcher::Config,
+    streaming_lists: Arc<AtomicU8>,
+    generation: u64,
+    tx: Sender<Msg>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut using_streaming = streaming_lists.load(Ordering::Acquire) != STREAMING_UNSUPPORTED;
+        let mut initializing = true;
+        // Distinct from `initializing`, which drives the streaming-list
+        // fallback and must keep its current lifetime: this only records
+        // that a full sync has happened, so a later re-list is a reconnect.
+        let mut synced_once = false;
+        let mut stream = watcher(
+            api.clone(),
+            if using_streaming {
+                cfg.clone().streaming_lists()
+            } else {
+                cfg.clone()
+            },
+        )
+        .modify(|obj| obj.managed_fields_mut().clear())
+        .boxed();
+        crate::log_info!(
+            "watch.start",
+            kind = kind,
+            ns = if ns.is_empty() { "*" } else { ns.as_str() },
+            generation = generation
+        );
+        if tx.send(Msg::Reset { generation }).await.is_err() {
+            return;
+        }
+
+        while let Some(event) = stream.next().await {
+            if using_streaming
+                && initializing
+                && event.as_ref().is_err_and(streaming_lists_unsupported)
+            {
+                streaming_lists.store(STREAMING_UNSUPPORTED, Ordering::Release);
+                using_streaming = false;
+                stream = watcher(api.clone(), cfg.clone())
+                    .modify(|obj| obj.managed_fields_mut().clear())
+                    .boxed();
+                continue;
+            }
+            let msg = match event {
+                Ok(watcher::Event::Apply(obj)) | Ok(watcher::Event::InitApply(obj)) => {
+                    Msg::Applied {
+                        generation,
+                        key: row_key(&obj),
+                        obj: Box::new(obj),
+                    }
+                }
+                Ok(watcher::Event::Delete(obj)) => Msg::Deleted {
+                    generation,
+                    key: row_key(&obj),
+                },
+                Ok(watcher::Event::Init) => {
+                    if synced_once {
+                        // The watcher healed a desync by re-listing. The
+                        // UI counts this as a reconnect off the same
+                        // message, so nothing extra crosses the channel.
+                        crate::log_info!("watch.relist", kind = kind, generation = generation);
+                    }
+                    Msg::Reset { generation }
+                }
+                Ok(watcher::Event::InitDone) => {
+                    initializing = false;
+                    synced_once = true;
+                    if using_streaming {
+                        // Unsupported is sticky if two startup watches
+                        // negotiate concurrently and only one endpoint
+                        // rejects the extension.
+                        let _ = streaming_lists.compare_exchange(
+                            STREAMING_UNKNOWN,
+                            STREAMING_SUPPORTED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                    }
+                    Msg::Synced { generation }
+                }
+                // The watcher heals a desync by re-listing on its own
+                // (the stream continues with Init/…/InitDone), so the
+                // "too old resource version: Expired" error is routine —
+                // the sync dot already shows the re-list. No error flash.
+                Err(e) if watch_error_is_benign(&e) => {
+                    crate::log_debug!("watch.desync", kind = kind, error = e);
+                    continue;
+                }
+                Err(e) => {
+                    crate::log_warn!("watch.error", kind = kind, error = e);
+                    Msg::Error {
+                        generation,
+                        error: e.to_string(),
+                    }
+                }
+            };
+            if tx.send(msg).await.is_err() {
+                break; // UI gone
+            }
+        }
+    })
 }
 
 /// Higher wins when two API groups expose the same bare plural/kind (e.g.
@@ -999,6 +1056,112 @@ impl Cluster {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn probe_cluster(streaming: bool, status: u16, delay: Duration) -> Cluster {
+        let mut cluster = Cluster::fake();
+        cluster.client = Client::new(
+            tower::service_fn(move |req: http::Request<kube::client::Body>| async move {
+                let query = req.uri().query().unwrap_or("");
+                let watch = query.contains("watch=true");
+                let initial = query.contains("sendInitialEvents=true");
+                let (code, body) = if initial && streaming {
+                    (200, concat!(
+                    "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"one\",\"resourceVersion\":\"1\"}}}\n",
+                    "{\"type\":\"BOOKMARK\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"resourceVersion\":\"1\",\"annotations\":{\"k8s.io/initial-events-end\":\"true\"}}}}\n"
+                ).to_string())
+                } else if initial {
+                    (400, r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"BadRequest","message":"streaming lists unsupported","code":400}"#.into())
+                } else if watch {
+                    tokio::time::sleep(delay).await;
+                    (
+                        status,
+                        if status == 200 {
+                            String::new()
+                        } else {
+                            serde_json::json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","message":"watch forbidden","code":status}).to_string()
+                        },
+                    )
+                } else {
+                    (200, r#"{"kind":"PodList","apiVersion":"v1","metadata":{"resourceVersion":"1"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"one","resourceVersion":"1"}}]}"#.into())
+                };
+                let keep_open = watch && code == 200;
+                let frames = futures_util::stream::iter([Ok::<_, std::io::Error>(
+                    hyper::body::Frame::data(hyper::body::Bytes::from(body)),
+                )])
+                .chain(futures_util::stream::poll_fn(move |_| {
+                    if keep_open {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(None)
+                    }
+                }));
+                Ok::<_, std::io::Error>(
+                    http::Response::builder()
+                        .status(code)
+                        .body(http_body_util::StreamBody::new(frames))
+                        .unwrap(),
+                )
+            }),
+            "default",
+        );
+        cluster
+    }
+
+    #[tokio::test]
+    async fn probe_requires_watch_headers_after_a_successful_list() {
+        let cluster = probe_cluster(false, 403, Duration::from_millis(20));
+        let probe = cluster
+            .probe_watch("pods", "default", Duration::from_secs(1))
+            .await;
+        assert!(
+            matches!(&probe, WatchProbe::Ran { synced: None, objects: 1, errors: 1, last_error: Some(error) } if error.contains("watch forbidden"))
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_bounds_the_wait_for_watch_headers() {
+        let cluster = probe_cluster(false, 200, Duration::from_secs(1));
+        let probe = cluster
+            .probe_watch("pods", "default", Duration::from_millis(30))
+            .await;
+        assert!(matches!(
+            probe,
+            WatchProbe::Ran {
+                synced: None,
+                objects: 1,
+                errors: 0,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_a_quiet_watch_after_the_fallback_list() {
+        let cluster = probe_cluster(false, 200, Duration::from_millis(20));
+        let probe = cluster
+            .probe_watch("pods", "default", Duration::from_secs(1))
+            .await;
+        assert!(
+            matches!(probe, WatchProbe::Ran { synced: Some(elapsed), objects: 1, errors: 0, .. } if elapsed >= Duration::from_millis(20))
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_a_complete_streaming_list() {
+        let cluster = probe_cluster(true, 403, Duration::ZERO);
+        let probe = cluster
+            .probe_watch("pods", "default", Duration::from_secs(1))
+            .await;
+        assert!(matches!(
+            probe,
+            WatchProbe::Ran {
+                synced: Some(_),
+                objects: 1,
+                errors: 0,
+                ..
+            }
+        ));
+    }
 
     fn exec_latency() -> (u64, u64, f64) {
         crate::diagnostics::latency_summary()
