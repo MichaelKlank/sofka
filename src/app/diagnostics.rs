@@ -135,7 +135,11 @@ impl App {
 
         self.detail = Scrollable {
             title: "diagnostics (:info)".into(),
-            lines: lines.into(),
+            redact_header: true,
+            lines: lines
+                .into_iter()
+                .map(|line| crate::diagnostics::safe(&line).into_owned())
+                .collect(),
             ..Default::default()
         };
         self.mode = Mode::Detail;

@@ -12413,6 +12413,60 @@ async fn info_redacts_complete_credentials_through_the_keyboard() {
 }
 
 #[tokio::test]
+async fn info_masks_ip_addresses_in_the_report_header_and_status() {
+    use ratatui::{Terminal, backend::TestBackend};
+    for (server, ip) in [
+        ("https://10.40.0.3:6443/", "10.40.0.3"),
+        ("https://[fd00::3]:6443/", "fd00::3"),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.cluster.cluster_url = server.into();
+        app.handle_msg(Msg::Error {
+            generation: app.generation,
+            error: format!("connection to {server} failed"),
+        });
+        for ch in ":info".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.mode, Mode::Detail);
+        assert!(!info_text(&app).contains(ip));
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!rendered.contains(ip), "{rendered}");
+        assert!(
+            rendered.contains("«redacted»") && rendered.contains(":6443/"),
+            "{rendered}"
+        );
+        assert_eq!(app.cluster.cluster_url, server);
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            rendered.contains(ip),
+            "the resource view must still identify the server"
+        );
+    }
+}
+
+#[tokio::test]
 async fn watch_relist_after_sync_counts_as_a_reconnect() {
     let (mut app, _rx) = test_app();
     let generation = app.generation;

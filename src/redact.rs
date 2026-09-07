@@ -13,6 +13,7 @@
 //! in a log, a false negative leaks a bearer token to disk.
 
 use std::borrow::Cow;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::OnceLock;
 
 use aho_corasick::{AhoCorasick, MatchKind};
@@ -81,7 +82,7 @@ pub fn is_credential_key(key: &str) -> bool {
         .any(|m| m.pattern().as_usize() < CREDENTIAL_HINTS.len())
 }
 
-/// Replace credential-looking values in `input` with [`REDACTED`].
+/// Replace credential-like values and literal IP addresses with [`REDACTED`].
 ///
 /// Recognises `key=value` / `key: value` (quoted or bare) for any key matching
 /// [`CREDENTIAL_HINTS`], `Bearer`/`Basic` header values, bare JWTs, and URL
@@ -90,6 +91,66 @@ pub fn is_credential_key(key: &str) -> bool {
 /// Borrows when there is nothing to redact, which is the overwhelmingly common
 /// case — this runs on every structured log field.
 pub fn text(input: &str) -> Cow<'_, str> {
+    match credentials(input) {
+        Cow::Borrowed(value) => ip_addresses(value),
+        Cow::Owned(value) => match ip_addresses(&value) {
+            Cow::Owned(masked) => Cow::Owned(masked),
+            Cow::Borrowed(_) => Cow::Owned(value),
+        },
+    }
+}
+
+fn ip_addresses(input: &str) -> Cow<'_, str> {
+    static CANDIDATES: OnceLock<regex::Regex> = OnceLock::new();
+    let candidates = CANDIDATES
+        .get_or_init(|| regex::Regex::new(r"[0-9A-Fa-f:.]+").expect("static IP address pattern"));
+    let mut out: Option<String> = None;
+    let mut last = 0;
+    for candidate in candidates.find_iter(input) {
+        let mut start = candidate.start();
+        let value = candidate.as_str().trim_end_matches('.');
+        let value = if value.starts_with(':') && !value.starts_with("::") {
+            start += 1;
+            &value[1..]
+        } else {
+            value
+        };
+        let length = if value.parse::<IpAddr>().is_ok() {
+            value.len()
+        } else if value.parse::<SocketAddr>().is_ok() {
+            value.rfind(':').expect("socket address has a port")
+        } else {
+            continue;
+        };
+        let end = start + length;
+        // Keep version strings and names that contain address-like text.
+        if input[..start].chars().next_back().is_some_and(ip_name_char)
+            || input[candidate.end()..]
+                .chars()
+                .next()
+                .is_some_and(ip_name_char)
+        {
+            continue;
+        }
+        let output = out.get_or_insert_with(|| String::with_capacity(input.len()));
+        output.push_str(&input[last..start]);
+        output.push_str(REDACTED);
+        last = end;
+    }
+    match out {
+        Some(mut output) => {
+            output.push_str(&input[last..]);
+            Cow::Owned(output)
+        }
+        None => Cow::Borrowed(input),
+    }
+}
+
+fn ip_name_char(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.')
+}
+
+fn credentials(input: &str) -> Cow<'_, str> {
     let bytes = input.as_bytes();
     let mut out: Option<String> = None;
     let mut last = 0usize;
@@ -246,6 +307,62 @@ mod tests {
             text("context=prod cluster=eu-west kinds=142"),
             Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn redacts_ip_addresses_and_keeps_ports_and_url_paths() {
+        for (input, expected) in [
+            (
+                "https://10.40.0.3:6443/api",
+                format!("https://{REDACTED}:6443/api"),
+            ),
+            (
+                "https://[fd00::3]:6443/api",
+                format!("https://[{REDACTED}]:6443/api"),
+            ),
+            (
+                "dial 192.0.2.1:443 failed",
+                format!("dial {REDACTED}:443 failed"),
+            ),
+            ("peer:10.40.0.3", format!("peer:{REDACTED}")),
+            (
+                "address 2001:db8::1 rejected",
+                format!("address {REDACTED} rejected"),
+            ),
+            (
+                "address ::ffff:192.0.2.1 rejected",
+                format!("address {REDACTED} rejected"),
+            ),
+            (
+                "https://[fe80::1%25en0]:6443",
+                format!("https://[{REDACTED}%25en0]:6443"),
+            ),
+            ("peer 192.0.2.1.", format!("peer {REDACTED}.")),
+            (
+                "192.0.2.1 and 198.51.100.2",
+                format!("{REDACTED} and {REDACTED}"),
+            ),
+        ] {
+            assert_eq!(red(input), expected, "{input}");
+        }
+        assert_eq!(
+            red("https://admin:pw@10.40.0.3:6443/?token_value=private"),
+            format!("https://{REDACTED}@{REDACTED}:6443/?token_value={REDACTED}")
+        );
+    }
+
+    #[test]
+    fn keeps_versions_timestamps_hostnames_and_invalid_addresses() {
+        for value in [
+            "v1.37.0",
+            "v1.2.3.4",
+            "2026-09-07T12:34:56.789Z",
+            "https://api.example.com:6443",
+            "999.1.2.3",
+            "api.192.0.2.1.example",
+        ] {
+            assert!(matches!(text(value), Cow::Borrowed(_)), "{value}");
+        }
     }
 
     #[test]

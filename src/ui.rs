@@ -257,6 +257,19 @@ fn header_title(server_version: &str) -> Line<'static> {
     Line::from(spans)
 }
 
+fn diagnostic_value<'a>(app: &App, value: &'a str) -> std::borrow::Cow<'a, str> {
+    let mode = match app.mode {
+        Mode::Command => app.palette_return,
+        Mode::DocFilter => app.doc_filter_return,
+        mode => mode,
+    };
+    if mode == Mode::Detail && app.detail.redact_header {
+        crate::redact::text(value)
+    } else {
+        std::borrow::Cow::Borrowed(value)
+    }
+}
+
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -276,7 +289,10 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let field = |label: &str, val: String, color| {
         Line::from(vec![
             Span::styled(format!("{label:<12}"), theme::dim()),
-            Span::styled(val, Style::default().fg(color)),
+            Span::styled(
+                diagnostic_value(app, &val).into_owned(),
+                Style::default().fg(color),
+            ),
         ])
     };
 
@@ -383,7 +399,7 @@ fn draw_compact_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(ns, Style::default().fg(theme::green())),
         Span::styled("  ", theme::dim()),
         Span::styled(
-            app.cluster.context.clone(),
+            diagnostic_value(app, &app.cluster.context).into_owned(),
             Style::default().fg(theme::mauve()),
         ),
     ];
@@ -399,7 +415,10 @@ fn draw_compact_header(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(theme::subtext0())
         };
         spans.push(Span::styled("  — ", theme::dim()));
-        spans.push(Span::styled(app.flash.clone(), style));
+        spans.push(Span::styled(
+            diagnostic_value(app, &app.flash).into_owned(),
+            style,
+        ));
     }
 
     let (synced, sync_color) = if app.describe_refresh_task.is_some() {
@@ -3936,7 +3955,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Min(10), Constraint::Length(12)])
         .split(area);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(format!(" {}", app.flash), style))),
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {}", diagnostic_value(app, &app.flash)),
+            style,
+        ))),
         cols[0],
     );
     frame.render_widget(

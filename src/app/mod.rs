@@ -464,6 +464,8 @@ enum PromptKind {
 #[derive(Default)]
 pub struct Scrollable {
     pub title: String,
+    /// Mask sensitive header and status values while this document is visible.
+    pub redact_header: bool,
     pub lines: VecDeque<String>,
     /// Vertical scroll offset in rendered display rows. `usize` on purpose: a
     /// paused wrapped log buffer can far exceed `u16`.

@@ -508,6 +508,26 @@ mod tests {
     }
 
     #[test]
+    fn log_fields_mask_ipv4_and_ipv6_addresses() {
+        let line = format_line(
+            Level::Warn,
+            "request.failed",
+            &[
+                ("server", &"https://10.40.0.3:6443/"),
+                ("error", &"cannot connect to [fd00::3]:6443"),
+            ],
+        );
+        assert!(
+            !line.contains("10.40.0.3") && !line.contains("fd00::3"),
+            "{line}"
+        );
+        assert!(
+            line.contains("https://«redacted»:6443/") && line.contains("[«redacted»]:6443"),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn disabled_level_emits_nothing() {
         // The global sink is never initialised in tests, so `emit` is inert;
         // what matters here is that the gate itself is closed by default.

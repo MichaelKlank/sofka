@@ -693,7 +693,12 @@ async fn run_info(
             Some(name) => Cluster::connect_context(name, args.allow_v1_client_cert).await,
             None => Cluster::connect(args.allow_v1_client_cert).await,
         }
-        .inspect_err(|e| eprintln!("\x1b[33mwarning:\x1b[0m {e:#}"))
+        .inspect_err(|e| {
+            eprintln!(
+                "\x1b[33mwarning:\x1b[0m {}",
+                diagnostics::safe(&format!("{e:#}"))
+            )
+        })
         .ok()
     };
 
@@ -871,7 +876,7 @@ async fn run_info(
     lines.extend(diagnostics::warning_lines(warnings));
 
     for line in lines {
-        println!("{line}");
+        println!("{}", diagnostics::safe(&line));
     }
     Ok(())
 }

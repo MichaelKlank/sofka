@@ -169,6 +169,10 @@ capture-and-review workflow.
 
 ## Runtime diagnostics
 
+`sofka info`, structured logging, and credential and IP address redaction are
+available from sofka 0.24.8. Run `sofka --version` and update older versions
+before collecting diagnostics for a bug report.
+
 `:info` shows the version and build, config sources, live context/cluster/API
 server and Kubernetes revision, discovery and Metrics API status, watch error
 and reconnect counts, API request latency, the logging destination, and the
@@ -198,7 +202,10 @@ when a first view is too slow to be usable.
 Identifiers, paths, and counts only, never credentials, tokens, decoded Secret
 values, or plugin inputs. Values that could carry a credential - an API server
 URL with userinfo, an error string echoing a request header - are redacted
-before they are printed.
+before they are printed. Literal IPv4 and IPv6 addresses are also masked in
+reports and logs. URL schemes, ports, and paths remain available for diagnosis.
+The `:info` screen also masks its header and status line. Hostnames, resource
+names, and file paths can still identify your setup; check them before sharing.
 
 ### Request latency
 
