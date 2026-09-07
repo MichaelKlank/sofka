@@ -345,35 +345,55 @@ impl App {
                     }
                 };
 
+                let blocked: Vec<String> = pod_list
+                    .items
+                    .iter()
+                    .filter(|pod| drainable_pod(pod))
+                    .filter_map(|pod| {
+                        drain_blocker(pod).map(|reason| {
+                            format!(
+                                "{}/{}: {reason}",
+                                pod.metadata.namespace.as_deref().unwrap_or("default"),
+                                pod.metadata.name.as_deref().unwrap_or("<unknown>"),
+                            )
+                        })
+                    })
+                    .collect();
+                if !blocked.is_empty() {
+                    failed = true;
+                    let _ = tx.send(Msg::Flash {
+                        generation: genr,
+                        claim,
+                        message: format!("drain {node} blocked: {}. Node remains cordoned; no pods were evicted from this node", blocked.join("; ")),
+                        err: true,
+                    }).await;
+                    continue;
+                }
+
                 for pod in pod_list.items.iter().filter(|pod| drainable_pod(pod)) {
                     let Some(name) = pod.metadata.name.as_deref() else {
                         continue;
                     };
                     let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
                     let pod_api: Api<Pod> = Api::namespaced(client.clone(), ns);
-                    let evict = EvictParams {
-                        delete_options: Some(DeleteParams::default()),
-                        ..Default::default()
-                    };
-                    match pod_api.evict(name, &evict).await {
+                    // kube 4.2 serializes EvictParams as delete_options. The API
+                    // requires deleteOptions to enforce the UID precondition.
+                    let eviction = serde_json::json!({
+                        "apiVersion": "policy/v1",
+                        "kind": "Eviction",
+                        "metadata": { "name": name, "namespace": ns },
+                        "deleteOptions": { "preconditions": { "uid": pod.metadata.uid } },
+                    });
+                    let result: Result<kube::core::Status, kube::Error> = pod_api
+                        .create_subresource("eviction", name, &PostParams::default(), &eviction)
+                        .await;
+                    match result {
                         Ok(_) => {}
-                        Err(e) if eviction_unsupported(&e) => {
-                            if let Err(delete_err) =
-                                pod_api.delete(name, &DeleteParams::default()).await
-                            {
-                                failed = true;
-                                let _ = tx
-                                    .send(Msg::Flash {
-                                        generation: genr,
-                                        claim,
-                                        message: format!(
-                                            "drain {node}: delete {ns}/{name} failed after eviction fallback: {delete_err}"
-                                        ),
-                                        err: true,
-                                    })
-                                    .await;
-                            }
-                        }
+                        Err(kube::Error::Api(e))
+                            if e.code == 404
+                                && e.details.as_ref().is_some_and(|details| {
+                                    details.kind == "pods" && details.name == name
+                                }) => {}
                         Err(e) => {
                             failed = true;
                             let _ = tx

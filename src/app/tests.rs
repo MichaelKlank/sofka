@@ -13690,3 +13690,144 @@ async fn a_failed_step_out_on_the_local_pane_says_why_too() {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).ok();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+async fn drain_api_case(
+    pods: serde_json::Value,
+    eviction_code: u16,
+    pod_missing: bool,
+) -> (String, bool, Vec<serde_json::Value>) {
+    use http_body_util::BodyExt;
+    let (mut app, mut rx) = test_app();
+    app.switch_kind("nodes");
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Node", "metadata":{"name":"node-a"}}),
+    );
+    app.table_state.select(Some(0));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let seen = seen.clone();
+            let pods = pods.clone();
+            async move {
+                let method = request.method().to_string();
+                let path = request.uri().path().to_owned();
+                let body = request.into_body().collect().await.unwrap().to_bytes();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or(json!(null));
+                seen.lock()
+                    .unwrap()
+                    .push(json!({"method":method,"path":path,"body":body}));
+                let (code, response) = match (method.as_str(), path.as_str()) {
+                    ("PATCH", "/api/v1/nodes/node-a") => (
+                        200,
+                        json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"node-a"}}),
+                    ),
+                    ("GET", "/api/v1/pods") => (
+                        200,
+                        json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":pods}),
+                    ),
+                    ("POST", "/api/v1/namespaces/default/pods/web/eviction") => (
+                        eviction_code,
+                        json!({"apiVersion":"v1","kind":"Status","code":eviction_code,"status":if eviction_code < 300 {"Success"} else {"Failure"},"reason":"NotFound","message":"mock eviction response", "details":if pod_missing { json!({"kind":"pods","name":"web"}) } else {json!({})}}),
+                    ),
+                    _ => panic!("unexpected drain request: {method} {path}"),
+                };
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(code)
+                        .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                            response.to_string(),
+                        )))
+                        .unwrap(),
+                )
+            }
+        }),
+        "default",
+    );
+    app.handle_key(press(KeyCode::Char('D'))).unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let (message, err) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(Msg::Flash { message, err, .. }) = rx.recv().await
+                && message.starts_with("drain")
+            {
+                break (message, err);
+            }
+        }
+    })
+    .await
+    .expect("drain did not finish");
+    let captured = requests.lock().unwrap().clone();
+    (message, err, captured)
+}
+
+fn drain_managed_pod() -> serde_json::Value {
+    json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"web","namespace":"default","uid":"original-uid","ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"web","uid":"controller-uid","controller":true}]},"spec":{"nodeName":"node-a","containers":[{"name":"app","image":"test"}]},"status":{"phase":"Running"}})
+}
+
+#[tokio::test]
+async fn drain_key_pins_uid_and_never_falls_back_to_delete() {
+    for (code, missing, expected_error) in [
+        (201, false, false),
+        (404, true, false),
+        (404, false, true),
+        (405, false, true),
+        (409, false, true),
+        (429, false, true),
+    ] {
+        let (_, err, requests) = drain_api_case(json!([drain_managed_pod()]), code, missing).await;
+        assert_eq!(
+            err, expected_error,
+            "eviction code {code}, missing {missing}"
+        );
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2]["method"], "POST");
+        assert_eq!(
+            requests[2]["body"]["deleteOptions"]["preconditions"]["uid"],
+            "original-uid"
+        );
+    }
+}
+
+#[tokio::test]
+async fn drain_key_blocks_unmanaged_pods_before_any_evictions() {
+    for controller in [json!(null), json!(false)] {
+        let mut unsafe_pod = drain_managed_pod();
+        unsafe_pod["metadata"]["name"] = json!("standalone");
+        unsafe_pod["metadata"]["ownerReferences"][0]["controller"] = controller;
+        let (message, err, requests) =
+            drain_api_case(json!([drain_managed_pod(), unsafe_pod]), 201, false).await;
+        assert!(err);
+        assert!(
+            message.contains("default/standalone: pod has no controller"),
+            "{message}"
+        );
+        assert_eq!(requests.len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn drain_key_blocks_emptydir_before_any_evictions() {
+    let mut unsafe_pod = drain_managed_pod();
+    unsafe_pod["spec"]["volumes"] = json!([{"name":"data","emptyDir":{}}]);
+    let (message, err, requests) =
+        drain_api_case(json!([drain_managed_pod(), unsafe_pod]), 201, false).await;
+    assert!(err);
+    assert!(message.contains("emptyDir data"), "{message}");
+    assert_eq!(requests.len(), 2);
+}
+
+#[tokio::test]
+async fn drain_key_blocks_missing_uid_before_any_evictions() {
+    let mut unsafe_pod = drain_managed_pod();
+    unsafe_pod["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("uid");
+    let (message, err, requests) = drain_api_case(json!([unsafe_pod]), 201, false).await;
+    assert!(err);
+    assert!(message.contains("UID is missing"), "{message}");
+    assert_eq!(requests.len(), 2);
+}
