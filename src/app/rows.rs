@@ -92,17 +92,18 @@ impl App {
         use crate::filter::{ParsedFilter, Term};
         match parsed {
             ParsedFilter::Fuzzy(pat) => {
-                pat.is_empty() || self.fuzzy_match_row(o, pat, key, cells, now)
+                pat.text().is_empty() || self.pattern_match_row(o, pat, key, cells, now)
             }
             ParsedFilter::Structured(s) => s.terms.iter().all(|t| match t {
-                Term::Fuzzy(pat) => self.fuzzy_match_row(o, pat, key, cells, now),
-                Term::NotFuzzy(pat) => !self.fuzzy_match_row(o, pat, key, cells, now),
+                Term::Text { negate, pat } => {
+                    negate ^ self.pattern_match_row(o, pat, key, cells, now)
+                }
                 Term::Cmp(cmp) => self.eval_cmp(o, cmp, now),
             }),
         }
     }
 
-    /// Does one fuzzy pattern match this row? "namespace name" first (the
+    /// Does one text pattern match this row? "namespace name" first (the
     /// original haystack — cheap, and by far the most common hit), then each
     /// rendered column cell individually, so `/10.96` finds a Service by its
     /// CLUSTER-IP. Cells are matched one at a time rather than joined so a
@@ -115,21 +116,26 @@ impl App {
     /// a helm view that meant five gunzip+JSON-parse rounds per row per
     /// keypress. Cached by `resourceVersion`, a row is now rendered once per
     /// change instead of once per keystroke.
-    fn fuzzy_match_row(
+    fn pattern_match_row(
         &self,
         o: &DynamicObject,
-        pat: &str,
+        pat: &crate::filter::Pattern,
         key: &RowKey,
         cells: &mut crate::store::FastMap<RowKey, CellCacheEntry>,
         now: i64,
     ) -> bool {
-        let pat_mask = subseq_mask(pat);
+        // Only fuzzy patterns use the byte mask. Unicode lowercase conversion
+        // can change the bytes of a literal or its cell text.
+        let pat_mask = match pat {
+            crate::filter::Pattern::Fuzzy(_) => subseq_mask(pat.text()),
+            _ => 0,
+        };
         {
             // Built into a reused buffer: this used to `format!` a fresh
             // `String` for every object on every keystroke.
             let mut hay = self.hay_buf.borrow_mut();
             self.write_fuzzy_hay(o, &mut hay);
-            if subseq_mask(&hay) & pat_mask == pat_mask && self.matcher.score(&hay, pat).is_some() {
+            if subseq_mask(&hay) & pat_mask == pat_mask && self.pattern_matches(pat, &hay) {
                 return true;
             }
         }
@@ -142,7 +148,17 @@ impl App {
             .cells
             .iter()
             .zip(&entry.cell_masks)
-            .any(|(c, &m)| m & pat_mask == pat_mask && self.matcher.score(c, pat).is_some())
+            .any(|(c, &m)| m & pat_mask == pat_mask && self.pattern_matches(pat, c))
+    }
+
+    /// One pattern against one string, with no prefiltering.
+    fn pattern_matches(&self, pat: &crate::filter::Pattern, text: &str) -> bool {
+        use crate::filter::Pattern;
+        match pat {
+            Pattern::Fuzzy(needle) => self.matcher.score(text, needle).is_some(),
+            Pattern::Literal(lit) => lit.matches(text),
+            Pattern::Regex(re) => re.is_match(text),
+        }
     }
 
     /// The cached cells for `key`, rendering them if absent or stale.
@@ -265,27 +281,27 @@ impl App {
             || parsed.fields() != self.applied_filter_fields.as_deref()
     }
 
-    /// Char indices in `name` that matched the active row filter's fuzzy
+    /// Char indices in `name` that matched the active row filter's text
     /// pattern, for highlighting them in the table. `None` when there's no
-    /// active filter or no fuzzy term (every visible row already passed
-    /// the filter pass, so this is purely a rendering aid, not a second
-    /// filter decision).
+    /// active filter or no positive text term (every visible row already
+    /// passed the filter pass, so this is purely a rendering aid, not a
+    /// second filter decision).
     ///
-    /// Memoized per name for the current needle: the renderer asks this for
-    /// every visible row on every redraw, and re-running the fuzzy matcher to
-    /// get an answer that cannot have changed is the single most expensive
-    /// thing a filtered frame used to do.
+    /// Memoized per name for the current filter: the renderer asks this for
+    /// every visible row on every redraw, and re-running the matcher to get
+    /// an answer that cannot have changed is the single most expensive thing
+    /// a filtered frame used to do.
     pub fn filter_match_indices(&self, name: &str) -> Option<Rc<[usize]>> {
         if self.filter.is_empty() {
             return None;
         }
         let parsed = self.parsed_filter();
-        let needle = parsed.fuzzy_needle()?;
+        let pat = parsed.highlight_pattern()?;
 
         let mut cache = self.highlight_cache.borrow_mut();
-        if cache.needle != needle {
-            cache.needle.clear();
-            cache.needle.push_str(needle);
+        if cache.filter != self.filter {
+            cache.filter.clear();
+            cache.filter.push_str(&self.filter);
             cache.rows.clear();
         }
         if let Some(hit) = cache.rows.get(name) {
@@ -294,12 +310,26 @@ impl App {
         if cache.rows.len() >= HIGHLIGHT_CACHE_LIMIT {
             cache.rows.clear();
         }
-        let idx = self
-            .matcher
-            .indices(name, needle)
-            .map(|idx| Rc::from(idx.as_slice()));
+        let idx = self.match_positions(pat, name).map(Rc::from);
         cache.rows.insert(Box::from(name), idx.clone());
         idx
+    }
+
+    /// Where `pat` matched in `name`, as char positions. A literal or a regex
+    /// matches one contiguous run, so both report the span they landed on;
+    /// only fuzzy scatters its positions.
+    fn match_positions(&self, pat: &crate::filter::Pattern, name: &str) -> Option<Vec<usize>> {
+        use crate::filter::Pattern;
+        match pat {
+            Pattern::Fuzzy(needle) => self.matcher.indices(name, needle),
+            Pattern::Literal(lit) => lit.match_span(name).map(Iterator::collect),
+            Pattern::Regex(re) => re.find(name).map(|m| {
+                // Byte offsets from the regex, char positions for the cell
+                // renderer, which walks `name.chars()`.
+                let start = name[..m.start()].chars().count();
+                (start..start + m.as_str().chars().count()).collect()
+            }),
+        }
     }
 
     pub(super) fn ensure_rows_cache(&self) {

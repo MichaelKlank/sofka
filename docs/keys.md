@@ -20,7 +20,7 @@ pickers keep both characters available as input.
 | `S` / `I`                                     | sort-column picker (fuzzy; ⏎ on the active column inverts) / invert sort direction — remembered per kind across views and restarts                            |
 | `ctrl-e`                                      | compact mode: collapse the header + footer (for tiled/multiplexed panes)                                                                                      |
 | `space`                                       | mark/unmark row for bulk actions                                                                                                                              |
-| `/`                                           | filter: fuzzy text · `!inverse` · `-l`/`-f` selectors (server-side on ⏎) · `status=X` `cpu>500m` `age<2h`                                                     |
+| `/`                                           | filter: fuzzy text · `"exact"` · `/regex/` · `!inverse` · `-l`/`-f` selectors (server-side on ⏎) · `status=X` `cpu>500m` `age<2h`                             |
 | `Ctrl+Z`                                      | toggle faults filter in pod views; configured actions take precedence; combine with `/`; press again to turn off                                              |
 | `n` / `0`                                     | namespace switcher / all namespaces                                                                                                                           |
 | `shift-j`                                     | jump to owner/controller                                                                                                                                      |
@@ -54,7 +54,7 @@ pickers keep both characters available as input.
 | `:find <text>`                                | global fuzzy find over object names across common kinds, all namespaces                                                                                       |
 | `i`                                           | set container image                                                                                                                                           |
 | `r`                                           | rollout restart (workloads) / force-sync (ExternalSecrets/PushSecrets) / refresh (elsewhere)                                                                  |
-| `f` / `shift-f`                               | port-forward (pods/services) — picker shows declared ports, or "Custom…" for manual entry; active forwards show `●` next to the name |
+| `f` / `shift-f`                               | port-forward (pods/services) — picker shows declared ports, or "Custom…" for manual entry; active forwards show `●` next to the name                          |
 | `t`                                           | Flux: suspend/resume/reconcile menu · ArgoCD App/AppSet: suspend/resume (App: + sync) · CronJobs: trigger/suspend/resume · pods: file transfer (`kubectl cp`) |
 | `C` / `U` / `D`                               | nodes: cordon / uncordon / drain                                                                                                                              |
 | `ctrl-d` / `ctrl-k`                           | delete / force-delete (marked rows, or current); in confirm: `f` toggles force, `c` cycles cascade (background → foreground → orphan)                         |

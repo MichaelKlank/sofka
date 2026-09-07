@@ -2186,7 +2186,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         ),
         bind(
             "/",
-            "filter: fuzzy · !inverse · -l/-f selectors (server-side on ⏎) · col=val cpu>500m age<2h",
+            "filter: fuzzy · \"exact\" · /regex/ · !inverse · -l/-f selectors (server-side on ⏎) · col=val cpu>500m age<2h",
         ),
         bind(
             "ctrl-u · ctrl-w",

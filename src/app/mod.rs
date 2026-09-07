@@ -1318,17 +1318,19 @@ struct FilterCache {
     parsed: crate::filter::ParsedFilter,
 }
 
-/// Highlight positions per row name for the active fuzzy needle.
+/// Highlight positions per row name for the active filter's pattern.
 ///
 /// The filter pass already ran the matcher over every row; without this the
 /// renderer ran it again for every *visible* row on every redraw, which is
-/// the same fuzzy scoring work repeated at frame rate for a result that only
-/// changes when the needle or the name does.
+/// the same scoring work repeated at frame rate for a result that only
+/// changes when the filter or the name does.
 #[derive(Default)]
 struct HighlightCache {
-    /// The needle these entries were matched against. Anything else empties
-    /// the map — a new needle invalidates every entry at once.
-    needle: String,
+    /// The filter these entries were matched against — the whole string, so
+    /// that `api` and `"api"` (a fuzzy and a literal needle of the same text,
+    /// which highlight differently) cannot share entries. Anything else
+    /// empties the map, invalidating every entry at once.
+    filter: String,
     /// Match positions per name. `None` — the name did not match — is a real
     /// answer and is cached too, so a filter that excludes most rows does not
     /// re-run the matcher over them every frame.
