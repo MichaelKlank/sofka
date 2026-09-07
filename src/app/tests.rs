@@ -15516,3 +15516,32 @@ async fn job_status_distinguishes_execution_states_through_navigation() {
         }
     }
 }
+
+#[tokio::test]
+async fn storage_table_shows_deletion_before_bound_phase() {
+    for (kind, plural, namespaced) in [
+        ("PersistentVolume", "persistentvolumes", false),
+        ("PersistentVolumeClaim", "persistentvolumeclaims", true),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.cluster.register_kind("", kind, plural, namespaced);
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for ch in plural.chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        for (version, deleting, expected) in [("1", false, "Bound"), ("2", true, "Terminating")] {
+            apply(
+                &mut app,
+                json!({"apiVersion":"v1", "kind":kind,
+                "metadata":{"name":"data", "namespace":namespaced.then_some("default"), "resourceVersion":version,
+                "deletionTimestamp":deleting.then_some("2026-09-07T10:00:00Z")}, "status":{"phase":"Bound"}}),
+            );
+            let rows = app.rows();
+            app.ensure_table_cell_cache(&rows);
+            let cache = app.table_cell_cache();
+            let (cells, status_idx) = cache.get(&row_key(rows[0])).unwrap();
+            assert_eq!(cells[status_idx.unwrap()], expected, "{kind}");
+        }
+    }
+}
