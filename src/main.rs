@@ -261,6 +261,7 @@ async fn run_main(args: Args) -> Result<()> {
     let sort_memory_path = sortmem::SortMemory::default_path();
     app.sort_memory = sortmem::SortMemory::load(&sort_memory_path);
     app.sort_memory_path = Some(sort_memory_path);
+    app.remember_sort = cfg.remember_sort.unwrap_or(true);
     // The last namespace picked per context persists too, so a relaunch (or
     // a `:ctx` switch back) lands where you left off.
     let namespace_memory_path = nsmem::NamespaceMemory::default_path();

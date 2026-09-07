@@ -879,7 +879,11 @@ impl App {
         if self.sort_column.is_some() {
             return;
         }
-        let Some((header, desc)) = self.active_user_view().and_then(|v| v.sort.clone()) else {
+        let specific_sort = self.active_user_view().and_then(|v| v.sort.clone());
+        let is_specific = specific_sort.is_some();
+        let Some((header, desc)) =
+            specific_sort.or_else(|| self.user_views.get("*").and_then(|v| v.sort.clone()))
+        else {
             return;
         };
         match self.display_headers().iter().position(|h| *h == header) {
@@ -888,7 +892,10 @@ impl App {
                 self.sort_desc = desc;
                 self.invalidate_rows();
             }
-            None => self.flash_warn(&format!("view sort column '{header}' not found")),
+            None if is_specific => {
+                self.flash_warn(&format!("view sort column '{header}' not found"));
+            }
+            None => {}
         }
     }
 
@@ -1050,7 +1057,7 @@ impl App {
     /// kind's entry is forgotten instead. View switches call `reset_sort`
     /// directly and must NOT land here — a switch isn't a sort choice.
     pub(super) fn remember_sort(&mut self) {
-        if self.kind_plural.is_empty() {
+        if !self.remember_sort || self.kind_plural.is_empty() {
             return;
         }
         let kind = self.kind_plural.clone();
@@ -1080,7 +1087,7 @@ impl App {
     /// the watch starts (see `Msg::PrinterColumns`, which retries this), and
     /// a wide-only column simply stays dormant until `w`.
     pub(super) fn apply_remembered_sort(&mut self) {
-        if self.sort_column.is_some() {
+        if !self.remember_sort || self.sort_column.is_some() {
             return;
         }
         let Some((header, desc)) = self.sort_memory.get(&self.kind_plural) else {

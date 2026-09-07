@@ -24,7 +24,7 @@ for the grammar and selector persistence rules.
 | `esc`                                         | go back / pop the view stack / clear filter / clear marks                                                                                                     |
 | `j`/`k`, `↓`/`↑`, `g`/`G`                     | navigate                                                                                                                                                      |
 | `ctrl-f` / `ctrl-b`, `PgDn` / `PgUp`          | page forward / back - one screenful at a time                                                                                                                 |
-| `S` / `I`                                     | sort-column picker (fuzzy; ⏎ on the active column inverts) / invert sort direction — remembered per kind across views and restarts                            |
+| `S` / `I`                                     | sort-column picker (fuzzy; ⏎ on the active column inverts) / invert sort direction; saved per kind by default (`remember_sort = false` disables this)         |
 | `ctrl-e`                                      | compact mode: collapse the header + footer (for tiled/multiplexed panes)                                                                                      |
 | `space`                                       | mark/unmark row for bulk actions                                                                                                                              |
 | `/`                                           | filter: fuzzy text · `"exact"` · `/regex/` · `!inverse` · `-l`/`-f` selectors (server-side on ⏎) · `status=X` `cpu>500m` `age<2h`                             |

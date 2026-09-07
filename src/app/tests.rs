@@ -6323,6 +6323,111 @@ async fn sort_choice_is_remembered_per_kind_across_view_switches() {
 }
 
 #[tokio::test]
+async fn wildcard_sort_is_the_fallback_for_resource_views() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."*"]
+        sort = "AGE:desc"
+        [views.pods]
+        [views.services]
+        sort = "NAME:asc"
+        "#,
+    );
+    for (resource, header, desc) in [
+        ("pods", "AGE", true),
+        ("deployments", "AGE", true),
+        ("services", "NAME", false),
+    ] {
+        palette(&mut app, resource);
+        assert_eq!(app.kind_plural, resource);
+        assert_eq!(
+            app.sort_column,
+            app.display_headers().iter().position(|h| h == header)
+        );
+        assert!(app.sort_column.is_some());
+        assert_eq!(app.sort_desc, desc);
+    }
+
+    palette(&mut app, "pods");
+    app.handle_key(press(KeyCode::Char('I'))).unwrap();
+    palette(&mut app, "services");
+    palette(&mut app, "pods");
+    assert!(!app.sort_desc, "saved choice has priority over the default");
+}
+
+#[tokio::test]
+async fn wildcard_sort_skips_missing_columns() {
+    let (mut app, _rx) = test_app();
+    install_views(&mut app, "[views.\"*\"]\nsort = \"RESTARTS:desc\"\n");
+    palette(&mut app, "services");
+    assert_eq!(app.sort_column, None);
+    assert!(!app.flash_err);
+    palette(&mut app, "pods");
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "RESTARTS")
+    );
+    assert!(app.sort_column.is_some());
+    assert!(app.sort_desc);
+}
+
+#[tokio::test]
+async fn disabled_sort_memory_keeps_changes_local_and_preserves_saved_state() {
+    let dir = std::env::temp_dir().join(format!("sofka-sort-option-{}", std::process::id()));
+    write_config(&dir, "remember_sort = false\n");
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+    let path = dir.join("sort.toml");
+    app.sort_memory.set("pods", "NAME", false);
+    app.sort_memory.save(&path).unwrap();
+    app.sort_memory_path = Some(path.clone());
+    let saved = std::fs::read(&path).unwrap();
+
+    palette(&mut app, "reload");
+    assert!(!app.remember_sort);
+    palette(&mut app, "pods");
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "AGE")
+    );
+    assert!(app.sort_desc);
+    app.handle_key(press(KeyCode::Char('I'))).unwrap();
+    assert!(!app.sort_desc);
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    for c in "rst".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "RESTARTS")
+    );
+    palette(&mut app, "services");
+    palette(&mut app, "pods");
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "AGE")
+    );
+    assert!(app.sort_desc);
+    assert_eq!(app.sort_memory.get("pods"), Some(("NAME".into(), false)));
+    assert_eq!(std::fs::read(&path).unwrap(), saved);
+
+    write_config(&dir, "");
+    palette(&mut app, "reload");
+    assert!(app.remember_sort, "sort memory is enabled by default");
+    palette(&mut app, "services");
+    palette(&mut app, "pods");
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "NAME")
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
 async fn sort_picker_esc_clears_filter_then_closes() {
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");

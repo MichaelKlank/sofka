@@ -16,6 +16,8 @@ readonly          = false  # true disables every mutating action (delete, edit,
                            # scale, shell, plugins, …); --readonly/--write win
 mouse             = true   # false keeps the terminal's native mouse behavior
                            # (text selection) instead of scroll/click/sort
+remember_sort     = true   # save and restore sort choices per resource kind
+                           # false makes sort changes temporary
 
 # Namespaces pinned to the top of the `n` switcher (★); session recents (·)
 # follow them.
@@ -24,6 +26,24 @@ favorite_namespaces = ["kube-system", "monitoring"]
 [aliases]
 dep = "deployments"
 ```
+
+`remember_sort` is enabled by default. Set it to `false` to stop saving and
+restoring sort choices from `S`, `I`, and column header clicks. Existing saved
+choices stay on disk and become available again when you enable the option.
+The option supports cluster and context overrides and `:reload`. A reload
+keeps the active sort; the option controls later sort changes and view starts.
+
+To use an initial sort for all resource tables, set a global default:
+
+```toml
+remember_sort = false
+
+[views."*"]
+sort = "AGE:desc"
+```
+
+A resource-specific sort has priority over this default. Tables without the
+specified column ignore the global sort. See [Views](views.md) for details.
 
 CRD short names are discovered automatically. To override a short name, add it
 under `[aliases]`. Use a group-qualified target when resource names overlap:
