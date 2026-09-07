@@ -1060,6 +1060,9 @@ fn col_hpa_replicas<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
 }
 
 fn col_pvc_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    if ctx.obj.metadata.deletion_timestamp.is_some() {
+        return "Terminating".into();
+    }
     Cow::Borrowed(sget(ctx.data, &["status", "phase"]).unwrap_or_default())
 }
 
@@ -1076,6 +1079,9 @@ fn col_pv_capacity<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
 }
 
 fn col_pv_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    if ctx.obj.metadata.deletion_timestamp.is_some() {
+        return "Terminating".into();
+    }
     Cow::Borrowed(sget(ctx.data, &["status", "phase"]).unwrap_or_default())
 }
 
