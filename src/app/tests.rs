@@ -15249,3 +15249,72 @@ async fn log_lookback_keys_keep_tail_limits_in_api_requests() {
         }
     }
 }
+
+#[tokio::test]
+async fn memory_filter_accepts_kubernetes_quantity_suffixes() {
+    for (quantity, bytes) in [
+        ("100500k", 100_500_000),
+        ("1P", 1_000_000_000_000_000),
+        ("1E", 1_000_000_000_000_000_000),
+        ("1Pi", 1_i64 << 50),
+        ("1Ei", 1_i64 << 60),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("nodes");
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1", "kind": "Node",
+                "metadata": {"name": "sample"},
+                "status": {"allocatable": {"cpu": "2", "memory": quantity}}
+            }),
+        );
+        app.handle_msg(Msg::Metrics {
+            generation: app.generation,
+            data: HashMap::from([("sample".into(), (100, bytes))]),
+            containers: HashMap::new(),
+        });
+        type_filter(&mut app, &format!("memory={quantity}"));
+        assert_eq!(row_names(&app), ["sample"], "{quantity}");
+        let obj = app.rows()[0].clone();
+        assert_eq!(crate::columns::node_allocatable(&obj).1, Some(bytes));
+        assert_eq!(crate::views::parse_quantity(quantity), Some(bytes as f64));
+    }
+}
+
+#[tokio::test]
+async fn memory_filter_rounds_fractional_bytes_up() {
+    for (quantity, bytes) in [("100m", 1), ("1.5", 2)] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("nodes");
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1", "kind": "Node",
+                "metadata": {"name": "sample"},
+                "status": {"allocatable": {"cpu": "2", "memory": quantity}}
+            }),
+        );
+        app.handle_msg(Msg::Metrics {
+            generation: app.generation,
+            data: HashMap::from([("sample".into(), (100, bytes))]),
+            containers: HashMap::new(),
+        });
+        type_filter(&mut app, &format!("memory={quantity}"));
+        assert_eq!(row_names(&app), ["sample"], "{quantity}");
+        assert_eq!(
+            crate::columns::node_allocatable(app.rows()[0]).1,
+            Some(bytes)
+        );
+    }
+}
+
+#[tokio::test]
+async fn memory_filter_rejects_invalid_quantities() {
+    for quantity in ["1K", "1Xi", "-1Mi", "NaN", "inf"] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("pods");
+        type_filter(&mut app, &format!("memory>{quantity}"));
+        assert!(app.filter_error().is_some(), "{quantity}");
+    }
+}

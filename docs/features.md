@@ -111,7 +111,10 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   `utilization` thresholds and sortable, so "which node is full" is one glance
   and one `S`. The container picker shows per-container CPU and memory, usage as
   a percent of request and of limit (`-` marks an unset one), and the pod QoS
-  class. All of it degrades cleanly when metrics-server isn't installed.
+  class. Memory quantities use Kubernetes units, including decimal `k`, `P`,
+  and `E`, and binary `Pi` and `Ei`, in metrics and filters. Fractional bytes
+  round up to the next whole byte.
+  All of it degrades cleanly when metrics-server isn't installed.
 - **Configurable thresholds** for the RESTARTS/CPU/MEM/request-limit coloring,
   globally and per resource and per context. See
   [Views and thresholds](views.md#thresholds).
