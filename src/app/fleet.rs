@@ -220,8 +220,7 @@ async fn gather_context(ctx: &str, readonly: bool, allow_v1_client_cert: bool) -
 
     if let Some(k) = cluster.resolve("pods") {
         let pods = list_or_warn(&client, &k.ar, k.namespaced, "", &mut warn).await;
-        row.pods_total = pods.len();
-        row.pods_unhealthy = pods.iter().filter(|o| !pod_healthy(o)).count();
+        update_pod_counts(&mut row, &pods);
     }
 
     // Flux failures: only report a count when the toolkit CRDs exist.
@@ -240,6 +239,11 @@ async fn gather_context(ctx: &str, readonly: bool, allow_v1_client_cert: bool) -
         None => FleetStatus::Ok,
     };
     row
+}
+
+pub(super) fn update_pod_counts(row: &mut FleetRow, pods: &[DynamicObject]) {
+    row.pods_total = pods.len();
+    row.pods_unhealthy = pods.iter().filter(|o| !pod_healthy(o)).count();
 }
 
 /// A pod counts as healthy when it isn't terminating and is Running-and-ready
