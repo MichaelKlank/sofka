@@ -2776,6 +2776,17 @@ fn draw_adjacent(frame: &mut Frame, app: &mut App, area: Rect) {
         };
         vec![ListItem::new(Span::styled(msg, theme::dim()))]
     } else {
+        // Columns sized to their widest cell, so a long relation or kind name
+        // never pushes its row out of line with the others.
+        let width = |cell: fn(&crate::store::AdjacentItem) -> &str| {
+            app.adjacent_items
+                .iter()
+                .map(|it| cell(it).chars().count())
+                .max()
+                .unwrap_or(0)
+        };
+        let relation_w = width(|it| &it.relation);
+        let kind_w = width(|it| &it.kind);
         app.adjacent_items
             .iter()
             .map(|it| {
@@ -2784,9 +2795,9 @@ fn draw_adjacent(frame: &mut Frame, app: &mut App, area: Rect) {
                     _ => it.name.clone(),
                 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{:<16} ", it.relation), theme::dim()),
+                    Span::styled(format!("{:<relation_w$}  ", it.relation), theme::dim()),
                     Span::styled(
-                        format!("{:<24} ", it.kind),
+                        format!("{:<kind_w$}  ", it.kind),
                         Style::default().fg(theme::text()),
                     ),
                     Span::styled(location, Style::default().fg(theme::text())),
