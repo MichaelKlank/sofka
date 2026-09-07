@@ -20,6 +20,8 @@ use serde_json::Value;
 /// How a custom column's value is rendered and sorted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColumnKind {
+    Metric(crate::columns::MetricColumn),
+    Builtin,
     #[default]
     Text,
     /// Text that also drives the row's status coloring.
@@ -261,7 +263,7 @@ pub fn compile(
                 warnings.push(format!("views.\"{key}\": column with empty name skipped"));
                 continue;
             }
-            let kind = match c.kind.as_deref() {
+            let mut kind = match c.kind.as_deref() {
                 None | Some("text") => ColumnKind::Text,
                 Some("status") => ColumnKind::Status,
                 Some("number") => ColumnKind::Number,
@@ -276,6 +278,41 @@ pub fn compile(
                     ColumnKind::Text
                 }
             };
+            let sources = usize::from(!c.path.is_empty())
+                + usize::from(c.metric.is_some())
+                + usize::from(c.builtin.is_some());
+            if sources != 1 {
+                warnings.push(format!("views.\"{key}\": column {header}: set exactly one of path, metric, or builtin; column skipped"));
+                continue;
+            }
+            if columns
+                .iter()
+                .any(|column: &UserColumn| column.header == header)
+            {
+                warnings.push(format!(
+                    "views.\"{key}\": duplicate column {header}; column skipped"
+                ));
+                continue;
+            }
+            if c.kind.is_some() && (c.metric.is_some() || c.builtin.is_some()) {
+                warnings.push(format!("views.\"{key}\": column {header}: type applies only to path columns; column skipped"));
+                continue;
+            }
+            let mut pointer = c.path.trim().to_string();
+            if let Some(metric) = &c.metric {
+                let Some(metric) = crate::columns::MetricColumn::parse(metric) else {
+                    warnings.push(format!("views.\"{key}\": column {header}: unknown metric '{metric}'; column skipped"));
+                    continue;
+                };
+                kind = ColumnKind::Metric(metric);
+            } else if let Some(builtin) = &c.builtin {
+                pointer = builtin.trim().to_uppercase();
+                if pointer.is_empty() {
+                    warnings.push(format!("views.\"{key}\": column {header}: builtin must name a column; column skipped"));
+                    continue;
+                }
+                kind = ColumnKind::Builtin;
+            }
             // A condition column's path is the condition *type* name, not a
             // pointer — conditions are found by name because their array
             // order isn't guaranteed by anything.
@@ -287,7 +324,9 @@ pub fn compile(
                     ));
                     continue;
                 }
-            } else if !c.path.starts_with('/') {
+            } else if !matches!(kind, ColumnKind::Metric(_) | ColumnKind::Builtin)
+                && !c.path.starts_with('/')
+            {
                 warnings.push(format!(
                     "views.\"{key}\": column {header}: path '{}' is not a JSON Pointer \
                      (must start with '/', e.g. /status/phase); column skipped",
@@ -310,7 +349,7 @@ pub fn compile(
             };
             columns.push(UserColumn {
                 header,
-                pointer: c.path.trim().to_string(),
+                pointer,
                 kind,
                 wide: c.wide,
                 width: c.width,
@@ -616,6 +655,9 @@ fn extract_string_map<'a>(
 
 /// Render one custom column's cell. Missing values read as `<none>`.
 pub fn render_cell(obj: &DynamicObject, col: &UserColumn, now: i64) -> String {
+    if matches!(col.kind, ColumnKind::Metric(_)) {
+        return "-".into();
+    }
     if col.kind == ColumnKind::Condition {
         return condition_status(obj, &col.pointer).unwrap_or_else(|| "<none>".into());
     }
@@ -716,7 +758,11 @@ pub fn sort_value(obj: &DynamicObject, col: &UserColumn, now: i64) -> SortValue 
         ),
         // Condition is handled above (its "pointer" is a condition name, not
         // something `extract` understands).
-        ColumnKind::Text | ColumnKind::Status | ColumnKind::Condition => SortValue::Text(
+        ColumnKind::Text
+        | ColumnKind::Status
+        | ColumnKind::Condition
+        | ColumnKind::Metric(_)
+        | ColumnKind::Builtin => SortValue::Text(
             v.as_ref()
                 .map(Extracted::render)
                 .unwrap_or_default()
@@ -927,6 +973,28 @@ mod tests {
 
     fn obj(v: serde_json::Value) -> DynamicObject {
         serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn column_sources_validate_without_discarding_other_columns() {
+        let cfg: crate::config::Config = toml::from_str(
+            r#"
+            [views."v1/pods"]
+            columns = [
+                { name = "NAME", builtin = "NAME" },
+                { name = "CPU", metric = "cpu" },
+                { name = "CPU", metric = "memory" },
+                { name = "BOTH", path = "/spec/cpu", metric = "cpu" },
+                { name = "UNKNOWN", metric = "cpus" },
+                { name = "BAD", builtin = "" },
+                { name = "TYPED", metric = "memory", type = "text" },
+            ]
+        "#,
+        )
+        .unwrap();
+        let (views, warnings) = compile(&cfg.views);
+        assert_eq!(views["v1/pods"].columns.len(), 2);
+        assert_eq!(warnings.len(), 5);
     }
 
     fn col(pointer: &str, kind: ColumnKind) -> UserColumn {

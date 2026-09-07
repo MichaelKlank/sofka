@@ -559,14 +559,18 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
 
 fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let show_ns = app.show_namespace_column();
-    let metrics_cols = app.metrics_columns();
     let headers = app.display_headers();
     let sort_col = app.sort_column;
     let sort_arrow = if app.sort_desc { " ↓" } else { " ↑" };
-    // Offset from a displayed column index back to the view spec's (the spec
-    // doesn't know about the prepended NAMESPACE or appended CPU/MEM).
+    // The namespace column is added before the view columns.
     let ns_off = usize::from(show_ns);
-    let name_col = usize::from(show_ns);
+    let name_col = (0..headers.len())
+        .find(|i| {
+            i.checked_sub(ns_off)
+                .and_then(|si| app.view_spec().canonical_header(si))
+                == Some("NAME")
+        })
+        .unwrap_or(ns_off);
     // Per-column custom alignment, precomputed so cells don't re-borrow app.
     let aligns: Vec<Option<Alignment>> = (0..headers.len())
         .map(|i| {
@@ -609,13 +613,27 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     // Column indices (fixed for the whole table) for the columns that get
     // their own visibility treatment below, computed once rather than
     // string-compared per cell.
-    let age_idx = headers.iter().position(|h| h == "AGE");
-    let ready_idx = headers.iter().position(|h| h == "READY");
-    let restarts_idx = headers.iter().position(|h| h == "RESTARTS");
-    let cpu_idx = headers.iter().position(|h| h == "CPU");
-    let mem_idx = headers.iter().position(|h| h == "MEM");
-    let pct_cpu_idx = headers.iter().position(|h| h == "%CPU");
-    let pct_mem_idx = headers.iter().position(|h| h == "%MEM");
+    let age_idx = (0..headers.len()).find(|i| {
+        i.checked_sub(ns_off)
+            .and_then(|si| app.view_spec().canonical_header(si))
+            == Some("AGE")
+    });
+    let ready_idx = (0..headers.len()).find(|i| {
+        i.checked_sub(ns_off)
+            .and_then(|si| app.view_spec().canonical_header(si))
+            == Some("READY")
+    });
+    let restarts_idx = (0..headers.len()).find(|i| {
+        i.checked_sub(ns_off)
+            .and_then(|si| app.view_spec().canonical_header(si))
+            == Some("RESTARTS")
+    });
+    let metric_columns: Vec<_> = (0..headers.len())
+        .map(|i| {
+            i.checked_sub(ns_off)
+                .and_then(|si| app.view_spec().metric_at(si))
+        })
+        .collect();
 
     let count = app.row_count();
     let visible_rows = area.height.saturating_sub(3).max(1) as usize;
@@ -663,6 +681,14 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                 .and_then(|si| app.view_spec().width_at(si))
             {
                 ColWidth::Exact(w)
+            } else if let Some(metric) = metric_columns[i] {
+                ColWidth::Exact(match metric {
+                    columns::MetricColumn::NodePods
+                    | columns::MetricColumn::NodeCpuUtilization
+                    | columns::MetricColumn::NodeMemoryUtilization => 5,
+                    _ if metric.percentage() => 7,
+                    _ => 8,
+                })
             } else {
                 match h.as_str() {
                     // NAME is the column you actually read — its weight takes
@@ -755,33 +781,13 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                 style_idx = status_idx.map(|i| i + 1);
             }
             for (i, cell) in base_cells.iter().enumerate() {
-                if let Some(value) =
-                    spec.volatile_cached(obj, &app.kind_plural, i, now, helm_updated)
+                if let Some(value) = app
+                    .live_cell(obj, i)
+                    .or_else(|| spec.volatile_cached(obj, &app.kind_plural, i, now, helm_updated))
                 {
                     cells.push(TableCellText::Owned(value));
                 } else {
                     cells.push(TableCellText::Borrowed(cell.as_str()));
-                }
-            }
-            if app.node_capacity_columns() {
-                cells.push(TableCellText::Owned(app.node_pods_cell(obj)));
-            }
-            let mut metrics_raw = None;
-            let mut node_pcts: (Option<i64>, Option<i64>) = (None, None);
-            if metrics_cols {
-                metrics_raw = app.metrics_for(obj);
-                let cpu = metrics_raw.map(|(cpu, _)| cpu);
-                let mem = metrics_raw.map(|(_, mem)| mem);
-                cells.push(TableCellText::Owned(columns::fmt_cpu_sample(cpu)));
-                cells.push(TableCellText::Owned(columns::fmt_mem_sample(mem)));
-                if app.node_capacity_columns() {
-                    let (alloc_cpu, alloc_mem) = columns::node_allocatable(obj);
-                    node_pcts = (
-                        cpu.and_then(|cpu| columns::usage_pct(cpu, alloc_cpu)),
-                        mem.and_then(|mem| columns::usage_pct(mem, alloc_mem)),
-                    );
-                    cells.push(TableCellText::Owned(columns::fmt_pct(node_pcts.0)));
-                    cells.push(TableCellText::Owned(columns::fmt_pct(node_pcts.1)));
                 }
             }
             // Combined colorer: the whole row takes a k9s-style status tint
@@ -843,23 +849,23 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                             .map(theme::severity_fg)
                             .unwrap_or(row_color);
                         c.into_cell_aligned(align).style(Style::default().fg(color))
-                    } else if Some(i) == cpu_idx {
-                        let color = metrics_raw
-                            .and_then(|(cpu, _)| thresholds.cpu.severity(cpu))
-                            .map(theme::severity_fg)
-                            .unwrap_or(row_color);
-                        c.into_cell_aligned(align).style(Style::default().fg(color))
-                    } else if Some(i) == mem_idx {
-                        let color = metrics_raw
-                            .and_then(|(_, mem)| thresholds.memory.severity(mem))
-                            .map(theme::severity_fg)
-                            .unwrap_or(row_color);
-                        c.into_cell_aligned(align).style(Style::default().fg(color))
-                    } else if Some(i) == pct_cpu_idx {
-                        let color = util_color(node_pcts.0, thresholds.utilization);
-                        c.into_cell_aligned(align).style(Style::default().fg(color))
-                    } else if Some(i) == pct_mem_idx {
-                        let color = util_color(node_pcts.1, thresholds.utilization);
+                    } else if let Some(metric) = metric_columns[i] {
+                        let value = app.metric_value(obj, metric);
+                        let color = if metric.percentage() {
+                            util_color(value, thresholds.utilization)
+                        } else if metric == columns::MetricColumn::NodePods {
+                            row_color
+                        } else {
+                            let band = if metric.cpu() {
+                                thresholds.cpu
+                            } else {
+                                thresholds.memory
+                            };
+                            value
+                                .and_then(|v| band.severity(v))
+                                .map(theme::severity_fg)
+                                .unwrap_or(row_color)
+                        };
                         c.into_cell_aligned(align).style(Style::default().fg(color))
                     } else {
                         c.into_cell_aligned(align)

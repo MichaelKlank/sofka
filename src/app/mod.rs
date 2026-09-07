@@ -1351,9 +1351,8 @@ struct HighlightCache {
 /// times per frame, and each call used to build a fresh `Vec<String>` of owned
 /// headers only to read one entry out of it.
 struct HeaderCache {
-    /// `(namespace column, node capacity columns, metrics columns)` — the
-    /// toggles that add columns around the spec's own.
-    shape: (bool, bool, bool),
+    /// Whether the namespace column is added before the view columns.
+    namespace: bool,
     /// Bumped whenever the view spec is rebuilt.
     spec_rev: u64,
     headers: Rc<[String]>,
