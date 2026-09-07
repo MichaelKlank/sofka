@@ -942,7 +942,7 @@ impl App {
                 self.metrics_error = None;
                 self.metrics = data;
                 self.container_metrics = containers;
-                if sort_uses_metrics {
+                if sort_uses_metrics || self.parsed_filter().uses_metrics() {
                     self.invalidate_rows();
                 }
             }

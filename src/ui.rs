@@ -557,7 +557,6 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let show_ns = app.show_namespace_column();
     let metrics_cols = app.metrics_columns();
     let headers = app.display_headers();
-    let pods_view = app.kind_plural == "pods";
     let sort_col = app.sort_column;
     let sort_arrow = if app.sort_desc { " ↓" } else { " ↑" };
     // Offset from a displayed column index back to the view spec's (the spec
@@ -762,25 +761,16 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
             let mut metrics_raw = None;
             let mut node_pcts: (Option<i64>, Option<i64>) = (None, None);
             if metrics_cols {
-                let name = obj.metadata.name.as_deref().unwrap_or_default();
-                let key = if pods_view {
-                    format!(
-                        "{}/{}",
-                        obj.metadata.namespace.as_deref().unwrap_or_default(),
-                        name
-                    )
-                } else {
-                    name.to_string()
-                };
-                let (cpu, mem) = app.metrics.get(&key).copied().unwrap_or((0, 0));
-                metrics_raw = Some((cpu, mem));
-                cells.push(TableCellText::Owned(columns::fmt_cpu(cpu)));
-                cells.push(TableCellText::Owned(columns::fmt_mem(mem)));
+                metrics_raw = app.metrics_for(obj);
+                let cpu = metrics_raw.map(|(cpu, _)| cpu);
+                let mem = metrics_raw.map(|(_, mem)| mem);
+                cells.push(TableCellText::Owned(columns::fmt_cpu_sample(cpu)));
+                cells.push(TableCellText::Owned(columns::fmt_mem_sample(mem)));
                 if app.node_capacity_columns() {
                     let (alloc_cpu, alloc_mem) = columns::node_allocatable(obj);
                     node_pcts = (
-                        columns::usage_pct(cpu, alloc_cpu),
-                        columns::usage_pct(mem, alloc_mem),
+                        cpu.and_then(|cpu| columns::usage_pct(cpu, alloc_cpu)),
+                        mem.and_then(|mem| columns::usage_pct(mem, alloc_mem)),
                     );
                     cells.push(TableCellText::Owned(columns::fmt_pct(node_pcts.0)));
                     cells.push(TableCellText::Owned(columns::fmt_pct(node_pcts.1)));

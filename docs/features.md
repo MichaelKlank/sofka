@@ -114,6 +114,9 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   class. Memory quantities use Kubernetes units, including decimal `k`, `P`,
   and `E`, and binary `Pi` and `Ei`, in metrics and filters. Fractional bytes
   round up to the next whole byte.
+  Missing samples show `-` and do not match numeric CPU or memory filters.
+  Measured zero shows `0m`, `0Mi`, or `0%`. Missing metric values sort before
+  measured values in ascending order and after them in descending order.
   All of it degrades cleanly when metrics-server isn't installed.
 - **Configurable thresholds** for the RESTARTS/CPU/MEM/request-limit coloring,
   globally and per resource and per context. See

@@ -1914,6 +1914,22 @@ pub fn node_allocatable(o: &DynamicObject) -> (Option<i64>, Option<i64>) {
     )
 }
 
+pub fn fmt_cpu_sample(milli: Option<i64>) -> String {
+    match milli {
+        Some(0) => "0m".into(),
+        Some(milli) => fmt_cpu(milli),
+        None => "-".into(),
+    }
+}
+
+pub fn fmt_mem_sample(bytes: Option<i64>) -> String {
+    match bytes {
+        Some(0) => "0Mi".into(),
+        Some(bytes) => fmt_mem(bytes),
+        None => "-".into(),
+    }
+}
+
 pub fn fmt_cpu(milli: i64) -> String {
     if milli <= 0 {
         "-".into()

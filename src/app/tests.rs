@@ -15318,3 +15318,132 @@ async fn memory_filter_rejects_invalid_quantities() {
         assert!(app.filter_error().is_some(), "{quantity}");
     }
 }
+
+#[tokio::test]
+async fn missing_metrics_do_not_match_usage_filters() {
+    for (plural, kind) in [("pods", "Pod"), ("nodes", "Node")] {
+        for (filter, expected) in [
+            ("cpu<10m", vec!["idle"]),
+            ("memory<1Mi", vec!["idle"]),
+            ("cpu=0", vec!["idle"]),
+            ("mem=0", vec!["idle"]),
+            ("cpu!=1", vec!["busy", "idle"]),
+            ("memory!=1", vec!["busy", "idle"]),
+        ] {
+            let (mut app, _rx) = test_app();
+            app.switch_kind(plural);
+            for name in ["unknown", "idle", "busy"] {
+                let mut obj = json!({
+                    "apiVersion": "v1", "kind": kind,
+                    "metadata": {"name": name}
+                });
+                if plural == "pods" {
+                    obj["metadata"]["namespace"] = json!("default");
+                }
+                apply(&mut app, obj);
+            }
+            let key = |name: &str| {
+                if plural == "pods" {
+                    format!("default/{name}")
+                } else {
+                    name.to_string()
+                }
+            };
+            app.handle_msg(Msg::Metrics {
+                generation: app.generation,
+                data: HashMap::from([
+                    (key("idle"), (0, 0)),
+                    (key("busy"), (100, 10 * 1024 * 1024)),
+                ]),
+                containers: HashMap::new(),
+            });
+            type_filter(&mut app, filter);
+            assert_eq!(row_names(&app), expected, "{plural}: {filter}");
+            app.handle_msg(Msg::Metrics {
+                generation: app.generation,
+                data: HashMap::new(),
+                containers: HashMap::new(),
+            });
+            assert!(row_names(&app).is_empty(), "{plural}: {filter}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn missing_node_metrics_stay_distinct_in_render_capture_and_sort() {
+    use ratatui::{Terminal, backend::TestBackend};
+    for header in ["CPU", "MEM", "%CPU", "%MEM"] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("nodes");
+        for name in ["unknown", "idle", "busy"] {
+            apply(
+                &mut app,
+                json!({
+                    "apiVersion": "v1", "kind": "Node",
+                    "metadata": {"name": name},
+                    "status": {"allocatable": {"cpu": "2", "memory": "1Gi"}}
+                }),
+            );
+        }
+        app.handle_msg(Msg::Metrics {
+            generation: app.generation,
+            data: HashMap::from([
+                ("idle".into(), (0, 0)),
+                ("busy".into(), (100, 10 * 1024 * 1024)),
+            ]),
+            containers: HashMap::new(),
+        });
+        app.handle_key(press(KeyCode::Char('S'))).unwrap();
+        for c in header.chars() {
+            app.handle_key(press(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.display_headers()[app.sort_column.unwrap()], header);
+        assert_eq!(row_names(&app), ["unknown", "idle", "busy"], "{header}");
+        app.handle_key(press(KeyCode::Char('I'))).unwrap();
+        assert_eq!(row_names(&app), ["busy", "idle", "unknown"], "{header}");
+
+        let (headers, rows) = app.snapshot_table();
+        let cell = |name: &str, header: &str| {
+            let row = rows.iter().find(|row| row[0] == name).unwrap();
+            &row[headers.iter().position(|h| h == header).unwrap()]
+        };
+        for metric in ["CPU", "MEM", "%CPU", "%MEM"] {
+            assert_eq!(cell("unknown", metric), "-");
+        }
+        for (metric, value) in [
+            ("CPU", "0m"),
+            ("MEM", "0Mi"),
+            ("%CPU", "0%"),
+            ("%MEM", "0%"),
+        ] {
+            assert_eq!(cell("idle", metric), value);
+        }
+
+        app.handle_key(press(KeyCode::End)).unwrap();
+        let fields = app.selected_row_fields();
+        for metric in ["CPU", "MEM", "%CPU", "%MEM"] {
+            assert_eq!(fields.iter().find(|(key, _)| key == metric).unwrap().1, "-");
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(200, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let lines: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        let unknown = lines.iter().find(|line| line.contains("unknown")).unwrap();
+        let idle = lines.iter().find(|line| line.contains("idle")).unwrap();
+        assert!(!unknown.contains("0%"), "{unknown}");
+        assert!(
+            idle.contains("0m") && idle.contains("0Mi") && idle.matches("0%").count() == 2,
+            "{idle}"
+        );
+    }
+}
