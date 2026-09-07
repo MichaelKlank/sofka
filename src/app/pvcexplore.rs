@@ -3,7 +3,9 @@ use super::*;
 use std::path::PathBuf;
 
 use crate::app::actions::SHELL_FALLBACK;
-use crate::pvcexplore::{self as pvc, Entry, HELPER_LABEL, HELPER_MOUNT, HELPER_PREFIX, Mount};
+use crate::pvcexplore::{
+    self as pvc, Entry, HELPER_ANNOTATION, HELPER_MOUNT, HELPER_PREFIX, Mount,
+};
 
 /// Ceiling on one `kubectl exec … ls`. A directory on an unresponsive NFS
 /// backend can hang the exec indefinitely; without this the pane would sit on
@@ -990,7 +992,7 @@ impl App {
                 Some(ns) => Api::namespaced(client, ns),
                 None => Api::all(client),
             };
-            let selector = format!("{}={}", HELPER_LABEL.0, HELPER_LABEL.1);
+            let selector = pvc::helper_selector();
             let mut deleted = 0usize;
             let mut failed = Vec::new();
             match pods.list(&ListParams::default().labels(&selector)).await {
@@ -999,9 +1001,20 @@ impl App {
                         let Some(name) = pod.metadata.name.clone() else {
                             continue;
                         };
-                        // Name prefix as well as the label: a pod that only
-                        // happens to carry the label is not ours to delete.
+                        // The labels got it into this list; the name prefix
+                        // and the claim annotation are the rest of the
+                        // evidence. None of it is unforgeable — nothing sofka
+                        // writes on creation is — but all four together make
+                        // an accidental match essentially impossible, and a
+                        // deliberate one still has to get past the
+                        // confirmation and the `pvc-explore` guardrail.
+                        let names_a_claim = pod
+                            .metadata
+                            .annotations
+                            .as_ref()
+                            .is_some_and(|a| a.contains_key(HELPER_ANNOTATION));
                         if !name.starts_with(HELPER_PREFIX)
+                            || !names_a_claim
                             || keep.as_deref() == Some(name.as_str())
                         {
                             continue;

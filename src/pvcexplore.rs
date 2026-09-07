@@ -18,14 +18,36 @@ use serde_json::{Value, json};
 /// change a path nobody types.
 pub const HELPER_MOUNT: &str = "/pvc";
 
-/// `metadata.generateName` for helper pods. `:pvc-clean` requires both this
-/// prefix and [`HELPER_LABEL`] before it deletes anything, so a pod that only
-/// happens to carry the label is never swept up.
+/// `metadata.generateName` for helper pods. `:pvc-clean` requires this prefix,
+/// both of [`HELPER_LABELS`], and the [`HELPER_ANNOTATION`] naming the claim
+/// before it deletes anything.
+///
+/// None of that is unforgeable — every label and annotation sofka writes on
+/// creation, anything else can write too — so it is not a permission check.
+/// It is there to make an *accidental* match essentially impossible; a
+/// deliberate one is bounded instead by the sweep being confirmed, journalled,
+/// blocked in read-only mode, and gated by the `pvc-explore` guardrail.
 pub const HELPER_PREFIX: &str = "sofka-pvc-explore-";
 
 /// Label every helper pod carries, so a leftover is identifiable as sofka's
 /// even after the annotation naming the claim is gone.
-pub const HELPER_LABEL: (&str, &str) = ("sofka.dev/component", "pvc-explore");
+pub const HELPER_LABELS: [(&str, &str); 2] = [
+    ("app.kubernetes.io/managed-by", "sofka"),
+    ("sofka.dev/component", "pvc-explore"),
+];
+
+/// Annotation naming the claim a helper pod was created for. Also part of the
+/// evidence [`HELPER_PREFIX`] describes.
+pub const HELPER_ANNOTATION: &str = "sofka.dev/pvc";
+
+/// The label selector `:pvc-clean` lists with.
+pub fn helper_selector() -> String {
+    HELPER_LABELS
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
 /// Cap on entries read from one directory. A volume with a million files in
 /// one directory is a real thing (a cache, a spool), and the cap is applied by
@@ -113,6 +135,10 @@ fn nonce() -> String {
 /// symlinks, so a link on the volume pointing at `/` would land the browser in
 /// the serving pod's root with every path still looking like it was under the
 /// mount. Comparing the *resolved* directory is the only check that sees it.
+///
+/// Both sides get a trailing slash before they are compared, which makes the
+/// boundary explicit — `/pvcx` is not inside `/pvc` — and keeps a root of `/`
+/// working without depending on a glob subtlety to say so.
 pub fn list_probe(root: &str) -> ListingProbe {
     let nonce = nonce();
     ListingProbe {
@@ -126,9 +152,8 @@ pub fn list_probe(root: &str) -> ListingProbe {
             r#"[ -n "$1" ] && [ -n "$2" ] || exit {EXIT_NOT_A_DIRECTORY}
 unset TIME_STYLE QUOTING_STYLE BLOCK_SIZE LS_BLOCK_SIZE
 root=$(cd -- "$2" 2>/dev/null && pwd -P) || exit {EXIT_NOT_A_DIRECTORY}
-root=${{root%/}}
 cd -- "$1" 2>/dev/null || exit {EXIT_NOT_A_DIRECTORY}
-case "$(pwd -P)" in "$root"|"$root"/*) ;; *) exit {EXIT_OUTSIDE_MOUNT} ;; esac
+case "$(pwd -P)/" in "${{root%/}}/"*) ;; *) exit {EXIT_OUTSIDE_MOUNT} ;; esac
 {{ LC_ALL=C ls -A -l; echo "{STATUS_MARKER}{nonce}:$?"; }} | head -n {}"#,
             MAX_ENTRIES + 2
         ),
@@ -491,12 +516,12 @@ pub fn helper_pod(claim: &str, image: &str, ttl_secs: u64) -> Value {
         "metadata": {
             "generateName": HELPER_PREFIX,
             "labels": {
-                "app.kubernetes.io/managed-by": "sofka",
-                HELPER_LABEL.0: HELPER_LABEL.1,
+                HELPER_LABELS[0].0: HELPER_LABELS[0].1,
+                HELPER_LABELS[1].0: HELPER_LABELS[1].1,
             },
             // A label value can't hold every legal claim name (63 chars, and
             // claims may be longer), so the claim goes in an annotation.
-            "annotations": { "sofka.dev/pvc": claim },
+            "annotations": { HELPER_ANNOTATION: claim },
         },
         "spec": {
             "restartPolicy": "Never",
@@ -1437,6 +1462,22 @@ mod tests {
     }
 
     #[test]
+    fn the_helper_pod_carries_every_piece_of_evidence_the_sweep_requires() {
+        let spec = helper_pod("data", "busybox:1.37", 900);
+        for (k, v) in HELPER_LABELS {
+            assert_eq!(spec["metadata"]["labels"][k], v);
+        }
+        assert_eq!(spec["metadata"]["annotations"][HELPER_ANNOTATION], "data");
+        assert_eq!(spec["metadata"]["generateName"], HELPER_PREFIX);
+        // The selector `:pvc-clean` lists with must name every label, or the
+        // extra evidence buys nothing.
+        let selector = helper_selector();
+        for (k, v) in HELPER_LABELS {
+            assert!(selector.contains(&format!("{k}={v}")), "{selector}");
+        }
+    }
+
+    #[test]
     fn a_link_that_leaves_the_mount_is_refused_by_its_own_exit_code() {
         let err = interpret(Some(EXIT_OUTSIDE_MOUNT), "", "").unwrap_err();
         assert!(err.contains("outside the volume"), "{err}");
@@ -1452,10 +1493,14 @@ mod tests {
                 .script
                 .contains(r#"root=$(cd -- "$2" 2>/dev/null && pwd -P)"#)
         );
+        // Trailing slash on both sides: the boundary is explicit, so `/pvcx`
+        // is not inside `/pvc` and a root of `/` needs no special case.
         assert!(
             probe
                 .script
-                .contains(r#"case "$(pwd -P)" in "$root"|"$root"/*)"#)
+                .contains(r#"case "$(pwd -P)/" in "${root%/}/"*)"#),
+            "{}",
+            probe.script
         );
         assert!(probe.script.contains(&format!("exit {EXIT_OUTSIDE_MOUNT}")));
         assert_eq!(probe.root, "/srv");

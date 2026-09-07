@@ -222,9 +222,13 @@ right - so a download or an upload is one keystroke rather than a hand-written
   it expires on its own even if sofka never gets to delete it, and closing the
   browser - or quitting sofka - deletes it immediately. `:pvc-clean` removes
   any a crashed session left behind: it sweeps the current namespace, or every
-  namespace when the view is across all of them, matching on both the name
-  prefix and the label sofka sets, and skipping the pod your own open browser
-  is using. It cannot tell a leftover from a pod *another* session is browsing
+  namespace when the view is across all of them, requiring the name prefix,
+  both of the labels sofka sets, and the annotation naming the claim, and
+  skipping the pod your own open browser is using. None of that evidence is
+  unforgeable - anything sofka writes on creation, anything else can write too
+  - so it is there to make an accidental match essentially impossible, not as
+  a permission check; the confirmation, the guardrail and read-only mode are
+  what bound a deliberate one. It cannot tell a leftover from a pod *another* session is browsing
   through right now, so the confirmation says so. Deleting pods is a mutation
   like any other: blocked in read-only mode, matched by the `pvc-explore`
   guardrail, recorded in `:journal`.
