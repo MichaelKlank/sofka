@@ -209,6 +209,7 @@ const CRONJOB_COLUMNS: &[Column] = &[
 
 const EVENT_COLUMNS: &[Column] = &[
     column("NAME", col_name),
+    column("LAST-SEEN", col_event_last_seen),
     column("TYPE", col_event_type),
     column("REASON", col_event_reason),
     column("OBJECT", col_event_object),
@@ -667,6 +668,7 @@ pub fn volatile_cell(obj: &DynamicObject, plural: &str, header: &str, now: i64) 
             crate::helm::decode_summary(obj).and_then(|r| r.last_deployed_secs),
             now,
         )),
+        ("events", "LAST-SEEN") => Some(event_last_seen(obj, now)),
         ("jobs", "DURATION") if sget(&obj.data, &["status", "completionTime"]).is_none() => {
             Some(job_duration(&obj.data, now))
         }
@@ -1062,6 +1064,10 @@ fn col_event_message<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     event_message(ctx.data)
 }
 
+fn col_event_last_seen<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(event_last_seen(ctx.obj, ctx.now))
+}
+
 fn col_event_count<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     Cow::Owned(event_count(ctx.data).to_string())
 }
@@ -1403,6 +1409,39 @@ pub fn age(obj: &DynamicObject, now: i64) -> String {
 pub fn age_secs(obj: &DynamicObject, now: i64) -> Option<i64> {
     let ts = obj.metadata.creation_timestamp.as_ref()?;
     Some((now - ts.0.as_second()).max(0))
+}
+
+/// Last event occurrence, with creation time as the fallback.
+pub fn event_last_seen_secs(obj: &DynamicObject) -> Option<i64> {
+    [
+        "/series/lastObservedTime",
+        "/lastTimestamp",
+        "/deprecatedLastTimestamp",
+        "/eventTime",
+        "/firstTimestamp",
+        "/deprecatedFirstTimestamp",
+    ]
+    .iter()
+    .find_map(|path| {
+        obj.data
+            .pointer(path)?
+            .as_str()?
+            .parse::<Timestamp>()
+            .ok()
+            .map(|ts| ts.as_second())
+    })
+    .or_else(|| {
+        obj.metadata
+            .creation_timestamp
+            .as_ref()
+            .map(|ts| ts.0.as_second())
+    })
+}
+
+fn event_last_seen(obj: &DynamicObject, now: i64) -> String {
+    event_last_seen_secs(obj)
+        .map(|secs| humanize((now - secs).max(0)))
+        .unwrap_or_else(|| "<unknown>".into())
 }
 
 /// One reading of the wall clock, in epoch seconds, for a whole frame or
@@ -2685,14 +2724,21 @@ mod tests {
         assert_eq!(
             headers("events"),
             vec![
-                "NAME", "TYPE", "REASON", "OBJECT", "MESSAGE", "COUNT", "AGE"
+                "NAME",
+                "LAST-SEEN",
+                "TYPE",
+                "REASON",
+                "OBJECT",
+                "MESSAGE",
+                "COUNT",
+                "AGE"
             ]
         );
-        assert_eq!(cells[1], "Warning");
-        assert_eq!(cells[2], "BackOff");
-        assert_eq!(cells[3], "Pod/nginx");
-        assert_eq!(cells[4], "Back-off restarting failed container");
-        assert_eq!(cells[5], "7");
+        assert_eq!(cells[2], "Warning");
+        assert_eq!(cells[3], "BackOff");
+        assert_eq!(cells[4], "Pod/nginx");
+        assert_eq!(cells[5], "Back-off restarting failed container");
+        assert_eq!(cells[6], "7");
         assert_eq!(status_idx, None);
     }
 
@@ -3219,5 +3265,37 @@ mod tests {
             pod_summary(&pod),
             ("1/2".into(), "Running".into(), "2".into())
         );
+    }
+
+    #[test]
+    fn event_last_seen_uses_series_and_legacy_fallbacks() {
+        let mut event = obj(json!({"apiVersion":"v1","kind":"Event",
+            "metadata":{"name":"event","creationTimestamp":"2026-09-07T10:00:00Z"}}));
+        let created = "2026-09-07T10:00:00Z"
+            .parse::<Timestamp>()
+            .unwrap()
+            .as_second();
+        let recent = "2026-09-07T10:59:55Z";
+        for field in [
+            "lastTimestamp",
+            "deprecatedLastTimestamp",
+            "eventTime",
+            "firstTimestamp",
+            "deprecatedFirstTimestamp",
+        ] {
+            event.data = json!({field:recent});
+            assert_eq!(
+                event_last_seen_secs(&event),
+                Some(created + 3595),
+                "{field}"
+            );
+        }
+        event.data =
+            json!({"lastTimestamp":"2026-09-07T10:30:00Z", "series":{"lastObservedTime":recent}});
+        assert_eq!(event_last_seen_secs(&event), Some(created + 3595));
+        event.data = json!({"lastTimestamp":"invalid"});
+        assert_eq!(event_last_seen_secs(&event), Some(created));
+        event.metadata.creation_timestamp = None;
+        assert_eq!(event_last_seen_secs(&event), None);
     }
 }
