@@ -80,9 +80,15 @@ the buffer size, and an optional `since` lookback:
 [logs]
 tail = 300         # initial lines fetched per stream (kubectl --tail)
 buffer = 5000      # max lines kept while following (oldest dropped)
-since = "1h"       # optional: only logs newer than this — replaces tail
+since = "1h"       # optional: only logs newer than this, within the tail limit
 fullscreen = false # open log views fullscreen (F toggles per session)
 ```
+
+The `since` window and the `1`–`5` time anchors keep the initial line limit.
+A pod stream requests at most `tail` initial lines per container. Workload and
+Service streams request at most `min(tail, 100)` initial lines per container.
+The time window can reduce this number. Live following continues after these
+initial lines. Previous-container logs keep their full history.
 
 In the view, `/` filters with a case-insensitive substring, a `/regex/`, or a
 leading `!` to invert (keep lines that don't match). A malformed regex is flagged
