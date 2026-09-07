@@ -14965,6 +14965,82 @@ async fn report_navigation_keeps_its_destination_after_a_late_reply() {
 }
 
 #[tokio::test]
+async fn palette_navigation_cancels_pending_health_reports() {
+    for gitops in [false, true] {
+        for through_help in [false, true] {
+            for command in ["detail", "diff", "events", "timeline", "can-i"] {
+                let (mut app, _rx) = test_app();
+                app.switch_kind("deployments");
+                apply(&mut app, expression_workload(true));
+                app.table_state.select(Some(0));
+                open_health_report_key(&mut app, gitops);
+                let claim = current_claim(&app);
+                let request = if gitops {
+                    app.gitops_request
+                } else {
+                    app.explain_request
+                };
+                let reply = if gitops {
+                    Msg::Gitops {
+                        generation: app.generation,
+                        request,
+                        claim,
+                        title: "cancelled report".into(),
+                        source: None,
+                        findings: Vec::new(),
+                    }
+                } else {
+                    Msg::Explain {
+                        generation: app.generation,
+                        request,
+                        claim,
+                        title: "cancelled report".into(),
+                        source: None,
+                        findings: Vec::new(),
+                    }
+                };
+                if through_help {
+                    app.handle_key(press(KeyCode::Char('?'))).unwrap();
+                    assert_eq!(app.mode, Mode::Help);
+                }
+                app.handle_key(press(KeyCode::Char(':'))).unwrap();
+                assert_eq!(
+                    current_claim(&app),
+                    claim,
+                    "opening the palette retains the report"
+                );
+                for key in command.chars() {
+                    app.handle_key(press(KeyCode::Char(key))).unwrap();
+                }
+                app.handle_key(press(KeyCode::Enter)).unwrap();
+                let destination = app.mode;
+                let current_request = if gitops {
+                    app.gitops_request
+                } else {
+                    app.explain_request
+                };
+                assert_ne!(current_request, request, "{command} must cancel the report");
+                assert!(
+                    app.status_claim
+                        .as_ref()
+                        .is_none_or(|status| status.claim != claim)
+                );
+                let flash = app.flash.clone();
+                app.handle_msg(reply);
+                assert_eq!(app.mode, destination);
+                assert_eq!(app.flash, flash);
+                let title = if gitops {
+                    &app.gitops_title
+                } else {
+                    &app.explain_title
+                };
+                assert_ne!(title, "cancelled report");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn leaving_health_view_rejects_its_pending_response() {
     for gitops in [false, true] {
         for close in [KeyCode::Esc, KeyCode::Char('q')] {

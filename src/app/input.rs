@@ -420,6 +420,8 @@ impl App {
         match source {
             Mode::Logs => self.stop_log_stream(),
             Mode::Events => self.stop_event_stream(),
+            Mode::Explain => self.cancel_explain_request(),
+            Mode::Gitops => self.cancel_gitops_request(),
             _ => {}
         }
         self.help_return = Mode::Table;
