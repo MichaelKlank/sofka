@@ -11915,3 +11915,144 @@ async fn faults_watch_changes_preserve_pod_identity_or_clear_selection() {
     });
     assert_eq!(app.table_state.selected(), None);
 }
+
+#[tokio::test]
+async fn workload_table_reports_rollout_generation_and_desired_readiness() {
+    for (plural, kind, spec, status, generation, expected_ready, expected_status) in [
+        (
+            "deployments",
+            "Deployment",
+            json!({"replicas": 3}),
+            json!({"replicas": 4, "readyReplicas": 4, "updatedReplicas": 3, "observedGeneration": 2}),
+            2,
+            "4/3",
+            "Progressing",
+        ),
+        (
+            "deployments",
+            "Deployment",
+            json!({}),
+            json!({"replicas": 1, "readyReplicas": 1, "updatedReplicas": 1, "observedGeneration": 2}),
+            2,
+            "1/1",
+            "Ready",
+        ),
+        (
+            "deployments",
+            "Deployment",
+            json!({"replicas": 0}),
+            json!({"observedGeneration": 1}),
+            2,
+            "0/0",
+            "Progressing",
+        ),
+        (
+            "statefulsets",
+            "StatefulSet",
+            json!({"replicas": 3, "ordinals": {"start": 5}, "updateStrategy": {"rollingUpdate": {"partition": 6}}}),
+            json!({"replicas": 3, "readyReplicas": 3, "updatedReplicas": 2, "observedGeneration": 2}),
+            2,
+            "3/3",
+            "Ready",
+        ),
+        (
+            "deployments",
+            "Deployment",
+            json!({"replicas": 3}),
+            json!({"replicas": 4, "readyReplicas": 3, "updatedReplicas": 1, "observedGeneration": 2}),
+            2,
+            "3/3",
+            "Progressing",
+        ),
+        (
+            "deployments",
+            "Deployment",
+            json!({"replicas": 3}),
+            json!({"replicas": 3, "readyReplicas": 3, "updatedReplicas": 3, "observedGeneration": 1}),
+            2,
+            "3/3",
+            "Progressing",
+        ),
+        (
+            "deployments",
+            "Deployment",
+            json!({"replicas": 3}),
+            json!({"replicas": 2, "readyReplicas": 2, "updatedReplicas": 2, "observedGeneration": 2}),
+            2,
+            "2/3",
+            "Progressing",
+        ),
+        (
+            "statefulsets",
+            "StatefulSet",
+            json!({"replicas": 3}),
+            json!({"replicas": 3, "readyReplicas": 3, "updatedReplicas": 1, "observedGeneration": 2}),
+            2,
+            "3/3",
+            "Progressing",
+        ),
+        (
+            "statefulsets",
+            "StatefulSet",
+            json!({"replicas": 3, "updateStrategy": {"rollingUpdate": {"partition": 2}}}),
+            json!({"replicas": 3, "readyReplicas": 3, "updatedReplicas": 1, "observedGeneration": 2}),
+            2,
+            "3/3",
+            "Ready",
+        ),
+        (
+            "statefulsets",
+            "StatefulSet",
+            json!({"replicas": 3, "updateStrategy": {"type": "OnDelete"}}),
+            json!({"replicas": 3, "readyReplicas": 3, "updatedReplicas": 0, "observedGeneration": 2}),
+            2,
+            "3/3",
+            "Ready",
+        ),
+        (
+            "daemonsets",
+            "DaemonSet",
+            json!({}),
+            json!({"desiredNumberScheduled": 3, "currentNumberScheduled": 3, "numberReady": 3, "updatedNumberScheduled": 1, "observedGeneration": 2}),
+            2,
+            "3",
+            "Progressing",
+        ),
+        (
+            "daemonsets",
+            "DaemonSet",
+            json!({"updateStrategy": {"type": "OnDelete"}}),
+            json!({"desiredNumberScheduled": 3, "currentNumberScheduled": 3, "numberReady": 3, "updatedNumberScheduled": 1, "observedGeneration": 2}),
+            2,
+            "3",
+            "Ready",
+        ),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.cluster.register_kind("apps", kind, plural, true);
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for ch in plural.chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        apply(
+            &mut app,
+            json!({"apiVersion": "apps/v1", "kind": kind, "metadata": {"name": "web", "namespace": "default", "generation": generation, "resourceVersion": format!("{spec}{status}")}, "spec": spec, "status": status}),
+        );
+        let headers = app.display_headers().to_vec();
+        let rows = app.rows();
+        app.ensure_table_cell_cache(&rows);
+        let cache = app.table_cell_cache();
+        let (cells, _) = cache.get(&row_key(rows[0])).unwrap();
+        assert_eq!(
+            cells[headers.iter().position(|h| h == "READY").unwrap()],
+            expected_ready,
+            "{kind}"
+        );
+        assert_eq!(
+            cells[headers.iter().position(|h| h == "STATUS").unwrap()],
+            expected_status,
+            "{kind}"
+        );
+    }
+}

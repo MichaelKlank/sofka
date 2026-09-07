@@ -266,3 +266,8 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 - **Local checks** validate package manifests and reports without a cluster.
 
 See [Create a plugin package](plugin-authoring.md).
+
+Workload STATUS shows `Progressing` until the controller observes the current
+specification and an active rolling update reaches its target. StatefulSet
+partitions and `OnDelete` strategies retain their update semantics. Deployment
+READY compares ready replicas with the desired count from the specification.
