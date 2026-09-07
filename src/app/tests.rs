@@ -17115,3 +17115,84 @@ async fn boolean_groups_preserve_literal_and_regex_terms() {
     });
     assert_eq!(row_names(&app), ["auth-api-0"]);
 }
+
+#[tokio::test]
+async fn invalid_local_query_keeps_pending_context_destination() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    type_resource_query(&mut app, "pods --context west /-l app=api");
+    let generation = app.generation;
+    type_resource_query(&mut app, "missing-resource /status=Running");
+    assert!(app.flash_err);
+    assert_eq!(app.generation, generation);
+    assert!(app.pending_resource_query.is_some());
+    land_context(&mut app, "west");
+    assert_eq!(app.cluster.context, "west");
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("app=api"));
+}
+
+#[tokio::test]
+async fn local_bookmark_rejects_original_context_connection_result() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    let home = app.cluster.context.clone();
+    bind_bookmark(&mut app, "services", &home);
+    type_resource_query(&mut app, "pods --context west /-l app=api");
+    let generation = app.generation;
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    assert_ne!(app.generation, generation);
+    let mut cluster = Cluster::fake();
+    cluster.context = "west".into();
+    app.handle_msg(Msg::ContextSwitched {
+        generation,
+        name: "west".into(),
+        result: Ok(Box::new(cluster)),
+    });
+    assert_eq!(app.cluster.context, home);
+    assert_eq!(app.kind_plural, "services");
+    assert!(app.context_switch_target.is_none());
+    assert!(app.pending_resource_query.is_none());
+}
+
+#[tokio::test]
+async fn local_query_clears_canceled_bookmark_destination() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    bind_bookmark(&mut app, "services", "west");
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    type_resource_query(&mut app, "pods /status=Running");
+    assert!(app.context_switch_target.is_none());
+    assert!(app.pending_bookmark.is_none());
+    assert!(app.pending_resource_query.is_none());
+    assert!(app.pending_workspace.is_none());
+}
+
+#[tokio::test]
+async fn local_query_clears_canceled_workspace_destination() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    app.workspaces = vec![crate::config::Workspace {
+        key: Some("ctrl-w".into()),
+        name: "ops".into(),
+        context: Some("west".into()),
+        views: vec![crate::config::WorkspaceView {
+            name: "services".into(),
+            resource: "services".into(),
+            ..Default::default()
+        }],
+    }];
+    app.handle_key(ctrl(KeyCode::Char('w'))).unwrap();
+    let generation = app.generation;
+    type_resource_query(&mut app, "pods /status=Running");
+    assert!(app.context_switch_target.is_none());
+    assert!(app.pending_workspace.is_none());
+    app.handle_msg(Msg::ContextSwitched {
+        generation,
+        name: "west".into(),
+        result: Err("connection failed".into()),
+    });
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.filter, "status=Running");
+    assert!(!app.flash_err);
+}

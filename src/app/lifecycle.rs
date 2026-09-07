@@ -28,7 +28,6 @@ impl App {
             self.pending_resource_query = Some(query);
             return;
         }
-        self.pending_resource_query = None;
         let Some(kind) = self.cluster.resolve(&query.resource) else {
             self.flash_warn(&format!("No resource matches '{}'", query.resource));
             return;
@@ -313,6 +312,13 @@ impl App {
                 parsed.fields().map(str::to_string),
             )
         };
+        // This watch replaces any pending context connection. Its result
+        // becomes stale when the generation changes below.
+        if self.context_switch_target.take().is_some() {
+            self.pending_resource_query = None;
+            self.pending_bookmark = None;
+            self.pending_workspace = None;
+        }
         self.applied_filter_labels = filter_labels;
         self.applied_filter_fields = filter_fields;
         self.clear_progress_flash();

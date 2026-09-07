@@ -77,3 +77,7 @@ scope. When changing context, resource resolution and the first filtered watch
 wait for that context to connect. Expressions use the typed scope literally;
 the existing `:resource namespace` completion remains available without a filter.
 Saved bookmark and workspace filters also scope their first API request.
+
+A valid local query, bookmark, or workspace replaces a pending context switch.
+The app ignores the old connection result. An invalid local query keeps the
+pending destination.
