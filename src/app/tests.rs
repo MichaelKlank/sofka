@@ -1,5 +1,6 @@
 use super::*;
 use crate::store::row_key;
+use k8s_openapi::jiff::Timestamp;
 use serde_json::json;
 use std::time::Instant;
 use tokio::sync::mpsc::{self, Receiver};
@@ -10,7 +11,17 @@ fn obj(v: serde_json::Value) -> DynamicObject {
 
 fn test_app() -> (App, Receiver<Msg>) {
     let (tx, rx) = mpsc::channel(1024);
-    (App::new(Cluster::fake(), tx), rx)
+    let mut app = App::new(Cluster::fake(), tx);
+    // Stub the port-forward spawner so tests don't require kubectl on PATH.
+    app.pf_spawner = |_argv| {
+        tokio::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    };
+    (app, rx)
 }
 
 /// The claim the operation that just started owns, for tests that hand-build
@@ -381,7 +392,7 @@ fn mock_cluster(url: &str) -> Cluster {
     // this test is about the app's fallback, not the client's retries.
     config.default_retry = false;
     let mut cluster = Cluster::fake();
-    cluster.client = crate::k8s::build_client(config).expect("mock client");
+    cluster.client = crate::k8s::build_client(config, false).expect("mock client");
     cluster.cluster_url = url.into();
     cluster
 }
@@ -766,6 +777,49 @@ fn helm_release_secret_deployed_at(
         },
         "data": { "release": wire_b64 },
     })
+}
+
+#[tokio::test]
+async fn discovered_short_names_select_resources_in_the_palette() {
+    for aggregated in [true, false] {
+        let url = crate::k8s::tests::mock_apiserver(aggregated, aggregated, true).await;
+        let cluster = crate::k8s::tests::connect_mock(url).await.unwrap();
+        let (tx, _rx) = mpsc::channel(1024);
+        let mut app = App::new(cluster, tx);
+        for (alias, plural) in [
+            ("md", "machinedeployments"),
+            ("zz", "widgets"),
+            ("gd", "gadgets"),
+            ("po", "pods"),
+            ("pods", "pods"),
+            ("shared", "gadgets"),
+            ("cross", "machinedeployments"),
+            ("native", "pods"),
+            ("MD", "machinedeployments"),
+        ] {
+            for ch in format!(":{alias}").chars() {
+                app.handle_key(press(KeyCode::Char(ch))).unwrap();
+            }
+            assert_eq!(
+                app.cluster
+                    .resolve(&app.cmd_suggestions[0].label)
+                    .unwrap()
+                    .ar
+                    .plural,
+                plural,
+                "alias {alias}, aggregated={aggregated}"
+            );
+            app.handle_key(press(KeyCode::Enter)).unwrap();
+            assert_eq!(app.kind_plural, plural);
+        }
+        app.cluster
+            .add_aliases(&HashMap::from([("md".into(), "widgets".into())]));
+        for ch in ":md".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.kind_plural, "widgets");
+    }
 }
 
 #[tokio::test]
@@ -1220,6 +1274,73 @@ async fn table_cell_cache_invalidates_on_apply() {
 }
 
 #[tokio::test]
+async fn pods_view_reads_ready_from_the_spec() {
+    let (mut app, _rx) = test_app();
+    app.kind_plural = "pods".into();
+    app.refresh_view_spec();
+
+    // Pending and unscheduled: the kubelet has published no container
+    // statuses, and the READY cell still has to say how many containers the
+    // pod is waiting on.
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "queued", "namespace": "default"},
+            "spec": {"containers": [{"name": "app"}, {"name": "worker"}]},
+            "status": {"phase": "Pending"}
+        }),
+    );
+    // Serving, with a native sidecar next to the app container and an init
+    // container that has already exited.
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "app"}],
+                "initContainers": [
+                    {"name": "migrate"},
+                    {"name": "proxy", "restartPolicy": "Always"}
+                ]
+            },
+            "status": {
+                "phase": "Running",
+                "initContainerStatuses": [
+                    {"name": "migrate", "ready": false, "restartCount": 0,
+                     "state": {"terminated": {"reason": "Completed", "exitCode": 0}}},
+                    {"name": "proxy", "ready": true, "restartCount": 2,
+                     "state": {"running": {}}}
+                ],
+                "containerStatuses": [
+                    {"name": "app", "ready": true, "restartCount": 1,
+                     "state": {"running": {}}}
+                ]
+            }
+        }),
+    );
+
+    let headers = app.display_headers().to_vec();
+    let ready = headers.iter().position(|h| h == "READY").unwrap();
+    let restarts = headers.iter().position(|h| h == "RESTARTS").unwrap();
+    let rows = app.rows();
+    app.ensure_table_cell_cache(&rows);
+    let cache = app.table_cell_cache();
+    let cell = |name: &str, idx: usize| {
+        let obj = rows
+            .iter()
+            .find(|o| o.metadata.name.as_deref() == Some(name))
+            .unwrap();
+        cache.get(&row_key(obj)).unwrap().0[idx].to_string()
+    };
+
+    assert_eq!(cell("queued", ready), "0/2");
+    assert_eq!(cell("web", ready), "2/2");
+    assert_eq!(cell("web", restarts), "3");
+}
+
+#[tokio::test]
 async fn palette_merges_commands_with_resources() {
     let (mut app, _rx) = test_app();
 
@@ -1642,6 +1763,8 @@ async fn saved_forwards_show_as_stopped_until_running() {
 
     // A live child linked by name moves the entry out of the stopped tail.
     app.port_forwards.push(PortForward {
+        context: app.cluster.context.clone(),
+        cluster_url: app.cluster.cluster_url.clone(),
         config_name: Some("argocd".into()),
         ns: "argocd".into(),
         target: "svc/argocd-server".into(),
@@ -1667,7 +1790,7 @@ async fn saved_forwards_show_as_stopped_until_running() {
 }
 
 #[tokio::test]
-async fn port_forward_prompt_prefills_first_exposed_port() {
+async fn port_forward_picker_lists_service_ports() {
     let (mut app, _rx) = test_app();
     app.switch_kind("services");
     apply(
@@ -1675,32 +1798,43 @@ async fn port_forward_prompt_prefills_first_exposed_port() {
         json!({
             "apiVersion": "v1", "kind": "Service",
             "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
-            "spec": {"ports": [{"port": 8080}, {"port": 9090}]}
+            "spec": {"ports": [{"port": 8080, "name": "http"}, {"port": 9090, "name": "metrics"}]}
         }),
     );
     app.table_state.select(Some(0));
     app.request_port_forward();
-    assert_eq!(app.mode, Mode::Prompt);
-    assert_eq!(
-        app.prompt_input, "8080:8080",
-        "first service port, LOCAL:REMOTE"
-    );
+    assert_eq!(app.mode, Mode::PortForwardPicker);
+    assert_eq!(app.pf_picker_items.len(), 3);
+    assert!(app.pf_picker_items[0].contains("8080:8080"));
+    assert!(app.pf_picker_items[0].contains("http"));
+    assert!(app.pf_picker_items[1].contains("9090:9090"));
+    assert!(app.pf_picker_items[1].contains("metrics"));
+    assert_eq!(app.pf_picker_items[2], "Custom…");
+}
 
-    // Pods take the first declared container port.
+#[tokio::test]
+async fn port_forward_picker_lists_pod_container_ports() {
+    let (mut app, _rx) = test_app();
     app.switch_kind("pods");
     apply(
         &mut app,
         json!({
             "apiVersion": "v1", "kind": "Pod",
             "metadata": {"name": "db", "namespace": "default", "resourceVersion": "1"},
-            "spec": {"containers": [{"name": "pg", "ports": [{"containerPort": 5432}]}]}
+            "spec": {"containers": [{"name": "pg", "ports": [{"containerPort": 5432, "name": "pgsql"}]}]}
         }),
     );
     app.table_state.select(Some(0));
     app.request_port_forward();
-    assert_eq!(app.prompt_input, "5432:5432");
+    assert_eq!(app.mode, Mode::PortForwardPicker);
+    assert_eq!(app.pf_picker_items.len(), 2);
+    assert!(app.pf_picker_items[0].contains("5432:5432"));
+    assert!(app.pf_picker_items[0].contains("pg/pgsql"));
+}
 
-    // No declared ports: the prompt stays empty as before.
+#[tokio::test]
+async fn port_forward_picker_no_ports_only_custom() {
+    let (mut app, _rx) = test_app();
     app.switch_kind("pods");
     apply(
         &mut app,
@@ -1712,7 +1846,408 @@ async fn port_forward_prompt_prefills_first_exposed_port() {
     );
     app.table_state.select(Some(0));
     app.request_port_forward();
-    assert_eq!(app.prompt_input, "");
+    assert_eq!(app.mode, Mode::PortForwardPicker);
+    assert_eq!(app.pf_picker_items, vec!["Custom…"]);
+}
+
+#[tokio::test]
+async fn port_forward_picker_filters_non_tcp_ports() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "dns", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [
+                {"port": 53, "protocol": "UDP", "name": "udp"},
+                {"port": 53, "protocol": "TCP", "name": "tcp"},
+                {"port": 8080, "name": "http"}
+            ]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    // UDP port filtered, TCP (explicit and default) kept + Custom…
+    assert_eq!(app.pf_picker_items.len(), 3);
+    assert!(!app.pf_picker_items.iter().any(|i| i.contains("udp")));
+    assert!(app.pf_picker_items[0].contains("53:53"));
+    assert!(app.pf_picker_items[0].contains("tcp"));
+    assert!(app.pf_picker_items[1].contains("8080:8080"));
+}
+
+#[tokio::test]
+async fn port_forward_handle_key_f_opens_picker() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 80}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('f'))).unwrap();
+    assert_eq!(app.mode, Mode::PortForwardPicker);
+    assert_eq!(app.pf_picker_items.len(), 2);
+    assert!(app.pf_picker_items[0].contains("80:80"));
+}
+
+#[tokio::test]
+async fn port_forward_picker_select_port_starts_forward() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 8080}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash.contains("port-forwarding"), "{}", app.flash);
+    assert_eq!(app.port_forwards.len(), 1);
+    assert_eq!(app.port_forwards[0].ports, "8080:8080");
+    assert_eq!(app.port_forwards[0].target, "svc/web");
+}
+
+#[tokio::test]
+async fn port_forward_picker_pod_target_no_svc_prefix() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "db", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "pg", "ports": [{"containerPort": 5432}]}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.port_forwards.len(), 1);
+    assert_eq!(app.port_forwards[0].target, "pod/db");
+}
+
+#[tokio::test]
+async fn port_forward_picker_custom_falls_through_to_prompt() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 8080}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    let custom_idx = app.pf_picker_items.len() - 1;
+    app.pf_picker_state.select(Some(custom_idx));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Prompt);
+    assert!(app.prompt_label.contains("Port-forward web"));
+    assert!(app.prompt_input.is_empty());
+}
+
+#[tokio::test]
+async fn port_forward_picker_esc_cancels() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 8080}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.port_forwards.is_empty());
+}
+
+#[tokio::test]
+async fn port_forward_picker_jk_navigation() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 80}, {"port": 443}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    assert_eq!(app.pf_picker_state.selected(), Some(0));
+
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    assert_eq!(app.pf_picker_state.selected(), Some(1));
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    assert_eq!(app.pf_picker_state.selected(), Some(2));
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    assert_eq!(app.pf_picker_state.selected(), Some(2)); // clamps
+
+    app.handle_key(press(KeyCode::Char('k'))).unwrap();
+    assert_eq!(app.pf_picker_state.selected(), Some(1));
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    assert_eq!(app.pf_picker_state.selected(), Some(2));
+    app.handle_key(press(KeyCode::Up)).unwrap();
+    assert_eq!(app.pf_picker_state.selected(), Some(1));
+}
+
+#[tokio::test]
+async fn port_forward_picker_includes_init_and_ephemeral_ports() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "multi", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "app", "ports": [{"containerPort": 8080}]}],
+                "initContainers": [{"name": "init", "ports": [{"containerPort": 9090}]}],
+                "ephemeralContainers": [{"name": "debug", "ports": [{"containerPort": 2222}]}]
+            }
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    assert_eq!(app.pf_picker_items.len(), 4);
+    assert!(app.pf_picker_items[0].contains("8080:8080"));
+    assert!(app.pf_picker_items[0].contains("app"));
+    assert!(app.pf_picker_items[1].contains("9090:9090"));
+    assert!(app.pf_picker_items[1].contains("init"));
+    assert!(app.pf_picker_items[2].contains("2222:2222"));
+    assert!(app.pf_picker_items[2].contains("debug"));
+}
+
+#[tokio::test]
+async fn port_forward_picker_skips_terminated_init_container_ports() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "multi", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "app", "ports": [{"containerPort": 8080}]}],
+                "initContainers": [{"name": "init", "ports": [{"containerPort": 9090}]}]
+            },
+            "status": {
+                "initContainerStatuses": [{
+                    "name": "init",
+                    "state": {"terminated": {"reason": "Completed"}}
+                }]
+            }
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    assert_eq!(app.pf_picker_items.len(), 2);
+    assert!(app.pf_picker_items[0].contains("8080:8080"));
+    assert!(!app.pf_picker_items.iter().any(|i| i.contains("9090")));
+}
+
+#[tokio::test]
+async fn port_forward_picker_dedups_identical_ports() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "dup", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [
+                    {"name": "a", "ports": [{"containerPort": 8080}]},
+                    {"name": "b", "ports": [{"containerPort": 8080}]}
+                ]
+            }
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    assert_eq!(app.pf_picker_items.len(), 3); // 2 unique labels + Custom…
+}
+
+#[tokio::test]
+async fn has_port_forward_matches_context_cluster_url_and_kind() {
+    let (mut app, _rx) = test_app();
+    app.cluster.context = "ctx-a".into();
+    app.cluster.cluster_url = "https://cluster-a".into();
+    app.port_forwards.push(PortForward {
+        context: "ctx-a".into(),
+        cluster_url: "https://cluster-a".into(),
+        config_name: None,
+        ns: "default".into(),
+        target: "svc/web".into(),
+        ports: "8080:80".into(),
+        child: spawn_test_child("sleep", "30"),
+    });
+
+    // Matching kind + ns + name → match.
+    assert!(app.has_port_forward("default", "web", "services"));
+
+    // Wrong kind (pod instead of service) → no match.
+    assert!(!app.has_port_forward("default", "web", "pods"));
+
+    // Different cluster URL → no match.
+    app.cluster.cluster_url = "https://cluster-b".into();
+    assert!(!app.has_port_forward("default", "web", "services"));
+    app.cluster.cluster_url = "https://cluster-a".into();
+
+    // Different context → no match.
+    app.cluster.context = "ctx-b".into();
+    assert!(!app.has_port_forward("default", "web", "services"));
+    app.cluster.context = "ctx-a".into();
+
+    // Wrong namespace → no match.
+    assert!(!app.has_port_forward("other", "web", "services"));
+
+    // Wrong name → no match.
+    assert!(!app.has_port_forward("default", "other", "services"));
+}
+
+#[tokio::test]
+async fn has_port_forward_pod_target_no_prefix() {
+    let (mut app, _rx) = test_app();
+    app.port_forwards.push(PortForward {
+        context: app.cluster.context.clone(),
+        cluster_url: app.cluster.cluster_url.clone(),
+        config_name: None,
+        ns: "default".into(),
+        target: "pod/db".into(),
+        ports: "5432:5432".into(),
+        child: spawn_test_child("sleep", "30"),
+    });
+    // Pod target matches via pod/db spelling.
+    assert!(app.has_port_forward("default", "db", "pods"));
+    // Service with same name should NOT match.
+    assert!(!app.has_port_forward("default", "db", "services"));
+}
+
+#[tokio::test]
+async fn has_port_forward_matches_saved_pod_target_spelling() {
+    let (mut app, _rx) = test_app();
+    // Saved forwards use the documented `pod/name` spelling.
+    app.port_forwards.push(PortForward {
+        context: app.cluster.context.clone(),
+        cluster_url: app.cluster.cluster_url.clone(),
+        config_name: Some("db-forward".into()),
+        ns: "default".into(),
+        target: "pod/db".into(),
+        ports: "5432:5432".into(),
+        child: spawn_test_child("sleep", "30"),
+    });
+    assert!(app.has_port_forward("default", "db", "pods"));
+    assert!(!app.has_port_forward("default", "db", "services"));
+}
+
+#[tokio::test]
+async fn port_forward_picker_skips_terminated_ephemeral_container_ports() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "multi", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "app", "ports": [{"containerPort": 8080}]}],
+                "ephemeralContainers": [{"name": "debug", "ports": [{"containerPort": 2222}]}]
+            },
+            "status": {
+                "ephemeralContainerStatuses": [{
+                    "name": "debug",
+                    "state": {"terminated": {"reason": "Completed"}}
+                }]
+            }
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.request_port_forward();
+    assert_eq!(app.pf_picker_items.len(), 2); // app port + Custom…
+    assert!(app.pf_picker_items[0].contains("8080:8080"));
+    assert!(!app.pf_picker_items.iter().any(|i| i.contains("2222")));
+}
+
+#[tokio::test]
+async fn port_forward_marker_renders_in_table() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "alpha", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 80}]}
+        }),
+    );
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "beta", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 8080}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+
+    // Start a forward on the first row (alpha) so it gets the marker.
+    app.request_port_forward();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.port_forwards.len(), 1);
+    assert_eq!(app.port_forwards[0].target, "svc/alpha");
+
+    let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let buffer = term.backend().buffer().clone();
+    let screen: String = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // The forwarded row "alpha" should have a ● before its name.
+    let alpha_line = screen
+        .lines()
+        .find(|l| l.contains("alpha"))
+        .expect("alpha row in screen");
+    assert!(
+        alpha_line.contains("●"),
+        "expected ● marker on forwarded row, got: {alpha_line}"
+    );
+
+    // The non-forwarded row "beta" should NOT have a ●.
+    let beta_line = screen
+        .lines()
+        .find(|l| l.contains("beta"))
+        .expect("beta row in screen");
+    assert!(
+        !beta_line.contains("●"),
+        "unexpected ● on non-forwarded row, got: {beta_line}"
+    );
 }
 
 #[test]
@@ -1820,6 +2355,126 @@ async fn pod_status_changes_keep_column_positions_stable() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn cordoned_node_statuses_keep_readiness_colors() {
+    use crate::theme;
+    use ratatui::{Terminal, backend::TestBackend, style::Color};
+
+    fn cell_text(terminal: &Terminal<TestBackend>, start: u16, end: u16, y: u16) -> String {
+        (start..end)
+            .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+            .collect::<String>()
+            .trim()
+            .to_string()
+    }
+
+    fn cell_color(terminal: &Terminal<TestBackend>, start: u16, end: u16, y: u16) -> Color {
+        (start..end)
+            .map(|x| &terminal.backend().buffer()[(x, y)])
+            .find(|cell| !cell.symbol().trim().is_empty())
+            .map(|cell| cell.fg)
+            .unwrap()
+    }
+
+    let (mut app, _rx) = test_app();
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "nodes".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.kind_plural, "nodes");
+
+    let node = |name: &str, ready: Option<&str>| {
+        let conditions = ready.map_or_else(
+            || json!([]),
+            |status| json!([{"type": "Ready", "status": status}]),
+        );
+        json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": name},
+            "spec": {"unschedulable": true},
+            "status": {"conditions": conditions}
+        })
+    };
+    apply(&mut app, node("a-ready", Some("True")));
+    apply(&mut app, node("b-not-ready", Some("False")));
+    apply(&mut app, node("c-unknown", None));
+
+    // Select the last row so the first two retain their semantic foregrounds.
+    app.handle_key(press(KeyCode::End)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(160, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let hit = app.table_hit.borrow().clone().unwrap();
+    let headers = app.display_headers();
+    let column_range = |header: &str| {
+        let index = headers.iter().position(|h| h == header).unwrap();
+        hit.cols
+            .iter()
+            .find(|(_, _, i)| *i == index)
+            .map(|&(start, end, _)| (start, end))
+            .unwrap()
+    };
+    let (name_start, name_end) = column_range("NAME");
+    let (status_start, status_end) = column_range("STATUS");
+    let ready_y = hit.rows_y;
+    let not_ready_y = ready_y + 1;
+    let unknown_y = ready_y + 2;
+
+    assert_eq!(
+        cell_text(&terminal, name_start, name_end, ready_y),
+        "a-ready"
+    );
+    assert_eq!(
+        cell_text(&terminal, status_start, status_end, ready_y),
+        "Ready,SchedulingDisabled"
+    );
+    assert_eq!(
+        cell_color(&terminal, name_start, name_end, ready_y),
+        theme::blue()
+    );
+    assert_eq!(
+        cell_color(&terminal, status_start, status_end, ready_y),
+        theme::yellow()
+    );
+
+    assert_eq!(
+        cell_text(&terminal, name_start, name_end, not_ready_y),
+        "b-not-ready"
+    );
+    assert_eq!(
+        cell_text(&terminal, status_start, status_end, not_ready_y),
+        "NotReady,SchedulingDisabled"
+    );
+    assert_eq!(
+        cell_color(&terminal, name_start, name_end, not_ready_y),
+        theme::red()
+    );
+    assert_eq!(
+        cell_color(&terminal, status_start, status_end, not_ready_y),
+        theme::red()
+    );
+
+    // Move selection away from Unknown and redraw before checking its colors.
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    assert_eq!(
+        cell_text(&terminal, status_start, status_end, unknown_y),
+        "Unknown,SchedulingDisabled"
+    );
+    assert_eq!(
+        cell_color(&terminal, name_start, name_end, unknown_y),
+        theme::blue()
+    );
+    assert_eq!(
+        cell_color(&terminal, status_start, status_end, unknown_y),
+        theme::overlay1()
+    );
 }
 
 #[tokio::test]
@@ -2002,49 +2657,190 @@ async fn mouse_click_selects_row_header_click_sorts_wheel_moves() {
 }
 
 #[tokio::test]
-async fn horizontal_column_scroll_anchors_name_and_clamps() {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
+async fn horizontal_scroll_keeps_names_and_moves_content_without_resizing() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for all_namespaces in [false, true] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("pods");
+        if all_namespaces {
+            app.namespace.clear();
+        }
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": "web", "namespace": "default"},
+                "spec": {"nodeName": "node-abcdefghijklmnopqrstuvwxyz-0123456789-long-value"},
+                "status": {"phase": "Running"}
+            }),
+        );
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        app.handle_key(press(KeyCode::Home)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(app.col_scroll_max > 5);
+        let initial = term.backend().buffer().clone();
+        let hit = app.table_hit.borrow().clone().unwrap();
+        let title = |term: &Terminal<TestBackend>| -> String {
+            (hit.x_min..hit.x_max)
+                .map(|x| term.backend().buffer()[(x, hit.header_y - 1)].symbol())
+                .collect()
+        };
+        assert!(title(&term).contains('→'));
+        assert!(!title(&term).contains('←'));
+        let anchored = usize::from(all_namespaces) + 1;
+        let frozen_end = hit.cols[anchored].0;
+        app.handle_key(press(KeyCode::Left)).unwrap();
+        assert_eq!(app.col_offset, 0);
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.col_offset, 5);
+        assert!(title(&term).contains('←'));
+        assert!(title(&term).contains('→'));
+        let moved = app.table_hit.borrow().clone().unwrap();
+        assert_eq!(&hit.cols[..anchored], &moved.cols[..anchored]);
+        for y in [hit.header_y, hit.rows_y] {
+            for x in hit.x_min..frozen_end {
+                assert_eq!(
+                    initial[(x, y)].symbol(),
+                    term.backend().buffer()[(x, y)].symbol()
+                );
+            }
+            for x in frozen_end..hit.x_max.saturating_sub(5) {
+                assert_eq!(
+                    initial[(x + 5, y)].symbol(),
+                    term.backend().buffer()[(x, y)].symbol()
+                );
+            }
+        }
+        app.handle_key(press(KeyCode::Left)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(term.backend().buffer(), &initial);
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let &(start, _, index) = moved.cols.last().unwrap();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: start,
+            row: moved.header_y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+        assert_eq!(app.sort_column, Some(index));
+        app.handle_key(press(KeyCode::Left)).unwrap();
+        assert_eq!(app.col_offset, 0);
+        for _ in 0..100 {
+            app.handle_key(press(KeyCode::Right)).unwrap();
+        }
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.col_offset, app.col_scroll_max);
+        assert_eq!(
+            app.table_hit
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .cols
+                .last()
+                .unwrap()
+                .2,
+            app.display_headers().len() - 1
+        );
+        assert!(title(&term).contains('←'));
+        assert!(!title(&term).contains('→'));
+        let at_end = app.col_offset;
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        assert_eq!(app.col_offset, at_end);
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        assert_eq!(app.col_offset, 0);
+    }
+}
+
+#[tokio::test]
+async fn horizontal_scroll_stops_when_columns_fit_and_resets_after_resize() {
+    use ratatui::{Terminal, backend::TestBackend};
 
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
+    let mut term = Terminal::new(TestBackend::new(180, 24)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.col_scroll_max, 0);
+    let before = term.backend().buffer().clone();
+    app.handle_key(press(KeyCode::Right)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.col_offset, 0);
+    assert_eq!(term.backend().buffer(), &before);
+
+    term.backend_mut().resize(45, 24);
+    term.autoresize().unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    app.handle_key(press(KeyCode::Right)).unwrap();
+    assert!(app.col_offset > 0);
+    term.backend_mut().resize(180, 24);
+    term.autoresize().unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.col_offset, 0);
+    assert_eq!(app.col_scroll_max, 0);
+}
+
+#[tokio::test]
+async fn horizontal_scroll_clips_wide_characters_at_both_edges() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [[views."cert-manager.io/v1/certificates".columns]]
+        name = "VALUE"
+        path = "/spec/value"
+        width = 40
+        align = "right"
+    "#,
+    );
+    app.switch_kind("certificates");
     apply(
         &mut app,
         json!({
-            "apiVersion": "v1", "kind": "Pod",
-            "metadata": {"name": "a", "namespace": "default"},
-            "status": {"phase": "Running"}
+            "apiVersion": "cert-manager.io/v1", "kind": "Certificate",
+            "metadata": {"name": "web", "namespace": "default"},
+            "spec": {"value": "界".repeat(20)}
         }),
     );
-    app.table_state.select(Some(0));
-
-    let headers = app.display_headers().to_vec();
-    assert_eq!(headers[0], "NAME");
-    let scrollable = headers.len() - 1;
-
-    // ← at the left edge is a no-op; → hides the column after NAME.
-    app.handle_key(press(KeyCode::Left)).unwrap();
-    assert_eq!(app.col_offset, 0);
-    app.handle_key(press(KeyCode::Right)).unwrap();
-    assert_eq!(app.col_offset, 1);
-
-    // → clamps so the last scrollable column stays visible.
-    for _ in 0..headers.len() {
-        app.handle_key(press(KeyCode::Right)).unwrap();
-    }
-    assert_eq!(app.col_offset, scrollable - 1);
-
-    // The rendered geometry skips the hidden columns: NAME (0) stays
-    // anchored, then only the last scrollable column follows.
-    let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(30, 24)).unwrap();
     term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
-    let hit = app.table_hit.borrow().clone().expect("geometry recorded");
-    let cols: Vec<usize> = hit.cols.iter().map(|&(_, _, i)| i).collect();
-    assert_eq!(cols, vec![0, headers.len() - 1]);
-
-    // Rebuilding the view spec (view switch, wide toggle) resets the scroll.
-    app.refresh_view_spec();
-    assert_eq!(app.col_offset, 0);
+    for _ in 0..4 {
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        let rendered = term
+            .draw(|f| crate::ui::draw(f, &mut app))
+            .unwrap()
+            .buffer
+            .clone();
+        let hit = app.table_hit.borrow().clone().unwrap();
+        let &(start, end, _) = hit.cols.iter().find(|c| c.2 == 1).unwrap();
+        for x in start..end {
+            let source = app.col_offset + usize::from(x - start);
+            let expected = if source.is_multiple_of(2) && x + 1 < end {
+                "界"
+            } else {
+                " "
+            };
+            assert_eq!(rendered[(x, hit.rows_y)].symbol(), expected);
+            // A terminal does not write the second half of a wide character.
+            if source.is_multiple_of(2) || x == start {
+                assert_eq!(term.backend().buffer()[(x, hit.rows_y)].symbol(), expected);
+            }
+        }
+    }
+    for width in [1, 2, 3, 4, 8] {
+        term.backend_mut().resize(width, 24);
+        term.autoresize().unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    }
 }
 
 #[tokio::test]
@@ -3513,12 +4309,14 @@ async fn explain_findings_clear_the_progress_flash() {
     // so the handler has to clear it — as the `Msg::Gitops` arm does.
     app.handle_msg(Msg::Explain {
         generation: app.generation,
+        request: app.explain_request,
         claim,
         title: "explain — web".into(),
+        source: None,
         findings: Vec::new(),
     });
 
-    assert_eq!(app.mode, Mode::Explain);
+    assert_eq!(app.mode, Mode::Table);
     assert!(app.flash.is_empty(), "{}", app.flash);
     assert!(!app.flash_err);
 }
@@ -3574,11 +4372,13 @@ async fn a_finished_report_only_clears_its_own_status_claim() {
     });
     app.handle_msg(Msg::Explain {
         generation: app.generation,
+        request: app.explain_request,
         claim: explain_claim,
         title: "explain — web".into(),
+        source: None,
         findings: Vec::new(),
     });
-    assert_eq!(app.mode, Mode::Explain);
+    assert_eq!(app.mode, Mode::Detail);
     assert!(app.flash_err);
     assert!(app.flash.contains("forbidden"), "{}", app.flash);
 }
@@ -4723,6 +5523,63 @@ async fn crd_plural_outranks_builtin_command() {
 }
 
 #[tokio::test]
+async fn palette_completion_accepts_minus_chords() {
+    let (mut app, _rx) = test_app();
+    let config: crate::config::Config = toml::from_str(
+        r#"
+        [keys]
+        palette_next = "ctrl--"
+        palette_prev = "alt--"
+        "#,
+    )
+    .unwrap();
+    let (palette_keys, warnings) = crate::config::compile_palette_keys(&config.keys);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    app.palette_keys = palette_keys;
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    assert_eq!(app.mode, Mode::Command);
+    assert!(app.cmd_suggestions.len() > 1);
+    assert_eq!(app.cmd_sel, 0);
+    app.handle_key(ctrl(KeyCode::Char('-'))).unwrap();
+    assert_eq!(app.cmd_sel, 1);
+    app.handle_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::ALT))
+        .unwrap();
+    assert_eq!(app.cmd_sel, 0);
+    assert!(app.command.is_empty());
+}
+
+#[tokio::test]
+async fn palette_shifted_minus_uses_the_resulting_character() {
+    for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+        let (mut app, _rx) = test_app();
+        let config: crate::config::Config = toml::from_str(
+            r#"
+            [keys]
+            palette_next = ["shift--", "_"]
+            "#,
+        )
+        .unwrap();
+        let (palette_keys, warnings) = crate::config::compile_palette_keys(&config.keys);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("bind the resulting character"));
+        app.palette_keys = palette_keys;
+
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        app.handle_key(press(KeyCode::Char('-'))).unwrap();
+        assert_eq!(app.command, "-");
+        app.handle_key(ctrl(KeyCode::Char('u'))).unwrap();
+        assert!(app.command.is_empty());
+        assert!(app.cmd_suggestions.len() > 1);
+        assert_eq!(app.cmd_sel, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('_'), modifiers))
+            .unwrap();
+        assert_eq!(app.cmd_sel, 1);
+        assert!(app.command.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn palette_completion_keys_are_rebindable() {
     let (mut app, _rx) = test_app();
     let keys_cfg: crate::config::Config = toml::from_str(
@@ -4909,6 +5766,8 @@ fn spawn_test_child(argv0: &str, arg: &str) -> tokio::process::Child {
 async fn stopping_a_forward_kills_only_that_one() {
     let (mut app, _rx) = test_app();
     app.port_forwards.push(PortForward {
+        context: app.cluster.context.clone(),
+        cluster_url: app.cluster.cluster_url.clone(),
         config_name: None,
         ns: "default".into(),
         target: "pod/a".into(),
@@ -4916,6 +5775,8 @@ async fn stopping_a_forward_kills_only_that_one() {
         child: spawn_test_child("sleep", "30"),
     });
     app.port_forwards.push(PortForward {
+        context: app.cluster.context.clone(),
+        cluster_url: app.cluster.cluster_url.clone(),
         config_name: None,
         ns: "default".into(),
         target: "pod/b".into(),
@@ -4942,6 +5803,8 @@ async fn reap_drops_exited_forwards_and_flashes() {
     let mut child = spawn_test_child("true", "");
     child.wait().await.unwrap(); // let it exit before reaping
     app.port_forwards.push(PortForward {
+        context: app.cluster.context.clone(),
+        cluster_url: app.cluster.cluster_url.clone(),
         config_name: None,
         ns: "default".into(),
         target: "pod/a".into(),
@@ -5460,6 +6323,540 @@ async fn sort_choice_is_remembered_per_kind_across_view_switches() {
 }
 
 #[tokio::test]
+async fn wildcard_sort_is_the_fallback_for_resource_views() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."*"]
+        sort = "AGE:desc"
+        [views.pods]
+        [views.services]
+        sort = "NAME:asc"
+        "#,
+    );
+    for (resource, header, desc) in [
+        ("pods", "AGE", true),
+        ("deployments", "AGE", true),
+        ("services", "NAME", false),
+    ] {
+        palette(&mut app, resource);
+        assert_eq!(app.kind_plural, resource);
+        assert_eq!(
+            app.sort_column,
+            app.display_headers().iter().position(|h| h == header)
+        );
+        assert!(app.sort_column.is_some());
+        assert_eq!(app.sort_desc, desc);
+    }
+
+    palette(&mut app, "pods");
+    app.handle_key(press(KeyCode::Char('I'))).unwrap();
+    palette(&mut app, "services");
+    palette(&mut app, "pods");
+    assert!(!app.sort_desc, "saved choice has priority over the default");
+}
+
+#[tokio::test]
+async fn wildcard_sort_skips_missing_columns() {
+    let (mut app, _rx) = test_app();
+    install_views(&mut app, "[views.\"*\"]\nsort = \"RESTARTS:desc\"\n");
+    palette(&mut app, "services");
+    assert_eq!(app.sort_column, None);
+    assert!(!app.flash_err);
+    palette(&mut app, "pods");
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "RESTARTS")
+    );
+    assert!(app.sort_column.is_some());
+    assert!(app.sort_desc);
+}
+
+#[tokio::test]
+async fn wildcard_sort_applies_when_wide_columns_appear() {
+    for remember in [true, false] {
+        let (mut app, _rx) = test_app();
+        app.remember_sort = remember;
+        install_views(&mut app, "[views.\"*\"]\nsort = \"IP:desc\"\n");
+        palette(&mut app, "pods");
+        assert_eq!(app.sort_column, None);
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        assert_eq!(
+            app.sort_column,
+            app.display_headers().iter().position(|h| h == "IP")
+        );
+        assert!(app.sort_column.is_some());
+        assert!(app.sort_desc);
+
+        app.handle_key(press(KeyCode::Char('I'))).unwrap();
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        assert_eq!(app.sort_column, None);
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        assert!(!app.sort_desc);
+    }
+}
+
+#[tokio::test]
+async fn temporary_wide_sort_keeps_its_column_and_direction_until_cleared_or_navigation() {
+    for remember in [true, false] {
+        for desc in [true, false] {
+            let (mut app, _rx) = test_app();
+            app.remember_sort = remember;
+            app.sort_memory.set("pods", "NAME", false);
+            install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+            palette(&mut app, "pods");
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            select_sort_with_keys(&mut app, "IP");
+            if desc {
+                app.handle_key(press(KeyCode::Char('I'))).unwrap();
+            }
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            assert_eq!(app.sort_column, None);
+            assert!(!app.sort_desc);
+            assert_eq!(
+                app.sort_origin,
+                SortOrigin::Selected {
+                    header: "IP".into(),
+                    desc
+                }
+            );
+            app.handle_key(ctrl(KeyCode::Char('r'))).unwrap();
+            assert_eq!(app.sort_column, None);
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            assert_eq!(
+                app.sort_column,
+                app.display_headers().iter().position(|h| h == "IP")
+            );
+            assert_eq!(app.sort_desc, desc);
+            assert_eq!(
+                app.sort_memory.get("pods"),
+                Some(if remember {
+                    ("IP".into(), desc)
+                } else {
+                    ("NAME".into(), false)
+                })
+            );
+
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            clear_sort_with_keys(&mut app);
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            assert_eq!(app.sort_column, None);
+            assert_eq!(app.sort_origin, SortOrigin::Cleared);
+            palette(&mut app, "services");
+            palette(&mut app, "pods");
+            assert_eq!(
+                app.sort_column,
+                app.display_headers().iter().position(|h| h == "AGE")
+            );
+            assert!(app.sort_desc);
+        }
+    }
+}
+
+fn select_sort_with_keys(app: &mut App, header: &str) {
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    for c in header.chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == header)
+    );
+    assert!(app.sort_column.is_some());
+}
+
+#[tokio::test]
+async fn new_sort_selection_replaces_a_hidden_temporary_sort() {
+    let (mut app, _rx) = test_app();
+    app.remember_sort = false;
+    install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+    palette(&mut app, "pods");
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    select_sort_with_keys(&mut app, "IP");
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.sort_column, None);
+    select_sort_with_keys(&mut app, "NAME");
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.sort_column, Some(0));
+    assert!(!app.sort_desc);
+    assert_eq!(app.sort_memory.get("pods"), None);
+}
+
+#[tokio::test]
+async fn bookmark_sort_waits_for_a_hidden_column_without_using_sort_memory() {
+    for remember in [true, false] {
+        let (mut app, _rx) = test_app();
+        app.remember_sort = remember;
+        app.sort_memory.set("pods", "NAME", false);
+        install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+        app.bookmarks = vec![crate::config::Bookmark {
+            key: Some("ctrl-y".into()),
+            name: "pods by IP".into(),
+            resource: "pods".into(),
+            sort: Some("IP:desc".into()),
+            ..Default::default()
+        }];
+        app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+        assert_eq!(app.sort_column, None);
+        app.handle_key(ctrl(KeyCode::Char('r'))).unwrap();
+        assert_eq!(app.sort_column, None);
+        for _ in 0..2 {
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            assert_eq!(
+                app.sort_column,
+                app.display_headers().iter().position(|h| h == "IP")
+            );
+            assert!(app.sort_column.is_some());
+            assert!(app.sort_desc);
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            assert_eq!(app.sort_column, None);
+        }
+        assert_eq!(app.sort_memory.get("pods"), Some(("NAME".into(), false)));
+    }
+}
+
+#[tokio::test]
+async fn temporary_printer_sort_waits_when_its_column_is_removed_then_restored() {
+    let (mut app, _rx) = test_app();
+    app.remember_sort = false;
+    app.sort_memory.set("certificates", "NAME", false);
+    install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+    palette(&mut app, "certificates");
+    deliver_ready_printer_column(&mut app);
+    select_sort_with_keys(&mut app, "READY");
+    app.handle_key(press(KeyCode::Char('I'))).unwrap();
+    app.handle_msg(Msg::PrinterColumns {
+        generation: app.generation,
+        resource: app.cluster.resolve("certificates").unwrap().resource_key(),
+        view: Box::new(None),
+    });
+    assert_eq!(app.sort_column, None);
+    deliver_ready_printer_column(&mut app);
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "READY")
+    );
+    assert!(app.sort_desc);
+    assert_eq!(
+        app.sort_memory.get("certificates"),
+        Some(("NAME".into(), false))
+    );
+}
+
+#[tokio::test]
+async fn wildcard_sort_applies_when_printer_columns_arrive_without_replacing_user_sort() {
+    for choose_name in [false, true] {
+        let (mut app, _rx) = test_app();
+        app.remember_sort = false;
+        install_views(&mut app, "[views.\"*\"]\nsort = \"READY:desc\"\n");
+        palette(&mut app, "certificates");
+        assert_eq!(app.sort_column, None);
+        if choose_name {
+            app.handle_key(press(KeyCode::Char('S'))).unwrap();
+            for c in "name".chars() {
+                app.handle_key(press(KeyCode::Char(c))).unwrap();
+            }
+            app.handle_key(press(KeyCode::Enter)).unwrap();
+        }
+        let crd = json!({"spec": {"versions": [{
+            "name": "v1", "served": true, "storage": true,
+            "additionalPrinterColumns": [
+                {"name": "Ready", "type": "string", "jsonPath": ".status.ready"}
+            ]
+        }]}});
+        app.handle_msg(Msg::PrinterColumns {
+            generation: app.generation,
+            resource: app.cluster.resolve("certificates").unwrap().resource_key(),
+            view: Box::new(crate::views::printer_columns_view(&crd, "v1")),
+        });
+        let header = if choose_name { "NAME" } else { "READY" };
+        assert_eq!(
+            app.sort_column,
+            app.display_headers().iter().position(|h| h == header)
+        );
+        assert!(app.sort_column.is_some());
+        assert_eq!(app.sort_desc, !choose_name);
+    }
+}
+
+#[tokio::test]
+async fn saved_printer_sort_replaces_config_default_but_not_a_new_user_choice() {
+    for (remember, invert) in [(true, false), (true, true), (false, false), (false, true)] {
+        let (mut app, _rx) = test_app();
+        app.remember_sort = remember;
+        app.sort_memory.set("certificates", "READY", false);
+        install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+        palette(&mut app, "certificates");
+        assert_eq!(app.sort_column, Some(1));
+        assert_eq!(app.sort_origin, SortOrigin::Configured);
+        if invert {
+            app.handle_key(press(KeyCode::Char('I'))).unwrap();
+            assert!(matches!(app.sort_origin, SortOrigin::Selected { .. }));
+        }
+        let crd = json!({"spec": {"versions": [{
+            "name": "v1", "served": true, "storage": true,
+            "additionalPrinterColumns": [
+                {"name": "Ready", "type": "string", "jsonPath": ".status.ready"}
+            ]
+        }]}});
+        app.handle_msg(Msg::PrinterColumns {
+            generation: app.generation,
+            resource: app.cluster.resolve("certificates").unwrap().resource_key(),
+            view: Box::new(crate::views::printer_columns_view(&crd, "v1")),
+        });
+        let header = if remember && !invert { "READY" } else { "AGE" };
+        assert_eq!(
+            app.sort_column,
+            app.display_headers().iter().position(|h| h == header)
+        );
+        assert_eq!(app.sort_desc, !remember && !invert);
+    }
+}
+
+#[tokio::test]
+async fn saved_wide_sort_replaces_config_default_when_its_column_appears() {
+    let (mut app, _rx) = test_app();
+    app.sort_memory.set("pods", "IP", false);
+    install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+    palette(&mut app, "pods");
+    assert_eq!(app.sort_origin, SortOrigin::Configured);
+    assert!(app.sort_desc);
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "IP")
+    );
+    assert!(app.sort_column.is_some());
+    assert!(matches!(app.sort_origin, SortOrigin::Selected { .. }));
+    assert!(!app.sort_desc);
+}
+
+#[tokio::test]
+async fn cleared_sort_survives_column_changes_and_watch_refresh_until_navigation() {
+    for remember in [true, false] {
+        for view_key in ["*", "certificates"] {
+            for header in ["AGE", "READY"] {
+                let (mut app, _rx) = test_app();
+                app.remember_sort = remember;
+                app.sort_memory.set("certificates", "READY", false);
+                install_views(
+                    &mut app,
+                    &format!("[views.\"{view_key}\"]\nsort = \"{header}:desc\"\n"),
+                );
+                palette(&mut app, "certificates");
+                clear_sort_with_keys(&mut app);
+                deliver_ready_printer_column(&mut app);
+                assert_eq!(app.sort_column, None);
+                assert!(!app.sort_desc);
+                for key in [
+                    press(KeyCode::Char('w')),
+                    press(KeyCode::Char('w')),
+                    ctrl(KeyCode::Char('r')),
+                ] {
+                    app.handle_key(key).unwrap();
+                    assert_eq!(app.sort_column, None);
+                    assert_eq!(app.sort_origin, SortOrigin::Cleared);
+                }
+                assert_eq!(
+                    app.sort_memory.get("certificates"),
+                    (!remember).then(|| ("READY".into(), false))
+                );
+
+                palette(&mut app, "services");
+                palette(&mut app, "certificates");
+                assert_eq!(
+                    app.sort_column,
+                    app.display_headers().iter().position(|h| h == header)
+                );
+                assert!(app.sort_column.is_some());
+                assert!(app.sort_desc);
+            }
+        }
+    }
+}
+
+fn clear_sort_with_keys(app: &mut App) {
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    while app.sort_picker_state.selected().unwrap() > 0 {
+        app.handle_key(press(KeyCode::Up)).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.sort_column, None);
+}
+
+fn deliver_ready_printer_column(app: &mut App) {
+    let crd = json!({"spec": {"versions": [{
+        "name": "v1", "served": true, "storage": true,
+        "additionalPrinterColumns": [
+            {"name": "Ready", "type": "string", "jsonPath": ".status.ready"}
+        ]
+    }]}});
+    app.handle_msg(Msg::PrinterColumns {
+        generation: app.generation,
+        resource: app.cluster.resolve("certificates").unwrap().resource_key(),
+        view: Box::new(crate::views::printer_columns_view(&crd, "v1")),
+    });
+}
+
+#[tokio::test]
+async fn enabling_sort_memory_does_not_replace_a_cleared_sort_in_the_active_view() {
+    let dir = std::env::temp_dir().join(format!("sofka-sort-clear-reload-{}", std::process::id()));
+    write_config(&dir, "remember_sort = false\n");
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+    app.sort_memory.set("certificates", "READY", false);
+    palette(&mut app, "reload");
+    palette(&mut app, "certificates");
+    clear_sort_with_keys(&mut app);
+    write_config(&dir, "remember_sort = true\n");
+    palette(&mut app, "reload");
+    assert!(app.remember_sort);
+    deliver_ready_printer_column(&mut app);
+    assert_eq!(app.sort_column, None);
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.sort_column, None);
+    palette(&mut app, "services");
+    palette(&mut app, "certificates");
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "READY")
+    );
+    assert!(!app.sort_desc);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn bookmark_sort_keeps_priority_over_delayed_saved_and_configured_sorts() {
+    for remember in [true, false] {
+        let (mut app, _rx) = test_app();
+        app.remember_sort = remember;
+        install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+        app.sort_memory.set("certificates", "READY", false);
+        palette(&mut app, "certificates");
+        clear_sort_with_keys(&mut app);
+        app.sort_memory.set("certificates", "READY", false);
+        app.bookmarks = vec![crate::config::Bookmark {
+            key: Some("ctrl-y".into()),
+            name: "sorted certificates".into(),
+            resource: "certificates".into(),
+            sort: Some("NAME:desc".into()),
+            ..Default::default()
+        }];
+        app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+        deliver_ready_printer_column(&mut app);
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        assert_eq!(app.sort_column, Some(0));
+        assert!(app.sort_desc);
+        assert!(matches!(app.sort_origin, SortOrigin::Selected { .. }));
+        assert_eq!(
+            app.sort_memory.get("certificates"),
+            Some(("READY".into(), false))
+        );
+    }
+}
+
+#[tokio::test]
+async fn sort_can_be_selected_again_after_clearing_with_memory_disabled() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    for mouse in [true, false] {
+        let (mut app, _rx) = test_app();
+        app.remember_sort = false;
+        install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+        app.sort_memory.set("certificates", "READY", false);
+        palette(&mut app, "certificates");
+        clear_sort_with_keys(&mut app);
+        if mouse {
+            let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
+            term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let hit = app.table_hit.borrow().clone().unwrap();
+            let (column, _, _) = hit.cols.iter().find(|(_, _, idx)| *idx == 0).unwrap();
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: *column,
+                row: hit.header_y,
+                modifiers: KeyModifiers::NONE,
+            })
+            .unwrap();
+        } else {
+            app.handle_key(press(KeyCode::Char('S'))).unwrap();
+            for c in "name".chars() {
+                app.handle_key(press(KeyCode::Char(c))).unwrap();
+            }
+            app.handle_key(press(KeyCode::Enter)).unwrap();
+        }
+        app.handle_key(press(KeyCode::Char('I'))).unwrap();
+        deliver_ready_printer_column(&mut app);
+        assert_eq!(app.sort_column, Some(0));
+        assert!(app.sort_desc);
+        assert!(matches!(app.sort_origin, SortOrigin::Selected { .. }));
+        assert_eq!(
+            app.sort_memory.get("certificates"),
+            Some(("READY".into(), false))
+        );
+    }
+}
+
+#[tokio::test]
+async fn disabled_sort_memory_keeps_changes_local_and_preserves_saved_state() {
+    let dir = std::env::temp_dir().join(format!("sofka-sort-option-{}", std::process::id()));
+    write_config(&dir, "remember_sort = false\n");
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+    let path = dir.join("sort.toml");
+    app.sort_memory.set("pods", "NAME", false);
+    app.sort_memory.save(&path).unwrap();
+    app.sort_memory_path = Some(path.clone());
+    let saved = std::fs::read(&path).unwrap();
+
+    palette(&mut app, "reload");
+    assert!(!app.remember_sort);
+    palette(&mut app, "pods");
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "AGE")
+    );
+    assert!(app.sort_desc);
+    app.handle_key(press(KeyCode::Char('I'))).unwrap();
+    assert!(!app.sort_desc);
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    for c in "rst".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "RESTARTS")
+    );
+    palette(&mut app, "services");
+    palette(&mut app, "pods");
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "AGE")
+    );
+    assert!(app.sort_desc);
+    assert_eq!(app.sort_memory.get("pods"), Some(("NAME".into(), false)));
+    assert_eq!(std::fs::read(&path).unwrap(), saved);
+
+    write_config(&dir, "");
+    palette(&mut app, "reload");
+    assert!(app.remember_sort, "sort memory is enabled by default");
+    palette(&mut app, "services");
+    palette(&mut app, "pods");
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "NAME")
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
 async fn sort_picker_esc_clears_filter_then_closes() {
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
@@ -5475,6 +6872,32 @@ async fn sort_picker_esc_clears_filter_then_closes() {
     app.handle_key(press(KeyCode::Esc)).unwrap();
     assert_eq!(app.mode, Mode::Table);
     assert_eq!(app.sort_column, None);
+}
+
+#[tokio::test]
+async fn sort_picker_ctrl_n_p_navigate_without_touching_filter() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    assert_eq!(app.sort_picker_state.selected(), Some(0));
+
+    app.handle_key(ctrl(KeyCode::Char('n'))).unwrap();
+    assert_eq!(app.sort_picker_state.selected(), Some(1));
+    app.handle_key(ctrl(KeyCode::Char('p'))).unwrap();
+    assert_eq!(app.sort_picker_state.selected(), Some(0));
+    assert!(
+        app.sort_picker_filter.is_empty(),
+        "ctrl-n/p must not fall through to the type-to-filter buffer"
+    );
+
+    // ctrl-alt-n is a distinct chord, left to typing "n" into the filter —
+    // not a nav move (see ctrl_alt_f leaves paging alone).
+    let ctrl_alt_n = KeyEvent::new(
+        KeyCode::Char('n'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    app.handle_key(ctrl_alt_n).unwrap();
+    assert_eq!(app.sort_picker_filter, "n");
 }
 
 #[tokio::test]
@@ -5519,6 +6942,40 @@ async fn copy_picker_lists_full_row_fields_and_filters_on_values() {
     assert!(app.copy_picker_filter.is_empty());
     app.handle_key(press(KeyCode::Esc)).unwrap();
     assert_eq!(app.mode, Mode::Table);
+}
+
+#[tokio::test]
+async fn copy_picker_ctrl_n_p_navigate_without_touching_filter() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Service",
+               "metadata": {"name": "web", "namespace": "default"},
+               "spec": {"type": "ClusterIP", "clusterIP": "10.96.13.5",
+                        "ports": [{"port": 80, "protocol": "TCP"}]}}),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('Y'))).unwrap();
+    assert_eq!(app.copy_picker_state.selected(), Some(0));
+
+    app.handle_key(ctrl(KeyCode::Char('n'))).unwrap();
+    assert_eq!(app.copy_picker_state.selected(), Some(1));
+    app.handle_key(ctrl(KeyCode::Char('p'))).unwrap();
+    assert_eq!(app.copy_picker_state.selected(), Some(0));
+    assert!(
+        app.copy_picker_filter.is_empty(),
+        "ctrl-n/p must not fall through to the type-to-filter buffer"
+    );
+
+    // ctrl-alt-n is a distinct chord, left to typing "n" into the filter —
+    // not a nav move (see ctrl_alt_f leaves paging alone).
+    let ctrl_alt_n = KeyEvent::new(
+        KeyCode::Char('n'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    app.handle_key(ctrl_alt_n).unwrap();
+    assert_eq!(app.copy_picker_filter, "n");
 }
 
 #[tokio::test]
@@ -5995,6 +7452,121 @@ async fn narrow_window_keeps_full_external_ip_visible() {
         screen.contains("LoadBalancer"),
         "type column trimmed in:\n{screen}"
     );
+}
+
+#[tokio::test]
+async fn logs_wait_for_container_start() {
+    for reason in ["ContainerCreating", "PodInitializing", "ImagePullBackOff"] {
+        let (mut app, mut rx, requests) = waiting_logs_app(400, reason);
+        app.handle_key(press(KeyCode::Char('l'))).unwrap();
+        assert_eq!(app.mode, Mode::Logs);
+        let msg = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let msg = rx.recv().await.unwrap();
+                if matches!(msg, Msg::LogLines { .. }) {
+                    break msg;
+                }
+            }
+        })
+        .await
+        .expect("logs should start after the container starts");
+        app.handle_msg(msg);
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(app.logs.view.lines.iter().collect::<Vec<_>>(), ["started"]);
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn leaving_logs_stops_container_start_retries() {
+    let (mut app, _rx, requests) = waiting_logs_app(400, "ContainerCreating");
+    app.handle_key(press(KeyCode::Char('l'))).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while requests.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn logs_report_errors_other_than_container_waiting() {
+    for (code, message, key) in [
+        (403, "is waiting to start", 'l'),
+        (400, "invalid container", 'l'),
+        (400, "ContainerCreating", 'p'),
+    ] {
+        let (mut app, mut rx, requests) = waiting_logs_app(code, message);
+        app.handle_key(press(KeyCode::Char(key))).unwrap();
+        let msg = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let msg = rx.recv().await.unwrap();
+                if matches!(msg, Msg::LogLines { .. }) {
+                    break msg;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        app.handle_msg(msg);
+        assert!(app.logs.view.lines[0].starts_with("[error]"));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+    }
+}
+
+fn waiting_logs_app(code: u16, reason: &str) -> (App, Receiver<Msg>, Arc<AtomicU64>) {
+    let (mut app, rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "pending", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "test"}]},
+            "status": {"phase": "Pending"}}),
+    );
+    app.table_state.select(Some(0));
+    let requests = Arc::new(AtomicU64::new(0));
+    let seen = requests.clone();
+    let message = if code == 400 && reason != "invalid container" {
+        format!("container \"app\" in pod \"pending\" is waiting to start: {reason}")
+    } else {
+        reason.to_owned()
+    };
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            assert_eq!(
+                request.uri().path(),
+                "/api/v1/namespaces/default/pods/pending/log"
+            );
+            let attempt = seen.fetch_add(1, Ordering::SeqCst);
+            let (status, body) = if attempt < 2 {
+                (
+                    code,
+                    json!({"kind": "Status", "apiVersion": "v1",
+                    "status": "Failure", "message": message,
+                    "reason": "BadRequest", "code": code})
+                    .to_string(),
+                )
+            } else {
+                (200, "started\n".to_owned())
+            };
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .body(http_body_util::Full::new(hyper::body::Bytes::from(body)))
+                        .unwrap(),
+                )
+            }
+        }),
+        "default",
+    );
+    (app, rx, requests)
 }
 
 #[tokio::test]
@@ -7072,7 +8644,7 @@ async fn helm_list_shows_only_latest_revision_per_release() {
         .expect("myapp row present");
     assert_eq!(crate::helm::revision(myapp_row), Some(2));
 
-    let (cells, _) = crate::columns::cells(myapp_row, "helm", crate::columns::now_secs());
+    let (cells, _) = crate::columns::cells(myapp_row, "", "helm", crate::columns::now_secs());
     assert_eq!(
         cells[0], "myapp",
         "NAME cell shows the release, not the secret"
@@ -7737,6 +9309,100 @@ async fn debug_is_blocked_in_readonly_and_by_guardrail() {
     app.request_debug(None);
     assert_ne!(app.mode, Mode::Prompt);
     assert!(app.flash.contains("blocked by guardrail"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn sanitize_ships_with_sofka_and_confirms_before_deleting() {
+    let (mut app, _rx) = app_with_pod();
+    // The package is registered from the binary, with no user configuration and
+    // nothing copied into the config directory.
+    app.plugins = crate::plugins::bundled()
+        .into_iter()
+        .map(|p| p.expect("bundled package parses"))
+        .collect();
+    let sanitize = app
+        .plugins
+        .iter()
+        .find(|p| p.palette.as_deref() == Some("sanitize"))
+        .expect(":sanitize is available out of the box");
+    assert!(sanitize.bundled);
+    assert!(sanitize.dangerous, "a bulk delete must confirm");
+    assert_eq!(sanitize.scopes, ["pods"]);
+    assert_eq!(sanitize.target.as_deref(), Some("context"));
+    // The adapter is this binary, so nothing extra has to be on PATH.
+    assert!(crate::plugins::available(sanitize).is_ok());
+
+    // Running it opens the confirmation instead of deleting anything.
+    plugin_command(&mut app, "sanitize");
+    assert_eq!(app.mode, Mode::Confirm);
+    assert!(app.pending.is_none(), "must not run before confirmation");
+    assert!(app.confirm_label.contains('⚠'), "{}", app.confirm_label);
+
+    // Declining leaves the cluster alone.
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.pending.is_none());
+}
+
+#[tokio::test]
+async fn a_guardrail_can_deny_sanitize() {
+    let (mut app, _rx) = app_with_pod();
+    app.plugins = crate::plugins::bundled()
+        .into_iter()
+        .map(|p| p.expect("bundled package parses"))
+        .collect();
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["plugin:sanitize".into()],
+        deny: true,
+        reason: Some("cleanup goes through the owning controller".into()),
+        ..Default::default()
+    }];
+
+    plugin_command(&mut app, "sanitize");
+    assert_ne!(
+        app.mode,
+        Mode::Confirm,
+        "a denied action must not even confirm"
+    );
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("blocked by guardrail"), "{}", app.flash);
+    assert!(app.flash.contains("owning controller"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn sanitize_checks_the_default_context_bulk_limit_before_confirmation() {
+    let (mut app, _rx) = app_with_pod();
+    app.cluster.context = "default".into();
+    app.plugins = crate::plugins::bundled()
+        .into_iter()
+        .map(|p| p.expect("bundled package parses"))
+        .collect();
+    app.guardrails = vec![crate::config::Guardrail {
+        contexts: vec!["default".into()],
+        actions: vec!["plugin:sanitize".into()],
+        max_bulk: Some(0),
+        ..Default::default()
+    }];
+
+    plugin_command(&mut app, "sanitize");
+    assert_ne!(app.mode, Mode::Confirm);
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("exceeds the max of 0"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn sanitize_is_blocked_in_readonly_mode() {
+    let (mut app, _rx) = app_with_pod();
+    app.readonly = true;
+    app.plugins = crate::plugins::bundled()
+        .into_iter()
+        .map(|p| p.expect("bundled package parses"))
+        .collect();
+
+    plugin_command(&mut app, "sanitize");
+    assert_ne!(app.mode, Mode::Confirm, "read-only must not even confirm");
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("read-only"), "{}", app.flash);
 }
 
 #[tokio::test]
@@ -8741,6 +10407,73 @@ async fn user_view_adds_provider_label_columns_to_curated_nodes() {
 }
 
 #[tokio::test]
+async fn node_wide_labels_render_filter_and_refresh() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("nodes");
+    let narrow_headers = app.display_headers().to_vec();
+    assert!(!narrow_headers.iter().any(|header| header == "LABELS"));
+    for (name, labels) in [
+        (
+            "worker-1",
+            json!({"zone": "west", "karpenter.sh/nodepool": "general", "empty": ""}),
+        ),
+        ("worker-2", json!({})),
+        ("worker-3", Value::Null),
+    ] {
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1", "kind": "Node",
+                "metadata": {"name": name, "resourceVersion": "1", "labels": labels}
+            }),
+        );
+    }
+
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    let labels_index = app
+        .display_headers()
+        .iter()
+        .position(|h| *h == "LABELS")
+        .unwrap();
+    {
+        let rows = app.rows();
+        app.ensure_table_cell_cache(&rows);
+        let cache = app.table_cell_cache();
+        for row in rows {
+            let (cells, _) = cache.get(&row_key(row)).unwrap();
+            let expected = if row.metadata.name.as_deref() == Some("worker-1") {
+                "empty=,karpenter.sh/nodepool=general,zone=west"
+            } else {
+                "<none>"
+            };
+            assert_eq!(cells[labels_index], expected);
+        }
+    }
+
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "general".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.rows().len(), 1);
+    assert_eq!(app.rows()[0].metadata.name.as_deref(), Some("worker-1"));
+
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "worker-1", "resourceVersion": "2",
+                         "labels": {"karpenter.sh/nodepool": "batch"}}
+        }),
+    );
+    assert!(app.rows().is_empty());
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.rows().len(), 3);
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.display_headers().to_vec(), narrow_headers);
+}
+
+#[tokio::test]
 async fn user_view_replace_swaps_out_curated_columns() {
     let (mut app, _rx) = test_app();
     install_views(
@@ -8793,7 +10526,7 @@ async fn printer_columns_msg_upgrades_name_age_fallback() {
     let view = crate::views::printer_columns_view(&crd, "v1");
     app.handle_msg(Msg::PrinterColumns {
         generation: app.generation,
-        plural: "certificates".into(),
+        resource: app.cluster.resolve("certificates").unwrap().resource_key(),
         view: Box::new(view),
     });
     // Narrow mode hides the priority>0 column; wide shows it.
@@ -8808,10 +10541,14 @@ async fn printer_columns_msg_upgrades_name_age_fallback() {
     app.switch_kind("pods");
     app.handle_msg(Msg::PrinterColumns {
         generation: app.generation - 1,
-        plural: "widgets".into(),
+        resource: GroupVersionResource::gvr("example.com", "v1", "widgets"),
         view: Box::new(None),
     });
-    assert!(!app.crd_views.contains_key("widgets"));
+    assert!(!app.crd_views.contains_key(&GroupVersionResource::gvr(
+        "example.com",
+        "v1",
+        "widgets"
+    )));
 }
 
 #[tokio::test]
@@ -8828,7 +10565,7 @@ async fn user_view_wins_over_printer_columns() {
     app.switch_kind("certificates");
     app.handle_msg(Msg::PrinterColumns {
         generation: app.generation,
-        plural: "certificates".into(),
+        resource: app.cluster.resolve("certificates").unwrap().resource_key(),
         view: Box::new(Some(crate::views::View {
             columns: vec![crate::views::UserColumn {
                 header: "THEIRS".into(),
@@ -9168,6 +10905,733 @@ fn row_names(app: &App) -> Vec<String> {
         .collect()
 }
 
+fn type_resource_query(app: &mut App, query: &str) {
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in query.chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+}
+
+fn selector_api(streaming: bool) -> (Cluster, mpsc::UnboundedReceiver<http::Uri>) {
+    use futures_util::stream;
+    use hyper::body::{Bytes, Frame};
+    use std::convert::Infallible;
+
+    let (seen, requests) = mpsc::unbounded_channel();
+    let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+        let uri = request.uri().clone();
+        seen.send(uri.clone()).ok();
+        async move {
+            let query: HashMap<_, _> = form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
+                .into_owned()
+                .collect();
+            let initial = query.contains_key("sendInitialEvents");
+            let watch = query.get("watch").is_some_and(|s| s == "true");
+            let table = uri.path().starts_with("/api/v1/") && uri.path().ends_with("/pods");
+            let invalid_field = query
+                .get("fieldSelector")
+                .is_some_and(|s| s.contains("spec.unsupported"));
+            let status = if !table {
+                404
+            } else if invalid_field || (initial && !streaming) {
+                400
+            } else {
+                200
+            };
+            let body = if status != 200 {
+                json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"BadRequest","code":status,
+                    "message": if invalid_field { "field label not supported: spec.unsupported" } else { "sendInitialEvents is not supported" }}).to_string()
+            } else {
+                let namespace = uri
+                    .path()
+                    .split("/namespaces/")
+                    .nth(1)
+                    .and_then(|s| s.split('/').next())
+                    .unwrap_or("prod");
+                let api = json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"api","namespace":namespace,"resourceVersion":"10","labels":{"app":"api","env":"prod"}},"spec":{"nodeName":"node-3"},"status":{"phase":"Running"}});
+                let unrelated = json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"other","namespace":namespace,"resourceVersion":"10"},"spec":{"nodeName":"node-4"}});
+                let items =
+                    if query.contains_key("labelSelector") || query.contains_key("fieldSelector") {
+                        vec![api]
+                    } else {
+                        vec![api, unrelated]
+                    };
+                if initial {
+                    let mut body = items
+                        .into_iter()
+                        .map(|object| json!({"type":"ADDED","object":object}).to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    body.push('\n');
+                    body.push_str(&json!({"type":"BOOKMARK","object":{"apiVersion":"v1","kind":"Pod","metadata":{"resourceVersion":"10","annotations":{"k8s.io/initial-events-end":"true"}}}}).to_string());
+                    body.push('\n');
+                    body
+                } else if watch {
+                    String::new()
+                } else {
+                    json!({"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"10"},"items":items}).to_string()
+                }
+            };
+            let frames = stream::iter([Ok::<_, Infallible>(Frame::data(Bytes::from(body)))]);
+            let frames = if watch && status == 200 {
+                frames.chain(stream::pending()).boxed()
+            } else {
+                frames.boxed()
+            };
+            Ok::<_, Infallible>(
+                http::Response::builder()
+                    .status(status)
+                    .body(http_body_util::StreamBody::new(frames))
+                    .unwrap(),
+            )
+        }
+    });
+    let mut cluster = Cluster::fake();
+    cluster.client = kube::Client::new(service, "default");
+    (cluster, requests)
+}
+
+async fn next_selector_request(requests: &mut mpsc::UnboundedReceiver<http::Uri>) -> http::Uri {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let uri = requests.recv().await.expect("request channel closed");
+            if uri.path().starts_with("/api/v1/") && uri.path().ends_with("/pods") {
+                return uri;
+            }
+        }
+    })
+    .await
+    .expect("pod API request timeout")
+}
+
+async fn sync_selector_view(app: &mut App, rx: &mut Receiver<Msg>) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let msg = rx.recv().await.expect("watch channel closed");
+            let done = matches!(&msg, Msg::Synced { generation } if *generation == app.generation);
+            app.handle_msg(msg);
+            if done {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("filtered view sync timeout");
+}
+
+#[tokio::test]
+async fn selectors_reach_streaming_list_and_watch_requests_from_keys() {
+    for streaming in [true, false] {
+        let (cluster, mut requests) = selector_api(streaming);
+        let (tx, mut rx) = mpsc::channel(1024);
+        let mut app = App::new(cluster, tx);
+        type_resource_query(
+            &mut app,
+            "pods -n prod /-l 'app in (api, worker),env=prod' -f spec.nodeName=node-3 status=Running",
+        );
+        sync_selector_view(&mut app, &mut rx).await;
+        assert_eq!(row_names(&app), ["api"]);
+        for step in 0..if streaming { 1 } else { 3 } {
+            let uri = next_selector_request(&mut requests).await;
+            let query: HashMap<_, _> = form_urlencoded::parse(uri.query().unwrap().as_bytes())
+                .into_owned()
+                .collect();
+            assert_eq!(uri.path(), "/api/v1/namespaces/prod/pods");
+            assert_eq!(
+                query.get("labelSelector").map(String::as_str),
+                Some("app in (api, worker),env=prod")
+            );
+            assert_eq!(
+                query.get("fieldSelector").map(String::as_str),
+                Some("spec.nodeName=node-3")
+            );
+            assert_eq!(query.contains_key("sendInitialEvents"), step == 0);
+            assert_eq!(
+                query.get("watch").map(String::as_str) == Some("true"),
+                step != 1
+            );
+        }
+        app.handle_key(ctrl(KeyCode::Char('r'))).unwrap();
+        sync_selector_view(&mut app, &mut rx).await;
+        let uri = next_selector_request(&mut requests).await;
+        assert!(uri.query().unwrap().contains("fieldSelector="));
+        if !streaming {
+            next_selector_request(&mut requests).await;
+        }
+        app.handle_key(press(KeyCode::Char('0'))).unwrap();
+        sync_selector_view(&mut app, &mut rx).await;
+        let uri = next_selector_request(&mut requests).await;
+        assert_eq!(uri.path(), "/api/v1/pods");
+        assert!(uri.query().unwrap().contains("labelSelector="));
+        if !streaming {
+            next_selector_request(&mut requests).await;
+        }
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        sync_selector_view(&mut app, &mut rx).await;
+        let uri = next_selector_request(&mut requests).await;
+        assert!(!uri.query().unwrap().contains("Selector="));
+        assert_eq!(row_names(&app), ["api", "other"]);
+    }
+}
+
+#[tokio::test]
+async fn unsupported_fields_remain_scoped_and_show_api_error() {
+    let (cluster, mut requests) = selector_api(true);
+    let (tx, mut rx) = mpsc::channel(1024);
+    let mut app = App::new(cluster, tx);
+    type_resource_query(&mut app, "pods /-l app=api -f spec.unsupported=x");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let msg = rx.recv().await.unwrap();
+            let done =
+                matches!(&msg, Msg::Error { generation, .. } if *generation == app.generation);
+            app.handle_msg(msg);
+            if done {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(app.flash_err);
+    assert!(
+        app.flash.contains("field label not supported"),
+        "{}",
+        app.flash
+    );
+    assert_eq!(
+        app.applied_filter_fields.as_deref(),
+        Some("spec.unsupported=x")
+    );
+    for _ in 0..2 {
+        let uri = next_selector_request(&mut requests).await;
+        let query: HashMap<_, _> = form_urlencoded::parse(uri.query().unwrap().as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(
+            query.get("fieldSelector").map(String::as_str),
+            Some("spec.unsupported=x")
+        );
+        assert_eq!(
+            query.get("labelSelector").map(String::as_str),
+            Some("app=api")
+        );
+    }
+    assert!(row_names(&app).is_empty());
+}
+
+/// Column comparisons read the same per-row cell cache the fuzzy path fills,
+/// so a row whose cell changed must not be answered from the previous
+/// rendering.
+#[tokio::test]
+async fn column_comparisons_see_updated_cells_not_cached_ones() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let pod = |state: serde_json::Value| {
+        json!({"apiVersion":"v1","kind":"Pod",
+        "metadata":{"name":"api","namespace":"prod","resourceVersion":"1"},
+        "status":{"phase":"Running","containerStatuses":[
+            {"name":"api","ready":true,"restartCount":0,"state":state}]}})
+    };
+    apply(&mut app, pod(json!({"running":{}})));
+    type_filter(&mut app, "status=Running");
+    assert_eq!(row_names(&app), ["api"]);
+
+    // Same object, new state. A cell answered from the cache would keep it.
+    apply(
+        &mut app,
+        pod(json!({"waiting":{"reason":"CrashLoopBackOff"}})),
+    );
+    assert_eq!(row_names(&app), Vec::<String>::new());
+    retype_filter(&mut app, "status=CrashLoopBackOff");
+    assert_eq!(row_names(&app), ["api"]);
+}
+
+#[tokio::test]
+async fn boolean_groups_short_circuit_and_match_operational_queries() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for (name, phase, restarts) in [
+        ("api", "Running", 1),
+        ("worker", "Pending", 7),
+        ("canary", "Running", 9),
+    ] {
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":name,"namespace":"prod"},
+            "spec":{"nodeName":"node-3"},
+            "status":{"phase":phase,"containerStatuses":[{"restartCount":restarts,"state":{"running":{}}}]}}),
+        );
+    }
+    type_filter(&mut app, "(status=Pending || restarts>=5) && !canary");
+    assert_eq!(row_names(&app), ["worker"]);
+    retype_filter(&mut app, "!(status=Pending || restarts>=5)");
+    assert_eq!(row_names(&app), ["api"]);
+    retype_filter(&mut app, "api || worker && restarts>=5");
+    assert_eq!(row_names(&app), ["api", "worker"]);
+    retype_filter(
+        &mut app,
+        "spec.nodeName=node-3 metadata.namespace=prod status.phase=Pending",
+    );
+    assert_eq!(row_names(&app), ["worker"]);
+    retype_filter(&mut app, "-l env=prod (api || worker)");
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("env=prod"));
+    assert_eq!(app.filter_location(), " ·server+local");
+    assert_eq!(
+        row_names(&app),
+        Vec::<String>::new(),
+        "new API watch starts empty"
+    );
+}
+
+#[tokio::test]
+async fn unavailable_metrics_are_unknown_even_under_negation() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for name in ["unknown", "zero", "busy"] {
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":name,"namespace":"default"}}),
+        );
+    }
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::from([
+            ("default/zero".into(), (0, 0)),
+            ("default/busy".into(), (600, 2 * 1024 * 1024 * 1024)),
+        ]),
+        containers: HashMap::new(),
+    });
+    for query in [
+        "cpu<500m",
+        "memory<1Gi",
+        "cpu=0",
+        "!(cpu>=500m)",
+        "!(memory>=1Gi)",
+    ] {
+        retype_filter(&mut app, query);
+        assert_eq!(row_names(&app), ["zero"], "{query}");
+    }
+    retype_filter(&mut app, "cpu>500m || memory>1Gi");
+    assert_eq!(row_names(&app), ["busy"]);
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::from([
+            ("default/zero".into(), (900, 0)),
+            ("default/busy".into(), (100, 0)),
+        ]),
+        containers: HashMap::new(),
+    });
+    assert_eq!(
+        row_names(&app),
+        ["zero"],
+        "poll changes membership without a watch event"
+    );
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::new(),
+        containers: HashMap::new(),
+    });
+    assert!(
+        row_names(&app).is_empty(),
+        "metrics removal invalidates membership"
+    );
+    retype_filter(&mut app, "name=unknown || cpu>500m");
+    assert_eq!(
+        row_names(&app),
+        ["unknown"],
+        "a known true OR branch can match"
+    );
+}
+
+#[tokio::test]
+async fn saved_selector_is_on_the_first_watch_and_visible_in_ui() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (cluster, mut requests) = selector_api(true);
+    let (tx, mut rx) = mpsc::channel(1024);
+    let mut app = App::new(cluster, tx);
+    app.bookmarks = vec![crate::config::Bookmark {
+        name: "API".into(),
+        key: Some("ctrl-a".into()),
+        resource: "pods".into(),
+        namespace: Some("prod".into()),
+        filter: Some("-l app=api status=Running".into()),
+        ..Default::default()
+    }];
+    app.handle_key(ctrl(KeyCode::Char('a'))).unwrap();
+    sync_selector_view(&mut app, &mut rx).await;
+    let uri = next_selector_request(&mut requests).await;
+    assert!(uri.query().unwrap().contains("labelSelector=app%3Dapi"));
+    assert_eq!(row_names(&app), ["api"]);
+    let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(screen.contains("/-l app=api status=Running"));
+    assert!(screen.contains("server+local"));
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    assert_eq!(app.filter, "-l app=api status=Running");
+    app.handle_key(ctrl(KeyCode::Char('u'))).unwrap();
+    assert_eq!(app.filter_location(), " ·pending ⏎");
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    sync_selector_view(&mut app, &mut rx).await;
+    assert_eq!(row_names(&app), ["api", "other"]);
+    assert_eq!(app.filter_location(), " ·local");
+}
+
+#[tokio::test]
+async fn palette_query_scopes_first_watch_and_supports_history() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    let generation = app.generation;
+    type_resource_query(
+        &mut app,
+        "pods -n prod --context test /-l app in (api, worker) -f spec.nodeName=node-3 && !canary status=Running",
+    );
+    assert_eq!(
+        app.generation,
+        generation + 1,
+        "no unfiltered initial watch"
+    );
+    assert_eq!(app.namespace, "prod");
+    assert_eq!(
+        app.applied_filter_labels.as_deref(),
+        Some("app in (api, worker)")
+    );
+    assert_eq!(
+        app.applied_filter_fields.as_deref(),
+        Some("spec.nodeName=node-3")
+    );
+    assert_eq!(app.filter_location(), " ·server+local");
+    for (name, phase) in [
+        ("api", "Running"),
+        ("canary", "Running"),
+        ("worker", "Pending"),
+    ] {
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1", "kind":"Pod", "metadata":{"name":name,"namespace":"prod"}, "status":{"phase":phase}}),
+        );
+    }
+    assert_eq!(row_names(&app), ["api"]);
+    app.handle_key(press(KeyCode::Char('['))).unwrap();
+    assert_eq!(app.kind_plural, "deployments");
+    app.handle_key(press(KeyCode::Char(']'))).unwrap();
+    assert_eq!(
+        app.applied_filter_fields.as_deref(),
+        Some("spec.nodeName=node-3")
+    );
+    app.handle_key(press(KeyCode::Char('0'))).unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(
+        app.applied_filter_fields.as_deref(),
+        Some("spec.nodeName=node-3")
+    );
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert!(app.filter.is_empty());
+    assert!(!app.filter_server_side());
+}
+
+/// Land an async context switch the way `Msg::ContextSwitched` does.
+fn land_context(app: &mut App, name: &str) {
+    let mut cluster = Cluster::fake();
+    cluster.context = name.into();
+    app.handle_msg(Msg::ContextSwitched {
+        generation: app.generation,
+        name: name.into(),
+        result: Ok(Box::new(cluster)),
+    });
+}
+
+#[tokio::test]
+async fn landing_a_context_flashes_skipped_discovery_groups() {
+    let (mut app, _rx) = test_app();
+    let mut cluster = Cluster::fake();
+    cluster.context = "dev".into();
+    cluster.discovery_warnings =
+        vec!["API discovery could not read odd.example.com/v1alpha3: expected v1".into()];
+    app.handle_msg(Msg::ContextSwitched {
+        generation: app.generation,
+        name: "dev".into(),
+        result: Ok(Box::new(cluster)),
+    });
+    assert_eq!(
+        app.flash,
+        "API discovery could not read 1 API group. Refer to :info for details."
+    );
+    assert!(app.flash_err);
+
+    land_context(&mut app, "prod");
+    assert_eq!(app.flash, "Viewing pods");
+    assert!(!app.flash_err);
+}
+
+#[tokio::test]
+async fn discovery_flash_yields_to_a_config_warning_on_context_switch() {
+    let dir = std::env::temp_dir().join(format!(
+        "sofka-discovery-flash-yields-{}",
+        std::process::id()
+    ));
+    let cluster_dir = dir.join("clusters").join("test-cluster");
+    std::fs::create_dir_all(&cluster_dir).unwrap();
+    std::fs::write(cluster_dir.join("config.toml"), "readonly = \n").unwrap();
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+
+    let mut cluster = Cluster::fake();
+    cluster.context = "dev".into();
+    cluster.discovery_warnings =
+        vec!["API discovery could not read odd.example.com/v1alpha3: expected v1".into()];
+    app.handle_msg(Msg::ContextSwitched {
+        generation: app.generation,
+        name: "dev".into(),
+        result: Ok(Box::new(cluster)),
+    });
+    assert!(app.flash_err);
+    assert!(
+        app.flash.starts_with("ignoring invalid "),
+        "config warning must stay visible, got: {}",
+        app.flash
+    );
+    assert_eq!(app.config_warnings.len(), 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn info_lists_skipped_discovery_groups() {
+    let (mut app, _rx) = test_app();
+    app.cluster.discovery_fallback =
+        Some("Aggregated API discovery failed: boom. Sofka read each API group separately.".into());
+    app.cluster.discovery_warnings = vec![
+        "API discovery could not read odd.example.com/v1alpha3: expected v1".into(),
+        "API discovery could not read broken.example.com/v1beta1: 503".into(),
+    ];
+    palette(&mut app, "info");
+    let lines: Vec<String> = app.detail.lines.iter().map(|l| l.to_string()).collect();
+    let discovery = lines
+        .iter()
+        .position(|l| l.starts_with("  discovery:"))
+        .expect("discovery line");
+    assert_eq!(
+        lines[discovery + 1],
+        "    • Aggregated API discovery failed: boom. Sofka read each API group separately."
+    );
+    assert_eq!(
+        lines[discovery + 2],
+        "    • API discovery could not read odd.example.com/v1alpha3: expected v1"
+    );
+    assert_eq!(
+        lines[discovery + 3],
+        "    • API discovery could not read broken.example.com/v1beta1: 503"
+    );
+    assert!(app.config_warnings.is_empty());
+}
+
+/// Choose `name` in the context switcher, through the switcher's own keys.
+fn pick_context(app: &mut App, name: &str) {
+    let mut list = vec![app.cluster.context.clone(), name.to_string()];
+    list.sort();
+    list.dedup();
+    app.mode = Mode::Contexts;
+    app.handle_msg(Msg::Contexts {
+        generation: app.generation,
+        list,
+    });
+    for c in name.chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+}
+
+/// A bookmark on a chord, so `handle_key` is what triggers it.
+fn bind_bookmark(app: &mut App, resource: &str, context: &str) {
+    app.bookmarks = vec![crate::config::Bookmark {
+        key: Some("ctrl-y".into()),
+        name: "bm".into(),
+        resource: resource.into(),
+        context: Some(context.into()),
+        ..Default::default()
+    }];
+}
+
+/// The no-op branch of a context re-select starts no switch, so it must not
+/// disarm a navigation that an in-flight one still owns.
+#[tokio::test]
+async fn a_noop_context_reselect_keeps_an_inflight_navigation() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    let home = app.cluster.context.clone();
+    bind_bookmark(&mut app, "services", "west");
+
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    assert!(
+        app.pending_bookmark.is_some(),
+        "chord did not arm the bookmark"
+    );
+    let inflight = app.generation;
+
+    // Re-selecting the context we are already on does nothing at all.
+    pick_context(&mut app, &home);
+    assert_eq!(app.generation, inflight);
+    assert!(
+        app.pending_bookmark.is_some(),
+        "in-flight bookmark disarmed"
+    );
+
+    land_context(&mut app, "west");
+    assert_eq!(app.kind_plural, "services");
+}
+
+/// Re-selecting the destination of an in-flight context switch must not start
+/// a replacement generation that loses the navigation waiting behind it.
+#[tokio::test]
+async fn reselecting_inflight_context_target_keeps_deferred_navigation() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    bind_bookmark(&mut app, "services", "west");
+
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    let inflight = app.generation;
+    assert!(app.pending_bookmark.is_some());
+
+    pick_context(&mut app, "west");
+    assert_eq!(app.generation, inflight, "replacement switch was started");
+    assert!(
+        app.pending_bookmark.is_some(),
+        "deferred bookmark was discarded"
+    );
+
+    land_context(&mut app, "west");
+    assert_eq!(app.kind_plural, "services");
+}
+
+#[tokio::test]
+async fn deferred_navigation_to_same_inflight_target_replaces_predecessor() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    bind_bookmark(&mut app, "services", "west");
+
+    type_resource_query(&mut app, "pods --context west /status=Running");
+    let inflight = app.generation;
+    assert!(app.pending_resource_query.is_some());
+
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    assert_eq!(app.generation, inflight);
+    assert!(
+        app.pending_resource_query.is_none(),
+        "displaced query stays armed"
+    );
+    assert!(app.pending_bookmark.is_some());
+
+    land_context(&mut app, "west");
+    assert_eq!(app.kind_plural, "services");
+}
+
+/// Deferred navigations are mutually exclusive: a bookmark, workspace or
+/// palette query that starts a context switch owns what lands when it
+/// completes, and must not leave an earlier one armed to fire later.
+#[tokio::test]
+async fn a_deferred_navigation_disarms_the_one_it_replaces() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    bind_bookmark(&mut app, "services", "west");
+
+    // The bookmark defers behind an async switch to its own context.
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    assert!(app.pending_bookmark.is_some());
+
+    // Before it lands, the user asks for something else somewhere else.
+    type_resource_query(&mut app, "pods -n prod --context east /-l app=api");
+    assert!(
+        app.pending_bookmark.is_none(),
+        "displaced bookmark stays armed"
+    );
+    assert!(app.pending_resource_query.is_some());
+
+    land_context(&mut app, "east");
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("app=api"));
+
+    // A later, unrelated switch must not resurrect the displaced bookmark.
+    pick_context(&mut app, "west");
+    land_context(&mut app, "west");
+    assert!(app.pending_bookmark.is_none());
+    assert_ne!(
+        app.kind_plural, "services",
+        "stale bookmark fired on a later switch"
+    );
+}
+
+#[tokio::test]
+async fn palette_query_waits_for_context_and_rejects_invalid_input() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    let generation = app.generation;
+    type_resource_query(&mut app, "pods -n prod /cpu>oops");
+    assert_eq!(app.generation, generation);
+    assert_eq!(app.kind_plural, "deployments");
+    assert!(app.flash_err);
+    type_resource_query(&mut app, "pods -n prod --context west /-l app=api");
+    assert!(app.pending_resource_query.is_some());
+    let mut cluster = Cluster::fake();
+    cluster.context = "west".into();
+    app.handle_msg(Msg::ContextSwitched {
+        generation: app.generation,
+        name: "west".into(),
+        result: Ok(Box::new(cluster)),
+    });
+    assert_eq!(app.cluster.context, "west");
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.namespace, "prod");
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("app=api"));
+    assert!(app.pending_resource_query.is_none());
+}
+
+#[tokio::test]
+async fn malformed_filter_stays_editable_without_widening_watch() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    type_filter(&mut app, "-l app=api");
+    let generation = app.generation;
+    retype_filter(&mut app, "-l app in (");
+    assert_eq!(app.mode, Mode::Filter);
+    assert_eq!(app.generation, generation);
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("app=api"));
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert!(!app.filter_server_side());
+}
+
+#[tokio::test]
+async fn age_filter_rechecks_rows_as_time_passes_without_watch_updates() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Pod", "metadata":{
+            "name":"old", "namespace":"default", "creationTimestamp":"2020-01-01T00:00:00Z"
+        }}),
+    );
+    type_filter(&mut app, "age>2h");
+    assert_eq!(row_names(&app), ["old"]);
+    // Model the previous second's membership; no dirty bit or watch event.
+    {
+        let mut cache = app.rows_cache.borrow_mut();
+        cache.keys.clear();
+        cache.filter_second -= 1;
+        assert!(!cache.dirty);
+    }
+    assert_eq!(row_names(&app), ["old"]);
+}
+
 #[tokio::test]
 async fn legacy_fuzzy_filter_with_spaces_is_one_pattern() {
     let (mut app, _rx) = test_app();
@@ -9204,6 +11668,176 @@ async fn inverse_filter_hides_fuzzy_matches() {
     app.filter = "api !canary".into();
     app.invalidate_rows();
     assert_eq!(row_names(&app), ["api-1"]);
+}
+
+/// The noise the fuzzy filter is prone to: a subsequence match means a short
+/// needle like `auth` also drags in every name with a scattered a…u…t…h.
+/// Quoting the term keeps only what a `grep` would find.
+#[tokio::test]
+async fn quoted_filter_matches_only_contiguous_text() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for n in ["auth-api-0", "api-gateway-runtime-hash"] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Pod",
+                   "metadata": {"name": n, "namespace": "default"}}),
+        );
+    }
+
+    // Unquoted, both match: a-u-t-h occurs in "api-gateway-runtime-hash" too.
+    type_filter(&mut app, "auth");
+    assert_eq!(row_names(&app), ["api-gateway-runtime-hash", "auth-api-0"]);
+
+    retype_filter(&mut app, "\"auth\"");
+    assert_eq!(row_names(&app), ["auth-api-0"]);
+
+    // Case-insensitive, like every other text term.
+    retype_filter(&mut app, "\"AUTH-API\"");
+    assert_eq!(row_names(&app), ["auth-api-0"]);
+}
+
+#[tokio::test]
+async fn regex_filter_terms_match_names_and_cells() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for n in ["auth-api-0", "auth-api-canary", "web-1"] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Pod",
+                   "metadata": {"name": n, "namespace": "default"}}),
+        );
+    }
+
+    type_filter(&mut app, "/auth-api-\\d/");
+    assert_eq!(row_names(&app), ["auth-api-0"]);
+
+    // Cells are matched one at a time, so `^` anchors to the NAME cell rather
+    // than to the "namespace name" haystack.
+    retype_filter(&mut app, "/^web/");
+    assert_eq!(row_names(&app), ["web-1"]);
+}
+
+#[tokio::test]
+async fn quoted_and_regex_terms_invert_and_combine() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for n in ["auth-api-0", "auth-api-canary", "web-1"] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Pod",
+                   "metadata": {"name": n, "namespace": "default"}}),
+        );
+    }
+
+    type_filter(&mut app, "!\"canary\"");
+    assert_eq!(row_names(&app), ["auth-api-0", "web-1"]);
+
+    // AND-ed with a positive literal term, and with an inverse regex.
+    retype_filter(&mut app, "\"auth\" !/canary/");
+    assert_eq!(row_names(&app), ["auth-api-0"]);
+}
+
+/// Literals see the rendered columns like fuzzy terms do — and, unlike fuzzy,
+/// an IP fragment can't match a cell that merely contains its digits in order.
+#[tokio::test]
+async fn quoted_filter_matches_column_cells_without_gaps() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    for (n, ip) in [("api", "10.96.13.5"), ("web", "10.9.61.35")] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Service",
+                   "metadata": {"name": n, "namespace": "default"},
+                   "spec": {"type": "ClusterIP", "clusterIP": ip,
+                            "ports": [{"port": 80, "protocol": "TCP"}]}}),
+        );
+    }
+
+    type_filter(&mut app, "10.96");
+    assert_eq!(row_names(&app), ["api", "web"]);
+
+    retype_filter(&mut app, "\"10.96\"");
+    assert_eq!(row_names(&app), ["api"]);
+}
+
+/// The row filter prefilters on a byte mask that folds with ASCII rules,
+/// while a literal folds with Unicode ones. A needle whose case mapping
+/// changes its bytes must still reach the matcher instead of being masked out.
+#[tokio::test]
+async fn unicode_literals_survive_the_mask_prefilter() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for n in ["kube-httpcache-0", "öresund-api", "web-1"] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Pod",
+                   "metadata": {"name": n, "namespace": "default"}}),
+        );
+    }
+
+    // U+212A KELVIN SIGN lowercases to a plain ASCII `k`.
+    type_filter(&mut app, "\"\u{212a}ube\"");
+    assert_eq!(row_names(&app), ["kube-httpcache-0"]);
+
+    // A needle whose folded form is itself non-ASCII.
+    retype_filter(&mut app, "\"Öresund\"");
+    assert_eq!(row_names(&app), ["öresund-api"]);
+}
+
+/// A term that cannot be compiled is skipped and reported, like every other
+/// malformed term — the rest of the filter still narrows the table.
+#[tokio::test]
+async fn malformed_regex_filter_reports_and_keeps_filtering() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for n in ["auth-api-0", "web-1"] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Pod",
+                   "metadata": {"name": n, "namespace": "default"}}),
+        );
+    }
+
+    type_filter(&mut app, "/[unclosed/ auth");
+    assert!(
+        app.filter_error().is_some_and(|e| e.contains("bad regex")),
+        "{:?}",
+        app.filter_error()
+    );
+    assert_eq!(row_names(&app), ["auth-api-0"]);
+    assert!(!app.filter_server_side());
+}
+
+/// The NAME highlight follows the term that matched: a literal or a regex
+/// marks the contiguous run it landed on, not fuzzy's scattered positions.
+#[tokio::test]
+async fn quoted_and_regex_filters_highlight_the_matched_run() {
+    let (mut app, _rx) = test_app();
+
+    retype_filter(&mut app, "khc");
+    let scattered = app.filter_match_indices("kube-httpcache-0").unwrap();
+    assert_eq!(scattered.len(), 3);
+
+    retype_filter(&mut app, "\"httpcache\"");
+    assert_eq!(
+        app.filter_match_indices("kube-httpcache-0")
+            .unwrap()
+            .to_vec(),
+        (5..14).collect::<Vec<usize>>()
+    );
+
+    retype_filter(&mut app, "/cache-\\d/");
+    assert_eq!(
+        app.filter_match_indices("kube-httpcache-0")
+            .unwrap()
+            .to_vec(),
+        (9..16).collect::<Vec<usize>>()
+    );
+
+    // A name the pattern doesn't occur in highlights nothing, even though the
+    // row may have matched on one of its other cells.
+    assert_eq!(app.filter_match_indices("web-1"), None);
 }
 
 #[tokio::test]
@@ -9413,10 +12047,10 @@ async fn local_filter_edits_never_restart_the_watch() {
 }
 
 #[tokio::test]
-async fn drill_clears_server_selector_and_pop_restores_it() {
+async fn drill_preserves_server_selector_and_pop_restores_it() {
     let (mut app, _rx) = test_app();
     app.switch_kind("deployments");
-    type_filter(&mut app, "-l env=prod");
+    type_filter(&mut app, "-l env=prod -f metadata.namespace=default");
     assert_eq!(app.applied_filter_labels.as_deref(), Some("env=prod"));
 
     apply(
@@ -9429,26 +12063,58 @@ async fn drill_clears_server_selector_and_pop_restores_it() {
     );
     app.table_state.select(Some(0));
 
-    // Drill: like the fuzzy filter, the filter (and with it the server-side
-    // selector) is cleared for the child view; the drill's own selector takes
-    // over.
+    // Drill combines the persistent query selector with the child scope.
     app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.kind_plural, "pods");
-    assert!(app.filter.is_empty());
-    assert_eq!(app.applied_filter_labels, None);
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("env=prod"));
+    assert_eq!(
+        app.watch_key.as_ref().unwrap().labels.as_deref(),
+        Some("app=web,env=prod")
+    );
     assert_eq!(app.labels.as_deref(), Some("app=web"));
+    assert_eq!(
+        app.watch_key.as_ref().unwrap().fields.as_deref(),
+        Some("metadata.namespace=default")
+    );
 
     // Pop: the saved frame restores the filter, and the rewatch re-applies
     // its selector server-side.
-    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Esc)).unwrap(); // clear child filter
+    app.handle_key(press(KeyCode::Esc)).unwrap(); // return to parent
     assert_eq!(app.kind_plural, "deployments");
-    assert_eq!(app.filter, "-l env=prod");
+    assert_eq!(app.filter, "-l env=prod -f metadata.namespace=default");
+    assert_eq!(
+        app.applied_filter_fields.as_deref(),
+        Some("metadata.namespace=default")
+    );
     assert_eq!(app.applied_filter_labels.as_deref(), Some("env=prod"));
     assert_eq!(app.labels, None);
 }
 
 #[tokio::test]
-async fn root_switch_and_history_clear_server_selector_like_fuzzy() {
+async fn namespace_picker_and_history_preserve_both_selectors() {
+    let (mut app, _rx) = test_app();
+    type_resource_query(&mut app, "pods -n prod /-l app=api -f spec.nodeName=node-3");
+    app.ns_list = vec!["<all>".into(), "prod".into(), "qa".into()];
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    for c in "qa".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.namespace, "qa");
+    for (key, namespace) in [('[', "prod"), (']', "qa")] {
+        app.handle_key(press(KeyCode::Char(key))).unwrap();
+        assert_eq!(app.namespace, namespace);
+        assert_eq!(app.applied_filter_labels.as_deref(), Some("app=api"));
+        assert_eq!(
+            app.applied_filter_fields.as_deref(),
+            Some("spec.nodeName=node-3")
+        );
+    }
+}
+
+#[tokio::test]
+async fn root_switch_clears_filter_and_history_restores_it() {
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
     type_filter(&mut app, "-l app=api");
@@ -9460,11 +12126,11 @@ async fn root_switch_and_history_clear_server_selector_like_fuzzy() {
     assert!(app.filter.is_empty());
     assert_eq!(app.applied_filter_labels, None);
 
-    // History replay lands on the root view without the old filter.
+    // History restores the complete root query.
     app.handle_key(press(KeyCode::Char('['))).unwrap();
     assert_eq!(app.kind_plural, "pods");
-    assert!(app.filter.is_empty());
-    assert_eq!(app.applied_filter_labels, None);
+    assert_eq!(app.filter, "-l app=api");
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("app=api"));
 }
 
 #[tokio::test]
@@ -10795,7 +13461,7 @@ async fn filtering_matches_a_naive_fuzzy_pass() {
 
         // Naive expectation: name haystack, else any rendered cell.
         let matcher = crate::fuzzy::Fuzzy::new();
-        let spec = crate::columns::build_spec("pods", None, None, false);
+        let spec = crate::columns::build_spec("", "pods", None, None, false);
         let mut want: Vec<String> = Vec::new();
         for (k, o) in app.store.iter() {
             let hay = format!(
@@ -11115,7 +13781,8 @@ async fn plugin_package_reload_loads_valid_packages_and_isolates_invalid_ones() 
     let (mut app, mut rx) = test_app();
     app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
     plugin_command(&mut app, "reload");
-    assert_eq!(app.plugins.len(), 1);
+    // Bundled packages are always present; this counts the configured ones.
+    assert_eq!(app.plugins.iter().filter(|p| !p.bundled).count(), 1);
     assert!(app.config_warnings.iter().any(|w| w.contains("broken")));
     plugin_command(&mut app, "example-plugin");
     app.handle_msg(plugin_result(&mut rx).await);
@@ -11127,7 +13794,7 @@ async fn plugin_package_reload_loads_valid_packages_and_isolates_invalid_ones() 
     );
     std::fs::remove_file(package.join("plugin.toml")).unwrap();
     plugin_command(&mut app, "reload");
-    assert!(app.plugins.is_empty());
+    assert!(!app.plugins.iter().any(|p| !p.bundled));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -11318,7 +13985,11 @@ async fn check_unknown_inline_fields(location: &str) {
             app.user_aliases.get("pluginpods").map(String::as_str),
             Some("pods")
         );
-        assert_eq!(app.plugins.len(), 2, "{layer}: plugins were lost");
+        assert_eq!(
+            app.plugins.iter().filter(|p| !p.bundled).count(),
+            2,
+            "{layer}: plugins were lost"
+        );
         assert!(
             app.config_warnings.is_empty(),
             "{layer}: {:?}",
@@ -11337,4 +14008,4763 @@ async fn check_unknown_inline_fields(location: &str) {
         assert!(app.flash.contains("outside range"));
         std::fs::remove_dir_all(dir).unwrap();
     }
+}
+
+fn faults_test_pod(name: &str) -> Value {
+    json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": name, "namespace": "default", "resourceVersion": "1"},
+        "spec": {"containers": [{"name": "app"}]},
+        "status": {
+            "phase": "Running",
+            "conditions": [{"type": "Ready", "status": "True"}],
+            "containerStatuses": [{"name": "app", "ready": true, "restartCount": 0,
+                                   "state": {"running": {}}}]
+        }
+    })
+}
+
+#[tokio::test]
+async fn ctrl_z_filters_pod_faults() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let healthy = faults_test_pod("healthy");
+    let mut cases = vec![(healthy.clone(), false)];
+    for phase in ["Pending", "Failed", "Unknown", "Succeeded"] {
+        let mut pod = faults_test_pod(phase);
+        pod["status"] = json!({"phase": phase});
+        cases.push((pod, phase != "Succeeded"));
+    }
+    for reason in [
+        "CrashLoopBackOff",
+        "ImagePullBackOff",
+        "ErrImagePull",
+        "ContainerCreating",
+    ] {
+        let mut pod = faults_test_pod(reason);
+        pod["status"]["containerStatuses"][0]["state"] = json!({"waiting": {"reason": reason}});
+        cases.push((pod, true));
+    }
+    let mut unready = faults_test_pod("unready");
+    unready["status"]["conditions"][0]["status"] = json!("False");
+    cases.push((unready, true));
+    let mut container_unready = faults_test_pod("container-unready");
+    container_unready["status"]["containerStatuses"][0]["ready"] = json!(false);
+    cases.push((container_unready, true));
+    let mut missing = faults_test_pod("missing-status");
+    missing["status"]["containerStatuses"] = json!([]);
+    cases.push((missing, true));
+    let mut terminating = faults_test_pod("terminating");
+    terminating["metadata"]["deletionTimestamp"] = json!("2026-09-06T00:00:00Z");
+    cases.push((terminating, true));
+    let mut gate = faults_test_pod("gate");
+    gate["spec"]["readinessGates"] = json!([{"conditionType": "example.com/ready"}]);
+    cases.push((gate, true));
+    for (name, sidecar, ready, faulty) in [
+        ("init-complete", false, true, false),
+        ("init-failed", false, false, true),
+        ("sidecar-ready", true, true, false),
+        ("sidecar-unready", true, false, true),
+    ] {
+        let mut pod = faults_test_pod(name);
+        pod["spec"]["initContainers"] = json!([{"name": "init"}]);
+        let state = if sidecar {
+            pod["spec"]["initContainers"][0]["restartPolicy"] = json!("Always");
+            json!({"running": {}})
+        } else {
+            json!({"terminated": {"exitCode": if ready { 0 } else { 1 }}})
+        };
+        pod["status"]["initContainerStatuses"] =
+            json!([{"name": "init", "ready": ready, "state": state}]);
+        cases.push((pod, faulty));
+    }
+    for (pod, _) in &cases {
+        apply(&mut app, pod.clone());
+    }
+    assert_eq!(app.row_count(), cases.len());
+    app.handle_key(press(KeyCode::End)).unwrap();
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    let names = row_names(&app);
+    for (pod, faulty) in &cases {
+        let name = pod["metadata"]["name"].as_str().unwrap();
+        assert_eq!(names.iter().any(|n| n == name), *faulty, "{name}");
+    }
+    assert_eq!(app.table_state.selected(), Some(0));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(screen.contains("[faults]"));
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.row_count(), cases.len());
+}
+
+#[tokio::test]
+async fn faults_filter_combines_with_text_and_tracks_watch_updates() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let mut pod = faults_test_pod("api");
+    apply(&mut app, pod.clone());
+    let mut other = faults_test_pod("other");
+    other["status"]["phase"] = json!("Pending");
+    apply(&mut app, other);
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(row_names(&app), ["other"]);
+    pod["metadata"]["resourceVersion"] = json!("2");
+    pod["status"]["conditions"][0]["status"] = json!("False");
+    apply(&mut app, pod.clone());
+    assert_eq!(row_names(&app), ["api", "other"]);
+    type_filter(&mut app, "api");
+    assert_eq!(row_names(&app), ["api"]);
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.filter, "api");
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    pod["metadata"]["resourceVersion"] = json!("3");
+    pod["status"]["conditions"][0]["status"] = json!("True");
+    apply(&mut app, pod);
+    assert!(row_names(&app).is_empty());
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(row_names(&app), ["other"]);
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "services".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.kind_plural, "services");
+    assert!(!app.faults_filter_active());
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Service",
+        "metadata": {"name": "service", "namespace": "default"}}),
+    );
+    assert_eq!(row_names(&app), ["service"]);
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert!(app.faults_only);
+}
+
+#[tokio::test]
+async fn configured_ctrl_z_actions_take_precedence_over_faults() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    app.bookmarks = vec![crate::config::Bookmark {
+        key: Some("ctrl-z".into()),
+        name: "services".into(),
+        resource: "services".into(),
+        ..Default::default()
+    }];
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.kind_plural, "services");
+    assert!(!app.faults_only);
+
+    app.bookmarks.clear();
+    app.switch_kind("pods");
+    app.workspaces = vec![crate::config::Workspace {
+        key: Some("ctrl-z".into()),
+        name: "ops".into(),
+        context: None,
+        views: vec![crate::config::WorkspaceView {
+            name: "services".into(),
+            resource: "services".into(),
+            ..Default::default()
+        }],
+    }];
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.kind_plural, "services");
+    assert!(!app.faults_only);
+
+    app.workspaces.clear();
+    app.switch_kind("pods");
+    app.readonly = true;
+    app.plugins = vec![crate::config::Plugin {
+        key: "ctrl-z".into(),
+        name: "custom".into(),
+        command: "true".into(),
+        scopes: vec!["pods".into()],
+        ..Default::default()
+    }];
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert!(app.flash.contains("read-only"));
+    assert!(!app.faults_only);
+    app.plugins[0].scopes = vec!["services".into()];
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert!(app.faults_only);
+}
+
+#[tokio::test]
+async fn faults_watch_changes_preserve_pod_identity_or_clear_selection() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for name in ["b", "c", "d"] {
+        let mut pod = faults_test_pod(name);
+        pod["metadata"]["uid"] = json!(name);
+        pod["status"]["phase"] = json!("Pending");
+        apply(&mut app, pod);
+    }
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    assert_eq!(
+        app.selected_ref().unwrap().metadata.name.as_deref(),
+        Some("c")
+    );
+
+    let mut earlier = faults_test_pod("a");
+    earlier["status"]["phase"] = json!("Pending");
+    apply(&mut app, earlier);
+    assert_eq!(app.table_state.selected(), Some(2));
+    assert_eq!(
+        app.selected_ref().unwrap().metadata.name.as_deref(),
+        Some("c")
+    );
+
+    let mut recovered = faults_test_pod("b");
+    recovered["metadata"]["uid"] = json!("b");
+    recovered["metadata"]["resourceVersion"] = json!("2");
+    apply(&mut app, recovered);
+    assert_eq!(app.table_state.selected(), Some(1));
+    assert_eq!(
+        app.selected_ref().unwrap().metadata.name.as_deref(),
+        Some("c")
+    );
+
+    let mut recovered = faults_test_pod("c");
+    recovered["metadata"]["uid"] = json!("c");
+    recovered["metadata"]["resourceVersion"] = json!("2");
+    apply(&mut app, recovered);
+    assert!(app.selected_ref().is_none());
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.table_state.selected(), None);
+    app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+    assert_ne!(app.mode, Mode::Confirm);
+
+    app.handle_key(press(KeyCode::End)).unwrap();
+    assert_eq!(
+        app.selected_ref().unwrap().metadata.name.as_deref(),
+        Some("d")
+    );
+    let mut replacement = faults_test_pod("d");
+    replacement["metadata"]["uid"] = json!("replacement");
+    replacement["metadata"]["resourceVersion"] = json!("2");
+    replacement["status"]["phase"] = json!("Pending");
+    apply(&mut app, replacement);
+    assert_eq!(app.table_state.selected(), None);
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    let key = row_key(app.selected_ref().unwrap());
+    app.handle_msg(Msg::Deleted {
+        generation: app.generation,
+        key,
+    });
+    assert_eq!(app.table_state.selected(), None);
+}
+
+// ----- PVC explore -------------------------------------------------------
+
+/// A PVC view with one bound claim selected. PVCs aren't in `Cluster::fake`'s
+/// standing registry, so the fixture declares the kind itself.
+fn app_with_pvc(phase: &str) -> (App, Receiver<Msg>) {
+    let (mut app, rx) = test_app();
+    app.cluster
+        .register_kind("", "PersistentVolumeClaim", "persistentvolumeclaims", true);
+    app.switch_kind("persistentvolumeclaims");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+               "metadata": {"name": "data", "namespace": "default"},
+               "status": {"phase": phase}}),
+    );
+    app.table_state.select(Some(0));
+    (app, rx)
+}
+
+fn pvc_mount() -> crate::pvcexplore::Mount {
+    crate::pvcexplore::Mount {
+        pod: "api-0".into(),
+        container: "app".into(),
+        path: "/srv".into(),
+        read_only: false,
+        helper: false,
+    }
+}
+
+fn pvc_entry(
+    name: &str,
+    kind: crate::pvcexplore::EntryKind,
+    size: u64,
+) -> crate::pvcexplore::Entry {
+    crate::pvcexplore::Entry {
+        name: name.into(),
+        kind,
+        size: Some(size),
+        link_target: String::new(),
+    }
+}
+
+/// Hand the browser the target its resolve task would have produced.
+fn resolve_pvc(app: &mut App, result: Result<Option<crate::pvcexplore::Mount>, String>) {
+    let claim = current_claim(app);
+    app.handle_msg(Msg::PvcTarget {
+        generation: app.generation,
+        run: app.pvc.run,
+        namespace: "default".into(),
+        context: app.cluster.context.clone(),
+        claim,
+        result,
+    });
+}
+
+fn listing(entries: Vec<crate::pvcexplore::Entry>) -> crate::pvcexplore::Listing {
+    crate::pvcexplore::Listing {
+        entries,
+        unparsed: 0,
+        unnameable: 0,
+        truncated: false,
+        status: Some(0),
+    }
+}
+
+fn list_pvc(app: &mut App, path: &str, entries: Vec<crate::pvcexplore::Entry>) {
+    app.handle_msg(Msg::PvcListing {
+        generation: app.generation,
+        run: app.pvc.run,
+        path: path.into(),
+        result: Ok((listing(entries), None)),
+    });
+}
+
+#[tokio::test]
+async fn pvc_browser_opens_once_a_mounting_pod_resolves() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    // Nothing is on screen until we know which pod can serve the volume.
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash.contains("finding a pod"), "{}", app.flash);
+
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert_eq!(app.mode, Mode::PvcExplore);
+    assert!(app.pvc.active);
+    // The remote pane starts at the mount point, not at "/".
+    assert_eq!(app.pvc.remote_path, "/srv");
+    assert_eq!(app.pvc.focus, Pane::Remote);
+}
+
+#[tokio::test]
+async fn pvc_listing_fills_the_remote_pane_and_enter_descends() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![
+            pvc_entry("logs", EntryKind::Dir, 0),
+            pvc_entry("a.txt", EntryKind::File, 12),
+        ],
+    );
+    assert_eq!(app.pvc.remote.len(), 2);
+    assert_eq!(app.pvc.remote_state.selected(), Some(0));
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.pvc.remote_path, "/srv/logs");
+    assert!(app.pvc.loading);
+
+    // A file is not a directory: enter does nothing rather than erroring.
+    list_pvc(
+        &mut app,
+        "/srv/logs",
+        vec![pvc_entry("app.log", EntryKind::File, 4)],
+    );
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.pvc.remote_path, "/srv/logs");
+}
+
+#[tokio::test]
+async fn pvc_browser_will_not_walk_above_the_mount_point() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(&mut app, "/srv", vec![pvc_entry("logs", EntryKind::Dir, 0)]);
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    list_pvc(&mut app, "/srv/logs", vec![]);
+    app.handle_key(press(KeyCode::Backspace)).unwrap();
+    assert_eq!(app.pvc.remote_path, "/srv");
+
+    list_pvc(&mut app, "/srv", vec![]);
+    app.handle_key(press(KeyCode::Backspace)).unwrap();
+    assert_eq!(app.pvc.remote_path, "/srv");
+    assert!(app.flash.contains("top of the volume"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn a_listing_for_a_directory_already_left_is_dropped() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(&mut app, "/srv", vec![pvc_entry("logs", EntryKind::Dir, 0)]);
+    app.handle_key(press(KeyCode::Enter)).unwrap(); // bumps the run counter
+
+    let stale = app.pvc.run - 1;
+    app.handle_msg(Msg::PvcListing {
+        generation: app.generation,
+        run: stale,
+        path: "/srv".into(),
+        result: Ok((
+            listing(vec![pvc_entry("stale.txt", EntryKind::File, 1)]),
+            None,
+        )),
+    });
+    assert_eq!(app.pvc.remote_path, "/srv/logs");
+    assert!(app.pvc.remote.iter().all(|e| e.name != "stale.txt"));
+}
+
+#[tokio::test]
+async fn tab_switches_panes_and_copy_follows_the_focus() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("a.txt", EntryKind::File, 12)],
+    );
+
+    // Focus starts on the volume, so `c` copies out of it.
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert!(app.flash.contains("api-0:/srv/a.txt"), "{}", app.flash);
+
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    assert_eq!(app.pvc.focus, Pane::Local);
+}
+
+#[tokio::test]
+async fn uploading_into_a_read_only_mount_is_refused() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    let mount = crate::pvcexplore::Mount {
+        read_only: true,
+        ..pvc_mount()
+    };
+    resolve_pvc(&mut app, Ok(Some(mount)));
+    app.pvc.local = vec![pvc_entry(
+        "notes.txt",
+        crate::pvcexplore::EntryKind::File,
+        3,
+    )];
+    app.pvc.local_state.select(Some(0));
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert!(app.flash.contains("read-only"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn a_claim_nothing_mounts_offers_a_helper_pod() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(None));
+    assert_eq!(app.mode, Mode::Confirm);
+    assert!(
+        app.confirm_label.contains("Nothing mounts data"),
+        "{}",
+        app.confirm_label
+    );
+    assert!(
+        app.confirm_label.contains(&app.pvc_cfg.image),
+        "{}",
+        app.confirm_label
+    );
+}
+
+#[tokio::test]
+async fn read_only_mode_refuses_the_helper_pod_rather_than_creating_one() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.readonly = true;
+    // Browsing itself is a read: `x` is allowed, the write it would need isn't.
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(None));
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash.contains("read-only"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn an_unbound_claim_is_not_browsable() {
+    let (mut app, _rx) = app_with_pvc("Pending");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash.contains("not Bound"), "{}", app.flash);
+    assert!(app.flash_err);
+}
+
+#[tokio::test]
+async fn shell_on_a_pvc_row_execs_at_the_mount_point() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    // The shell is requested from the resolve message, not the keystroke, so
+    // the run loop has to pick it up there too.
+    let Some(Suspend::Shell(argv)) = app.pending.take() else {
+        panic!("no shell queued");
+    };
+    assert_eq!(&argv[..3], ["kubectl", "--context", "test"]);
+    assert!(argv.contains(&"api-0".to_string()));
+    assert_eq!(argv.last().unwrap(), "/srv");
+    // Never opens the browser — `s` asked for a terminal.
+    assert_eq!(app.mode, Mode::Table);
+    assert!(!app.pvc.active);
+}
+
+#[tokio::test]
+async fn esc_leaves_the_pvc_browser() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(!app.pvc.active);
+}
+
+#[tokio::test]
+async fn a_failed_resolve_reports_the_error_instead_of_opening_the_browser() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Err("listing pods in default: forbidden".into()));
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash.contains("forbidden"), "{}", app.flash);
+    assert!(app.flash_err);
+}
+
+#[tokio::test]
+async fn navigating_out_of_the_pvc_browser_tears_it_down() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert!(app.pvc.active);
+
+    // The palette stays over the browser…
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    assert!(app.pvc.active);
+    // …but jumping to another kind leaves it, so no helper pod is orphaned and
+    // the overlays stop drawing panes that are gone.
+    for c in "pods".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.kind_plural, "pods");
+    assert!(!app.pvc.active);
+}
+
+#[tokio::test]
+async fn a_shell_from_a_pvc_row_keeps_its_pod_until_the_shell_returns() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    let helper = crate::pvcexplore::Mount {
+        pod: "sofka-pvc-explore-abc".into(),
+        container: "explore".into(),
+        path: "/pvc".into(),
+        read_only: false,
+        helper: true,
+    };
+    resolve_pvc(&mut app, Ok(Some(helper)));
+    // The shell is queued but has not run yet: the pod it needs is still held.
+    assert!(app.pending.is_some());
+    assert!(app.pvc.mount.as_ref().is_some_and(|m| m.helper));
+
+    app.pending.take();
+    app.after_suspend(); // the run loop's post-suspend hook
+    assert!(app.pvc.mount.is_none());
+    assert!(!app.pvc.shell_pending);
+}
+
+#[tokio::test]
+async fn a_shell_from_inside_the_browser_keeps_the_browser_and_its_pod() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    let helper = crate::pvcexplore::Mount {
+        pod: "sofka-pvc-explore-abc".into(),
+        container: "explore".into(),
+        path: "/pvc".into(),
+        read_only: false,
+        helper: true,
+    };
+    resolve_pvc(&mut app, Ok(Some(helper)));
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    assert!(app.pending.is_some());
+    app.pending.take();
+    app.after_suspend();
+    // Still browsing, so the pod stays.
+    assert!(app.pvc.active);
+    assert!(app.pvc.mount.as_ref().is_some_and(|m| m.helper));
+}
+
+#[tokio::test]
+async fn a_shell_guardrail_covers_the_pvc_shell_too() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    // "no shells in this context" must not be defeated by reaching the same
+    // pod through a claim it mounts.
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["shell".into()],
+        deny: true,
+        reason: Some("prod is locked".into()),
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert!(app.pending.is_none(), "guardrail did not block the exec");
+    assert!(app.flash.contains("prod is locked"), "{}", app.flash);
+    // Nothing is left holding a pod for a shell that will never run.
+    assert!(!app.pvc.shell_pending);
+    assert!(app.pvc.mount.is_none());
+}
+
+#[tokio::test]
+async fn a_confirmed_pvc_shell_can_be_cancelled_without_stranding_state() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["shell".into()],
+        confirmation: Some("confirm".into()),
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert_eq!(app.mode, Mode::Confirm);
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    assert!(app.pending.is_none());
+    assert!(!app.pvc.shell_pending);
+    assert!(app.pvc.mount.is_none());
+}
+
+#[tokio::test]
+async fn pvc_clean_is_a_mutation_and_is_gated_like_one() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.readonly = true;
+    palette(&mut app, "pvc-clean");
+    assert_ne!(app.mode, Mode::Confirm);
+    assert!(app.flash.contains("read-only"), "{}", app.flash);
+
+    app.readonly = false;
+    palette(&mut app, "pvc-clean");
+    assert_eq!(app.mode, Mode::Confirm);
+    assert!(
+        app.confirm_label.contains("helper pod"),
+        "{}",
+        app.confirm_label
+    );
+    // The current namespace, not a hardcoded default.
+    assert!(
+        app.confirm_label.contains("default"),
+        "{}",
+        app.confirm_label
+    );
+
+    // An all-namespaces view sweeps all namespaces, or a helper leaked
+    // elsewhere would be invisible to the command meant to find it.
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.namespace.clear();
+    palette(&mut app, "pvc-clean");
+    assert!(
+        app.confirm_label.contains("all namespaces"),
+        "{}",
+        app.confirm_label
+    );
+}
+
+/// Run a palette command by typing it, the way a user would.
+fn palette(app: &mut App, command: &str) {
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in command.chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+}
+
+#[tokio::test]
+async fn a_namespace_guardrail_still_covers_a_cluster_wide_pvc_clean() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.guardrails = vec![crate::config::Guardrail {
+        namespaces: vec!["prod".into()],
+        actions: vec!["pvc-explore".into()],
+        deny: true,
+        reason: Some("prod volumes are hands-off".into()),
+        ..Default::default()
+    }];
+    // An all-namespaces sweep has no single namespace to match against, so
+    // without the all-namespaces scope the rule would simply be skipped.
+    app.namespace.clear();
+    palette(&mut app, "pvc-clean");
+    assert_ne!(app.mode, Mode::Confirm);
+    assert!(
+        app.flash.contains("prod volumes are hands-off"),
+        "{}",
+        app.flash
+    );
+}
+
+#[tokio::test]
+async fn pvc_is_still_the_kubectl_alias_for_the_resource() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.cluster.add_aliases(&std::collections::HashMap::from([(
+        "pvc".to_string(),
+        "persistentvolumeclaims".to_string(),
+    )]));
+    app.switch_kind("pods");
+    // A palette command outranks a kind, so `:pvc-explore` must not claim the
+    // bare `pvc` alias people already use to navigate.
+    palette(&mut app, "pvc");
+    assert_eq!(app.kind_plural, "persistentvolumeclaims");
+    assert_eq!(app.mode, Mode::Table);
+}
+
+#[tokio::test]
+async fn a_helper_pod_that_lands_after_a_generation_bump_is_not_stranded() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    let claim = current_claim(&app);
+    let run = app.pvc.run;
+    let context = app.cluster.context.clone();
+    let helper = crate::pvcexplore::Mount {
+        pod: "sofka-pvc-explore-xyz".into(),
+        container: "explore".into(),
+        path: "/pvc".into(),
+        read_only: false,
+        helper: true,
+    };
+    // Anything that restarts the watch (`:pulse`, `:ctx`, ctrl-r) bumps the
+    // generation while the helper pod is still coming up. The message must
+    // still reach the delete path, not the generic stale-message arm.
+    let stale = app.generation;
+    app.bump_generation();
+    let journal_before = app.journal.len();
+    app.handle_msg(Msg::PvcTarget {
+        generation: stale,
+        run,
+        namespace: "default".into(),
+        context,
+        claim,
+        result: Ok(Some(helper)),
+    });
+    assert!(!app.pvc.active);
+    assert_eq!(
+        app.journal.len(),
+        journal_before + 1,
+        "the abandoned helper pod was not deleted"
+    );
+    let logged = app.journal.lines().join("\n");
+    assert!(logged.contains("helper pod removed"), "{logged}");
+    assert!(logged.contains("sofka-pvc-explore-xyz"), "{logged}");
+}
+
+#[tokio::test]
+async fn a_helper_pod_from_another_cluster_is_left_alone() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    let claim = current_claim(&app);
+    let run = app.pvc.run;
+    let stale = app.generation;
+    app.bump_generation();
+    let journal_before = app.journal.len();
+    // A `:ctx` switch bumps the generation *and* swaps the client, so the pod
+    // name would resolve against the wrong cluster.
+    app.handle_msg(Msg::PvcTarget {
+        generation: stale,
+        run,
+        namespace: "default".into(),
+        context: "some-other-cluster".into(),
+        claim,
+        result: Ok(Some(crate::pvcexplore::Mount {
+            pod: "sofka-pvc-explore-xyz".into(),
+            container: "explore".into(),
+            path: "/pvc".into(),
+            read_only: false,
+            helper: true,
+        })),
+    });
+    assert_eq!(
+        app.journal.len(),
+        journal_before,
+        "deleted a pod against a cluster it was never created in"
+    );
+}
+
+#[tokio::test]
+async fn a_mismatched_typed_confirmation_does_not_strand_the_shell_state() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["shell".into()],
+        confirmation: Some("type-resource-name".into()),
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert_eq!(app.mode, Mode::Prompt);
+    // Enter on an empty prompt is the natural way to back out.
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(app.pending.is_none());
+    assert!(!app.pvc.shell_pending);
+    assert!(app.pvc.mount.is_none());
+}
+
+#[tokio::test]
+async fn a_failed_listing_steps_back_to_the_directory_it_came_from() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(&mut app, "/srv", vec![pvc_entry("logs", EntryKind::Dir, 0)]);
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    app.handle_msg(Msg::PvcListing {
+        generation: app.generation,
+        run: app.pvc.run,
+        path: "/srv/logs".into(),
+        result: Err("not a directory, or permission denied".into()),
+    });
+    // The entries on screen still belong to /srv, so the title must too.
+    assert_eq!(app.pvc.remote_path, "/srv");
+    assert_eq!(app.pvc.remote.len(), 1);
+    assert!(app.flash.contains("permission denied"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn a_block_volume_is_refused_before_anything_is_created() {
+    let (mut app, _rx) = test_app();
+    app.cluster
+        .register_kind("", "PersistentVolumeClaim", "persistentvolumeclaims", true);
+    app.switch_kind("persistentvolumeclaims");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+               "metadata": {"name": "raw", "namespace": "default"},
+               "spec": {"volumeMode": "Block"},
+               "status": {"phase": "Bound"}}),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash.contains("block volume"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn a_resolve_landing_after_the_user_moved_on_does_not_hijack_the_screen() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    // The resolve is slow; meanwhile the user opens the YAML view.
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    assert_eq!(app.mode, Mode::Detail);
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert_eq!(app.mode, Mode::Detail);
+    assert!(!app.pvc.active);
+}
+
+#[tokio::test]
+async fn a_superseded_resolve_never_opens_the_browser() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    let claim = current_claim(&app);
+    let stale = app.pvc.run;
+    app.handle_key(press(KeyCode::Char('x'))).unwrap(); // supersedes it
+    app.handle_msg(Msg::PvcTarget {
+        generation: app.generation,
+        run: stale,
+        namespace: "default".into(),
+        context: app.cluster.context.clone(),
+        claim,
+        result: Ok(Some(pvc_mount())),
+    });
+    assert!(!app.pvc.active);
+    assert!(app.pvc.mount.is_none());
+}
+
+#[tokio::test]
+async fn downloading_over_an_existing_local_file_asks_first() {
+    use crate::pvcexplore::EntryKind;
+    let dir = std::env::temp_dir().join(format!("sofka-pvc-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), b"old").unwrap();
+
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.pvc.local_path = dir.clone();
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("a.txt", EntryKind::File, 12)],
+    );
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+    assert!(
+        app.confirm_label.contains("Overwrite"),
+        "{}",
+        app.confirm_label
+    );
+    // Declining returns to the browser, not to the table underneath it.
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    assert_eq!(app.mode, Mode::PvcExplore);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn escaping_a_pvc_shell_dialog_with_the_palette_releases_its_pod() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["shell".into()],
+        confirmation: Some("confirm".into()),
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    resolve_pvc(
+        &mut app,
+        Ok(Some(crate::pvcexplore::Mount {
+            pod: "sofka-pvc-explore-xyz".into(),
+            container: "explore".into(),
+            path: "/pvc".into(),
+            read_only: false,
+            helper: true,
+        })),
+    );
+    assert_eq!(app.mode, Mode::Confirm);
+    // `:` is accepted from a confirm dialog and simply abandons the action —
+    // nothing else will ever run the suspend the pod was created for.
+    let journal_before = app.journal.len();
+    palette(&mut app, "pods");
+    assert!(!app.pvc.shell_pending);
+    assert!(app.pvc.mount.is_none());
+    assert!(app.pending.is_none());
+    assert_eq!(
+        app.journal.len(),
+        journal_before + 1,
+        "the abandoned helper pod was not deleted"
+    );
+}
+
+#[tokio::test]
+async fn a_background_message_that_takes_the_screen_leaves_the_browser() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert!(app.pvc.active);
+
+    // A describe requested before the browser opened finally lands. It takes
+    // the screen without a keystroke, so the key-path sweep never sees it.
+    let claim = app.claim_status("describing…");
+    app.handle_msg(Msg::Detail {
+        generation: app.generation,
+        claim,
+        title: "data — describe".into(),
+        lines: vec!["Name: data".into()],
+        warn: None,
+    });
+    assert_eq!(app.mode, Mode::Detail);
+    assert!(
+        !app.pvc.active,
+        "the browser was left drawing behind a document"
+    );
+}
+
+#[tokio::test]
+async fn only_the_browsers_own_dialog_draws_over_its_panes() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    // A dialog raised from somewhere else must not be drawn as though it were
+    // about the two panes.
+    app.confirm_return = Mode::Table;
+    assert!(!app.over_pvc_browser());
+    app.confirm_return = Mode::PvcExplore;
+    assert!(app.over_pvc_browser());
+}
+
+#[tokio::test]
+async fn pvc_explore_is_reachable_from_the_palette() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    palette(&mut app, "pvc-explore");
+    assert!(app.flash.contains("finding a pod"), "{}", app.flash);
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert_eq!(app.mode, Mode::PvcExplore);
+}
+
+#[tokio::test]
+async fn a_denied_shell_never_creates_a_helper_pod_to_be_refused_in() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["shell".into()],
+        deny: true,
+        reason: Some("prod is locked".into()),
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    // Nothing mounts the claim, so this would normally offer a helper pod —
+    // one that exists only to host a shell the guardrail is going to refuse.
+    resolve_pvc(&mut app, Ok(None));
+    assert_ne!(app.mode, Mode::Confirm, "offered a pod for a denied shell");
+    assert!(app.flash.contains("blocked by guardrail"), "{}", app.flash);
+    assert!(
+        app.journal.is_empty(),
+        "created something for a denied shell"
+    );
+}
+
+#[tokio::test]
+async fn browsing_still_offers_a_helper_pod_when_only_shells_are_denied() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["shell".into()],
+        deny: true,
+        ..Default::default()
+    }];
+    // Browsing is not shelling: the lookahead must not over-reach.
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(None));
+    assert_eq!(app.mode, Mode::Confirm);
+    assert!(
+        app.confirm_label.contains("Nothing mounts data"),
+        "{}",
+        app.confirm_label
+    );
+}
+
+#[tokio::test]
+async fn confirming_an_overwrite_downloads_rather_than_uploading() {
+    use crate::pvcexplore::EntryKind;
+    let dir = std::env::temp_dir().join(format!("sofka-pvc-dl-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), b"old").unwrap();
+
+    let (mut app, _rx) = app_with_pvc("Bound");
+    // Read-only mode must not change the answer: a download writes to the
+    // user's own disk, never to the cluster.
+    app.readonly = true;
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.pvc.local_path = dir.clone();
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("a.txt", EntryKind::File, 12)],
+    );
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+
+    // Accepting it must run the copy in the direction that was asked for.
+    // `ConfirmAction::Transfer` used to be upload-only, so confirming a
+    // download here wrote the local file *into the cluster* — past read-only
+    // mode and both upload guardrails.
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    let dest = dir.join("a.txt");
+    assert!(
+        app.flash
+            .contains(&format!("api-0:/srv/a.txt → {}", dest.display())),
+        "{}",
+        app.flash
+    );
+    assert!(!app.journal.lines().join("\n").contains("cp upload"));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn names_kubectl_cp_cannot_address_are_refused_with_a_reason() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+
+    // `kubectl cp` splits each argument on the first ':' to separate pod from
+    // path, so an ISO-8601 timestamped log — which is what volumes are full of
+    // — cannot be addressed however it is quoted.
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("2026-01-01T00:00:00Z.log", EntryKind::File, 12)],
+    );
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert_ne!(app.mode, Mode::Confirm);
+    assert!(
+        app.flash.contains("kubectl cp cannot address"),
+        "{}",
+        app.flash
+    );
+
+    // A name that lost bytes to lossy UTF-8 decoding names nothing at all.
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("caf\u{FFFD}.txt", EntryKind::File, 12)],
+    );
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert!(app.flash.contains("not valid UTF-8"), "{}", app.flash);
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(app.flash.contains("not valid UTF-8"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn a_failed_listing_never_mislabels_the_entries_on_screen() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![
+            pvc_entry("a", EntryKind::Dir, 0),
+            pvc_entry("b", EntryKind::Dir, 0),
+        ],
+    );
+    // Two descents in flight: the first never lands, the second fails. The
+    // title must return to the directory whose entries are actually shown,
+    // not to the one the first descent was heading for.
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    app.pvc.remote_state.select(Some(1));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    app.handle_msg(Msg::PvcListing {
+        generation: app.generation,
+        run: app.pvc.run,
+        path: "/srv/b".into(),
+        result: Err("not a directory, or permission denied".into()),
+    });
+    assert_eq!(app.pvc.remote_path, "/srv");
+    assert_eq!(app.pvc.remote.len(), 2);
+}
+
+#[tokio::test]
+async fn a_transfer_guardrail_on_pods_still_covers_a_pvc_upload() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    // The rule an operator already wrote to stop `t` uploads into prod pods.
+    // Reaching the same pod through a claim it mounts must not defeat it.
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["transfer".into()],
+        resources: vec!["pods".into()],
+        deny: true,
+        reason: Some("no uploads into prod".into()),
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.pvc.local = vec![pvc_entry("notes.txt", EntryKind::File, 3)];
+    app.pvc.local_state.select(Some(0));
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert!(app.flash.contains("no uploads into prod"), "{}", app.flash);
+    assert!(app.status_claim.is_none(), "the copy started anyway");
+}
+
+#[tokio::test]
+async fn refreshing_keeps_the_cursor_where_it_was() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    let entries = || {
+        vec![
+            pvc_entry("a.txt", EntryKind::File, 1),
+            pvc_entry("b.txt", EntryKind::File, 2),
+            pvc_entry("c.txt", EntryKind::File, 3),
+        ]
+    };
+    list_pvc(&mut app, "/srv", entries());
+    app.pvc.remote_state.select(Some(2));
+
+    // `r` — and the reload after every completed copy — must not send the
+    // cursor back to the top; in a real directory that means re-finding your
+    // place after every single file.
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    list_pvc(&mut app, "/srv", entries());
+    assert_eq!(app.pvc.remote_state.selected(), Some(2));
+    assert_eq!(
+        app.pvc.selected_remote().map(|e| e.name.as_str()),
+        Some("c.txt")
+    );
+
+    // An entry that has gone away falls back to the top rather than to a
+    // stale index.
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("a.txt", EntryKind::File, 1)],
+    );
+    assert_eq!(app.pvc.remote_state.selected(), Some(0));
+
+    // Stepping into a *new* directory starts at the top, even though the
+    // entry it lands on has the same name as the one the cursor was on.
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![
+            pvc_entry("logs", EntryKind::Dir, 0),
+            pvc_entry("a.txt", EntryKind::File, 1),
+        ],
+    );
+    app.pvc.remote_state.select(Some(0));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.pvc.remote_path, "/srv/logs", "did not descend");
+    list_pvc(
+        &mut app,
+        "/srv/logs",
+        vec![
+            pvc_entry("x.log", EntryKind::File, 1),
+            pvc_entry("logs", EntryKind::File, 1),
+        ],
+    );
+    // Row 0, not the row named "logs": a new directory starts at the top even
+    // when the name the cursor was on happens to exist there too.
+    assert_eq!(app.pvc.remote_state.selected(), Some(0));
+    assert_eq!(
+        app.pvc.selected_remote().map(|e| e.name.as_str()),
+        Some("x.log")
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn a_failed_local_navigation_keeps_both_the_path_and_the_cursor() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("sofka-local-nav-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("locked")).unwrap();
+    std::fs::write(dir.join("a.txt"), b"x").unwrap();
+
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.pvc.local_path = dir.clone();
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    // Put the cursor on a directory that is about to become unreadable.
+    let idx = app
+        .pvc
+        .local
+        .iter()
+        .position(|e| e.name == "locked")
+        .expect("the directory is listed");
+    app.pvc.local_state.select(Some(idx));
+    // Still there, just not readable — so the rollback listing does contain
+    // the row the cursor was on.
+    std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(dir.join("locked")).is_ok() {
+        // Running as root (a devcontainer, a root CI image): the directory is
+        // readable anyway, so there is no failed navigation to assert on.
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o755)).ok();
+        std::fs::remove_dir_all(&dir).ok();
+        return;
+    }
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    // Back where it started, cursor included — the rollback re-read would
+    // otherwise land on row 0.
+    assert_eq!(app.pvc.local_path, dir);
+    assert_eq!(
+        app.pvc.selected_local().map(|e| e.name.as_str()),
+        Some("locked"),
+        "the rollback lost the cursor"
+    );
+
+    std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o755)).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn a_failed_first_listing_leaves_the_title_on_the_mount_root() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    // Nothing has ever listed successfully. Restoring "the previously shown
+    // directory" would blank the path — and `cd -- ""` succeeds in every
+    // shell, so `r` would then list the container's working directory under
+    // an empty title.
+    app.handle_msg(Msg::PvcListing {
+        generation: app.generation,
+        run: app.pvc.run,
+        path: "/srv".into(),
+        result: Err("permission denied".into()),
+    });
+    assert_eq!(app.pvc.remote_path, "/srv");
+    assert!(!app.pvc.loading);
+}
+
+#[tokio::test]
+async fn a_watch_restart_does_not_leave_the_pane_loading_forever() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert!(app.pvc.loading);
+    let stale = app.generation;
+    app.bump_generation();
+    app.handle_msg(Msg::PvcListing {
+        generation: stale,
+        run: app.pvc.run,
+        path: "/srv".into(),
+        result: Ok((listing(vec![]), None)),
+    });
+    assert!(!app.pvc.loading, "the pane would say loading… until `r`");
+}
+
+#[tokio::test]
+async fn a_resolve_landing_over_a_dialog_does_not_discard_the_decision() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    // A confirmation the user has not answered yet.
+    app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert_eq!(
+        app.mode,
+        Mode::Confirm,
+        "the browser took over a live dialog"
+    );
+    assert!(app.confirm_action.is_some());
+    assert!(!app.pvc.active);
+}
+
+#[tokio::test]
+async fn an_unreadable_volume_root_says_so_instead_of_reading_empty() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.handle_msg(Msg::PvcListing {
+        generation: app.generation,
+        run: app.pvc.run,
+        path: "/srv".into(),
+        result: Err("ls: cannot open directory '.': Permission denied".into()),
+    });
+    // The flash expires after eight seconds; the pane is what the user is
+    // still looking at after that, and "empty" is the one thing an unreadable
+    // volume must never claim.
+    assert_eq!(
+        app.pvc.remote_error.as_deref(),
+        Some("ls: cannot open directory '.': Permission denied")
+    );
+    assert!(app.pvc.remote.is_empty());
+}
+
+#[tokio::test]
+async fn a_later_good_listing_clears_the_error() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.handle_msg(Msg::PvcListing {
+        generation: app.generation,
+        run: app.pvc.run,
+        path: "/srv".into(),
+        result: Err("permission denied".into()),
+    });
+    assert!(app.pvc.remote_error.is_some());
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("a.txt", EntryKind::File, 1)],
+    );
+    assert!(app.pvc.remote_error.is_none());
+}
+
+#[tokio::test]
+async fn stepping_out_of_a_directory_lands_back_on_it() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    let parent = || {
+        vec![
+            pvc_entry("archive", EntryKind::Dir, 0),
+            pvc_entry("logs", EntryKind::Dir, 0),
+            pvc_entry("uploads", EntryKind::Dir, 0),
+        ]
+    };
+    list_pvc(&mut app, "/srv", parent());
+    app.pvc.remote_state.select(Some(2)); // "uploads"
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    list_pvc(&mut app, "/srv/uploads", vec![]);
+
+    // `⌫` returns to the parent — and to the row you came out of, not row 0.
+    app.handle_key(press(KeyCode::Backspace)).unwrap();
+    list_pvc(&mut app, "/srv", parent());
+    assert_eq!(app.pvc.remote_path, "/srv");
+    assert_eq!(
+        app.pvc.selected_remote().map(|e| e.name.as_str()),
+        Some("uploads")
+    );
+}
+
+#[tokio::test]
+async fn an_action_taken_mid_listing_targets_the_directory_on_screen() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![
+            pvc_entry("logs", EntryKind::Dir, 0),
+            pvc_entry("a.txt", EntryKind::File, 12),
+        ],
+    );
+    // Step into `logs` and act before the listing lands. The pane still shows
+    // /srv, so /srv is what the action must use — targeting the directory
+    // being navigated to would copy from, and write into, a directory the
+    // user has never seen.
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(app.pvc.loading);
+    app.pvc.remote_state.select(Some(1)); // a.txt
+
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert!(app.flash.contains("api-0:/srv/a.txt"), "{}", app.flash);
+    assert!(!app.flash.contains("/srv/logs/"), "{}", app.flash);
+
+    // Same for a shell…
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    let Some(Suspend::Shell(argv)) = app.pending.take() else {
+        panic!("no shell queued");
+    };
+    assert_eq!(argv.last().unwrap(), "/srv");
+}
+
+#[tokio::test]
+async fn an_upload_mid_listing_writes_where_the_user_is_looking() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(&mut app, "/srv", vec![pvc_entry("logs", EntryKind::Dir, 0)]);
+    app.pvc.local = vec![pvc_entry("notes.txt", EntryKind::File, 3)];
+    app.pvc.local_state.select(Some(0));
+
+    app.handle_key(press(KeyCode::Enter)).unwrap(); // into logs, still loading
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    // With no guardrail this runs immediately, with no dialog naming the
+    // destination — so the destination had better be the visible one.
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert!(app.flash.contains("api-0:/srv/notes.txt"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn a_failed_step_out_does_not_steer_the_next_listing() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    let parent = || {
+        vec![
+            pvc_entry("a.txt", EntryKind::File, 1),
+            pvc_entry("logs", EntryKind::Dir, 0),
+        ]
+    };
+    list_pvc(&mut app, "/srv", parent());
+    app.pvc.remote_state.select(Some(1));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    list_pvc(
+        &mut app,
+        "/srv/logs",
+        vec![pvc_entry("x.log", EntryKind::File, 1)],
+    );
+
+    // Step out — which asks the next listing to land on "logs" — and have that
+    // listing fail. The request is over, so its hint must die with it.
+    app.handle_key(press(KeyCode::Backspace)).unwrap();
+    app.handle_msg(Msg::PvcListing {
+        generation: app.generation,
+        run: app.pvc.run,
+        path: "/srv".into(),
+        result: Err("permission denied".into()),
+    });
+    // Now an ordinary refresh of the directory we never left.
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    list_pvc(
+        &mut app,
+        "/srv/logs",
+        vec![pvc_entry("x.log", EntryKind::File, 1)],
+    );
+    assert_eq!(app.pvc.remote_path, "/srv/logs");
+    assert_eq!(
+        app.pvc.selected_remote().map(|e| e.name.as_str()),
+        Some("x.log"),
+        "a stale step-out hint steered an unrelated listing"
+    );
+    // …and a failed step-out must not label the directory on screen unreadable.
+    assert!(app.pvc.remote_error.is_none());
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn the_local_pane_steps_out_onto_the_directory_it_left() {
+    let dir = std::env::temp_dir().join(format!("sofka-local-up-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("work")).unwrap();
+    std::fs::create_dir_all(dir.join("zzz")).unwrap();
+    // A name shared by parent and child: reselecting "the child's cursor" in
+    // the parent would land here instead of on "work".
+    std::fs::write(dir.join("notes.md"), b"x").unwrap();
+    std::fs::write(dir.join("work/notes.md"), b"x").unwrap();
+
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.pvc.local_path = dir.join("work");
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert_eq!(
+        app.pvc.selected_local().map(|e| e.name.as_str()),
+        Some("notes.md")
+    );
+
+    app.handle_key(press(KeyCode::Backspace)).unwrap();
+    assert_eq!(app.pvc.local_path, dir);
+    assert_eq!(
+        app.pvc.selected_local().map(|e| e.name.as_str()),
+        Some("work"),
+        "stepping out must land on the directory left, not on a name coincidence"
+    );
+
+    // And stepping back in starts at the top, not on a name coincidence.
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.pvc.local_path, dir.join("work"));
+    assert_eq!(app.pvc.local_state.selected(), Some(0));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn a_failed_local_navigation_says_why() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("sofka-local-why-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("locked")).unwrap();
+
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.pvc.local_path = dir.clone();
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(dir.join("locked")).is_ok() {
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o755)).ok();
+        std::fs::remove_dir_all(&dir).ok();
+        return; // running as root: nothing fails, nothing to report
+    }
+
+    // The rollback re-read succeeds and clears the error, so without carrying
+    // the reason across it the keystroke is a silent no-op — while the remote
+    // pane flashes on the identical failure.
+    app.flash.clear();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(
+        app.flash.contains("locked"),
+        "silent no-op: {:?}",
+        app.flash
+    );
+    assert!(app.flash_err);
+    assert_eq!(app.pvc.local_path, dir);
+
+    std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o755)).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn a_failed_step_out_on_the_local_pane_says_why_too() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("sofka-local-up-why-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("child")).unwrap();
+
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.pvc.local_path = dir.join("child");
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    // Traversable but not readable: `⌫` into it fails where `cd` would not.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o111)).unwrap();
+    if std::fs::read_dir(&dir).is_ok() {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).ok();
+        std::fs::remove_dir_all(&dir).ok();
+        return; // running as root
+    }
+
+    app.flash.clear();
+    app.handle_key(press(KeyCode::Backspace)).unwrap();
+    assert!(app.flash_err, "stepping out failed silently");
+    assert!(!app.flash.is_empty(), "stepping out failed silently");
+    assert_eq!(app.pvc.local_path, dir.join("child"));
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+async fn drain_api_case(
+    pods: serde_json::Value,
+    eviction_code: u16,
+    pod_missing: bool,
+) -> (String, bool, Vec<serde_json::Value>) {
+    use http_body_util::BodyExt;
+    let (mut app, mut rx) = test_app();
+    app.switch_kind("nodes");
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Node", "metadata":{"name":"node-a"}}),
+    );
+    app.table_state.select(Some(0));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let seen = seen.clone();
+            let pods = pods.clone();
+            async move {
+                let method = request.method().to_string();
+                let path = request.uri().path().to_owned();
+                let body = request.into_body().collect().await.unwrap().to_bytes();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or(json!(null));
+                seen.lock()
+                    .unwrap()
+                    .push(json!({"method":method,"path":path,"body":body}));
+                let (code, response) = match (method.as_str(), path.as_str()) {
+                    ("PATCH", "/api/v1/nodes/node-a") => (
+                        200,
+                        json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"node-a"}}),
+                    ),
+                    ("GET", "/api/v1/pods") => (
+                        200,
+                        json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":pods}),
+                    ),
+                    ("POST", "/api/v1/namespaces/default/pods/web/eviction") => (
+                        eviction_code,
+                        json!({"apiVersion":"v1","kind":"Status","code":eviction_code,"status":if eviction_code < 300 {"Success"} else {"Failure"},"reason":"NotFound","message":"mock eviction response", "details":if pod_missing { json!({"kind":"pods","name":"web"}) } else {json!({})}}),
+                    ),
+                    _ => panic!("unexpected drain request: {method} {path}"),
+                };
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(code)
+                        .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                            response.to_string(),
+                        )))
+                        .unwrap(),
+                )
+            }
+        }),
+        "default",
+    );
+    app.handle_key(press(KeyCode::Char('D'))).unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let (message, err) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(Msg::Flash { message, err, .. }) = rx.recv().await
+                && message.starts_with("drain")
+            {
+                break (message, err);
+            }
+        }
+    })
+    .await
+    .expect("drain did not finish");
+    let captured = requests.lock().unwrap().clone();
+    (message, err, captured)
+}
+
+fn drain_managed_pod() -> serde_json::Value {
+    json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"web","namespace":"default","uid":"original-uid","ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"web","uid":"controller-uid","controller":true}]},"spec":{"nodeName":"node-a","containers":[{"name":"app","image":"test"}]},"status":{"phase":"Running"}})
+}
+
+#[tokio::test]
+async fn drain_key_pins_uid_and_never_falls_back_to_delete() {
+    for (code, missing, expected_error) in [
+        (201, false, false),
+        (404, true, false),
+        (404, false, true),
+        (405, false, true),
+        (409, false, true),
+        (429, false, true),
+    ] {
+        let (_, err, requests) = drain_api_case(json!([drain_managed_pod()]), code, missing).await;
+        assert_eq!(
+            err, expected_error,
+            "eviction code {code}, missing {missing}"
+        );
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2]["method"], "POST");
+        assert_eq!(
+            requests[2]["body"]["deleteOptions"]["preconditions"]["uid"],
+            "original-uid"
+        );
+    }
+}
+
+#[tokio::test]
+async fn drain_key_blocks_unmanaged_pods_before_any_evictions() {
+    for controller in [json!(null), json!(false)] {
+        let mut unsafe_pod = drain_managed_pod();
+        unsafe_pod["metadata"]["name"] = json!("standalone");
+        unsafe_pod["metadata"]["ownerReferences"][0]["controller"] = controller;
+        let (message, err, requests) =
+            drain_api_case(json!([drain_managed_pod(), unsafe_pod]), 201, false).await;
+        assert!(err);
+        assert!(
+            message.contains("default/standalone: pod has no controller"),
+            "{message}"
+        );
+        assert_eq!(requests.len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn drain_key_blocks_emptydir_before_any_evictions() {
+    let mut unsafe_pod = drain_managed_pod();
+    unsafe_pod["spec"]["volumes"] = json!([{"name":"data","emptyDir":{}}]);
+    let (message, err, requests) =
+        drain_api_case(json!([drain_managed_pod(), unsafe_pod]), 201, false).await;
+    assert!(err);
+    assert!(message.contains("emptyDir data"), "{message}");
+    assert_eq!(requests.len(), 2);
+}
+
+#[tokio::test]
+async fn drain_key_blocks_missing_uid_before_any_evictions() {
+    let mut unsafe_pod = drain_managed_pod();
+    unsafe_pod["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("uid");
+    let (message, err, requests) = drain_api_case(json!([unsafe_pod]), 201, false).await;
+    assert!(err);
+    assert!(message.contains("UID is missing"), "{message}");
+    assert_eq!(requests.len(), 2);
+}
+
+#[tokio::test]
+async fn workload_table_reports_rollout_generation_and_desired_readiness() {
+    for (plural, kind, spec, status, generation, expected_ready, expected_status) in [
+        (
+            "deployments",
+            "Deployment",
+            json!({"replicas": 3}),
+            json!({"replicas": 4, "readyReplicas": 4, "updatedReplicas": 3, "observedGeneration": 2}),
+            2,
+            "4/3",
+            "Progressing",
+        ),
+        (
+            "deployments",
+            "Deployment",
+            json!({}),
+            json!({"replicas": 1, "readyReplicas": 1, "updatedReplicas": 1, "observedGeneration": 2}),
+            2,
+            "1/1",
+            "Ready",
+        ),
+        (
+            "deployments",
+            "Deployment",
+            json!({"replicas": 0}),
+            json!({"observedGeneration": 1}),
+            2,
+            "0/0",
+            "Progressing",
+        ),
+        (
+            "statefulsets",
+            "StatefulSet",
+            json!({"replicas": 3, "ordinals": {"start": 5}, "updateStrategy": {"rollingUpdate": {"partition": 1}}}),
+            json!({"replicas": 3, "readyReplicas": 3, "updatedReplicas": 2, "observedGeneration": 2}),
+            2,
+            "3/3",
+            "Ready",
+        ),
+        (
+            "deployments",
+            "Deployment",
+            json!({"replicas": 3}),
+            json!({"replicas": 4, "readyReplicas": 3, "updatedReplicas": 1, "observedGeneration": 2}),
+            2,
+            "3/3",
+            "Progressing",
+        ),
+        (
+            "deployments",
+            "Deployment",
+            json!({"replicas": 3}),
+            json!({"replicas": 3, "readyReplicas": 3, "updatedReplicas": 3, "observedGeneration": 1}),
+            2,
+            "3/3",
+            "Progressing",
+        ),
+        (
+            "deployments",
+            "Deployment",
+            json!({"replicas": 3}),
+            json!({"replicas": 2, "readyReplicas": 2, "updatedReplicas": 2, "observedGeneration": 2}),
+            2,
+            "2/3",
+            "Progressing",
+        ),
+        (
+            "statefulsets",
+            "StatefulSet",
+            json!({"replicas": 3}),
+            json!({"replicas": 3, "readyReplicas": 3, "updatedReplicas": 1, "observedGeneration": 2}),
+            2,
+            "3/3",
+            "Progressing",
+        ),
+        (
+            "statefulsets",
+            "StatefulSet",
+            json!({"replicas": 3, "updateStrategy": {"rollingUpdate": {"partition": 2}}}),
+            json!({"replicas": 3, "readyReplicas": 3, "updatedReplicas": 1, "observedGeneration": 2}),
+            2,
+            "3/3",
+            "Ready",
+        ),
+        (
+            "statefulsets",
+            "StatefulSet",
+            json!({"replicas": 3, "updateStrategy": {"type": "OnDelete"}}),
+            json!({"replicas": 3, "readyReplicas": 3, "updatedReplicas": 0, "observedGeneration": 2}),
+            2,
+            "3/3",
+            "Ready",
+        ),
+        (
+            "daemonsets",
+            "DaemonSet",
+            json!({}),
+            json!({"desiredNumberScheduled": 3, "currentNumberScheduled": 3, "numberReady": 3, "updatedNumberScheduled": 1, "observedGeneration": 2}),
+            2,
+            "3",
+            "Progressing",
+        ),
+        (
+            "daemonsets",
+            "DaemonSet",
+            json!({"updateStrategy": {"type": "OnDelete"}}),
+            json!({"desiredNumberScheduled": 3, "currentNumberScheduled": 3, "numberReady": 3, "updatedNumberScheduled": 1, "observedGeneration": 2}),
+            2,
+            "3",
+            "Ready",
+        ),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.cluster.register_kind("apps", kind, plural, true);
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for ch in plural.chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        apply(
+            &mut app,
+            json!({"apiVersion": "apps/v1", "kind": kind, "metadata": {"name": "web", "namespace": "default", "generation": generation, "resourceVersion": format!("{spec}{status}")}, "spec": spec, "status": status}),
+        );
+        let headers = app.display_headers().to_vec();
+        let rows = app.rows();
+        app.ensure_table_cell_cache(&rows);
+        let cache = app.table_cell_cache();
+        let (cells, _) = cache.get(&row_key(rows[0])).unwrap();
+        assert_eq!(
+            cells[headers.iter().position(|h| h == "READY").unwrap()],
+            expected_ready,
+            "{kind}"
+        );
+        assert_eq!(
+            cells[headers.iter().position(|h| h == "STATUS").unwrap()],
+            expected_status,
+            "{kind}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn workload_table_keeps_active_rollouts_progressing_when_unavailable() {
+    for (current, ready, updated, stalled, expected) in [
+        (3, 1, 1, false, "Progressing"),
+        (4, 2, 3, false, "Progressing"),
+        (2, 1, 2, false, "Progressing"),
+        (3, 0, 1, false, "Unavailable"),
+        (3, 2, 3, false, "Unavailable"),
+        (3, 3, 3, false, "Unavailable"),
+        (3, 1, 1, true, "Stalled"),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.cluster
+            .register_kind("apps", "Deployment", "deployments", true);
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for ch in "deployments".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        let mut conditions = vec![json!({"type": "Available", "status": "False"})];
+        if stalled {
+            conditions.push(json!({"type": "Progressing", "status": "False", "reason": "ProgressDeadlineExceeded"}));
+        }
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "apps/v1", "kind": "Deployment",
+                "metadata": {"name": "web", "namespace": "default", "generation": 2},
+                "spec": {"replicas": 3},
+                "status": {
+                    "observedGeneration": 2, "replicas": current,
+                    "readyReplicas": ready, "updatedReplicas": updated,
+                    "conditions": conditions,
+                },
+            }),
+        );
+        let headers = app.display_headers().to_vec();
+        let rows = app.rows();
+        app.ensure_table_cell_cache(&rows);
+        let cache = app.table_cell_cache();
+        let (cells, _) = cache.get(&row_key(rows[0])).unwrap();
+        assert_eq!(
+            cells[headers.iter().position(|h| h == "STATUS").unwrap()],
+            expected,
+            "current={current}, ready={ready}, updated={updated}, stalled={stalled}"
+        );
+    }
+}
+
+fn health_test_pod(name: &str) -> Value {
+    json!({"apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": name, "namespace": "default", "uid": name, "resourceVersion": "1"},
+        "spec": {"containers": [{"name": "app"}]},
+        "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}],
+            "containerStatuses": [{"name": "app", "ready": true, "restartCount": 0,
+                "state": {"running": {}}}]}})
+}
+
+fn health_row_color(app: &mut App, name: &str, text: &str) -> ratatui::style::Color {
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 24)).unwrap();
+    terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    for y in 0..buffer.area.height {
+        let line: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect();
+        if line.contains(name)
+            && let Some(offset) = line.find(text)
+        {
+            let x = line[..offset].chars().count() as u16;
+            return buffer[(x, y)].fg;
+        }
+    }
+    panic!("missing {text} in row {name}");
+}
+
+#[tokio::test]
+async fn pod_init_states_and_restarts_are_visible_through_filter_keys() {
+    for (state, status) in [
+        (json!({"running": {}}), "Init:0/1"),
+        (
+            json!({"waiting": {"reason": "CrashLoopBackOff"}}),
+            "Init:CrashLoopBackOff",
+        ),
+        (
+            json!({"terminated": {"reason": "Error", "exitCode": 1}}),
+            "Init:Error",
+        ),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("pods");
+        let mut pod = health_test_pod("init-target");
+        pod["spec"]["initContainers"] = json!([{"name": "init"}]);
+        pod["status"]["phase"] = json!("Pending");
+        pod["status"]["conditions"] = json!([]);
+        pod["status"]["containerStatuses"][0] = json!({"name": "app", "ready": false,
+            "restartCount": 0, "state": {"waiting": {"reason": "PodInitializing"}}});
+        pod["status"]["initContainerStatuses"] = json!([{"name": "init", "ready": false,
+            "restartCount": 7, "state": state}]);
+        apply(&mut app, pod);
+        apply(&mut app, health_test_pod("healthy"));
+        type_filter(&mut app, &format!("status={status} restarts>=7"));
+        assert_eq!(row_names(&app), ["init-target"]);
+        let (headers, rows) = app.snapshot_table();
+        let cell = |header| &rows[0][headers.iter().position(|h| h == header).unwrap()];
+        assert_eq!(cell("READY"), "0/1");
+        assert_eq!(cell("STATUS"), status);
+        assert_eq!(cell("RESTARTS"), "7");
+    }
+}
+
+#[tokio::test]
+async fn pod_specific_reasons_are_visible_through_filter_keys() {
+    for (status, expected) in [
+        (json!({"phase": "Failed", "reason": "Evicted"}), "Evicted"),
+        (
+            json!({"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "False",
+            "reason": "SchedulingGated"}]}),
+            "SchedulingGated",
+        ),
+        (
+            json!({"phase": "Running", "containerStatuses": [{"state": {"terminated": {"exitCode": 42}}}]}),
+            "ExitCode:42",
+        ),
+        (
+            json!({"phase": "Running", "containerStatuses": [{"state": {"terminated": {"reason": "", "signal": 9, "exitCode": 137}}}]}),
+            "Signal:9",
+        ),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("pods");
+        let mut pod = health_test_pod("reason-target");
+        pod["spec"]["initContainers"] = json!([{"name": "init"}]);
+        pod["status"] = status;
+        apply(&mut app, pod);
+        apply(&mut app, health_test_pod("healthy"));
+        type_filter(&mut app, &format!("status={expected}"));
+        assert_eq!(row_names(&app), ["reason-target"]);
+        let (headers, rows) = app.snapshot_table();
+        assert_eq!(
+            rows[0][headers.iter().position(|h| h == "STATUS").unwrap()],
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn readiness_gate_colors_follow_watch_updates_after_faults_key() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let mut pod = health_test_pod("a-gated");
+    pod["spec"]["readinessGates"] = json!([{"conditionType": "example.com/ready"}]);
+    pod["status"]["conditions"] = json!([{"type": "Ready", "status": "False"}]);
+    apply(&mut app, pod.clone());
+    apply(&mut app, health_test_pod("z-selected"));
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(row_names(&app), ["a-gated"]);
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    app.handle_key(press(KeyCode::End)).unwrap();
+    assert_eq!(
+        health_row_color(&mut app, "a-gated", "Running"),
+        crate::theme::yellow()
+    );
+    assert_eq!(
+        health_row_color(&mut app, "a-gated", "a-gated"),
+        crate::theme::peach()
+    );
+    pod["metadata"]["resourceVersion"] = json!("2");
+    pod["status"]["conditions"] = json!([
+        {"type": "Ready", "status": "True"}, {"type": "example.com/ready", "status": "True"}]);
+    apply(&mut app, pod.clone());
+    assert_eq!(
+        health_row_color(&mut app, "a-gated", "Running"),
+        crate::theme::green()
+    );
+    pod["metadata"]["resourceVersion"] = json!("3");
+    pod["status"]["conditions"][1]["status"] = json!("Unknown");
+    apply(&mut app, pod);
+    assert_eq!(
+        health_row_color(&mut app, "a-gated", "Running"),
+        crate::theme::yellow()
+    );
+}
+
+#[tokio::test]
+async fn specific_failure_colors_render_after_navigation_keys() {
+    for reason in [
+        "CreateContainerConfigError",
+        "InvalidImageName",
+        "ContainerCannotRun",
+        "DeadlineExceeded",
+    ] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("pods");
+        let mut pod = health_test_pod("a-failure");
+        pod["status"]["containerStatuses"][0]["state"] = json!({"waiting": {"reason": reason}});
+        apply(&mut app, pod);
+        apply(&mut app, health_test_pod("z-selected"));
+        app.handle_key(press(KeyCode::End)).unwrap();
+        assert_eq!(
+            health_row_color(&mut app, "a-failure", reason),
+            crate::theme::red()
+        );
+        assert_eq!(
+            health_row_color(&mut app, "a-failure", "a-failure"),
+            crate::theme::red()
+        );
+    }
+    let (mut app, _rx) = test_app();
+    app.cluster
+        .register_kind("", "PersistentVolumeClaim", "persistentvolumeclaims", true);
+    app.switch_kind("persistentvolumeclaims");
+    for (name, phase) in [("a-lost", "Lost"), ("z-selected", "Bound")] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+            "metadata": {"name": name, "namespace": "default"}, "status": {"phase": phase}}),
+        );
+    }
+    app.handle_key(press(KeyCode::End)).unwrap();
+    assert_eq!(
+        health_row_color(&mut app, "a-lost", "Lost"),
+        crate::theme::red()
+    );
+    assert_eq!(
+        health_row_color(&mut app, "a-lost", "a-lost"),
+        crate::theme::red()
+    );
+}
+
+#[tokio::test]
+async fn timeline_key_shows_init_and_sidecar_restart_updates() {
+    for sidecar in [false, true] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("pods");
+        let mut pod = health_test_pod("restart-target");
+        pod["spec"]["initContainers"] = json!([{"name": "init"}]);
+        if sidecar {
+            pod["spec"]["initContainers"][0]["restartPolicy"] = json!("Always");
+        } else {
+            pod["status"]["phase"] = json!("Pending");
+        }
+        pod["status"]["initContainerStatuses"] = json!([{"name": "init", "restartCount": 2,
+            "state": {"running": {}}}]);
+        apply(&mut app, pod.clone());
+        pod["metadata"]["resourceVersion"] = json!("2");
+        pod["status"]["initContainerStatuses"][0]["restartCount"] = json!(3);
+        apply(&mut app, pod);
+        app.handle_key(press(KeyCode::Home)).unwrap();
+        app.handle_key(press(KeyCode::Char('T'))).unwrap();
+        assert_eq!(app.mode, Mode::Timeline);
+        let (plural, key) = app.timeline_target.as_ref().unwrap();
+        let entries = app.timeline.entries(plural, key).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.level == crate::timeline::Level::Warn
+                    && entry.text == "container restart (2 → 3 total)")
+        );
+    }
+}
+#[tokio::test]
+async fn sidecar_failures_remain_visible_after_initialization() {
+    for (app_state, phase, expected) in [
+        (json!({"running": {}}), "Running", "Init:CrashLoopBackOff"),
+        (
+            json!({"waiting": {"reason": "ImagePullBackOff"}}),
+            "Pending",
+            "ImagePullBackOff",
+        ),
+        (
+            json!({"terminated": {"reason": "Error", "exitCode": 1}}),
+            "Failed",
+            "Error",
+        ),
+        (
+            json!({"terminated": {"reason": "Completed", "exitCode": 0}}),
+            "Succeeded",
+            "Succeeded",
+        ),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("pods");
+        let mut pod = health_test_pod("a-sidecar");
+        pod["spec"]["initContainers"] = json!([
+            {"name": "setup"}, {"name": "proxy", "restartPolicy": "Always"}
+        ]);
+        pod["status"]["phase"] = json!(phase);
+        pod["status"]["conditions"] = json!([
+            {"type": "Initialized", "status": "True"},
+            {"type": "Ready", "status": "False"}
+        ]);
+        pod["status"]["containerStatuses"][0]["ready"] = json!(app_state.get("running").is_some());
+        pod["status"]["containerStatuses"][0]["state"] = app_state;
+        pod["status"]["initContainerStatuses"] = json!([
+            {"name": "setup", "ready": true, "restartCount": 5,
+             "state": {"terminated": {"reason": "Completed", "exitCode": 0}}},
+            {"name": "proxy", "ready": false, "started": false, "restartCount": 3,
+             "state": {"waiting": {"reason": "CrashLoopBackOff"}}}
+        ]);
+        apply(&mut app, pod);
+        apply(&mut app, health_test_pod("z-selected"));
+        type_filter(&mut app, &format!("status={expected} restarts=3"));
+        assert_eq!(row_names(&app), ["a-sidecar"], "{expected}");
+        let (headers, rows) = app.snapshot_table();
+        if expected == "Init:CrashLoopBackOff" {
+            assert_eq!(
+                rows[0][headers.iter().position(|h| h == "READY").unwrap()],
+                "1/2"
+            );
+        }
+        assert_eq!(
+            rows[0][headers.iter().position(|h| h == "RESTARTS").unwrap()],
+            "3"
+        );
+        retype_filter(&mut app, "");
+        app.handle_key(press(KeyCode::End)).unwrap();
+        let color = if expected == "Succeeded" {
+            crate::theme::overlay0()
+        } else {
+            crate::theme::red()
+        };
+        assert_eq!(health_row_color(&mut app, "a-sidecar", expected), color);
+        assert_eq!(health_row_color(&mut app, "a-sidecar", "a-sidecar"), color);
+    }
+}
+
+fn explain_selected_with_pure_evidence(app: &mut App) {
+    app.handle_key(press(KeyCode::Char('X'))).unwrap();
+    assert_eq!(app.mode, Mode::Explain);
+    let source = app.explain_source.as_ref().unwrap();
+    let findings = crate::explain::explain(&crate::explain::Evidence {
+        kind: &app.kind.as_ref().unwrap().ar.kind,
+        plural: &app.kind_plural,
+        obj: source,
+        pods: &[],
+        events: &[],
+        events_v1: false,
+    });
+    app.handle_msg(Msg::Explain {
+        generation: app.generation,
+        claim: current_claim(app),
+        title: app.explain_title.clone(),
+        request: app.explain_request,
+        source: None,
+        findings,
+    });
+}
+
+#[tokio::test]
+async fn explain_key_reports_node_pressure_without_warning_on_healthy_conditions() {
+    for state in ["False", "True", "Unknown"] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("nodes");
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "worker"}, "status": {"conditions": [
+                {"type": "Ready", "status": "True"},
+                {"type": "MemoryPressure", "status": state, "reason": "MemoryCondition"},
+                {"type": "DiskPressure", "status": state},
+                {"type": "PIDPressure", "status": state},
+                {"type": "NetworkUnavailable", "status": state}]}}),
+        );
+        app.handle_key(press(KeyCode::Home)).unwrap();
+        explain_selected_with_pure_evidence(&mut app);
+        assert_eq!(app.explain_items[0].text, "Node/worker is Ready");
+        for condition in [
+            "MemoryPressure",
+            "DiskPressure",
+            "PIDPressure",
+            "NetworkUnavailable",
+        ] {
+            let finding = app
+                .explain_items
+                .iter()
+                .find(|f| f.text.starts_with(condition));
+            if state == "False" {
+                assert!(finding.is_none(), "{condition}");
+            } else {
+                assert_eq!(finding.unwrap().level, crate::explain::Level::Warn);
+            }
+        }
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        assert_eq!(app.mode, Mode::Table);
+    }
+}
+
+#[tokio::test]
+async fn explain_key_shows_reported_daemonset_availability() {
+    let (mut app, _rx) = test_app();
+    app.cluster
+        .register_kind("apps", "DaemonSet", "daemonsets", true);
+    app.switch_kind("daemonsets");
+    apply(
+        &mut app,
+        json!({"apiVersion": "apps/v1", "kind": "DaemonSet",
+        "metadata": {"name": "agent", "namespace": "default"},
+        "status": {"desiredNumberScheduled": 3, "currentNumberScheduled": 3,
+            "updatedNumberScheduled": 3, "numberReady": 3, "numberAvailable": 3}}),
+    );
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    explain_selected_with_pure_evidence(&mut app);
+    assert_eq!(app.explain_items[0].text, "DaemonSet/agent is healthy");
+    assert!(
+        app.explain_items
+            .iter()
+            .any(|f| f.text == "desired 3 · ready 3 · available 3")
+    );
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+}
+
+fn expression_workload(include_labels: bool) -> serde_json::Value {
+    let mut workload = json!({"apiVersion":"apps/v1","kind":"Deployment",
+        "metadata":{"name":"web","namespace":"default","uid":"workload-uid"},
+        "spec":{"replicas":1,"selector":{"matchExpressions":[
+            {"key":"tier","operator":"In","values":["frontend","api"]},
+            {"key":"environment","operator":"NotIn","values":["test"]},
+            {"key":"enabled","operator":"Exists"},
+            {"key":"disabled","operator":"DoesNotExist"}
+        ]}}, "status":{"replicas":1,"readyReplicas":1,"updatedReplicas":1}});
+    if include_labels {
+        workload["spec"]["selector"]["matchLabels"] = json!({"app":"web"});
+    }
+    workload
+}
+
+#[tokio::test]
+async fn workload_enter_preserves_all_selector_requirements() {
+    for include_labels in [false, true] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("deployments");
+        apply(&mut app, expression_workload(include_labels));
+        app.table_state.select(Some(0));
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.kind_plural, "pods");
+        let expected = if include_labels {
+            "app=web,tier in (api,frontend),environment notin (test),enabled,!disabled"
+        } else {
+            "tier in (api,frontend),environment notin (test),enabled,!disabled"
+        };
+        assert_eq!(app.labels.as_deref(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn workload_explain_requests_complete_expression_selector() {
+    let (mut app, mut rx) = test_app();
+    app.switch_kind("deployments");
+    let workload = expression_workload(true);
+    apply(&mut app, workload.clone());
+    app.table_state.select(Some(0));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            seen.lock().unwrap().push(request.uri().to_string());
+            let response = if request.uri().path().ends_with("/pods") {
+                json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":[]})
+            } else if request.uri().path().ends_with("/web") {
+                workload.clone()
+            } else {
+                json!({"apiVersion":"v1","kind":"EventList","metadata":{},"items":[]})
+            };
+            async move {
+                Ok::<_, std::convert::Infallible>(http::Response::new(http_body_util::Full::new(
+                    hyper::body::Bytes::from(response.to_string()),
+                )))
+            }
+        }),
+        "default",
+    );
+    app.handle_key(press(KeyCode::Char('X'))).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if matches!(rx.recv().await, Some(Msg::Explain { .. })) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let requests = requests.lock().unwrap();
+    let pods = requests
+        .iter()
+        .find(|uri| uri.contains("/pods?"))
+        .expect("owned pods requested");
+    let params: std::collections::HashMap<_, _> =
+        form_urlencoded::parse(pods.split_once('?').unwrap().1.as_bytes())
+            .into_owned()
+            .collect();
+    assert_eq!(
+        params.get("labelSelector").map(String::as_str),
+        Some("app=web,tier in (api,frontend),environment notin (test),enabled,!disabled")
+    );
+}
+
+type HealthResponses = Arc<std::sync::Mutex<HashMap<String, (u16, serde_json::Value)>>>;
+
+fn health_report_app(
+    plural: &str,
+    resource: serde_json::Value,
+) -> (
+    App,
+    Receiver<Msg>,
+    HealthResponses,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let (mut app, rx) = test_app();
+    app.switch_kind(plural);
+    apply(&mut app, resource);
+    app.table_state.select(Some(0));
+    let responses: HealthResponses = Arc::default();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let replies = responses.clone();
+    let seen = requests.clone();
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            assert_eq!(request.method(), http::Method::GET);
+            let path = request.uri().path().to_owned();
+            seen.lock().unwrap().push(path.clone());
+            let (code, response) = replies.lock().unwrap().get(&path).cloned().unwrap_or_else(
+                || {
+                    if path.ends_with("/namespaces") {
+                        (200, json!({"apiVersion":"v1","kind":"NamespaceList","metadata":{},"items":[]}))
+                    } else if path.ends_with("/events") {
+                        (
+                            200,
+                            json!({"apiVersion":"v1","kind":"EventList","metadata":{},"items":[]}),
+                        )
+                    } else if path.ends_with("/pods") {
+                        (
+                            200,
+                            json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":[]}),
+                        )
+                    } else {
+                        panic!("unexpected report GET {path}")
+                    }
+                },
+            );
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(code)
+                        .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                            response.to_string(),
+                        )))
+                        .unwrap(),
+                )
+            }
+        }),
+        "default",
+    );
+    (app, rx, responses, requests)
+}
+
+fn open_health_report_key(app: &mut App, gitops: bool) {
+    if gitops {
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for key in "gitops".chars() {
+            app.handle_key(press(KeyCode::Char(key))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+    } else {
+        app.handle_key(press(KeyCode::Char('X'))).unwrap();
+    }
+}
+
+async fn receive_health_report(app: &mut App, rx: &mut Receiver<Msg>, gitops: bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(message) = rx.recv().await {
+            let report = if gitops {
+                matches!(message, Msg::Gitops { .. })
+            } else {
+                matches!(message, Msg::Explain { .. })
+            };
+            if report {
+                app.handle_msg(message);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("health report did not finish");
+}
+
+#[tokio::test]
+async fn explain_refresh_reads_current_resource_without_watch_updates() {
+    let root = expression_workload(true);
+    let (mut app, mut rx, responses, requests) = health_report_app("deployments", root.clone());
+    let path = "/apis/apps/v1/namespaces/default/deployments/web";
+    responses
+        .lock()
+        .unwrap()
+        .insert(path.into(), (200, root.clone()));
+    open_health_report_key(&mut app, false);
+    receive_health_report(&mut app, &mut rx, false).await;
+    assert!(
+        app.explain_items
+            .iter()
+            .any(|finding| finding.text.contains("is healthy"))
+    );
+    let mut fresh = root;
+    fresh["status"]["readyReplicas"] = json!(0);
+    responses.lock().unwrap().insert(path.into(), (200, fresh));
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    receive_health_report(&mut app, &mut rx, false).await;
+    assert!(
+        app.explain_items
+            .iter()
+            .any(|finding| finding.text.contains("is unavailable"))
+    );
+    assert_eq!(
+        app.explain_source.as_ref().unwrap().data["status"]["readyReplicas"],
+        0
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| *request == path)
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn gitops_refresh_reads_current_owner_and_source_reference() {
+    let root = json!({"apiVersion":"kustomize.toolkit.fluxcd.io/v1","kind":"Kustomization",
+        "metadata":{"name":"web","namespace":"default","uid":"owner-uid"},
+        "spec":{"sourceRef":{"kind":"GitRepository","name":"old-source"}},
+        "status":{"conditions":[{"type":"Ready","status":"True"}]}});
+    let (mut app, mut rx, responses, requests) = health_report_app("kustomizations", root.clone());
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/kustomizations/web",
+        kind.ar.api_version
+    );
+    app.cluster.register_kind(
+        "source.toolkit.fluxcd.io",
+        "GitRepository",
+        "gitrepositories",
+        true,
+    );
+    let source_kind = app.cluster.resolve("gitrepositories").unwrap();
+    let source_path = format!(
+        "/apis/{}/namespaces/default/gitrepositories",
+        source_kind.ar.api_version
+    );
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(path.clone(), (200, root.clone()));
+        for name in ["old-source", "new-source"] {
+            replies.insert(format!("{source_path}/{name}"), (200, json!({"apiVersion":source_kind.ar.api_version,"kind":"GitRepository","metadata":{"name":name,"namespace":"default"},"status":{"conditions":[{"type":"Ready","status":"True"}]}})));
+        }
+    }
+    open_health_report_key(&mut app, true);
+    receive_health_report(&mut app, &mut rx, true).await;
+    let mut fresh = root;
+    fresh["status"]["conditions"][0]["status"] = json!("False");
+    fresh["spec"]["sourceRef"]["name"] = json!("new-source");
+    responses.lock().unwrap().insert(path.clone(), (200, fresh));
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    receive_health_report(&mut app, &mut rx, true).await;
+    assert!(
+        app.gitops_items
+            .iter()
+            .any(|finding| finding.text.contains("Ready: False"))
+    );
+    assert_eq!(
+        app.gitops_source.as_ref().unwrap().data["spec"]["sourceRef"]["name"],
+        "new-source"
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests.iter().filter(|request| **request == path).count(),
+        2
+    );
+    assert!(requests.contains(&format!("{source_path}/new-source")));
+}
+
+#[tokio::test]
+async fn health_refresh_does_not_analyze_replacements_or_failed_root_reads() {
+    for gitops in [false, true] {
+        let root = expression_workload(true);
+        let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+        let path = "/apis/apps/v1/namespaces/default/deployments/web";
+        responses
+            .lock()
+            .unwrap()
+            .insert(path.into(), (200, root.clone()));
+        open_health_report_key(&mut app, gitops);
+        receive_health_report(&mut app, &mut rx, gitops).await;
+        let mut replacement = root;
+        replacement["metadata"]["uid"] = json!("replacement-uid");
+        let cases = [
+            (200, replacement, "was replaced"),
+            (
+                404,
+                json!({"kind":"Status","apiVersion":"v1","status":"Failure","code":404,"reason":"NotFound","message":"resource is gone"}),
+                "resource is gone",
+            ),
+            (
+                403,
+                json!({"kind":"Status","apiVersion":"v1","status":"Failure","code":403,"reason":"Forbidden","message":"access denied"}),
+                "access denied",
+            ),
+        ];
+        for (code, response, expected) in cases {
+            responses
+                .lock()
+                .unwrap()
+                .insert(path.into(), (code, response));
+            app.handle_key(press(KeyCode::Char('r'))).unwrap();
+            receive_health_report(&mut app, &mut rx, gitops).await;
+            let (source, findings) = if gitops {
+                (&app.gitops_source, &app.gitops_items)
+            } else {
+                (&app.explain_source, &app.explain_items)
+            };
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].level, crate::explain::Level::Warn);
+            assert!(findings[0].text.contains(expected), "{}", findings[0].text);
+            assert_eq!(
+                source.as_ref().unwrap().metadata.uid.as_deref(),
+                Some("workload-uid")
+            );
+        }
+    }
+}
+
+async fn take_health_report(rx: &mut Receiver<Msg>, gitops: bool) -> Msg {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(message) = rx.recv().await {
+            if if gitops {
+                matches!(message, Msg::Gitops { .. })
+            } else {
+                matches!(message, Msg::Explain { .. })
+            } {
+                return message;
+            }
+        }
+        panic!("health response channel closed");
+    })
+    .await
+    .expect("health response did not arrive")
+}
+
+#[tokio::test]
+async fn health_report_keys_reject_an_older_resource_response() {
+    for gitops in [false, true] {
+        let first = expression_workload(true);
+        let mut second = first.clone();
+        second["metadata"]["name"] = json!("zzz");
+        second["metadata"]["uid"] = json!("second-uid");
+        let (mut app, mut rx, responses, requests) =
+            health_report_app("deployments", first.clone());
+        apply(&mut app, second.clone());
+        let first_path = "/apis/apps/v1/namespaces/default/deployments/web";
+        let second_path = "/apis/apps/v1/namespaces/default/deployments/zzz";
+        {
+            let mut responses = responses.lock().unwrap();
+            responses.insert(first_path.into(), (200, first));
+            responses.insert(second_path.into(), (200, second));
+        }
+        let generation = app.generation;
+        open_health_report_key(&mut app, gitops);
+        let old_reply = take_health_report(&mut rx, gitops).await;
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        app.handle_key(press(KeyCode::Char('j'))).unwrap();
+        assert_eq!(
+            app.selected().unwrap().metadata.name.as_deref(),
+            Some("zzz")
+        );
+        open_health_report_key(&mut app, gitops);
+        let new_reply = take_health_report(&mut rx, gitops).await;
+        assert_eq!(
+            app.generation, generation,
+            "both requests share the watch generation"
+        );
+        app.handle_msg(new_reply);
+        app.handle_msg(old_reply);
+        let (source, title) = if gitops {
+            (&app.gitops_source, &app.gitops_title)
+        } else {
+            (&app.explain_source, &app.explain_title)
+        };
+        assert_eq!(
+            source.as_ref().unwrap().metadata.uid.as_deref(),
+            Some("second-uid")
+        );
+        assert!(title.starts_with("zzz"), "{title}");
+        app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        app.handle_msg(take_health_report(&mut rx, gitops).await);
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.iter().filter(|path| *path == first_path).count(),
+            1
+        );
+        assert_eq!(
+            requests.iter().filter(|path| *path == second_path).count(),
+            2
+        );
+    }
+}
+
+#[tokio::test]
+async fn health_refresh_keys_preserve_the_newest_error_over_older_success() {
+    for gitops in [false, true] {
+        let root = expression_workload(true);
+        let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+        let path = "/apis/apps/v1/namespaces/default/deployments/web";
+        responses
+            .lock()
+            .unwrap()
+            .insert(path.into(), (200, root.clone()));
+        open_health_report_key(&mut app, gitops);
+        app.handle_msg(take_health_report(&mut rx, gitops).await);
+        let mut old_success = root.clone();
+        old_success["status"]["readyReplicas"] = json!(0);
+        responses
+            .lock()
+            .unwrap()
+            .insert(path.into(), (200, old_success));
+        let previous = if gitops {
+            app.gitops_items.clone()
+        } else {
+            app.explain_items.clone()
+        };
+        app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        let pending = if gitops {
+            &app.gitops_items
+        } else {
+            &app.explain_items
+        };
+        assert_eq!(pending, &previous, "refresh retains the last report");
+        let old_reply = take_health_report(&mut rx, gitops).await;
+        responses.lock().unwrap().insert(path.into(), (403, json!({"kind":"Status","apiVersion":"v1","status":"Failure","code":403,"reason":"Forbidden","message":"latest access denied"})));
+        app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        app.handle_msg(take_health_report(&mut rx, gitops).await);
+        app.handle_msg(old_reply);
+        let (source, findings) = if gitops {
+            (&app.gitops_source, &app.gitops_items)
+        } else {
+            (&app.explain_source, &app.explain_items)
+        };
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].text.contains("latest access denied"));
+        assert_eq!(source.as_ref().unwrap().data["status"]["readyReplicas"], 1);
+        let mut current = root;
+        current["status"]["readyReplicas"] = json!(2);
+        responses
+            .lock()
+            .unwrap()
+            .insert(path.into(), (200, current));
+        app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        app.handle_msg(take_health_report(&mut rx, gitops).await);
+        let source = if gitops {
+            &app.gitops_source
+        } else {
+            &app.explain_source
+        };
+        assert_eq!(source.as_ref().unwrap().data["status"]["readyReplicas"], 2);
+    }
+}
+
+#[tokio::test]
+async fn report_navigation_keeps_its_destination_after_a_late_reply() {
+    for (gitops, key, destination) in [
+        (false, KeyCode::Enter, Mode::Table),
+        (false, KeyCode::Char('E'), Mode::Events),
+        (false, KeyCode::Char('l'), Mode::Logs),
+        (true, KeyCode::Enter, Mode::Table),
+        (false, KeyCode::Char(':'), Mode::Command),
+        (true, KeyCode::Char(':'), Mode::Command),
+    ] {
+        let root = expression_workload(true);
+        let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+        responses.lock().unwrap().insert(
+            "/apis/apps/v1/namespaces/default/deployments/web".into(),
+            (200, root),
+        );
+        open_health_report_key(&mut app, gitops);
+        let reply = take_health_report(&mut rx, gitops).await;
+        let finding = crate::explain::Finding {
+            indent: 0,
+            level: crate::explain::Level::Warn,
+            text: "inspect Pod".into(),
+            target: Some(crate::explain::Target {
+                plural: "pods".into(),
+                namespace: Some("default".into()),
+                name: "web".into(),
+            }),
+        };
+        if gitops {
+            app.gitops_items = vec![finding];
+            app.gitops_state.select(Some(0));
+        } else {
+            app.explain_items = vec![finding];
+            app.explain_state.select(Some(0));
+        }
+        let request = if gitops {
+            app.gitops_request
+        } else {
+            app.explain_request
+        };
+        app.handle_key(press(key)).unwrap();
+        assert_eq!(app.mode, destination);
+        if destination == Mode::Table {
+            let current = if gitops {
+                app.gitops_request
+            } else {
+                app.explain_request
+            };
+            assert_ne!(current, request, "navigation must cancel the report");
+        }
+        app.handle_msg(reply);
+        assert_eq!(
+            app.mode, destination,
+            "a reply must preserve the destination"
+        );
+        if gitops {
+            assert!(app.gitops_claim.is_none());
+        } else {
+            assert!(app.explain_claim.is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn palette_navigation_cancels_pending_health_reports() {
+    for gitops in [false, true] {
+        for through_help in [false, true] {
+            for command in ["detail", "diff", "events", "timeline", "can-i"] {
+                let (mut app, _rx) = test_app();
+                app.switch_kind("deployments");
+                apply(&mut app, expression_workload(true));
+                app.table_state.select(Some(0));
+                open_health_report_key(&mut app, gitops);
+                let claim = current_claim(&app);
+                let request = if gitops {
+                    app.gitops_request
+                } else {
+                    app.explain_request
+                };
+                let reply = if gitops {
+                    Msg::Gitops {
+                        generation: app.generation,
+                        request,
+                        claim,
+                        title: "cancelled report".into(),
+                        source: None,
+                        findings: Vec::new(),
+                    }
+                } else {
+                    Msg::Explain {
+                        generation: app.generation,
+                        request,
+                        claim,
+                        title: "cancelled report".into(),
+                        source: None,
+                        findings: Vec::new(),
+                    }
+                };
+                if through_help {
+                    app.handle_key(press(KeyCode::Char('?'))).unwrap();
+                    assert_eq!(app.mode, Mode::Help);
+                }
+                app.handle_key(press(KeyCode::Char(':'))).unwrap();
+                assert_eq!(
+                    current_claim(&app),
+                    claim,
+                    "opening the palette retains the report"
+                );
+                for key in command.chars() {
+                    app.handle_key(press(KeyCode::Char(key))).unwrap();
+                }
+                app.handle_key(press(KeyCode::Enter)).unwrap();
+                let destination = app.mode;
+                let current_request = if gitops {
+                    app.gitops_request
+                } else {
+                    app.explain_request
+                };
+                assert_ne!(current_request, request, "{command} must cancel the report");
+                assert!(
+                    app.status_claim
+                        .as_ref()
+                        .is_none_or(|status| status.claim != claim)
+                );
+                let flash = app.flash.clone();
+                app.handle_msg(reply);
+                assert_eq!(app.mode, destination);
+                assert_eq!(app.flash, flash);
+                let title = if gitops {
+                    &app.gitops_title
+                } else {
+                    &app.explain_title
+                };
+                assert_ne!(title, "cancelled report");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn explain_evidence_views_keep_pending_findings_and_refresh_history() {
+    for refresh in [false, true] {
+        for key in ['E', 'l'] {
+            for reply_before_return in [false, true] {
+                let root = expression_workload(true);
+                let (mut app, mut rx, responses, _) =
+                    health_report_app("deployments", root.clone());
+                let path = "/apis/apps/v1/namespaces/default/deployments/web";
+                responses
+                    .lock()
+                    .unwrap()
+                    .insert(path.into(), (200, root.clone()));
+                open_health_report_key(&mut app, false);
+                let mut reply = take_health_report(&mut rx, false).await;
+                let previous = if refresh {
+                    app.handle_msg(reply);
+                    let previous = app.explain_items.clone();
+                    assert!(!previous.is_empty());
+                    let mut updated = root;
+                    updated["status"]["readyReplicas"] = json!(0);
+                    responses
+                        .lock()
+                        .unwrap()
+                        .insert(path.into(), (200, updated));
+                    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+                    assert_eq!(app.explain_items, previous);
+                    reply = take_health_report(&mut rx, false).await;
+                    previous
+                } else {
+                    Vec::new()
+                };
+                let request = app.explain_request;
+                app.handle_key(press(KeyCode::Char(key))).unwrap();
+                let evidence_mode = if key == 'E' { Mode::Events } else { Mode::Logs };
+                assert_eq!(app.mode, evidence_mode);
+                assert_eq!(app.explain_request, request);
+                if reply_before_return {
+                    app.handle_msg(reply);
+                    assert_eq!(app.mode, evidence_mode);
+                    app.handle_key(press(KeyCode::Esc)).unwrap();
+                } else {
+                    app.handle_key(press(KeyCode::Esc)).unwrap();
+                    assert_eq!(app.explain_items, previous);
+                    app.handle_msg(reply);
+                }
+                assert_eq!(app.mode, Mode::Explain);
+                assert!(!app.explain_items.is_empty());
+                if refresh {
+                    assert_ne!(app.explain_items, previous);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn palette_exit_from_evidence_cancels_the_parent_report() {
+    for key in ['E', 'l'] {
+        let root = expression_workload(true);
+        let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+        responses.lock().unwrap().insert(
+            "/apis/apps/v1/namespaces/default/deployments/web".into(),
+            (200, root),
+        );
+        open_health_report_key(&mut app, false);
+        let reply = take_health_report(&mut rx, false).await;
+        let request = app.explain_request;
+        app.handle_key(press(KeyCode::Char(key))).unwrap();
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for key in "timeline".chars() {
+            app.handle_key(press(KeyCode::Char(key))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.mode, Mode::Timeline);
+        assert_ne!(app.explain_request, request);
+        assert!(app.explain_claim.is_none());
+        app.handle_msg(reply);
+        assert_eq!(app.mode, Mode::Timeline);
+        assert!(app.explain_items.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn leaving_health_view_rejects_its_pending_response() {
+    for gitops in [false, true] {
+        for close in [KeyCode::Esc, KeyCode::Char('q')] {
+            for newer_status in [false, true] {
+                let root = expression_workload(true);
+                let (mut app, mut rx, responses, _) =
+                    health_report_app("deployments", root.clone());
+                responses.lock().unwrap().insert(
+                    "/apis/apps/v1/namespaces/default/deployments/web".into(),
+                    (200, root),
+                );
+                open_health_report_key(&mut app, gitops);
+                let reply = take_health_report(&mut rx, gitops).await;
+                assert!(app.status_claim.as_ref().unwrap().pending);
+                let newer_claim = newer_status.then(|| app.claim_status("loading another report"));
+                app.handle_key(press(close)).unwrap();
+                assert_eq!(app.mode, Mode::Table);
+                if let Some(claim) = newer_claim {
+                    assert_eq!(current_claim(&app), claim);
+                    assert_eq!(app.flash, "loading another report");
+                } else {
+                    assert!(app.status_claim.is_none(), "closing must release progress");
+                    assert!(app.flash.is_empty(), "closing must clear report progress");
+                }
+                app.handle_msg(reply);
+                assert_eq!(app.mode, Mode::Table);
+                if let Some(claim) = newer_claim {
+                    assert_eq!(current_claim(&app), claim);
+                    assert_eq!(app.flash, "loading another report");
+                } else {
+                    assert!(app.status_claim.is_none());
+                    assert!(app.flash.is_empty());
+                }
+            }
+        }
+    }
+}
+
+async fn next_log_query(rx: &mut Receiver<String>) -> HashMap<String, String> {
+    let query = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .expect("log request");
+    form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect()
+}
+
+#[tokio::test]
+async fn log_lookback_keys_keep_tail_limits_in_api_requests() {
+    for aggregate in [false, true] {
+        for tail in [40, 300] {
+            let (mut app, _rx) = test_app();
+            app.switch_kind(if aggregate { "deployments" } else { "pods" });
+            let pod = json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"web","namespace":"default"},"spec":{"containers":[{"name":"app","image":"test"}]},"status":{"phase":"Running"}});
+            apply(
+                &mut app,
+                if aggregate {
+                    expression_workload(true)
+                } else {
+                    pod.clone()
+                },
+            );
+            app.table_state.select(Some(0));
+            app.logs_cfg.tail = tail;
+            app.logs_cfg.since = Some("4h".into());
+            let (tx, mut queries) = mpsc::channel(32);
+            app.cluster.client = kube::Client::new(
+                tower::service_fn(move |request: http::Request<kube::client::Body>| {
+                    assert_eq!(request.method(), http::Method::GET);
+                    let response = if request.uri().path().ends_with("/log") {
+                        tx.try_send(request.uri().query().unwrap_or_default().to_owned())
+                            .unwrap();
+                        "line\n".to_owned()
+                    } else {
+                        assert_eq!(request.uri().path(), "/api/v1/namespaces/default/pods");
+                        json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":[pod]})
+                            .to_string()
+                    };
+                    async move {
+                        Ok::<_, std::convert::Infallible>(http::Response::new(
+                            http_body_util::Full::new(hyper::body::Bytes::from(response)),
+                        ))
+                    }
+                }),
+                "default",
+            );
+            app.handle_key(press(KeyCode::Char('l'))).unwrap();
+            let expected_tail = if aggregate { tail.min(100) } else { tail }.to_string();
+            let query = next_log_query(&mut queries).await;
+            assert_eq!(query.get("tailLines"), Some(&expected_tail));
+            assert_eq!(query.get("sinceSeconds").map(String::as_str), Some("14400"));
+            assert_eq!(query.get("follow").map(String::as_str), Some("true"));
+            app.handle_key(press(KeyCode::Char('2'))).unwrap();
+            let query = next_log_query(&mut queries).await;
+            assert_eq!(query.get("tailLines"), Some(&expected_tail));
+            assert_eq!(query.get("sinceSeconds").map(String::as_str), Some("300"));
+            app.handle_key(press(KeyCode::Char('0'))).unwrap();
+            let query = next_log_query(&mut queries).await;
+            assert_eq!(query.get("tailLines"), Some(&expected_tail));
+            assert!(!query.contains_key("sinceSeconds"));
+            app.handle_key(press(KeyCode::Esc)).unwrap();
+            if !aggregate {
+                app.handle_key(press(KeyCode::Char('p'))).unwrap();
+                let query = next_log_query(&mut queries).await;
+                assert_eq!(query.get("previous").map(String::as_str), Some("true"));
+                assert!(!query.contains_key("tailLines"));
+                assert!(!query.contains_key("sinceSeconds"));
+                assert!(!query.contains_key("follow"));
+                app.handle_key(press(KeyCode::Esc)).unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn memory_filter_accepts_kubernetes_quantity_suffixes() {
+    for (quantity, bytes) in [
+        ("100500k", 100_500_000),
+        ("1P", 1_000_000_000_000_000),
+        ("1E", 1_000_000_000_000_000_000),
+        ("1Pi", 1_i64 << 50),
+        ("1Ei", 1_i64 << 60),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("nodes");
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1", "kind": "Node",
+                "metadata": {"name": "sample"},
+                "status": {"allocatable": {"cpu": "2", "memory": quantity}}
+            }),
+        );
+        app.handle_msg(Msg::Metrics {
+            generation: app.generation,
+            data: HashMap::from([("sample".into(), (100, bytes))]),
+            containers: HashMap::new(),
+        });
+        type_filter(&mut app, &format!("memory={quantity}"));
+        assert_eq!(row_names(&app), ["sample"], "{quantity}");
+        let obj = app.rows()[0].clone();
+        assert_eq!(crate::columns::node_allocatable(&obj).1, Some(bytes));
+        assert_eq!(crate::views::parse_quantity(quantity), Some(bytes as f64));
+    }
+}
+
+#[tokio::test]
+async fn memory_filter_rounds_fractional_bytes_up() {
+    for (quantity, bytes) in [("100m", 1), ("1.5", 2)] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("nodes");
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1", "kind": "Node",
+                "metadata": {"name": "sample"},
+                "status": {"allocatable": {"cpu": "2", "memory": quantity}}
+            }),
+        );
+        app.handle_msg(Msg::Metrics {
+            generation: app.generation,
+            data: HashMap::from([("sample".into(), (100, bytes))]),
+            containers: HashMap::new(),
+        });
+        type_filter(&mut app, &format!("memory={quantity}"));
+        assert_eq!(row_names(&app), ["sample"], "{quantity}");
+        assert_eq!(
+            crate::columns::node_allocatable(app.rows()[0]).1,
+            Some(bytes)
+        );
+    }
+}
+
+#[tokio::test]
+async fn memory_filter_rejects_invalid_quantities() {
+    for quantity in ["1K", "1Xi", "-1Mi", "NaN", "inf"] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("pods");
+        type_filter(&mut app, &format!("memory>{quantity}"));
+        assert!(app.filter_error().is_some(), "{quantity}");
+    }
+}
+
+#[tokio::test]
+async fn missing_metrics_do_not_match_usage_filters() {
+    for (plural, kind) in [("pods", "Pod"), ("nodes", "Node")] {
+        for (filter, expected) in [
+            ("cpu<10m", vec!["idle"]),
+            ("memory<1Mi", vec!["idle"]),
+            ("cpu=0", vec!["idle"]),
+            ("mem=0", vec!["idle"]),
+            ("cpu!=1", vec!["busy", "idle"]),
+            ("memory!=1", vec!["busy", "idle"]),
+        ] {
+            let (mut app, _rx) = test_app();
+            app.switch_kind(plural);
+            for name in ["unknown", "idle", "busy"] {
+                let mut obj = json!({
+                    "apiVersion": "v1", "kind": kind,
+                    "metadata": {"name": name}
+                });
+                if plural == "pods" {
+                    obj["metadata"]["namespace"] = json!("default");
+                }
+                apply(&mut app, obj);
+            }
+            let key = |name: &str| {
+                if plural == "pods" {
+                    format!("default/{name}")
+                } else {
+                    name.to_string()
+                }
+            };
+            app.handle_msg(Msg::Metrics {
+                generation: app.generation,
+                data: HashMap::from([
+                    (key("idle"), (0, 0)),
+                    (key("busy"), (100, 10 * 1024 * 1024)),
+                ]),
+                containers: HashMap::new(),
+            });
+            type_filter(&mut app, filter);
+            assert_eq!(row_names(&app), expected, "{plural}: {filter}");
+            app.handle_msg(Msg::Metrics {
+                generation: app.generation,
+                data: HashMap::new(),
+                containers: HashMap::new(),
+            });
+            assert!(row_names(&app).is_empty(), "{plural}: {filter}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn missing_node_metrics_stay_distinct_in_render_capture_and_sort() {
+    use ratatui::{Terminal, backend::TestBackend};
+    for header in ["CPU", "MEM", "%CPU", "%MEM"] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("nodes");
+        for name in ["unknown", "idle", "busy"] {
+            apply(
+                &mut app,
+                json!({
+                    "apiVersion": "v1", "kind": "Node",
+                    "metadata": {"name": name},
+                    "status": {"allocatable": {"cpu": "2", "memory": "1Gi"}}
+                }),
+            );
+        }
+        app.handle_msg(Msg::Metrics {
+            generation: app.generation,
+            data: HashMap::from([
+                ("idle".into(), (0, 0)),
+                ("busy".into(), (100, 10 * 1024 * 1024)),
+            ]),
+            containers: HashMap::new(),
+        });
+        app.handle_key(press(KeyCode::Char('S'))).unwrap();
+        for c in header.chars() {
+            app.handle_key(press(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.display_headers()[app.sort_column.unwrap()], header);
+        assert_eq!(row_names(&app), ["unknown", "idle", "busy"], "{header}");
+        app.handle_key(press(KeyCode::Char('I'))).unwrap();
+        assert_eq!(row_names(&app), ["busy", "idle", "unknown"], "{header}");
+
+        let (headers, rows) = app.snapshot_table();
+        let cell = |name: &str, header: &str| {
+            let row = rows.iter().find(|row| row[0] == name).unwrap();
+            &row[headers.iter().position(|h| h == header).unwrap()]
+        };
+        for metric in ["CPU", "MEM", "%CPU", "%MEM"] {
+            assert_eq!(cell("unknown", metric), "-");
+        }
+        for (metric, value) in [
+            ("CPU", "0m"),
+            ("MEM", "0Mi"),
+            ("%CPU", "0%"),
+            ("%MEM", "0%"),
+        ] {
+            assert_eq!(cell("idle", metric), value);
+        }
+
+        app.handle_key(press(KeyCode::End)).unwrap();
+        let fields = app.selected_row_fields();
+        for metric in ["CPU", "MEM", "%CPU", "%MEM"] {
+            assert_eq!(fields.iter().find(|(key, _)| key == metric).unwrap().1, "-");
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(200, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let lines: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        let unknown = lines.iter().find(|line| line.contains("unknown")).unwrap();
+        let idle = lines.iter().find(|line| line.contains("idle")).unwrap();
+        assert!(!unknown.contains("0%"), "{unknown}");
+        assert!(
+            idle.contains("0m") && idle.contains("0Mi") && idle.matches("0%").count() == 2,
+            "{idle}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn job_status_distinguishes_execution_states_through_navigation() {
+    for (spec, status, deleting, expected) in [
+        (
+            json!({"completions":1}),
+            json!({"active":0,"succeeded":1,"terminating":1,"conditions":[{"type":"SuccessCriteriaMet","status":"True"}]}),
+            false,
+            "Completing",
+        ),
+        (json!({}), json!({}), false, "Pending"),
+        (
+            json!({}),
+            json!({"active": 1, "failed": 2}),
+            false,
+            "Running",
+        ),
+        (
+            json!({}),
+            json!({"conditions": [{"type": "Failed", "status": "True"}]}),
+            false,
+            "Failed",
+        ),
+        (
+            json!({}),
+            json!({"active": 1, "conditions": [{"type": "FailureTarget", "status": "True"}]}),
+            false,
+            "Failed",
+        ),
+        (
+            json!({}),
+            json!({"conditions": [{"type": "Complete", "status": "True"}]}),
+            false,
+            "Completed",
+        ),
+        (json!({"suspend": true}), json!({}), false, "Suspended"),
+        (
+            json!({}),
+            json!({"conditions": [{"type": "Suspended", "status": "True"}]}),
+            false,
+            "Suspended",
+        ),
+        (
+            json!({}),
+            json!({"conditions": [{"type": "Complete", "status": "True"}]}),
+            true,
+            "Terminating",
+        ),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for ch in "jobs".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        apply(
+            &mut app,
+            json!({"apiVersion":"batch/v1", "kind":"Job", "metadata":{"name":"job", "namespace":"default", "deletionTimestamp": deleting.then_some("2026-09-07T10:00:00Z")}, "spec":spec, "status":status}),
+        );
+        let rows = app.rows();
+        app.ensure_table_cell_cache(&rows);
+        let cache = app.table_cell_cache();
+        let (cells, status_idx) = cache.get(&row_key(rows[0])).unwrap();
+        assert_eq!(cells[status_idx.unwrap()], expected);
+        if expected == "Failed" {
+            assert_eq!(crate::theme::row_color(expected), crate::theme::red());
+        }
+    }
+}
+
+#[tokio::test]
+async fn storage_table_shows_deletion_before_bound_phase() {
+    for (kind, plural, namespaced) in [
+        ("PersistentVolume", "persistentvolumes", false),
+        ("PersistentVolumeClaim", "persistentvolumeclaims", true),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.cluster.register_kind("", kind, plural, namespaced);
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for ch in plural.chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        for (version, deleting, expected) in [("1", false, "Bound"), ("2", true, "Terminating")] {
+            apply(
+                &mut app,
+                json!({"apiVersion":"v1", "kind":kind,
+                "metadata":{"name":"data", "namespace":namespaced.then_some("default"), "resourceVersion":version,
+                "deletionTimestamp":deleting.then_some("2026-09-07T10:00:00Z")}, "status":{"phase":"Bound"}}),
+            );
+            let rows = app.rows();
+            app.ensure_table_cell_cache(&rows);
+            let cache = app.table_cell_cache();
+            let (cells, status_idx) = cache.get(&row_key(rows[0])).unwrap();
+            assert_eq!(cells[status_idx.unwrap()], expected, "{kind}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn service_endpoint_columns_include_names_addresses_and_node_ports() {
+    for (spec, status, expected_ip, expected_ports) in [
+        (
+            json!({"type":"ExternalName", "externalName":"db.example.com"}),
+            json!({}),
+            "db.example.com",
+            "<none>",
+        ),
+        (
+            json!({"type":"ClusterIP", "externalIPs":["192.0.2.10"], "ports":[{"port":80,"protocol":"TCP"}]}),
+            json!({}),
+            "192.0.2.10",
+            "80/TCP",
+        ),
+        (
+            json!({"type":"NodePort", "ports":[{"port":80,"nodePort":30080,"protocol":"TCP"},{"port":53,"nodePort":30053,"protocol":"UDP"}]}),
+            json!({}),
+            "<none>",
+            "80:30080/TCP,53:30053/UDP",
+        ),
+        (
+            json!({"type":"LoadBalancer", "externalIPs":["192.0.2.10"], "ports":[]}),
+            json!({"loadBalancer":{"ingress":[{"hostname":"lb.example.com"}]}}),
+            "lb.example.com,192.0.2.10",
+            "<none>",
+        ),
+        (
+            json!({"type":"LoadBalancer"}),
+            json!({}),
+            "<pending>",
+            "<none>",
+        ),
+        (
+            json!({"type":"LoadBalancer", "externalIPs":["192.0.2.10"]}),
+            json!({}),
+            "192.0.2.10",
+            "<none>",
+        ),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for ch in "services".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1", "kind":"Service", "metadata":{"name":"svc","namespace":"default"}, "spec":spec, "status":status}),
+        );
+        let headers = app.display_headers().to_vec();
+        let rows = app.rows();
+        app.ensure_table_cell_cache(&rows);
+        let cache = app.table_cell_cache();
+        let (cells, _) = cache.get(&row_key(rows[0])).unwrap();
+        assert_eq!(
+            cells[headers.iter().position(|h| h == "EXTERNAL-IP").unwrap()],
+            expected_ip
+        );
+        assert_eq!(
+            cells[headers.iter().position(|h| h == "PORTS").unwrap()],
+            expected_ports
+        );
+    }
+}
+
+#[tokio::test]
+async fn node_roles_include_legacy_labels_without_duplicates() {
+    for (labels, expected) in [
+        (json!({"kubernetes.io/role":"worker"}), "worker"),
+        (
+            json!({"kubernetes.io/role":"worker", "node-role.kubernetes.io/worker":"", "node-role.kubernetes.io/control-plane":""}),
+            "control-plane,worker",
+        ),
+        (
+            json!({"kubernetes.io/role":"", "node-role.kubernetes.io/":""}),
+            "<none>",
+        ),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for ch in "nodes".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1", "kind":"Node", "metadata":{"name":"worker","labels":labels}}),
+        );
+        let headers = app.display_headers().to_vec();
+        let rows = app.rows();
+        app.ensure_table_cell_cache(&rows);
+        let cache = app.table_cell_cache();
+        let (cells, _) = cache.get(&row_key(rows[0])).unwrap();
+        assert_eq!(
+            cells[headers.iter().position(|h| h == "ROLES").unwrap()],
+            expected
+        );
+    }
+}
+
+fn open_helm_clock_view(app: &mut App) {
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "helm".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.kind_plural, "helm");
+}
+
+fn helm_updated_snapshot(app: &App, now: i64) -> String {
+    let (headers, rows) = app.snapshot_table_at(now);
+    rows[0][headers.iter().position(|h| h == "UPDATED").unwrap()].clone()
+}
+
+#[tokio::test]
+async fn helm_updated_advances_without_decoding_cached_releases() {
+    let deployed = "2026-09-07T00:00:00Z";
+    let base = deployed.parse::<Timestamp>().unwrap().as_second();
+    for history in [false, true] {
+        let (mut app, _rx) = test_app();
+        open_helm_clock_view(&mut app);
+        let mut secret =
+            helm_release_secret_deployed_at("clock", "default", 1, "deployed", deployed);
+        secret["metadata"]["resourceVersion"] = json!("1");
+        apply(&mut app, secret.clone());
+        if history {
+            app.handle_key(press(KeyCode::Enter)).unwrap();
+            assert_eq!(app.kind_plural, "helmhistory");
+            apply(&mut app, secret);
+        }
+        let before = crate::helm::release_decode_count();
+        assert_eq!(helm_updated_snapshot(&app, base + 59), "59s");
+        assert_eq!(crate::helm::release_decode_count(), before + 1);
+        assert_eq!(helm_updated_snapshot(&app, base + 60), "1m");
+        assert_eq!(helm_updated_snapshot(&app, base + 3600), "1h");
+        app.table_column_widths();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        assert_eq!(crate::helm::release_decode_count(), before + 1);
+        let mut fresh = helm_release_secret_deployed_at(
+            "clock",
+            "default",
+            1,
+            "deployed",
+            "2026-09-07T00:01:00Z",
+        );
+        fresh["metadata"]["resourceVersion"] = json!("2");
+        apply(&mut app, fresh);
+        assert_eq!(helm_updated_snapshot(&app, base + 120), "1m");
+        assert_eq!(crate::helm::release_decode_count(), before + 2);
+    }
+}
+
+#[tokio::test]
+async fn helm_unknown_updated_stays_cached_and_future_times_clamp_to_zero() {
+    let base = "2026-09-07T00:00:00Z"
+        .parse::<Timestamp>()
+        .unwrap()
+        .as_second();
+    for deployed in ["", "invalid", "2026-09-07T01:00:00Z"] {
+        let (mut app, _rx) = test_app();
+        open_helm_clock_view(&mut app);
+        apply(
+            &mut app,
+            helm_release_secret_deployed_at("clock", "default", 1, "deployed", deployed),
+        );
+        let before = crate::helm::release_decode_count();
+        let expected = if deployed.starts_with("2026") {
+            "0s"
+        } else {
+            "<unknown>"
+        };
+        assert_eq!(helm_updated_snapshot(&app, base), expected);
+        assert_eq!(helm_updated_snapshot(&app, base + 60), expected);
+        assert_eq!(crate::helm::release_decode_count(), before + 1);
+    }
+}
+
+#[test]
+fn helm_updated_custom_columns_keep_their_own_type_and_clock() {
+    let cfg: crate::config::Config = toml::from_str(
+        r#"
+        [views.helm]
+        replace = true
+        [[views.helm.columns]]
+        name = "UPDATED"
+        path = "/metadata/creationTimestamp"
+        type = "time"
+    "#,
+    )
+    .unwrap();
+    let (views, warnings) = crate::views::compile(&cfg.views);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let view = views.get("helm").unwrap();
+    let mut secret = obj(helm_release_secret("clock", "default", 1, "deployed"));
+    let base = "2026-09-07T00:00:00Z"
+        .parse::<Timestamp>()
+        .unwrap()
+        .as_second();
+    secret.metadata.creation_timestamp = Some(
+        k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Timestamp::from_second(base).unwrap()),
+    );
+    let spec = crate::columns::build_spec("", "helm", Some(view), None, false);
+    let before = crate::helm::release_decode_count();
+    let (_, _, cached) = spec.cells_with_helm_time(&secret, base + 59);
+    assert_eq!(
+        spec.volatile_cached(&secret, "helm", 0, base + 60, cached)
+            .as_deref(),
+        Some("1m")
+    );
+    assert_eq!(crate::helm::release_decode_count(), before);
+    let mut text = view.clone();
+    text.columns[0].kind = crate::views::ColumnKind::Text;
+    let spec = crate::columns::build_spec("", "helm", Some(&text), None, false);
+    assert!(
+        spec.volatile_cached(&secret, "helm", 0, base + 60, Some(base))
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn event_last_seen_sorts_recent_occurrences_and_advances_with_time() {
+    let now = "2026-09-07T11:00:00Z"
+        .parse::<k8s_openapi::jiff::Timestamp>()
+        .unwrap()
+        .as_second();
+    for (query, api_version, recent) in [
+        (
+            "events",
+            "v1",
+            json!({"lastTimestamp":"2026-09-07T10:59:55Z", "count":20}),
+        ),
+        (
+            "events.events.k8s.io",
+            "events.k8s.io/v1",
+            json!({"eventTime":"2026-09-07T10:00:00Z", "series":{"lastObservedTime":"2026-09-07T10:59:55Z", "count":20}}),
+        ),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind(query);
+        let mut repeated = json!({"apiVersion":api_version,"kind":"Event","metadata":{"name":"repeat","namespace":"default","resourceVersion":"1","creationTimestamp":"2026-09-07T10:00:00Z"}});
+        repeated
+            .as_object_mut()
+            .unwrap()
+            .extend(recent.as_object().unwrap().clone());
+        apply(&mut app, repeated);
+        apply(
+            &mut app,
+            json!({"apiVersion":api_version,"kind":"Event","metadata":{"name":"single","namespace":"default","resourceVersion":"1","creationTimestamp":"2026-09-07T10:50:00Z"},"eventTime":"2026-09-07T10:50:00Z"}),
+        );
+        app.handle_key(press(KeyCode::Char('S'))).unwrap();
+        for ch in "lastseen".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(row_names(&app), ["repeat", "single"]);
+        let idx = app
+            .display_headers()
+            .iter()
+            .position(|h| h == "LAST-SEEN")
+            .unwrap();
+        let age_idx = app
+            .display_headers()
+            .iter()
+            .position(|h| h == "AGE")
+            .unwrap();
+        {
+            let rows = app.rows();
+            let (cells, _) = app.spec.cells(rows[0], now);
+            assert_eq!(cells[idx], "5s");
+            assert_eq!(cells[age_idx], "1h");
+            assert_eq!(
+                app.spec.volatile(rows[0], "events", idx, now + 30),
+                Some("35s".into())
+            );
+        }
+        apply(
+            &mut app,
+            json!({"apiVersion":api_version,"kind":"Event","metadata":{"name":"single","namespace":"default","resourceVersion":"2","creationTimestamp":"2026-09-07T10:50:00Z"},"series":{"lastObservedTime":"2026-09-07T11:00:01Z","count":2}}),
+        );
+        assert_eq!(row_names(&app), ["single", "repeat"]);
+        app.handle_key(press(KeyCode::Char('S'))).unwrap();
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(row_names(&app), ["repeat", "single"]);
+    }
+}
+
+#[tokio::test]
+async fn service_columns_and_cached_rows_follow_the_api_group() {
+    let (mut app, mut rx) = test_app();
+    for group in ["serving.knative.dev", "other.example.com"] {
+        app.cluster
+            .register_kind(group, "Service", "services", true);
+    }
+    app.cluster.register_kind("", "Service", "services", true);
+    app.cluster.register_kind(
+        "apiextensions.k8s.io",
+        "CustomResourceDefinition",
+        "customresourcedefinitions",
+        false,
+    );
+    let fetched = Arc::new(AtomicU64::new(0));
+    let requests = fetched.clone();
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let path = request.uri().path();
+            let is_crd = path
+                .starts_with("/apis/apiextensions.k8s.io/v1/customresourcedefinitions/services.");
+            let (status, body) = if is_crd {
+                requests.fetch_add(1, Ordering::SeqCst);
+                let columns = if path.ends_with("serving.knative.dev") {
+                    json!([
+                        {"name": "Ready", "type": "string", "jsonPath": ".status.ready"},
+                        {"name": "URL", "type": "string", "jsonPath": ".status.url"}
+                    ])
+                } else {
+                    json!([{"name": "State", "type": "string", "jsonPath": ".status.state"}])
+                };
+                (
+                    200,
+                    json!({
+                        "apiVersion": "apiextensions.k8s.io/v1",
+                        "kind": "CustomResourceDefinition",
+                        "metadata": {"name": path.rsplit('/').next().unwrap()},
+                        "spec": {"versions": [{"name": "v1", "served": true, "storage": true,
+                            "additionalPrinterColumns": columns}]}
+                    }),
+                )
+            } else {
+                (
+                    403,
+                    json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                    "reason": "Forbidden", "message": "unused test request", "code": 403}),
+                )
+            };
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                            body.to_string(),
+                        )))
+                        .unwrap(),
+                )
+            }
+        }),
+        "default",
+    );
+    let command = |app: &mut App, name: &str| {
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for c in name.chars() {
+            app.handle_key(press(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+    };
+    command(&mut app, "services");
+    assert_eq!(app.kind.as_ref().unwrap().ar.group, "");
+    let core_headers = app.display_headers().to_vec();
+    assert!(core_headers.contains(&"CLUSTER-IP".into()));
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "shared", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"clusterIP": "10.0.0.1"}
+        }),
+    );
+    app.handle_msg(Msg::Synced {
+        generation: app.generation,
+    });
+    command(&mut app, "services.serving.knative.dev");
+    assert!(
+        app.rows().is_empty(),
+        "core rows must not enter the Knative view"
+    );
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "AGE"]);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(message @ Msg::PrinterColumns { .. }) = rx.recv().await {
+                app.handle_msg(message);
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        app.display_headers().to_vec(),
+        ["NAME", "READY", "URL", "AGE"]
+    );
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "serving.knative.dev/v1", "kind": "Service",
+            "metadata": {"name": "shared", "namespace": "default", "resourceVersion": "1"},
+            "status": {"ready": "True", "url": "https://app.example.com"}
+        }),
+    );
+    assert_eq!(app.snapshot_table().1[0][2], "https://app.example.com");
+
+    app.handle_msg(Msg::Synced {
+        generation: app.generation,
+    });
+    command(&mut app, "services.other.example.com");
+    assert!(app.rows().is_empty());
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "AGE"]);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(message @ Msg::PrinterColumns { .. }) = rx.recv().await {
+                app.handle_msg(message);
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "STATE", "AGE"]);
+    command(&mut app, "services");
+    assert_eq!(app.display_headers().to_vec(), core_headers);
+    assert_eq!(app.rows()[0].data["spec"]["clusterIP"], "10.0.0.1");
+    command(&mut app, "services.serving.knative.dev");
+    assert_eq!(
+        app.display_headers().to_vec(),
+        ["NAME", "READY", "URL", "AGE"]
+    );
+    assert_eq!(
+        app.rows()[0].data["status"]["url"],
+        "https://app.example.com"
+    );
+    assert_eq!(fetched.load(Ordering::SeqCst), 2);
+
+    install_views(
+        &mut app,
+        r#"
+        [views."serving.knative.dev/services"]
+        replace = true
+        [[views."serving.knative.dev/services".columns]]
+        name = "CUSTOM"
+        path = "/metadata/name"
+    "#,
+    );
+    command(&mut app, "services.serving.knative.dev");
+    assert_eq!(app.display_headers().to_vec(), ["CUSTOM"]);
+    command(&mut app, "services");
+    assert_eq!(app.display_headers().to_vec(), core_headers);
+    command(&mut app, "helm");
+    assert!(app.display_headers().contains(&"REVISION".to_string()));
+    assert!(!app.display_headers().contains(&"TYPE".to_string()));
+}
+
+#[tokio::test]
+async fn regex_filter_preserves_spaces() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Pod", "metadata":{"name":"auth-api-0","namespace":"default"}}),
+    );
+    type_filter(&mut app, r"/default\sauth/");
+    assert_eq!(row_names(&app), ["auth-api-0"]);
+    retype_filter(&mut app, r"/default auth/");
+    assert_eq!(row_names(&app), ["auth-api-0"]);
+}
+
+#[tokio::test]
+async fn regex_filter_preserves_quotes_and_following_terms() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Pod", "metadata":{"name":"auth-api-0","namespace":"default"}}),
+    );
+    type_filter(&mut app, r#"/auth|"/ !canary"#);
+    assert_eq!(row_names(&app), ["auth-api-0"]);
+}
+
+#[tokio::test]
+async fn quoted_filter_folds_unicode_column_text() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("events");
+    for (name, message) in [("event-1", "Kube started"), ("event-2", "other message")] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Event",
+            "metadata": {"name": name, "namespace": "default"},
+            "message": message}),
+        );
+    }
+    type_filter(&mut app, "\"kube\"");
+    assert_eq!(row_names(&app), ["event-1"]);
+    retype_filter(&mut app, "\"KUBE\"");
+    assert_eq!(row_names(&app), ["event-1"]);
+    retype_filter(&mut app, "!\"kube\"");
+    assert_eq!(row_names(&app), ["event-2"]);
+}
+
+#[tokio::test]
+async fn boolean_groups_preserve_literal_and_regex_terms() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for name in [
+        "auth-api-0",
+        "auth-api-canary",
+        "web-1",
+        "api-gateway-runtime-hash",
+    ] {
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1","kind":"Pod",
+            "metadata":{"name":name,"namespace":"default"}}),
+        );
+    }
+    for query in [
+        r#"("auth" || /^web/) && !/canary/"#,
+        r#"("auth"||/^web/)&&!("canary")"#,
+        r#"(/^(auth-api-0|web-1)$/)"#,
+        r#"(name=missing||/^(auth-api-0|web-1)$/)"#,
+        r#"(/a"b/ || /^(auth-api-0|web-1)$/)"#,
+    ] {
+        retype_filter(&mut app, query);
+        assert_eq!(app.filter_error(), None, "{query}");
+        assert_eq!(row_names(&app), ["auth-api-0", "web-1"], "{query}");
+    }
+    retype_filter(&mut app, r#"("auth" && cpu>500m)"#);
+    assert!(row_names(&app).is_empty());
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::from([("default/auth-api-0".into(), (600, 0))]),
+        containers: HashMap::new(),
+    });
+    assert_eq!(row_names(&app), ["auth-api-0"]);
+}
+
+#[tokio::test]
+async fn invalid_local_query_keeps_pending_context_destination() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    type_resource_query(&mut app, "pods --context west /-l app=api");
+    let generation = app.generation;
+    type_resource_query(&mut app, "missing-resource /status=Running");
+    assert!(app.flash_err);
+    assert_eq!(app.generation, generation);
+    assert!(app.pending_resource_query.is_some());
+    land_context(&mut app, "west");
+    assert_eq!(app.cluster.context, "west");
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("app=api"));
+}
+
+#[tokio::test]
+async fn local_bookmark_rejects_original_context_connection_result() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    let home = app.cluster.context.clone();
+    bind_bookmark(&mut app, "services", &home);
+    type_resource_query(&mut app, "pods --context west /-l app=api");
+    let generation = app.generation;
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    assert_ne!(app.generation, generation);
+    let mut cluster = Cluster::fake();
+    cluster.context = "west".into();
+    app.handle_msg(Msg::ContextSwitched {
+        generation,
+        name: "west".into(),
+        result: Ok(Box::new(cluster)),
+    });
+    assert_eq!(app.cluster.context, home);
+    assert_eq!(app.kind_plural, "services");
+    assert!(app.context_switch_target.is_none());
+    assert!(app.pending_resource_query.is_none());
+}
+
+#[tokio::test]
+async fn local_query_clears_canceled_bookmark_destination() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    bind_bookmark(&mut app, "services", "west");
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    type_resource_query(&mut app, "pods /status=Running");
+    assert!(app.context_switch_target.is_none());
+    assert!(app.pending_bookmark.is_none());
+    assert!(app.pending_resource_query.is_none());
+    assert!(app.pending_workspace.is_none());
+}
+
+#[tokio::test]
+async fn local_query_clears_canceled_workspace_destination() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    app.workspaces = vec![crate::config::Workspace {
+        key: Some("ctrl-w".into()),
+        name: "ops".into(),
+        context: Some("west".into()),
+        views: vec![crate::config::WorkspaceView {
+            name: "services".into(),
+            resource: "services".into(),
+            ..Default::default()
+        }],
+    }];
+    app.handle_key(ctrl(KeyCode::Char('w'))).unwrap();
+    let generation = app.generation;
+    type_resource_query(&mut app, "pods /status=Running");
+    assert!(app.context_switch_target.is_none());
+    assert!(app.pending_workspace.is_none());
+    app.handle_msg(Msg::ContextSwitched {
+        generation,
+        name: "west".into(),
+        result: Err("connection failed".into()),
+    });
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.filter, "status=Running");
+    assert!(!app.flash_err);
+}
+
+#[tokio::test]
+async fn bundled_plugin_receives_v1_consent_only_when_enabled() {
+    for allow in [false, true] {
+        let (mut app, _rx) = app_with_pod();
+        app.cluster.allow_v1_client_cert = allow;
+        app.plugins = crate::plugins::bundled()
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        plugin_command(&mut app, "sanitize");
+        let Some(ConfirmAction::Plugin { jobs, .. }) = app.confirm_action.as_ref() else {
+            panic!("expected plugin confirmation");
+        };
+        assert!(!jobs.is_empty());
+        for job in jobs {
+            assert_eq!(
+                job.argv.iter().any(|arg| arg == "--allow-v1-client-cert"),
+                allow
+            );
+        }
+        app.handle_key(press(KeyCode::Char('n'))).unwrap();
+        assert_eq!(app.mode, Mode::Table);
+    }
+}
+
+#[tokio::test]
+async fn refresh_key_reads_pods_through_a_configured_ca_server_certificate() {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let pem = include_bytes!("../../tests/fixtures/tls/proxy-ca.pem");
+    let der = CertificateDer::from_pem_slice(pem).unwrap();
+    let tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![der.clone()],
+            PrivateKeyDer::from_pem_slice(include_bytes!("../../tests/fixtures/tls/server.key"))
+                .unwrap(),
+        )
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = kube::Config::new(
+        format!("https://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap(),
+    );
+    config.root_cert = Some(vec![der.to_vec()]);
+    config.tls_server_name = Some("localhost".into());
+    config.default_retry = false;
+    let (request_tx, mut requests) = mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let acceptor = acceptor.clone();
+            let request_tx = request_tx.clone();
+            connections.spawn(async move {
+                let Ok(mut stream) = acceptor.accept(socket).await else { return };
+                let mut bytes = Vec::new();
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    let Ok(byte) = stream.read_u8().await else { return };
+                    bytes.push(byte);
+                    assert!(bytes.len() < 16384);
+                }
+                let request = String::from_utf8(bytes).unwrap();
+                if !request.lines().next().unwrap().contains("/pods?") {
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
+                    return;
+                }
+                request_tx.send(request).unwrap();
+                let body = concat!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                    "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"proxy-pod\",\"namespace\":\"default\",\"resourceVersion\":\"1\"}}}\n",
+                    "{\"type\":\"BOOKMARK\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"resourceVersion\":\"1\",\"annotations\":{\"k8s.io/initial-events-end\":\"true\"}}}}\n",
+                );
+                stream.write_all(body.as_bytes()).await.unwrap();
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    let (mut app, mut rx) = test_app();
+    app.cluster.client = crate::k8s::build_client(config, false).unwrap();
+    app.kind = app.cluster.resolve("pods");
+    app.kind_plural = "pods".into();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    sync_selector_view(&mut app, &mut rx).await;
+    assert_eq!(row_names(&app), ["proxy-pod"]);
+    let request = requests.recv().await.unwrap().to_ascii_lowercase();
+    assert!(request.contains("watch=true"), "{request}");
+    assert!(request.contains("accept-encoding: identity"), "{request}");
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn namespace_views_follow_navigation_bookmarks_and_wide_mode() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [[views."v1/pods".columns]]
+        name = "OWNER"
+        path = "/metadata/ownerReferences/0/kind"
+
+        [views."pods@matlab"]
+        sort = "TENANT:desc"
+        [[views."pods@matlab".columns]]
+        name = "TENANT"
+        path = "/metadata/annotations/ops.example.com~1tenant"
+        [[views."pods@matlab".columns]]
+        name = "MODEL"
+        path = "/metadata/annotations/ops.example.com~1model"
+        wide = true
+
+        [views."pods@python"]
+        replace = true
+        [[views."pods@python".columns]]
+        name = "NAME"
+        path = "/metadata/name"
+
+        [[views."nodes@matlab".columns]]
+        name = "WRONG"
+        path = "/metadata/name"
+    "#,
+    );
+    // Startup sets the CLI namespace before it opens the resource.
+    app.namespace = "matlab".into();
+    app.switch_kind("pods");
+    assert!(app.display_headers().contains(&"TENANT".to_string()));
+    assert!(!app.display_headers().contains(&"OWNER".to_string()));
+    assert_eq!(app.display_headers()[app.sort_column.unwrap()], "TENANT");
+    assert!(app.sort_desc);
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "job", "namespace": "matlab",
+                "annotations": {"ops.example.com/tenant": "team-a"}}
+        }),
+    );
+    let rows = app.rows();
+    app.ensure_table_cell_cache(&rows);
+    let index = app
+        .display_headers()
+        .iter()
+        .position(|h| h == "TENANT")
+        .unwrap();
+    assert_eq!(
+        app.table_cell_cache().get(&row_key(rows[0])).unwrap().0[index],
+        "team-a"
+    );
+    drop(rows);
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert!(app.display_headers().contains(&"MODEL".to_string()));
+    assert_eq!(app.display_headers()[app.sort_column.unwrap()], "TENANT");
+
+    palette(&mut app, "pods all");
+    assert!(app.all_namespaces());
+    assert!(app.display_headers().contains(&"OWNER".to_string()));
+    assert!(!app.display_headers().contains(&"TENANT".to_string()));
+    app.handle_key(press(KeyCode::Char('['))).unwrap();
+    assert_eq!(app.namespace, "matlab");
+    assert!(app.display_headers().contains(&"TENANT".to_string()));
+
+    app.bookmarks = vec![crate::config::Bookmark {
+        key: Some("z".into()),
+        name: "batch".into(),
+        resource: "pods".into(),
+        namespace: Some("python".into()),
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.namespace, "python");
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "CPU", "MEM"]);
+    assert!(app.sort_column.is_none());
+    palette(&mut app, "pods other");
+    assert!(app.display_headers().contains(&"OWNER".to_string()));
+    palette(&mut app, "nodes matlab");
+    assert!(!app.display_headers().contains(&"WRONG".to_string()));
+}
+
+#[tokio::test]
+async fn namespace_view_picker_keeps_the_user_sort() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."pods@matlab"]
+        sort = "TENANT:desc"
+        [[views."pods@matlab".columns]]
+        name = "TENANT"
+        path = "/metadata/name"
+    "#,
+    );
+    palette(&mut app, "pods other");
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let header = app.display_headers()[app.sort_column.unwrap()].clone();
+    let desc = app.sort_desc;
+    app.ns_list = vec!["<all>".into(), "matlab".into(), "other".into()];
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    for c in "matlab".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.namespace, "matlab");
+    assert!(app.display_headers().contains(&"TENANT".to_string()));
+    assert_eq!(app.display_headers()[app.sort_column.unwrap()], header);
+    assert_eq!(app.sort_desc, desc);
+}
+
+#[tokio::test]
+async fn namespace_view_navigation_settings_fall_back_separately() {
+    for (namespace, expected_node, expected_target) in [
+        ("matlab", "batch-node", "secrets"),
+        ("other", "base-node", "pods"),
+        ("all", "base-node", "pods"),
+    ] {
+        let (mut app, _rx) = test_app();
+        install_views(
+            &mut app,
+            r#"
+            [views.certificates]
+            node = "/status/baseNode"
+            drill = { kind = "pods", labels = "cert={name}" }
+            [views."certificates@matlab"]
+            node = "/status/batchNode"
+            drill = { kind = "secrets", labels = "cert={name}" }
+            [[views."cert-manager.io/v1/certificates@matlab".columns]]
+            name = "EXTRA"
+            path = "/metadata/name"
+        "#,
+        );
+        palette(&mut app, &format!("certificates {namespace}"));
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "cert-manager.io/v1", "kind": "Certificate",
+                "metadata": {"name": "tls", "namespace": "matlab"},
+                "status": {"baseNode": "base-node", "batchNode": "batch-node"}
+            }),
+        );
+        app.table_state.select(Some(0));
+        app.handle_key(press(KeyCode::Char('o'))).unwrap();
+        assert_eq!(app.kind_plural, "nodes");
+        assert_eq!(app.fields, Some(format!("metadata.name={expected_node}")));
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "cert-manager.io/v1", "kind": "Certificate",
+                "metadata": {"name": "tls", "namespace": "matlab"}
+            }),
+        );
+        app.table_state.select(Some(0));
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.kind_plural, expected_target);
+        assert_eq!(app.labels.as_deref(), Some("cert=tls"));
+    }
+}
+
+fn describe_refresh_app() -> (App, Receiver<Msg>) {
+    let (mut app, rx) = test_app();
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Pod",
+        "metadata":{"name":"web", "namespace":"default"}}),
+    );
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    let claim = app.claim_status("describing web");
+    app.describe_source = Some((
+        claim,
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf 'Events:\nnew event\n'".into(),
+        ],
+    ));
+    app.handle_msg(Msg::Detail {
+        generation: app.generation,
+        claim,
+        title: "web describe".into(),
+        lines: vec!["Events:".into(), "old event".into()],
+        warn: None,
+    });
+    (app, rx)
+}
+
+#[tokio::test]
+async fn describe_refresh_toggle_updates_and_rejects_stopped_results() {
+    let (mut app, mut rx) = describe_refresh_app();
+    assert!(app.describe_refresh_task.is_none());
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "event".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    let scroll = app.detail.scroll;
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert!(app.describe_refresh_task.is_some());
+    let generation = app.describe_refresh_generation;
+    let msg = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    app.handle_msg(msg);
+    assert_eq!(app.detail.lines[1], "new event");
+    assert_eq!(app.detail.filter, "event");
+    assert_eq!(app.detail.scroll, scroll);
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert!(app.describe_refresh_task.is_none());
+    app.handle_msg(Msg::DescribeRefresh {
+        generation,
+        result: Ok(vec!["late".into()]),
+    });
+    assert_eq!(app.detail.lines[1], "new event");
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.describe_refresh_task.is_none());
+    assert!(app.describe_source.is_none());
+}
+
+#[tokio::test]
+async fn describe_refresh_failure_keeps_document_and_search_accepts_updates() {
+    let (mut app, _rx) = describe_refresh_app();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    let generation = app.describe_refresh_generation;
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    app.handle_msg(Msg::DescribeRefresh {
+        generation,
+        result: Ok(vec!["updated".into()]),
+    });
+    assert_eq!(app.mode, Mode::DocFilter);
+    assert_eq!(app.detail.lines[0], "updated");
+    app.handle_msg(Msg::DescribeRefresh {
+        generation,
+        result: Err("request failed".into()),
+    });
+    assert_eq!(app.detail.lines[0], "updated");
+    assert!(app.describe_refresh_task.is_none());
+    assert!(app.flash.contains("request failed"));
+}
+
+#[tokio::test]
+async fn describe_refresh_is_unavailable_in_yaml_and_stops_on_palette_navigation() {
+    let (mut app, _rx) = describe_refresh_app();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    assert!(app.describe_refresh_task.is_none());
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert!(app.describe_source.is_none());
+    assert!(app.describe_refresh_task.is_none());
+}
+
+#[tokio::test]
+async fn describe_refresh_repeats_for_the_original_resource() {
+    let (mut app, mut rx) = describe_refresh_app();
+    let (_, argv) = app.describe_source.as_mut().unwrap();
+    *argv = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "printf '%s' \"$1\"".into(),
+        "describe".into(),
+        "web".into(),
+    ];
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Pod",
+        "metadata":{"name":"another", "namespace":"default"}}),
+    );
+    app.table_state.select(Some(0));
+    assert_eq!(
+        app.selected_ref().unwrap().metadata.name.as_deref(),
+        Some("another")
+    );
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    for _ in 0..2 {
+        let msg = tokio::time::timeout(Duration::from_secs(8), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_msg(msg);
+        assert_eq!(app.detail.lines[0], "web");
+    }
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+}
+
+#[tokio::test]
+async fn describe_refresh_does_not_replace_plugin_output_or_yaml_fallback() {
+    let (mut app, _rx) = describe_refresh_app();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    let generation = app.describe_refresh_generation;
+    let claim = app.claim_status("plugin");
+    app.handle_msg(Msg::PluginOutput {
+        run: app.plugin_run,
+        generation: app.generation,
+        claim,
+        title: "plugin".into(),
+        lines: vec!["report".into()],
+        warn: None,
+    });
+    app.handle_msg(Msg::DescribeRefresh {
+        generation,
+        result: Ok(vec!["late".into()]),
+    });
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert_eq!(app.detail.lines[0], "report");
+    assert!(app.describe_refresh_task.is_none());
+    assert!(app.describe_source.is_none());
+
+    let (mut app, _rx) = describe_refresh_app();
+    let claim = app.describe_source.as_ref().unwrap().0;
+    app.handle_msg(Msg::Detail {
+        generation: app.generation,
+        claim,
+        title: "web YAML".into(),
+        lines: vec!["fallback".into()],
+        warn: Some("describe failed".into()),
+    });
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert!(app.describe_refresh_task.is_none());
+    assert!(app.describe_source.is_none());
+    assert_eq!(app.detail.lines[0], "fallback");
+}
+
+#[tokio::test]
+async fn describe_refresh_clamps_horizontal_scroll_when_content_shrinks() {
+    for viewport in [false, true] {
+        let (mut app, _rx) = describe_refresh_app();
+        if viewport {
+            app.detail.set_viewport(4, 2);
+        }
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        assert_eq!(app.detail.hscroll, 5);
+        app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        let generation = app.describe_refresh_generation;
+
+        app.handle_msg(Msg::DescribeRefresh {
+            generation,
+            result: Ok(vec!["another wide event".into()]),
+        });
+        assert_eq!(app.detail.hscroll, 5);
+
+        app.handle_msg(Msg::DescribeRefresh {
+            generation,
+            result: Ok(vec!["ok".into()]),
+        });
+        assert_eq!(app.detail.hscroll, 1);
+
+        app.handle_msg(Msg::DescribeRefresh {
+            generation,
+            result: Ok(vec![]),
+        });
+        assert_eq!(app.detail.hscroll, 0);
+        app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn configured_metric_columns_keep_order_values_and_live_filters() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/pods"]
+        replace = true
+        columns = [
+            { name = "NAME", builtin = "NAME" },
+            { name = "READY", builtin = "READY" },
+            { name = "CPU", metric = "cpu" },
+            { name = "CPU/R", metric = "cpu-request" },
+            { name = "LOAD", metric = "cpu-request-utilization" },
+            { name = "MEM/R", metric = "memory-request" },
+            { name = "LIMIT", metric = "memory-limit-utilization", wide = true },
+            { name = "AGE", builtin = "AGE" },
+        ]
+    "#,
+    );
+    palette(&mut app, "pods");
+    for name in ["api", "worker"] {
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": name, "namespace": "default"},
+                "spec": {
+                    "containers": [
+                        {"name": "app", "resources": {"requests": {"cpu": "4", "memory": "1Gi"}, "limits": {"memory": "2Gi"}}},
+                        {"name": "reloader", "resources": {"requests": {"cpu": "100m"}}}
+                    ],
+                    "initContainers": [
+                        {"name": "proxy", "restartPolicy": "Always", "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}}},
+                        {"name": "setup", "resources": {"requests": {"cpu": "20", "memory": "8Gi"}}}
+                    ]
+                },
+                "status": {"phase": "Running", "containerStatuses": [
+                    {"name": "app", "ready": true, "restartCount": 0},
+                    {"name": "reloader", "ready": true, "restartCount": 0}
+                ], "initContainerStatuses": [{"name": "proxy", "ready": true, "restartCount": 0}]}
+            }),
+        );
+    }
+    let metrics = |app: &mut App, api| {
+        app.handle_msg(Msg::Metrics {
+            generation: app.generation,
+            data: HashMap::from([
+                ("default/api".into(), (api, 0)),
+                ("default/worker".into(), (420, 0)),
+            ]),
+            containers: HashMap::new(),
+        });
+    };
+    metrics(&mut app, 4200);
+    let (headers, rows) = app.snapshot_table();
+    assert_eq!(
+        headers,
+        ["NAME", "READY", "CPU", "CPU/R", "LOAD", "MEM/R", "AGE"]
+    );
+    assert_eq!(
+        &rows[0][..6],
+        ["api", "3/3", "4200m", "4200m", "100%", "1.1Gi"]
+    );
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    let (headers, rows) = app.snapshot_table();
+    assert_eq!(headers[6], "LIMIT");
+    assert_eq!(rows[0][6], "-");
+    let fields = app.selected_row_fields();
+    assert!(fields.contains(&("LOAD".into(), "100%".into())));
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(180, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let mut found_red = false;
+    for y in 0..buffer.area.height {
+        let line: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect();
+        if line.contains("api")
+            && let Some(x) = line.find("100%")
+        {
+            // The table prefix can contain a multi-byte border or marker.
+            let x = line[..x].chars().count() as u16;
+            found_red = buffer[(x, y)].fg == crate::theme::red();
+        }
+    }
+    assert!(found_red);
+    type_filter(&mut app, "load>=75%");
+    assert_eq!(row_names(&app), ["api"]);
+    metrics(&mut app, 0);
+    assert!(row_names(&app).is_empty());
+    retype_filter(&mut app, "cpu/r>4 mem/r>=1Gi");
+    assert_eq!(row_names(&app), ["api", "worker"]);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    for c in "LOAD".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(row_names(&app), ["api", "worker"]);
+    metrics(&mut app, 4200);
+    assert_eq!(row_names(&app), ["worker", "api"]);
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::new(),
+        containers: HashMap::new(),
+    });
+    let (_, rows) = app.snapshot_table();
+    assert_eq!(rows[0][2], "-");
+    assert_eq!(rows[0][3], "4200m");
+    assert_eq!(rows[0][4], "-");
+}
+
+#[tokio::test]
+async fn configured_node_metrics_filter_and_refresh_by_source() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/nodes"]
+        replace = true
+        columns = [
+            { name = "NAME", builtin = "NAME" },
+            { name = "COUNT", metric = "node-pods" },
+            { name = "LOAD", metric = "node-cpu-utilization" },
+            { name = "USED", metric = "memory" },
+        ]
+    "#,
+    );
+    palette(&mut app, "nodes");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": "node"}, "status": {"allocatable": {"cpu": "2"}}}),
+    );
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::from([("node".into(), (1000, 1024 * 1024 * 1024))]),
+        containers: HashMap::new(),
+    });
+    type_filter(&mut app, "count>0 load>=50 used>=1Gi");
+    assert!(row_names(&app).is_empty());
+    app.handle_msg(Msg::NodePods {
+        generation: app.generation,
+        counts: HashMap::from([("node".into(), 3)]),
+    });
+    assert_eq!(row_names(&app), ["node"]);
+    let (headers, rows) = app.snapshot_table();
+    assert_eq!(headers, ["NAME", "COUNT", "LOAD", "USED"]);
+    assert_eq!(rows[0], ["node", "3", "50%", "1.0Gi"]);
+    app.handle_msg(Msg::NodePods {
+        generation: app.generation,
+        counts: HashMap::new(),
+    });
+    assert!(row_names(&app).is_empty());
+}
+
+#[tokio::test]
+async fn metric_layout_keeps_hidden_columns_hidden_and_avoids_duplicate_defaults() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/pods"]
+        replace = true
+        columns = [
+            { name = "NAME", builtin = "NAME" },
+            { name = "CPU", metric = "cpu", wide = true },
+        ]
+    "#,
+    );
+    palette(&mut app, "pods");
+    assert_eq!(app.display_headers().to_vec(), ["NAME"]);
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "CPU"]);
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/pods"]
+        columns = [{ name = "CPU", path = "/spec/containers/0/resources/requests/cpu", type = "quantity" }]
+    "#,
+    );
+    palette(&mut app, "nodes");
+    palette(&mut app, "pods");
+    assert_eq!(
+        app.display_headers()
+            .iter()
+            .filter(|h| h.as_str() == "CPU")
+            .count(),
+        1
+    );
+    assert!(app.display_headers().contains(&"MEM".into()));
+}
+
+#[tokio::test]
+async fn metric_overlay_retains_defaults_and_filters_percent_headers() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/pods"]
+        columns = [{ name = "%CPU/R", metric = "cpu-request-utilization" }]
+    "#,
+    );
+    palette(&mut app, "pods");
+    assert_eq!(
+        app.display_headers().to_vec(),
+        [
+            "NAME", "READY", "STATUS", "RESTARTS", "%CPU/R", "AGE", "CPU", "MEM"
+        ]
+    );
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "api", "namespace": "default"}, "spec": {"containers": [{"resources": {"requests": {"cpu": "1"}}}]}}),
+    );
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::from([("default/api".into(), (900, 0))]),
+        containers: HashMap::new(),
+    });
+    type_filter(&mut app, "%cpu/r>=90%");
+    assert_eq!(row_names(&app), ["api"]);
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::from([("default/api".into(), (800, 0))]),
+        containers: HashMap::new(),
+    });
+    assert!(row_names(&app).is_empty());
+}
+
+#[tokio::test]
+async fn unsupported_column_sources_warn_and_keep_a_usable_view() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/nodes"]
+        replace = true
+        columns = [
+            { name = "READY", builtin = "READY" },
+            { name = "CPU/R", metric = "cpu-request" },
+        ]
+    "#,
+    );
+    palette(&mut app, "nodes");
+    assert!(app.display_headers().contains(&"NAME".into()));
+    assert!(!app.display_headers().contains(&"CPU/R".into()));
+    assert_eq!(app.config_warnings.len(), 2);
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.config_warnings.len(), 2);
+}
+
+#[tokio::test]
+async fn builtin_aliases_keep_numeric_sort_and_elapsed_values() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/pods"]
+        replace = true
+        columns = [
+            { name = "NAME", builtin = "NAME" },
+            { name = "RETRY", builtin = "RESTARTS" },
+            { name = "CREATED", builtin = "AGE" },
+        ]
+    "#,
+    );
+    palette(&mut app, "pods");
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "RETRY", "CREATED"]);
+    for (name, restarts) in [("api", 10), ("worker", 2)] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": name, "namespace": "default", "creationTimestamp": "2025-01-01T00:00:00Z"}, "status": {"containerStatuses": [{"name": "app", "restartCount": restarts}]}}),
+        );
+    }
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    for c in "RETRY".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(row_names(&app), ["worker", "api"]);
+    let now = "2025-01-01T00:01:00Z"
+        .parse::<Timestamp>()
+        .unwrap()
+        .as_second();
+    assert_eq!(app.snapshot_table_at(now).1[0][2], "1m");
+    assert_eq!(app.snapshot_table_at(now + 60).1[0][2], "2m");
 }

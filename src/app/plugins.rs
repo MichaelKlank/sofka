@@ -138,14 +138,17 @@ impl App {
                         "sofka".into(),
                     ]
                 } else {
-                    vec![if plugin.package_dir.is_some() {
+                    vec![if plugin.package_dir.is_some() || plugin.bundled {
                         plugin.command.clone()
                     } else {
                         subst(&plugin.command)
                     }]
                 };
                 argv.extend(plugin.args.iter().map(|a| subst(a)));
-                let object = if plugin.package_dir.is_some()
+                if plugin.bundled && self.cluster.allow_v1_client_cert {
+                    argv.push("--allow-v1-client-cert".into());
+                }
+                let object = if (plugin.package_dir.is_some() || plugin.bundled)
                     && plugin.target.as_deref() != Some("context")
                 {
                     let key = if ns.is_empty() {
@@ -157,7 +160,8 @@ impl App {
                 } else {
                     None
                 };
-                let request = plugin.package_dir.as_ref().map(|_| {
+                let speaks_protocol = plugin.package_dir.is_some() || plugin.bundled;
+                let request = speaks_protocol.then(|| {
                     let mut request = serde_json::json!({
                         "schema_version": 1, "context": self.cluster.kubectl_context(),
                         "cluster": cluster, "namespace": ns, "resource": res,

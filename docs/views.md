@@ -11,7 +11,8 @@ lowercase kind. The most specific key wins.
 [views."cert-manager.io/v1/certificates"]
 sort = "EXPIRES:desc"     # initial sort column, ":asc" (default) or ":desc";
                           # a sort you pick in the TUI (S/I/header click) is
-                          # remembered per kind and wins over this
+                          # saved per kind by default and has priority
+                          # set remember_sort = false at the top level to disable
 # replace = true          # replace the curated columns instead of overlaying
 
 [[views."cert-manager.io/v1/certificates".columns]]
@@ -47,11 +48,166 @@ the layout. By default columns overlay the curated ones: a matching header
 replaces it in place, new columns go before AGE. Invalid entries are skipped with
 a warning in the app - they never take down the TUI.
 
+### Built-in and metric columns
+
+Set exactly one source for each column: `path`, `builtin`, or `metric`.
+Use `builtin` to retain an existing computed column, such as `READY` or `AGE`.
+Its value comes from the selected resource's built-in view. Use `metric` for
+live usage, resource totals, or percentages. `name` sets the displayed header.
+`type` applies only to `path` columns. All sources support `wide`, `width`,
+and `align`.
+
+This example puts CPU usage and request utilization before memory usage and AGE:
+
+```toml
+[views."v1/pods"]
+replace = true
+columns = [
+  { name = "NAME", builtin = "NAME" },
+  { name = "READY", builtin = "READY" },
+  { name = "STATUS", builtin = "STATUS" },
+  { name = "RESTARTS", builtin = "RESTARTS" },
+  { name = "CPU", metric = "cpu" },
+  { name = "CPU/R", metric = "cpu-request" },
+  { name = "%CPU/R", metric = "cpu-request-utilization" },
+  { name = "%CPU/L", metric = "cpu-limit-utilization", wide = true },
+  { name = "MEM", metric = "memory" },
+  { name = "%MEM/R", metric = "memory-request-utilization" },
+  { name = "%MEM/L", metric = "memory-limit-utilization", wide = true },
+  { name = "AGE", builtin = "AGE" },
+]
+```
+
+With `replace = true` and at least one valid `builtin` or `metric` column,
+only the declared columns are used, in declaration order. A namespace column
+is still added in all-namespaces mode. Without `replace`, columns overlay
+the built-in view. Default metrics remain unless their source or header is
+already declared, including a declaration with `wide = true`.
+Existing configurations that use only `path` retain their default metric
+columns. A custom CPU or MEM header prevents a duplicate default header.
+
+Available metric sources:
+
+| Sources                                                 | Resources   | Value                                          |
+| ------------------------------------------------------- | ----------- | ---------------------------------------------- |
+| `cpu`, `memory`                                         | Pods, nodes | Live usage                                     |
+| `cpu-request`, `memory-request`                         | Pods        | Request totals                                 |
+| `cpu-limit`, `memory-limit`                             | Pods        | Limit totals                                   |
+| `cpu-request-utilization`, `memory-request-utilization` | Pods        | Usage as a percentage of the request           |
+| `cpu-limit-utilization`, `memory-limit-utilization`     | Pods        | Usage as a percentage of the limit             |
+| `node-pods`                                             | Nodes       | Pod count                                      |
+| `node-cpu-utilization`, `node-memory-utilization`       | Nodes       | Usage as a percentage of allocatable resources |
+
+Pod totals sum application containers and native sidecars
+(`initContainers` with `restartPolicy = "Always"`). A declaration in
+`spec.resources` takes priority for that resource and request or limit.
+Regular init containers and pod overhead are excluded. These are workload
+totals after startup, not the effective values used for scheduling.
+Pod percentages can hide a container that is near its own limit. Open the
+container picker to check individual containers.
+
+For requests, unset container values contribute zero. If all values are
+unset, the total is `-`. For limits, the total is `-` if any included
+container has no limit, unless a pod-level limit is set. A percentage is
+`-` when its request or limit is missing or zero, or usage is unavailable.
+A measured zero usage is `0m`, `0Mi`, or `0%`. Request and limit totals
+remain available without Metrics Server.
+
+Sorting uses numeric values. Missing values sort first in ascending order,
+as in the default CPU and MEM columns. Structured filters use the displayed
+header, without regard to letter case: `cpu/r>4`, `%cpu/r>=75`,
+`%mem/l>=90%`, or `mem/r>=1Gi`. CPU quantities without a suffix are cores.
+Memory quantities without a suffix are bytes. Percentage values are points
+from zero, with an optional `%` suffix. Metric filters and sorts update
+when a new sample arrives. Use structured filters to search metric values.
+The existing `cpu`, `mem`, and `memory` usage filters remain available when
+those default columns are hidden.
+
+CPU and memory values use the existing resource threshold bands.
+Percentages use `[thresholds].utilization`, including per-resource overrides.
+Duplicate headers, invalid source combinations, and sources that are not
+available for a resource produce configuration warnings.
+
+### Namespace-specific views
+
+Add `@<namespace>` to a view key to select a layout for one namespace:
+
+```toml
+[[views."v1/pods".columns]]
+name = "OWNERKIND"
+path = "/metadata/ownerReferences/0/kind"
+
+[[views."v1/pods@matlab".columns]]
+name = "TENANT"
+path = "/metadata/annotations/ops.example.com~1tenant"
+
+[[views."v1/pods@matlab".columns]]
+name = "MODEL"
+path = "/metadata/annotations/ops.example.com~1model"
+```
+
+When a namespaced resource view is set to one namespace, sofka tries these
+keys in order:
+
+1. `apiVersion/plural@namespace`
+2. `group/plural@namespace`
+3. `plural@namespace`
+4. `kind@namespace`
+5. The same resource keys without a namespace, in the same order.
+
+For example, `pods@matlab` has priority over `v1/pods`.
+All-namespaces mode and cluster-scoped resources use only unqualified keys.
+A row filter does not change the namespace used for this lookup.
+
+The selected layout does not inherit columns, `replace`, or `sort` from
+another resource key. If it has no `sort`, `[views."*"].sort` supplies the
+global default. The `"*"` key supports only the default sort; it does not
+supply columns or navigation settings. A table without the specified column
+ignores the global sort until that column is available. The default sort is
+checked again when CRD printer columns arrive or wide mode changes. A saved
+sort can replace a configured default when its column becomes available.
+An active user or bookmark sort keeps its priority. Columns still overlay the built-in layout unless
+`replace = true`. In this example, the `matlab` view adds TENANT and MODEL,
+but does not add OWNERKIND. Wide mode works as usual. An active sort stays
+on its column if that column is still present. A saved user sort has priority
+over the configured initial sort when `remember_sort` is enabled (the default).
+Set `remember_sort = false` at the top level of the config to stop saving
+and restoring user sort choices. Sort changes still work in the active view.
+On a new view start, the configured sort applies again. Existing saved
+choices stay on disk while the option is disabled.
+
+The sort picker's no-sort entry clears sorting in the active view. Column
+updates, wide mode, config reload, and watch refresh keep that choice.
+Opening a resource view again applies its saved or configured sort as usual.
+
+A user or bookmark sort waits while its column is hidden or unavailable.
+The table uses its natural order during that time. When the column returns,
+the selected sort and direction return, even with `remember_sort = false`.
+Clearing the sort or selecting another column cancels the waiting choice.
+
+The `node` and `drill` settings use the same key order, but each setting
+falls back separately. A view that sets only columns does not hide a
+`node` or `drill` setting on a less specific key. Built-in navigation rules
+still apply.
+
+Namespace selection works with `sofka pods -n matlab`, the namespace picker,
+resource commands, bookmarks, and view history. The namespace suffix must
+be a valid namespace name: 1 to 63 lowercase letters, digits, or hyphens,
+with a letter or digit at each end. Invalid suffixes produce a configuration
+warning and the view is ignored.
+
 ### Pods and nodes
 
 Custom columns also overlay sofka's curated core-resource views. Pods already
 show `IP` and `NODE` after toggling wide mode with `w`, and nodes always show
-`VERSION`. Extra node topology and provisioning details can come from labels:
+`VERSION`. Press `w` in the nodes view to show `LABELS` as comma-separated
+`key=value` pairs in key order. Nodes without labels show `<none>`.
+Use `/` to find text in the visible labels. To filter by an exact label, press
+`/`, enter `-l karpenter.sh/nodepool=default`, then press Enter. Label selectors
+also work with wide mode off. Use the label key and value for your cluster.
+
+Custom columns can show individual labels or annotations. Extra node topology
+and provisioning details can come from labels:
 
 ```toml
 # Karpenter example; adjust provider-specific NODEPOOL and TYPE label names.
@@ -145,7 +301,11 @@ columns therefore doesn't hide a `node` or `drill` set under a broader key.
 
 A custom resource with no explicit view picks up its CRD
 `additionalPrinterColumns` automatically (columns with `priority > 0` become
-wide-only). A condition lookup
+wide-only). Built-in columns match both the API group and resource name.
+For example, core Services keep their network columns, while
+`services.serving.knative.dev` uses the Knative CRD columns. Printer columns
+and cached resource rows stay separate for each API group and version.
+An explicit user view with columns still takes precedence. A condition lookup
 (`.status.conditions[?(@.type=="Ready")].status` - how most CRDs express their
 READY column) becomes a `condition` column, found by type name. The same filter
 selecting another field (`.reason`, `.message`, `.lastTransitionTime`, …) keeps

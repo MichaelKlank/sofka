@@ -48,6 +48,10 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     kubeconfig: Option<PathBuf>,
 
+    /// Allow X.509 v1 client certificates for this run. Does not disable server checks.
+    #[arg(long)]
+    allow_v1_client_cert: bool,
+
     /// Disable every action that could modify the cluster (delete, edit,
     /// scale, shell, plugins, …). Overrides the config `readonly` option,
     /// including per-cluster/per-context overrides, for the whole session.
@@ -80,6 +84,12 @@ struct Args {
     /// Deprecated alias for `sofka info --offline`.
     #[arg(long)]
     info: bool,
+
+    /// Run a core plugin's adapter: read a plugin request on stdin, write its
+    /// report on stdout. sofka spawns itself with this; it is not a user-facing
+    /// entry point, which is why it is hidden from `--help`.
+    #[arg(long, value_name = "NAME", hide = true)]
+    plugin_adapter: Option<String>,
 }
 
 #[derive(clap::Subcommand, Debug, Clone)]
@@ -130,6 +140,14 @@ fn main() -> Result<()> {
 }
 
 async fn run_main(args: Args) -> Result<()> {
+    // Before anything else: an adapter run owns stdout for its report and must
+    // never load config, connect, or touch the terminal.
+    if let Some(name) = &args.plugin_adapter {
+        return match name.as_str() {
+            "sanitize" => sofka::sanitize::run(args.allow_v1_client_cert).await,
+            other => Err(anyhow::anyhow!("unknown core plugin adapter '{other}'")),
+        };
+    }
     if let Some(dir) = &args.validate_plugin {
         let plugin = sofka::plugins::read_package(dir).map_err(anyhow::Error::msg)?;
         sofka::plugins::available(&plugin).map_err(anyhow::Error::msg)?;
@@ -169,8 +187,8 @@ async fn run_main(args: Args) -> Result<()> {
     // with the error, since there is no picker to fall back to.
     eprintln!("Connecting to cluster…");
     let connect = match args.context.as_deref() {
-        Some(name) => Cluster::connect_context(name).await,
-        None => Cluster::connect().await,
+        Some(name) => Cluster::connect_context(name, args.allow_v1_client_cert).await,
+        None => Cluster::connect(args.allow_v1_client_cert).await,
     };
     let (mut cluster, connect_error) = match connect {
         Ok(c) => (c, None),
@@ -187,6 +205,14 @@ async fn run_main(args: Args) -> Result<()> {
             )
         }
     };
+    cluster.allow_v1_client_cert = args.allow_v1_client_cert;
+    for w in cluster
+        .discovery_fallback
+        .iter()
+        .chain(&cluster.discovery_warnings)
+    {
+        eprintln!("\x1b[33mwarning:\x1b[0m {w}");
+    }
     // Per-cluster/per-context override files merge over the base config.
     let resolved = loader.resolve(&cluster.context, &cluster.cluster_name);
     for w in &resolved.warnings {
@@ -214,6 +240,11 @@ async fn run_main(args: Args) -> Result<()> {
             "  kinds:      {} resource types discovered",
             cluster.catalog.len()
         );
+        let not_read = cluster.discovery_warnings.len();
+        if not_read > 0 {
+            let noun = if not_read == 1 { "group" } else { "groups" };
+            println!("  not read:   {not_read} API {noun}. Refer to the warnings above.");
+        }
         for alias in ["pods", "po", "dp", "svc", "no", "ns", "cm"] {
             match cluster.resolve(alias) {
                 Some(k) => println!(
@@ -271,6 +302,7 @@ async fn run_main(args: Args) -> Result<()> {
     let sort_memory_path = sortmem::SortMemory::default_path();
     app.sort_memory = sortmem::SortMemory::load(&sort_memory_path);
     app.sort_memory_path = Some(sort_memory_path);
+    app.remember_sort = cfg.remember_sort.unwrap_or(true);
     // The last namespace picked per context persists too, so a relaunch (or
     // a `:ctx` switch back) lands where you left off.
     let namespace_memory_path = nsmem::NamespaceMemory::default_path();
@@ -293,6 +325,7 @@ async fn run_main(args: Args) -> Result<()> {
     app.guardrails = cfg.guardrails.clone();
     app.debug = cfg.debug.clone();
     app.bundle_cfg = cfg.bundle.clone();
+    app.pvc_cfg = cfg.pvc_explore.clone();
     app.logs_cfg = cfg.logs.clone();
     // Seed the session toggle once; later `F` presses (and per-context config
     // reloads) don't fight the user's in-session choice.
@@ -307,6 +340,7 @@ async fn run_main(args: Args) -> Result<()> {
         .chain(config::guardrail_warnings(&app.guardrails))
         .chain(config::forward_warnings(&app.forwards_cfg))
         .chain(config::notify_warnings(&app.notify_cfg))
+        .chain(config::pvc_explore_warnings(&app.pvc_cfg))
     {
         eprintln!("warning: {w}");
         config_warnings.push(w);
@@ -384,6 +418,7 @@ async fn run_main(args: Args) -> Result<()> {
         app.flash = w.clone();
         app.flash_err = true;
     }
+    app.flash_discovery_warnings();
 
     if args.snapshot {
         let result = snapshot(&mut app, &mut rx).await;
@@ -398,6 +433,9 @@ async fn run_main(args: Args) -> Result<()> {
     }
     install_panic_hook(panic_tx);
     let result = run(&mut terminal, &mut app, &mut rx, mouse).await;
+    // Still inside the runtime, so this actually completes — a spawned delete
+    // would not, and the helper pod would sit out its TTL holding the volume.
+    app.shutdown_pvc_helper().await;
     // Disable before leaving the alternate screen so the shell never sees
     // mouse-report sequences (harmless if capture was never enabled).
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
@@ -652,8 +690,8 @@ async fn run_info(
     } else {
         eprintln!("Connecting to cluster…");
         match args.context.as_deref() {
-            Some(name) => Cluster::connect_context(name).await,
-            None => Cluster::connect().await,
+            Some(name) => Cluster::connect_context(name, args.allow_v1_client_cert).await,
+            None => Cluster::connect(args.allow_v1_client_cert).await,
         }
         .inspect_err(|e| eprintln!("\x1b[33mwarning:\x1b[0m {e:#}"))
         .ok()
@@ -726,6 +764,13 @@ async fn run_info(
             "  discovery:   {} resource kinds",
             cluster.catalog.len()
         ));
+        for warning in cluster
+            .discovery_fallback
+            .iter()
+            .chain(&cluster.discovery_warnings)
+        {
+            lines.push(format!("    • {}", diagnostics::safe(warning)));
+        }
         lines.push(format!(
             "  metrics API: {}",
             if cluster.resolve("pods.metrics.k8s.io").is_some() {
@@ -874,14 +919,24 @@ fn dispatch(
     }
     for key in keys {
         app.handle_key(key)?;
-        if let Some(app::Suspend::Shell(argv)) = app.pending.take() {
-            suspend_and_run(terminal, &argv, captured);
-            app.flash = format!("ran: {}", argv.join(" "));
-            app.flash_err = false;
-        }
+        take_suspend(terminal, app, captured);
     }
     terminal.draw(|f| ui::draw(f, app))?;
     Ok(true)
+}
+
+/// Run whatever interactive command the app just queued, if any. Called after
+/// every path that can queue one — a keystroke, a mouse click, and a background
+/// message (the PVC browser resolves which pod to exec into asynchronously, so
+/// its shell is requested from a message, not from the keystroke that asked
+/// for it).
+fn take_suspend(terminal: &mut ratatui::DefaultTerminal, app: &mut App, captured: bool) {
+    if let Some(app::Suspend::Shell(argv)) = app.pending.take() {
+        suspend_and_run(terminal, &argv, captured);
+        app.flash = format!("ran: {}", argv.join(" "));
+        app.flash_err = false;
+        app.after_suspend();
+    }
 }
 
 async fn run(
@@ -949,11 +1004,7 @@ async fn run(
                     }
                     Some(Ok(Event::Mouse(m))) => {
                         app.handle_mouse(m)?;
-                        if let Some(app::Suspend::Shell(argv)) = app.pending.take() {
-                            suspend_and_run(terminal, &argv, captured);
-                            app.flash = format!("ran: {}", argv.join(" "));
-                            app.flash_err = false;
-                        }
+                        take_suspend(terminal, app, captured);
                         dirty = true;
                     }
                     Some(Err(_)) | None => return Ok(()),
@@ -972,6 +1023,7 @@ async fn run(
                     app.run_notify_command(&text);
                     ring_notification(&text, &app.notify_cfg);
                 }
+                take_suspend(terminal, app, captured);
                 dirty = true;
             }
             _ = frame.tick(), if dirty => {
@@ -991,5 +1043,31 @@ async fn run(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v1_client_cert_requires_an_explicit_cli_flag() {
+        assert!(
+            !Args::try_parse_from(["sofka"])
+                .unwrap()
+                .allow_v1_client_cert
+        );
+        for mode in ["--check", "--snapshot"] {
+            let args = Args::try_parse_from(["sofka", mode, "--allow-v1-client-cert"]).unwrap();
+            assert!(args.allow_v1_client_cert);
+        }
+        let args = Args::try_parse_from([
+            "sofka",
+            "--plugin-adapter",
+            "sanitize",
+            "--allow-v1-client-cert",
+        ])
+        .unwrap();
+        assert!(args.allow_v1_client_cert);
     }
 }

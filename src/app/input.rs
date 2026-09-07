@@ -7,13 +7,16 @@ impl App {
         let before = match self.mode {
             Mode::Command => self.palette_return,
             Mode::Help => self.help_return,
-            Mode::Filter | Mode::Confirm | Mode::Prompt | Mode::SortPicker | Mode::CopyPicker => {
-                Mode::Table
-            }
+            // Where the overlay will return to: the table, except for a
+            // dialog raised from the PVC browser, which returns there. Getting
+            // this wrong reads as "left the view" and stops a running plugin.
+            Mode::Confirm | Mode::Prompt => self.overlay_return(),
+            Mode::Filter | Mode::SortPicker | Mode::CopyPicker => Mode::Table,
             other => other,
         };
         let run = self.plugin_run;
         let result = self.handle_key_inner(key);
+        self.check_describe_refresh();
         let overlay = matches!(
             self.mode,
             Mode::Command
@@ -26,8 +29,28 @@ impl App {
                 | Mode::SortPicker
                 | Mode::CopyPicker
         );
+        if before == Mode::Detail && self.mode != Mode::Detail && !overlay {
+            self.describe_source = None;
+        }
         if self.should_quit || (self.plugin_run == run && self.mode != before && !overlay) {
             self.stop_plugins();
+        }
+        // Anything that navigated out of the PVC browser — a palette jump, a
+        // bookmark, a workspace — would otherwise leave it holding a helper
+        // pod and two stale panes. `leave_pvc_explore` is idempotent, so the
+        // `esc` path having already run it costs nothing.
+        if self.pvc.active && self.mode != Mode::PvcExplore && !overlay {
+            self.leave_pvc_explore();
+        }
+        // A PVC shell waiting on a dialog can also be walked away from — `:`
+        // is accepted from `Mode::Confirm` and simply abandons the action.
+        // Nothing else will ever run the suspend, so release what it holds.
+        let awaiting = matches!(self.mode, Mode::Confirm | Mode::Prompt) || self.pending.is_some();
+        if self.pvc.shell_pending && !self.pvc.active && !awaiting {
+            if matches!(self.confirm_action, Some(ConfirmAction::PvcShell { .. })) {
+                self.confirm_action = None;
+            }
+            self.after_suspend();
         }
         result
     }
@@ -57,6 +80,22 @@ impl App {
                 }
                 KeyCode::Char('r') if self.mode == Mode::Table => {
                     self.start_watch();
+                    return Ok(());
+                }
+                KeyCode::Char('z')
+                    if self.mode == Mode::Table
+                        && self.kind_plural == "pods"
+                        && key.modifiers == KeyModifiers::CONTROL =>
+                {
+                    if self.try_bookmark_key(key)
+                        || self.try_workspace_key(key)
+                        || self.try_plugin_key(key)
+                    {
+                        return Ok(());
+                    }
+                    self.faults_only = !self.faults_only;
+                    self.invalidate_rows();
+                    self.table_state.select(Some(0));
                     return Ok(());
                 }
                 KeyCode::Char('f')
@@ -137,6 +176,8 @@ impl App {
             Mode::Snapshots => self.key_snapshots(key),
             Mode::Fleet => self.key_fleet(key),
             Mode::Find => self.key_find(key),
+            Mode::PvcExplore => self.key_pvc_explore(key),
+            Mode::PortForwardPicker => self.key_port_forward_picker(key),
         }
         Ok(())
     }
@@ -164,6 +205,7 @@ impl App {
                 | Mode::Snapshots
                 | Mode::Fleet
                 | Mode::Find
+                | Mode::PvcExplore
         )
     }
 
@@ -186,6 +228,7 @@ impl App {
                     // Dropping the filter also drops its server-side
                     // selectors, so the watch must widen back out.
                     self.sync_filter_selectors();
+                    self.save_history_filter();
                 } else if !self.pop_frame() {
                     // at root, nothing to pop
                 }
@@ -201,9 +244,7 @@ impl App {
             }
             KeyCode::PageDown => self.move_page(1),
             KeyCode::PageUp => self.move_page(-1),
-            // Horizontal column scroll for narrow panes: the NAMESPACE/NAME
-            // prefix stays anchored, → hides the next column after it, ←
-            // brings one back.
+            // Move the viewport; keep NAMESPACE/NAME in place.
             KeyCode::Right => self.scroll_columns(1),
             KeyCode::Left => self.scroll_columns(-1),
             // k9s: SPACE marks/unmarks the current row for bulk actions, then
@@ -218,6 +259,10 @@ impl App {
             // k9s: `x` shows a secret's data base64-decoded. Elsewhere `x`
             // stays free for user plugins (the fallthrough arm below).
             KeyCode::Char('x') if self.kind_plural == "secrets" => self.open_decoded_secret(),
+            // `x` on a PVC opens the split-pane volume browser.
+            KeyCode::Char('x') if self.kind_plural == "persistentvolumeclaims" => {
+                self.open_pvc_explore()
+            }
             KeyCode::Char('E') => self.open_events(),
             KeyCode::Char('l') => self.open_logs(),
             // Logs from the configured external provider ([providers.logs]).
@@ -228,6 +273,10 @@ impl App {
             KeyCode::Char('s') => {
                 if self.kind_plural == "pods" {
                     self.request_exec();
+                } else if self.kind_plural == "persistentvolumeclaims" {
+                    // A PVC can't scale; `s` shells into the volume instead,
+                    // through whatever pod mounts it.
+                    self.request_pvc_shell();
                 } else {
                     self.request_scale();
                 }
@@ -267,6 +316,7 @@ impl App {
             }
             // k9s: 0 = all namespaces.
             KeyCode::Char('0') => {
+                self.save_history_filter();
                 self.namespace.clear();
                 self.drop_owner_scope();
                 self.remember_namespace();
@@ -378,8 +428,30 @@ impl App {
             Mode::Events => self.stop_event_stream(),
             _ => {}
         }
+        self.cancel_explain_request();
+        self.cancel_gitops_request();
         self.help_return = Mode::Table;
         self.palette_return = Mode::Table;
+        let query_head = typed.split_whitespace().next().unwrap_or("");
+        let owns_command = PALETTE_COMMANDS
+            .iter()
+            .any(|c| c.names.contains(&query_head))
+            || self
+                .plugins
+                .iter()
+                .any(|p| p.palette.as_deref() == Some(query_head));
+        if (self.cluster.resolve(query_head).is_some() || !owns_command)
+            && (typed.contains(" /")
+                || typed
+                    .split_whitespace()
+                    .any(|s| matches!(s, "-n" | "--namespace" | "--context")))
+        {
+            match crate::filter::ResourceQuery::parse(&typed) {
+                Ok(query) => self.apply_resource_query(query),
+                Err(error) => self.flash_warn(&format!("query: {error}")),
+            }
+            return;
+        }
         // `:kind namespace` switches both at once (`:deploy social`,
         // `:cephclusters all`); only the first word selects the kind.
         let (head, ns_arg) = match typed.split_once(char::is_whitespace) {
@@ -486,6 +558,8 @@ impl App {
             PaletteAction::Info => self.open_info(),
             PaletteAction::Fleet => self.open_fleet(),
             PaletteAction::Rightsize => self.open_rightsize(),
+            PaletteAction::PvcExplore => self.open_pvc_explore(),
+            PaletteAction::PvcClean => self.request_pvc_clean(),
             PaletteAction::Find => self.flash_warn("usage: :find <text>"),
             PaletteAction::Diff => self.open_diff(),
             PaletteAction::Events => self.switch_kind("events.events.k8s.io"),
@@ -847,13 +921,15 @@ impl App {
                 self.filter.clear();
                 self.mode = Mode::Table;
                 self.sync_filter_selectors();
+                self.save_history_filter();
             }
             KeyCode::Enter => {
-                self.mode = Mode::Table;
                 if let Some(err) = self.filter_error() {
                     self.flash_warn(&format!("filter: {err}"));
                 } else {
+                    self.mode = Mode::Table;
                     self.sync_filter_selectors();
+                    self.save_history_filter();
                 }
             }
             KeyCode::Backspace => {
@@ -887,6 +963,8 @@ impl App {
                 } else if self.mode == Mode::Events {
                     self.stop_event_stream();
                 }
+                self.stop_describe_refresh();
+                self.describe_source = None;
                 self.mode = self.return_mode;
                 if self.return_mode == Mode::Table {
                     self.restore_selection();
@@ -903,6 +981,7 @@ impl App {
             // when no search is active.
             KeyCode::Char('n') if detail => target.step_match(true),
             KeyCode::Char('N') if detail => target.step_match(false),
+            KeyCode::Char('r') if self.mode == Mode::Detail => self.toggle_describe_refresh(),
             // Copy the document to the clipboard (k9s `c`), same as the logs
             // view: an active search copies only the matching lines.
             KeyCode::Char('c') if detail => {

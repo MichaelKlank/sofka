@@ -6,9 +6,23 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 
 - **Connect** to the current kubeconfig context, including exec credential
   plugins (GKE, EKS, and friends).
+- **Optional v1 client certificates** through `--allow-v1-client-cert`, disabled
+  by default. See [certificate compatibility](debugging.md#x509-v1-client-certificates).
+- **Teleport local proxy certificates** work when the server certificate exactly
+  matches a configured CA. Hostname, date, usage, and TLS signature checks remain
+  enabled. See [proxy certificates](debugging.md#teleport-local-kubernetes-proxy-certificates).
 - **API discovery** of every resource type on the cluster, with k9s-style short
   aliases (`po`, `dp`, `svc`, `no`, `cm`, `sts`, `ds`, `ks`, `hr`, …) and correct
   precedence - core `pods` wins over `pods.metrics.k8s.io`.
+  Discovered short names also work for custom resources, such as `:md` for
+  MachineDeployments. Exact aliases appear before fuzzy resource matches.
+  Resource names and built-in aliases take priority over discovered short names.
+  Shared short names use group priority, then alphabetical group and resource
+  order. User aliases override discovered aliases.
+  Sofka can connect when it cannot read one API group. Examples: the
+  extension API server is down, or it sends an `apiVersion` that is not `v1`.
+  Sofka does not load that group. It shows a warning at startup and a flash
+  on the first screen. `:info` shows the group and the reason.
 - **Live watch** of any kind through `kube::runtime::watcher`, streamed into an
   in-memory store. Watch requests use uncompressed responses to avoid gzip
   stream errors. List requests retain gzip compression.
@@ -16,16 +30,49 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   statefulsets, daemonsets, services, nodes, namespaces, configmaps, secrets,
   jobs, cronjobs, PVC/PV, ingresses, endpoints, CustomResourceDefinitions), with
   a NAME/AGE fallback for everything else. STATUS columns use a fixed width of
-  26 characters so status changes do not move adjacent columns. A configured
-  column width takes priority. Column widths use the full filtered list so
-  scrolling does not move the columns.
-- **Custom views** - define columns for any resource in the config file. An
+  26 characters, or 27 for Nodes, so status changes do not move adjacent
+  columns. A configured column width takes priority. Column widths use the full filtered list so
+  vertical scrolling does not move the columns. Node ROLES combines
+  `node-role.kubernetes.io/` labels with the legacy `kubernetes.io/role` value
+  and removes duplicate roles. Node STATUS adds `SchedulingDisabled` when
+  the Node is cordoned and keeps its readiness color.
+- **Event timing** - LAST-SEEN shows the most recent reported occurrence for
+  core and events.k8s.io Events. It advances with time and sorts by occurrence
+  timestamp. AGE continues to show object creation age.
+- **Service endpoints** include ExternalName targets, configured external IPs,
+  load balancer addresses, and NodePort values such as `80:30080/TCP`.
+- **Pod health** shows init progress and failure reasons, Pod reasons such as
+  `Evicted`, scheduling gates, and termination signals or exit codes.
+  Init progress appears after the kubelet reports init state. Until then, the
+  table keeps the Pod phase or reason, including `SchedulingGated`.
+  Normal init containers count toward RESTARTS during initialization, but not READY.
+  Native sidecars count toward READY and RESTARTS. Their failures remain
+  visible after initialization, without adding restarts from completed normal init containers.
+  Application waiting and termination reasons take precedence after initialization.
+  A blocked readiness gate
+  gives a Running pod warning colors even when all containers are ready.
+  Failure reasons use red rows and status text, including init failures and
+  the `Lost` PVC state.
+- **Horizontal scrolling** - Left and Right move the table by five text positions.
+  NAME and NAMESPACE stay fixed. Other columns keep their widths while you
+  scroll. Arrows in the title show where more content is available. When all
+  columns fit, Left and Right do nothing.
+- **Custom views** - define columns for any resource in the config file.
+  Select and order built-in columns, live CPU/MEM usage, pod request and limit
+  totals, and utilization percentages. Metric columns support numeric sorting,
+  structured filters, and threshold colors. An
   unknown custom resource picks up its CRD `additionalPrinterColumns`
-  automatically. `w` toggles wide-only columns (kubectl `-o wide`). See
+  automatically. `w` toggles wide-only columns (kubectl `-o wide`), including
+  node labels. Add `@<namespace>` to a view key to select columns for one
+  namespace. See
   [Views and thresholds](views.md).
 - **Drill-down navigation** with a breadcrumb stack: workload/service → pods,
   cronjob → its jobs, node → its pods, pod → containers, namespace → re-scope,
   CRD → its custom resources. `esc` goes back.
+  Workload pod selection includes both `matchLabels` and `matchExpressions`.
+  Drill-down, logs, Explain, and diagnostic bundles apply all requirements,
+  including `In`, `NotIn`, `Exists`, and `DoesNotExist`. Services use their
+  plain label map.
 - **Resource cycling** (`Tab` / `Shift-Tab`) - browse pods → services →
   deployments → statefulsets → daemonsets → secrets → configmaps → ingresses →
   PVCs, wrapping in either direction without configuration. Keeps the current
@@ -39,10 +86,26 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   `events`, `pf`, `notify`, `find`, `vlogs`, `rightsize`, `fleet`, `skin`,
   `reload`, `config`, `info`). `:` and `?` open the palette and help from every
   navigation screen, then close back to the screen where they were opened.
-- **Filtering** (`/`) with matched-character highlighting: fuzzy text, `!text`
-  inverse match, `-l`/`-f` label and field selectors (evaluated server-side on
+- **Filtering** (`/`) with matched-character highlighting: fuzzy text, `"text"`
+  contiguous match, `/re/` regular expression (both case-insensitive), `!text`
+  inverse match (also `!"text"` and `!/re/`), `-l`/`-f` label and field selectors (evaluated server-side on
   ⏎), and typed column comparisons (`status=CrashLoopBackOff`, `cpu>500m`,
-  `memory>1Gi`, `restarts>=5`, `age<2h`). Space-separated terms AND together.
+  `memory>1Gi`, `restarts>=5`, `age<2h`). Structured terms AND together with
+  spaces or `&&`; `||` combines alternatives, parentheses group expressions,
+  and `!(...)` negates a group. Quote values containing spaces. Selectors
+  survive refresh, namespace changes, drill-down, and view history. The title
+  shows local, server-side, mixed, or pending evaluation; `/` edits and Esc
+  clears. Palette queries combine scope and filtering:
+  `:pods -n prod --context west /-l app=api status=Running`.
+  See [filter grammar and selectors](filtering.md).
+- **Toggle faults** (`Ctrl+Z`, pods only) shows pending, failed, unknown,
+  terminating, and running pods that are not ready. Completed pods are hidden.
+  The table title shows `[faults]` while the filter is on. It works with the
+  text filter and current namespace or drill scope. Press `Ctrl+Z` again to
+  turn it off. The setting stays on for pod views during the session and does
+  not filter other resource types. Configured `Ctrl+Z` bookmark, workspace,
+  and matching plugin actions take precedence. Live updates keep the selected
+  pod selected. If it leaves the list or its UID changes, selection is cleared.
 - **Global fuzzy find** (`:find <text>`) - search object names across the common
   kinds (workloads, pods, services, config, ingresses, jobs, storage, nodes,
   namespaces, Flux objects) in every namespace at once, concurrently. Results
@@ -61,6 +124,9 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   session recents (·) above the rest, plus a context switcher (`:ctx`). The
   last namespace picked in each context is remembered across restarts
   (`<state-dir>/namespaces.toml`); `-n`/`-A` override it for a session.
+- **Default sort** - `[views."*"].sort` sets a global initial sort, with
+  resource-specific overrides. Sort choices are saved per kind by default.
+  Set `remember_sort = false` to make user sort changes temporary.
 - **Mouse support** - the wheel scrolls every view (one notch is three steps of
   that view's own up/down), clicking a row selects it, clicking a column header
   sorts by it (click again to flip). Document views (YAML/describe, diff,
@@ -82,7 +148,13 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   `utilization` thresholds and sortable, so "which node is full" is one glance
   and one `S`. The container picker shows per-container CPU and memory, usage as
   a percent of request and of limit (`-` marks an unset one), and the pod QoS
-  class. All of it degrades cleanly when metrics-server isn't installed.
+  class. Memory quantities use Kubernetes units, including decimal `k`, `P`,
+  and `E`, and binary `Pi` and `Ei`, in metrics and filters. Fractional bytes
+  round up to the next whole byte.
+  Missing samples show `-` and do not match numeric CPU or memory filters.
+  Measured zero shows `0m`, `0Mi`, or `0%`. Missing metric values sort before
+  measured values in ascending order and after them in descending order.
+  All of it degrades cleanly when metrics-server isn't installed.
 - **Configurable thresholds** for the RESTARTS/CPU/MEM/request-limit coloring,
   globally and per resource and per context. See
   [Views and thresholds](views.md#thresholds).
@@ -92,6 +164,12 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   `ScaledDown`, `Terminating`), and the whole row is tinted by it - so a
   workload whose pods are crashing or whose desired replicas aren't met reads
   red/peach in the list, like k9s, instead of looking uniformly healthy.
+- **Job execution status** distinguishes pending, running, suspended, failed,
+  completing, completed, and terminating jobs. Failed jobs use the error color even when
+  no pod is active.
+- **Storage deletion status** shows `Terminating` for PVs and PVCs after
+  deletion starts, including when a storage protection finalizer keeps the
+  object in the API.
 - **Explain-unhealthy view** (`X` / `:explain`) - a deterministic, evidence-based
   explanation of why the selection is unhealthy: rollout state, degraded
   conditions, blocking pods and their container failure reasons
@@ -99,6 +177,15 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   and recent Warning events. No AI, no external service. `⏎`, `E`, or `l` jumps
   from a finding to the pod, its events, or its logs. After opening evidence,
   `esc` returns to Explain before another `esc` returns to the table.
+  Opening the view or pressing `r` reads the selected resource from the API
+  before gathering its evidence. A failed read or a changed UID produces a
+  warning instead of findings from an old snapshot. Only the latest requested
+  report can update the findings. Closing the view with `esc` or `q` cancels
+  pending results and clears the report progress message. Navigation to
+  a target resource or a palette destination also cancels pending results.
+  Temporary Events and Logs views keep the parent report active. New findings
+  update that report without changing the evidence view. Refresh keeps the
+  previous findings until new results arrive.
 - **Session-local timeline** (`T` / `:timeline`) - a per-object timestamped log
   of every state change the watch saw: generation bumps, replica and readiness
   changes, pod phase, restarts, waiting reasons, condition flips. Computed from
@@ -131,14 +218,22 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   chain for the selection: the owning Kustomization/HelmRelease, its source
   (GitRepository/OCIRepository/HelmRepository) with applied and latest revision,
   the `dependsOn` edges, and ready status. Each item is a finding you can `⏎`
-  into.
+  into. Opening the view or pressing `r` reads the original resource again,
+  then follows its current owner labels, source, and dependencies. A missing
+  or replaced resource produces a warning. These reads require `get` access.
+  Only the latest requested report can update the findings. Closing the view
+  with `esc` or `q` cancels pending results and clears the report progress
+  message. Navigation to a target resource or a palette destination also
+  cancels pending results.
 - **Native Helm inspector** (`:helm` / `:hm`) - sofka decodes Helm's release
   storage Secrets directly (double base64 → gunzip → JSON, same as Helm) and
   lists one row per release at its latest revision, like `helm list`. `⏎` opens
   the full revision history (`helm history`); on a revision, `⏎` shows
   user-supplied values, `y` the rendered manifest, `d` the NOTES.txt. `r` rolls
   back and `ctrl-d` uninstalls - those two shell out to the real `helm` binary,
-  all the inspection is native.
+  all the inspection is native. UPDATED advances with the clock in both the
+  release list and revision history. The table keeps the deployment timestamp
+  in its row cache, so clock updates do not decode the release again.
 - **Managed-resource mutation warnings** - before you edit, delete, scale, or
   otherwise change an object Flux (or another controller) owns, sofka tells you
   the next reconcile will revert it or recreate it. Fix the source instead of
@@ -150,16 +245,23 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   like `kubectl create job --from`), suspend, resume.
 - **Background port-forwards** (`f`/`F` to start, `:pf` to manage) plus **saved
   forwards** that show up in `:pf` even while stopped, with optional autostart.
-  See [Saved forwards](plugins.md#saved-forwards).
+  Pressing `f` on a pod or service opens a picker listing the manifest's
+  declared ports; select one to forward immediately, or choose "Custom…" for
+  manual `LOCAL:REMOTE` input. Active forwards show a teal `●` in a dedicated
+  indicator column next to the row name. See [Saved forwards](plugins.md#saved-forwards).
 - **File transfer** (`t` on a pod, or `t` in the container picker for one
   container) - download from or upload to a pod via `kubectl cp`, off-thread
   with a completion flash. Uploads are gated by the `transfer` guardrail and
   read-only mode.
+- **PVC explore** (`x` on a PVC, or `:pvc-explore`) - a two-pane browser over a
+  volume's contents, with `s` for a shell inside it. See
+  [PVC explore](#pvc-explore).
 - **Ephemeral debug containers** and **node debug pods** (`:debug`). See
   [Debug containers and pods](debugging.md#debug-containers-and-pods).
 - **Logs** (`l`) - per-container on a pod, or aggregated across all matching
   pods on a workload/service, with filtering, previous-container logs, and
-  configurable tail/buffer/lookback. sofka parses ANSI color from the source app
+  configurable tail/buffer/lookback. If a container is waiting to start, sofka
+  retries until its logs are available. sofka parses ANSI color from the source app
   and maps it onto the active skin instead of printing literal escapes. See
   [Log controls](debugging.md#log-controls).
 - **VictoriaLogs integration** (`L` / `:vlogs`) - log history from a
@@ -182,6 +284,99 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   `kubectl apply`s - sofka diffs against the previous revision this session's
   watch saw, so "what just changed?" has an answer. The last revision of up to
   256 changed objects is kept in memory.
+
+In the describe view, `r` turns automatic refresh on or off. Refresh is off
+when the view opens. When on, it runs `kubectl describe` immediately and then
+5 seconds after each result. This updates the full document, including events.
+The resource, scroll position, and search stay the same. Refresh stops when
+you leave the view or a request fails. A failed request keeps the last result.
+
+## PVC explore
+
+A PersistentVolumeClaim has no API that returns its contents: the only way to
+see what is on a volume is from inside a pod that mounts it. `x` on a PVC row
+(or `:pvc-explore`) does that for you and puts the result on screen as a
+two-pane file browser - your local filesystem on the left, the volume on the
+right - so a download or an upload is one keystroke rather than a hand-written
+`kubectl cp` path.
+
+- **It uses a pod that is already there.** sofka looks for a running pod in the
+  claim's namespace that mounts it, preferring one with a writable mount, and
+  execs into that container at its `mountPath`. Nothing is created, so this
+  works in read-only mode.
+- **Otherwise it offers a helper pod.** When nothing mounts the claim - the
+  common case for a volume you are trying to inspect _because_ its workload is
+  scaled to zero - sofka asks before creating a short-lived pod that mounts it
+  at `/pvc`. That is a write: it is blocked in read-only mode, matches the
+  `pvc-explore` guardrail action, and always confirms, naming the image and the
+  namespace. The helper carries both a `sleep` and `activeDeadlineSeconds`, so
+  it expires on its own even if sofka never gets to delete it, and closing the
+  browser - or quitting sofka - deletes it immediately. `:pvc-clean` removes
+  any a crashed session left behind: it sweeps the current namespace, or every
+  namespace when the view is across all of them, requiring the name prefix,
+  both of the labels sofka sets, and the annotation naming the claim, and
+  skipping the pod your own open browser is using. None of that evidence is
+  unforgeable - anything sofka writes on creation, anything else can write too
+  - so it is there to make an accidental match essentially impossible, not as
+    a permission check; the confirmation, the guardrail and read-only mode are
+    what bound a deliberate one. It cannot tell a leftover from a pod _another_ session is browsing
+    through right now, so the confirmation says so. Deleting pods is a mutation
+    like any other: blocked in read-only mode, matched by the `pvc-explore`
+    guardrail, recorded in `:journal`.
+- **Navigation is confined to the mount.** `⌫` stops at the mount point, and
+  every listing verifies with `pwd -P` that it actually landed inside the
+  volume - so a symlink on the volume pointing at `/` is refused rather than
+  quietly dropping you into the serving pod's root. sofka also treats the
+  volume's contents as untrusted: GNU `ls` writes file names into a pipe
+  unescaped, so a file whose name contains a newline can inject what looks
+  like an extra row, and a symlink target can carry an absolute path. Such a
+  row may still appear as a phantom entry - there is no way to tell it from a
+  real one - but it is contained: entries naming `.`, `..`, or anything
+  containing `/` are discarded, so a forged row can reach neither outside the
+  mount nor outside the directory a download lands in. busybox `ls` - the
+  default helper image - substitutes `?` for control characters instead, so
+  there is nothing to forge; such a name lists looking ordinary and fails when
+  you open or copy it.
+- **`c` copies from the focused pane into the other one** - out of the volume
+  when the right pane has the cursor, into it when the left one does. Uploads go
+  through `kubectl cp`, are blocked in read-only mode, match the `pvc-upload`
+  guardrail action, and are refused up front when the mount is `readOnly`. A
+  download that would overwrite a local file confirms first. `kubectl cp`
+  splits its arguments on the first `:`, so a name containing one is refused
+  with an explanation rather than a `filespec must match the canonical format`
+  from kubectl.
+- **`s` opens a shell** at the directory the remote pane is showing (or at the
+  mount point, from the PVC row directly). The exec lands in a real pod, so it
+  passes the same `shell` guardrail as `s` on that pod's row - a rule that
+  denies shells in prod is not defeated by reaching the pod through a claim it
+  mounts, and a denied shell is refused before a helper pod is created rather
+  than after.
+
+Listings are read with `ls -A -l` over `kubectl exec`, so the pod's image needs
+a shell and `ls`; transfers additionally need `tar`, as `kubectl cp` always
+does. An entry `ls` cannot stat still appears, with an unknown size and a
+warning, rather than blanking the whole directory. The helper-pod image and
+lifetime are configurable:
+
+```toml
+[pvc_explore]
+image = "busybox:1.37"   # helper-pod image
+ttl = "30m"              # how long it lives before deleting itself
+```
+
+Only a `Bound` filesystem claim can be browsed: an unbound one has no volume
+behind it, and a `volumeMode: Block` one has no filesystem. A listing is a
+point-in-time read, not a watch: `r` re-reads both panes. Both panes cap one
+directory at 5,000 entries - on the volume side by `head` inside the pod, so a
+spool directory is never streamed out in full. An entry nothing could stat
+still lists, with `?` for its size.
+
+The helper pod runs as whatever user its image defaults to, because reading a
+volume's contents generally needs root. It drops all capabilities and sets
+`allowPrivilegeEscalation: false` and `seccompProfile: RuntimeDefault`, which
+satisfies the `baseline` Pod Security Standard - but not `restricted`, which
+also requires `runAsNonRoot`. In a namespace enforcing `restricted` the helper
+pod is rejected; browse through a pod that already mounts the claim instead.
 
 ## Safety
 
@@ -216,7 +411,7 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   [Snapshots](debugging.md#snapshots).
 - **Runtime diagnostics** (`:info`, or `sofka info`) - version and build, config
   sources, live context/cluster/API server and Kubernetes revision, discovery
-  and Metrics API status, watch error and reconnect counts, API request latency
+  with warnings for unread API groups, Metrics API status, watch error and reconnect counts, API request latency
   per class, active skin, loaded plugins and views, and the
   state/log/snapshot/bundle directories. The connected Kubernetes revision also
   stays visible in the main header.
@@ -226,6 +421,23 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   session log as logfmt lines under the state directory, with every value
   redacted on the way in and writes off the UI thread. Off by default. See
   [Structured logging](debugging.md#structured-logging).
+
+## Bundled plugins
+
+- **`:sanitize`** deletes the pods a namespace has finished with - completed
+  jobs, failed and evicted pods, and optionally the wedged ones. It ships with
+  sofka and needs no runtime on `PATH`; the adapter is the sofka binary.
+  `states` selects `terminal` (the default), `stuck`, or `all`, based on
+  application container state and Pod phase. Specific table reason labels do
+  not add deletion categories. `dry_run=true` reports without deleting.
+  It confirms before running, is blocked in read-only mode, and matches
+  guardrails as `plugin:sanitize`. It never deletes a pod that is terminating,
+  still has a running container, or was replaced since the scan.
+  The scope is the current namespace - **all namespaces when the view is**.
+  `-l`/`-f` filter terms narrow the scan server-side; a filter it cannot
+  reproduce exactly makes it refuse rather than delete more than the table
+  shows.
+  See [Sanitize pods](../plugins/sanitize/README.md).
 
 ## External plugin packages
 
@@ -242,3 +454,11 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 - **Local checks** validate package manifests and reports without a cluster.
 
 See [Create a plugin package](plugin-authoring.md).
+
+Workload STATUS shows `Progressing` until the controller observes the current
+specification and an active rolling update reaches its target. StatefulSet
+partitions and `OnDelete` strategies retain their update semantics. Deployment
+READY compares ready replicas with the desired count from the specification.
+An active rollout with some ready replicas shows `Progressing` even when
+`Available=False`. A workload with no ready replicas shows `Unavailable`. A
+failed rollout shows `Stalled`.

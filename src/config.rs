@@ -84,6 +84,8 @@ pub struct Config {
     pub debug: DebugConfig,
     /// Diagnostic-bundle (`:bundle`) options — see [`BundleConfig`].
     pub bundle: BundleConfig,
+    /// Helper-pod defaults for the PVC browser — see [`PvcExploreConfig`].
+    pub pvc_explore: PvcExploreConfig,
     /// Log-view options — see [`LogsConfig`].
     pub logs: LogsConfig,
     /// Cross-context fleet dashboard (`:fleet`) — see [`FleetConfig`].
@@ -96,6 +98,8 @@ pub struct Config {
     /// behavior (text selection) everywhere. Document views release capture
     /// on their own regardless — see [`crate::app::App::wants_mouse_capture`].
     pub mouse: Option<bool>,
+    /// Save and restore sort choices per kind. Defaults to true.
+    pub remember_sort: Option<bool>,
     /// How `:notify` events are delivered — see [`NotifyConfig`].
     pub notify: NotifyConfig,
     /// Command-palette completion key rebinds — see [`KeysConfig`]. Compiled
@@ -372,7 +376,7 @@ pub struct FleetConfig {
 /// [logs]
 /// tail = 300         # initial lines fetched per stream
 /// buffer = 5000      # max lines retained while following (bounded tail)
-/// since = "1h"       # optional: only logs newer than this (overrides tail)
+/// since = "1h"       # optional: only logs newer than this, within the tail limit
 /// fullscreen = false # open log views fullscreen (F toggles; k9s fullScreenLogs)
 /// ```
 #[derive(Debug, Clone, Deserialize)]
@@ -384,7 +388,7 @@ pub struct LogsConfig {
     /// dropped (keeps a chatty pod from growing memory without bound).
     pub buffer: usize,
     /// Optional lookback (`30m`, `4h`, `2d`): stream only logs newer than this.
-    /// When set it replaces `tail` (Kubernetes accepts one or the other).
+    /// The initial request also keeps the configured `tail` limit.
     pub since: Option<String>,
     /// Start log views fullscreen — the pane takes the whole frame, without
     /// header or borders (k9s `fullScreenLogs`). `F` toggles per session.
@@ -497,6 +501,64 @@ impl Default for BundleConfig {
             max_pods: 3,
         }
     }
+}
+
+/// Fallback TTL for a PVC-explore helper pod when [`PvcExploreConfig::ttl`] is
+/// unreadable. Also the default itself.
+pub const PVC_DEFAULT_TTL_SECS: u64 = 1_800;
+
+/// Defaults for the PVC browser (`x` on a PVC, `:pvc-explore`).
+///
+/// A claim that some running pod already mounts is browsed through that pod
+/// and none of this applies. When nothing mounts it, sofka offers to create a
+/// short-lived pod that does — these are that pod's image and lifetime.
+///
+/// ```toml
+/// [pvc_explore]
+/// image = "busybox:1.37"   # helper-pod image; needs a shell and `ls`
+/// ttl = "30m"              # helper pod self-destructs after this
+/// ```
+///
+/// The image needs `sh`, `ls`, and — for transfers, which go through
+/// `kubectl cp` — `tar`. busybox has all three.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PvcExploreConfig {
+    /// Image for the helper pod.
+    pub image: String,
+    /// How long the helper pod lives before it deletes itself, as a duration
+    /// like `"30m"`. Set on the pod as both a `sleep` and
+    /// `activeDeadlineSeconds`, so it expires even if sofka never gets to
+    /// delete it. Validated by [`pvc_explore_warnings`].
+    pub ttl: String,
+}
+
+impl Default for PvcExploreConfig {
+    fn default() -> Self {
+        Self {
+            image: "busybox:1.37".into(),
+            ttl: "30m".into(),
+        }
+    }
+}
+
+/// Validate `[pvc_explore]`: an empty image or an unparseable/absurd TTL.
+pub fn pvc_explore_warnings(cfg: &PvcExploreConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    if cfg.image.trim().is_empty() {
+        out.push("pvc_explore: image is empty — helper pods cannot be created".into());
+    }
+    match crate::providers::parse_lookback(&cfg.ttl) {
+        Err(e) => out.push(format!("pvc_explore: ttl: {e}; using 30m")),
+        Ok(secs) if secs <= 0 => {
+            out.push(format!(
+                "pvc_explore: ttl {:?} must be positive; using 30m",
+                cfg.ttl
+            ));
+        }
+        Ok(_) => {}
+    }
+    out
 }
 
 /// Defaults for `:debug`, which attaches an ephemeral debug container to the
@@ -776,6 +838,10 @@ pub struct DrillConfig {
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct ViewColumnConfig {
+    /// Built-in metric source. Use exactly one of path, metric, or builtin.
+    pub metric: Option<String>,
+    /// Existing built-in column, such as READY or AGE.
+    pub builtin: Option<String>,
     /// Column header (displayed uppercased).
     pub name: String,
     /// JSON Pointer to the cell value, e.g. `/status/phase`.
@@ -876,6 +942,10 @@ pub struct Plugin {
     pub port_forward: Option<String>,
     #[serde(skip)]
     pub package_dir: Option<PathBuf>,
+    /// Set for a package sofka ships, whose adapter is this binary. Such a
+    /// plugin speaks the request/report protocol without a package directory.
+    #[serde(skip)]
+    pub bundled: bool,
     pub name: String,
     pub command: String,
     #[serde(default)]
@@ -1047,8 +1117,8 @@ pub fn workspace_warnings(workspaces: &[Workspace]) -> Vec<String> {
 /// A declarative safety policy: match dangerous actions by context, namespace,
 /// resource, and action, then require extra confirmation, deny them, or cap a
 /// bulk selection. Gates `delete`, `force-delete`, `drain`, `restart`,
-/// `shell`, `debug`, and `node-debug` today. Empty match lists mean "any";
-/// glob `*` supported.
+/// `shell`, `debug`, `node-debug`, `transfer`, `pvc-explore`, and
+/// `pvc-upload` today. Empty match lists mean "any"; glob `*` supported.
 ///
 /// ```toml
 /// [[guardrails]]
@@ -1077,7 +1147,8 @@ pub struct Guardrail {
     /// Resource plurals/kinds this applies to (globs). Empty = any.
     pub resources: Vec<String>,
     /// Actions this applies to: `delete`, `force-delete`, `drain`, `restart`,
-    /// `shell`, `debug`, `node-debug`, `transfer`. Empty = any.
+    /// `shell`, `debug`, `node-debug`, `transfer`, `pvc-explore` (creating or
+    /// sweeping a PVC-explore helper pod), `pvc-upload`. Empty = any.
     pub actions: Vec<String>,
     /// Block the action outright.
     pub deny: bool,
@@ -1306,6 +1377,20 @@ impl ConfigLoader {
         });
         if let Some(dir) = &self.dir {
             crate::plugins::load_packages(&dir.join("plugins"), &mut config.plugins, &mut warnings);
+        }
+        // Last, so an inline entry or a user package of the same name wins and
+        // a user can replace a shipped plugin without editing sofka.
+        for bundled in crate::plugins::bundled() {
+            match bundled {
+                Ok(p) => {
+                    if !config.plugins.iter().any(|old| {
+                        old.name == p.name || (p.palette.is_some() && old.palette == p.palette)
+                    }) {
+                        config.plugins.push(p);
+                    }
+                }
+                Err(e) => warnings.push(e),
+            }
         }
         let skin_override = overlay
             .get("skin")

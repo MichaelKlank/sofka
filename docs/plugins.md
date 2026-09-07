@@ -7,6 +7,10 @@ To create a package, see [Create a plugin package](plugin-authoring.md).
 Packages support named commands, validated inputs, JSON reports, and managed port-forwards.
 Enter `:plugin-cancel` to stop the active plugin run.
 
+sofka ships one plugin: `:sanitize`, which deletes the pods a namespace has
+finished with. It needs nothing installed - see [Sanitize pods](../plugins/sanitize/README.md).
+An inline entry or a user package of the same name replaces it.
+
 For core plugins maintained and shipped by the sofka project, Rust is the preferred language.
 External plugins can use any programming language that follows the plugin protocol.
 See [Language choice](plugin-authoring.md#language-choice).
@@ -15,6 +19,12 @@ See [Language choice](plugin-authoring.md#language-choice).
 character (`"g"`), a modifier combination (`"ctrl-g"`, `"alt-x"`, `"shift-b"`), or
 a function or named key (`"f5"`, `"ctrl-f2"`). A built-in key wins over a plugin
 on the same chord.
+
+For the minus key, use `"-"` alone or `"ctrl--"`, `"alt--"`, or `"ctrl-alt--"`
+with modifiers. The final two hyphens are the separator and the minus key.
+`"shift--"` is not supported. Bind the character that your keyboard produces
+instead. For example, use `"_"` if Shift+minus produces an underscore, or
+`"ctrl-_"` to add Ctrl.
 
 ```toml
 [[plugins]]

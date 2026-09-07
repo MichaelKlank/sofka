@@ -4,14 +4,22 @@
 //! pattern over "namespace name", falling back to each rendered column cell
 //! (so `/10.96` finds a Service by its CLUSTER-IP). Once any structured marker
 //! appears, the input is split on whitespace and every term must match
-//! (terms are AND-ed; there is no OR/grouping — deliberately small):
+//! (terms are AND-ed, optionally with `&&`; `||` and parentheses combine groups):
 //!
 //! - `text`                   fuzzy match (namespace + name + any column cell)
-//! - `!text`                  inverse fuzzy match
+//! - `"text"`                 literal match: contiguous, case-insensitive
+//! - `/re/`                   regular expression (case-insensitive)
+//! - `!text`                  inverse match (`!"text"` and `!/re/` too)
 //! - `-l app=api,env=prod`    Kubernetes label selector (sent server-side)
 //! - `-f spec.nodeName=n1`    Kubernetes field selector (sent server-side)
 //! - `status=CrashLoopBackOff` column equality (case-insensitive)
 //! - `cpu>500m` `memory>1Gi` `restarts>=5` `age<2h` typed comparisons
+//!
+//! Fuzzy is deliberately loose — `khc` finds `kube-httpcache-0` — which in a
+//! namespace with hundreds of pods makes a short needle like `auth` match
+//! every name with a scattered `a`…`u`…`t`…`h` in it. Quoting the term
+//! (`"auth"`) drops the gaps and matches only what a `grep` would; `/re/`
+//! covers the rest.
 //!
 //! Comparison operators: `=` (or `==`), `!=`, `>`, `>=`, `<`, `<=`. The
 //! value's type follows the key: `cpu` parses CPU quantities (millicores),
@@ -19,14 +27,17 @@
 //! `1d2h`); any other key compares numerically when the value is a number
 //! and as case-insensitive text otherwise. Parsing never fails hard — a
 //! broken term is skipped and reported via [`Structured::error`] so the
-//! table doesn't blank out mid-keystroke.
+//! table doesn't blank out mid-keystroke. Enter keeps malformed input open.
+//! Quotes preserve spaces in values; parentheses preserve label-selector sets.
 
 /// The parsed form of the filter input.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedFilter {
-    /// The whole input is one fuzzy pattern (no structured markers) — the
-    /// original `/text` behavior, kept byte-for-byte compatible.
-    Fuzzy(String),
+    /// The whole input is one pattern (no structured markers) — the original
+    /// `/text` behavior, kept byte-for-byte compatible. Always
+    /// [`Pattern::Fuzzy`]: a `"literal"` or `/re/` is a marker, so it parses
+    /// as a one-term [`Structured`] filter instead.
+    Fuzzy(Pattern),
     Structured(Structured),
 }
 
@@ -44,9 +55,156 @@ pub struct Structured {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Term {
-    Fuzzy(String),
-    NotFuzzy(String),
+    /// One text pattern, inverted when the term was written `!pat`.
+    Text {
+        negate: bool,
+        pat: Pattern,
+    },
     Cmp(Cmp),
+    All(Vec<Term>),
+    Any(Vec<Term>),
+    Not(Vec<Term>),
+}
+
+impl Term {
+    pub fn metrics_sensitive(&self, is_metric: &impl Fn(&str) -> bool) -> bool {
+        match self {
+            Self::Cmp(Cmp {
+                value: CmpValue::Cpu(_) | CmpValue::Mem(_),
+                ..
+            }) => true,
+            Self::Cmp(cmp) => is_metric(&cmp.key),
+            Self::All(terms) | Self::Any(terms) | Self::Not(terms) => {
+                terms.iter().any(|t| t.metrics_sensitive(is_metric))
+            }
+            _ => false,
+        }
+    }
+
+    pub fn time_sensitive(&self) -> bool {
+        match self {
+            Self::Cmp(Cmp {
+                value: CmpValue::Duration(_),
+                ..
+            }) => true,
+            Self::All(terms) | Self::Any(terms) | Self::Not(terms) => {
+                terms.iter().any(Self::time_sensitive)
+            }
+            _ => false,
+        }
+    }
+
+    fn highlight_pattern(&self) -> Option<&Pattern> {
+        match self {
+            Self::Text { negate: false, pat } => Some(pat),
+            Self::All(terms) | Self::Any(terms) => terms.iter().find_map(Self::highlight_pattern),
+            _ => None,
+        }
+    }
+}
+
+/// How a text term matches a row.
+#[derive(Clone)]
+pub enum Pattern {
+    /// Plain text: a fuzzy subsequence match, gaps allowed (`khc` finds
+    /// `kube-httpcache-0`).
+    Fuzzy(String),
+    /// `"text"`: a contiguous case-insensitive substring — what `grep` would
+    /// find, for when fuzzy is too loose to name one thing.
+    Literal(Literal),
+    /// `/re/`: a case-insensitive regular expression.
+    Regex(Box<regex::Regex>),
+}
+
+impl Pattern {
+    /// The text the user typed inside the markers — the fuzzy needle, the
+    /// quoted text, or the regex source.
+    pub fn text(&self) -> &str {
+        match self {
+            Pattern::Fuzzy(pat) => pat,
+            Pattern::Literal(lit) => lit.text(),
+            Pattern::Regex(re) => re.as_str(),
+        }
+    }
+}
+
+/// Compared by source text: two patterns built from the same term are equal,
+/// and a compiled automaton has no meaningful equality of its own.
+impl PartialEq for Pattern {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Pattern::Fuzzy(a), Pattern::Fuzzy(b)) => a == b,
+            (Pattern::Literal(a), Pattern::Literal(b)) => a.text() == b.text(),
+            (Pattern::Regex(a), Pattern::Regex(b)) => a.as_str() == b.as_str(),
+            _ => false,
+        }
+    }
+}
+
+/// The text, not the automaton behind it — a `{:?}` of a filter should read
+/// like the filter.
+impl std::fmt::Debug for Pattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Pattern::Fuzzy(pat) => write!(f, "Fuzzy({pat:?})"),
+            Pattern::Literal(lit) => write!(f, "Literal({:?})", lit.text()),
+            Pattern::Regex(re) => write!(f, "Regex({:?})", re.as_str()),
+        }
+    }
+}
+
+/// A compiled `"text"` term: the text as typed, for highlighting, alongside
+/// the case-insensitive substring automaton that tests it. Built once per
+/// filter change — a filter pass runs it against every row in the store.
+#[derive(Clone)]
+pub struct Literal {
+    text: String,
+    substring: crate::logfilter::Substring,
+}
+
+impl Literal {
+    /// `text` must not be empty; the parser rejects `""` before this.
+    fn new(text: &str) -> Self {
+        Literal {
+            text: text.to_string(),
+            substring: crate::logfilter::Substring::new(text),
+        }
+    }
+
+    /// The text as typed, without the quotes.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn matches(&self, haystack: &str) -> bool {
+        if haystack.is_ascii() {
+            self.substring.matches(haystack)
+        } else {
+            self.substring.matches(&haystack.to_lowercase())
+        }
+    }
+
+    /// Char positions of the first occurrence in `haystack`, for highlighting
+    /// it in the NAME cell. `None` when the text does not occur there — a row
+    /// can match on a column cell instead, and then its name highlights
+    /// nothing.
+    ///
+    /// Folds one character at a time rather than through `str::to_lowercase`:
+    /// the mappings that change length (`İ` → `i̇`) are exactly the ones that
+    /// would put the reported position on the wrong character. This is a
+    /// highlight, not the match decision — [`matches`](Self::matches) already
+    /// made that with full folding.
+    pub fn match_span(&self, haystack: &str) -> Option<std::ops::Range<usize>> {
+        let fold = |c: char| c.to_lowercase().next().unwrap_or(c);
+        let hay: Vec<char> = haystack.chars().map(fold).collect();
+        let needle: Vec<char> = self.text.chars().map(fold).collect();
+        if needle.is_empty() || needle.len() > hay.len() {
+            return None;
+        }
+        (0..=hay.len() - needle.len())
+            .find(|&i| hay[i..i + needle.len()] == needle[..])
+            .map(|i| i..i + needle.len())
+    }
 }
 
 /// One `key<op>value` column comparison.
@@ -88,6 +246,8 @@ impl Op {
 pub enum CmpValue {
     /// Plain number (`restarts>=5`).
     Num(f64),
+    /// A quantity for metric columns, with text retained for other columns.
+    Quantity { value: f64, text: String },
     /// CPU quantity in millicores (`cpu>500m`).
     Cpu(i64),
     /// Memory quantity in bytes (`memory>1Gi`).
@@ -101,6 +261,10 @@ pub enum CmpValue {
 }
 
 impl ParsedFilter {
+    pub fn uses_metrics(&self, is_metric: &impl Fn(&str) -> bool) -> bool {
+        matches!(self, Self::Structured(s) if s.terms.iter().any(|t| t.metrics_sensitive(is_metric)))
+    }
+
     pub fn labels(&self) -> Option<&str> {
         match self {
             ParsedFilter::Fuzzy(_) => None,
@@ -123,14 +287,11 @@ impl ParsedFilter {
     }
 
     /// The pattern NAME-cell highlighting should mark: the legacy fuzzy
-    /// pattern, or the first positive fuzzy term of a structured filter.
-    pub fn fuzzy_needle(&self) -> Option<&str> {
+    /// pattern, or the first positive text term of a structured filter.
+    pub fn highlight_pattern(&self) -> Option<&Pattern> {
         match self {
-            ParsedFilter::Fuzzy(pat) => (!pat.is_empty()).then_some(pat.as_str()),
-            ParsedFilter::Structured(s) => s.terms.iter().find_map(|t| match t {
-                Term::Fuzzy(pat) => Some(pat.as_str()),
-                _ => None,
-            }),
+            ParsedFilter::Fuzzy(pat) => (!pat.text().is_empty()).then_some(pat),
+            ParsedFilter::Structured(s) => s.terms.iter().find_map(Term::highlight_pattern),
         }
     }
 }
@@ -138,12 +299,52 @@ impl ParsedFilter {
 pub fn parse(input: &str) -> ParsedFilter {
     let trimmed = input.trim();
     if trimmed.is_empty() || !is_structured(trimmed) {
-        return ParsedFilter::Fuzzy(trimmed.to_string());
+        return ParsedFilter::Fuzzy(Pattern::Fuzzy(trimmed.to_string()));
     }
 
+    ParsedFilter::Structured(match tokenize(trimmed) {
+        Ok(tokens) => parse_tokens(&tokens, 0),
+        Err(error) => Structured {
+            error: Some(error),
+            ..Structured::default()
+        },
+    })
+}
+
+fn parse_tokens(tokens: &[String], depth: usize) -> Structured {
+    if depth > 32 {
+        return Structured {
+            error: Some("filter nesting exceeds 32 levels".into()),
+            ..Structured::default()
+        };
+    }
+    if tokens.iter().any(|t| t == "||") {
+        let mut branches = Vec::new();
+        for branch in tokens.split(|t| t == "||") {
+            let parsed = parse_tokens(branch, depth + 1);
+            let error = if branch.is_empty() {
+                Some("expected terms on both sides of ||".into())
+            } else if parsed.labels.is_some() || parsed.fields.is_some() {
+                Some("place selectors outside OR groups: -l app=api (a || b)".into())
+            } else {
+                parsed.error
+            };
+            if let Some(error) = error {
+                return Structured {
+                    error: Some(error),
+                    ..Structured::default()
+                };
+            }
+            branches.push(Term::All(parsed.terms));
+        }
+        return Structured {
+            terms: vec![Term::Any(branches)],
+            ..Structured::default()
+        };
+    }
     let mut terms = Vec::new();
-    let mut labels: Vec<&str> = Vec::new();
-    let mut fields: Vec<&str> = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
+    let mut fields: Vec<String> = Vec::new();
     let mut error: Option<String> = None;
     let fail = |slot: &mut Option<String>, msg: String| {
         if slot.is_none() {
@@ -151,33 +352,82 @@ pub fn parse(input: &str) -> ParsedFilter {
         }
     };
 
-    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
     let mut i = 0;
     while i < tokens.len() {
-        let tok = tokens[i];
+        let tok = tokens[i].as_str();
         i += 1;
+        let group = tok
+            .strip_prefix("!(")
+            .map(|s| (s, true))
+            .or_else(|| tok.strip_prefix('(').map(|s| (s, false)));
+        if let Some((inner, inverse)) = group {
+            let parsed = inner
+                .strip_suffix(')')
+                .ok_or("unclosed group".to_string())
+                .and_then(tokenize)
+                .map(|tokens| parse_tokens(&tokens, depth + 1));
+            match parsed {
+                Ok(s) if s.labels.is_some() || s.fields.is_some() => fail(
+                    &mut error,
+                    "selectors must be outside Boolean groups".into(),
+                ),
+                Ok(s) if s.error.is_some() => fail(&mut error, s.error.unwrap()),
+                Ok(s) if s.terms.is_empty() => fail(&mut error, "empty Boolean group".into()),
+                Ok(s) => terms.push(if inverse {
+                    Term::Not(s.terms)
+                } else {
+                    Term::All(s.terms)
+                }),
+                Err(e) => fail(&mut error, e),
+            }
+            continue;
+        }
+        if tok == "&&" {
+            if i == 1 || i == tokens.len() || tokens[i] == "&&" {
+                fail(&mut error, "expected terms on both sides of &&".into());
+            }
+            continue;
+        }
         // `-l <sel>` / `-f <sel>`, or attached (`-lapp=api`).
         if tok == "-l" || tok == "-f" {
             match tokens.get(i) {
-                Some(sel) => {
+                Some(sel) if !sel.starts_with('-') && sel != "&&" => {
+                    let mut sel = unquote(sel).to_string();
+                    i += 1;
+                    if tok == "-l" && tokens.get(i).is_some_and(|s| s == "in" || s == "notin") {
+                        sel.push(' ');
+                        sel.push_str(&tokens[i]);
+                        i += 1;
+                        if let Some(set) = tokens.get(i).filter(|s| s.starts_with('(')) {
+                            sel.push(' ');
+                            sel.push_str(set);
+                            i += 1;
+                        } else {
+                            fail(&mut error, "expected selector set in parentheses".into());
+                            continue;
+                        }
+                    }
+                    if sel.is_empty() || (tok == "-f" && !sel.contains('=')) {
+                        fail(&mut error, format!("invalid selector after {tok}"));
+                        continue;
+                    }
                     if tok == "-l" {
                         &mut labels
                     } else {
                         &mut fields
                     }
                     .push(sel);
-                    i += 1;
                 }
-                None => fail(&mut error, format!("expected selector after {tok}")),
+                _ => fail(&mut error, format!("expected selector after {tok}")),
             }
             continue;
         }
         if let Some(sel) = attached_selector(tok, "-l") {
-            labels.push(sel);
+            labels.push(sel.to_string());
             continue;
         }
         if let Some(sel) = attached_selector(tok, "-f") {
-            fields.push(sel);
+            fields.push(sel.to_string());
             continue;
         }
         if let Some((key, op, value)) = split_cmp(tok) {
@@ -185,7 +435,7 @@ pub fn parse(input: &str) -> ParsedFilter {
                 fail(&mut error, format!("missing value in '{tok}'"));
                 continue;
             }
-            match typed_value(key, value) {
+            match typed_value(key, unquote(value)) {
                 Ok(v) => terms.push(Term::Cmp(Cmp {
                     key: key.to_ascii_lowercase(),
                     op,
@@ -195,36 +445,235 @@ pub fn parse(input: &str) -> ParsedFilter {
             }
             continue;
         }
-        if let Some(pat) = tok.strip_prefix('!') {
-            if pat.is_empty() {
-                fail(&mut error, "expected text after '!'".into());
-            } else {
-                terms.push(Term::NotFuzzy(pat.to_string()));
-            }
+        // Text: `!` inverts, then the term's own markers pick the matcher.
+        let (negate, rest) = match tok.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, tok),
+        };
+        if rest.is_empty() {
+            fail(&mut error, "expected text after '!'".into());
             continue;
         }
-        terms.push(Term::Fuzzy(tok.to_string()));
+        match pattern(rest) {
+            Ok(pat) => terms.push(Term::Text { negate, pat }),
+            Err(e) => fail(&mut error, e),
+        }
     }
 
-    ParsedFilter::Structured(Structured {
+    Structured {
         terms,
         labels: (!labels.is_empty()).then(|| labels.join(",")),
         fields: (!fields.is_empty()).then(|| fields.join(",")),
         error,
-    })
+    }
 }
 
 /// Whether any token flips the input from a single legacy fuzzy pattern into
 /// the structured grammar. Mirrors the markers `parse` acts on.
 fn is_structured(input: &str) -> bool {
-    input.split_whitespace().any(|tok| {
-        tok == "-l"
+    let structured = |tok: &str| {
+        let text = tok.strip_prefix('!').unwrap_or(tok);
+        tok == "&&"
+            || tok == "||"
+            || tok == "-l"
             || tok == "-f"
             || attached_selector(tok, "-l").is_some()
             || attached_selector(tok, "-f").is_some()
             || tok.starts_with('!')
+            || tok.starts_with('(')
+            || text.starts_with('"')
+            || is_regex(text)
             || split_cmp(tok).is_some()
-    })
+    };
+    match tokenize(input) {
+        Ok(tokens) => tokens.iter().any(|t| structured(t)),
+        Err(_) => input.split_whitespace().any(structured),
+    }
+}
+
+fn tokenize(input: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut depth = 0usize;
+    let mut chars = input.char_indices().peekable();
+    while let Some((offset, c)) = chars.next() {
+        if let Some(q) = quote {
+            token.push(c);
+            if c == q {
+                quote = None;
+            }
+        } else if c == '/'
+            && input[..offset]
+                .trim_end_matches('!')
+                .chars()
+                .next_back()
+                .is_none_or(|previous| {
+                    previous.is_whitespace() || matches!(previous, '(' | '&' | '|')
+                })
+            && let Some(end) = regex_end(&input[offset..], 1)
+        {
+            token.push_str(&input[offset..offset + end]);
+            while chars.peek().is_some_and(|(i, _)| *i < offset + end) {
+                chars.next();
+            }
+        } else if c == '\'' || c == '"' {
+            quote = Some(c);
+            token.push(c);
+        } else if c == '(' {
+            depth += 1;
+            token.push(c);
+        } else if c == ')' {
+            depth = depth.checked_sub(1).ok_or("unexpected ')' in filter")?;
+            token.push(c);
+        } else if depth == 0
+            && matches!(c, '&' | '|')
+            && chars.peek().is_some_and(|(_, next)| *next == c)
+        {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+            chars.next();
+            tokens.push(format!("{c}{c}"));
+        } else if c.is_whitespace() && depth == 0 {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+        } else {
+            token.push(c);
+        }
+    }
+    if depth != 0 || quote.is_some() && !(token.starts_with('"') || token.starts_with("!\"")) {
+        return Err("unclosed quote or selector set".into());
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    Ok(tokens)
+}
+
+fn unquote(value: &str) -> &str {
+    for quote in ['\'', '"'] {
+        if let Some(inner) = value
+            .strip_prefix(quote)
+            .and_then(|s| s.strip_suffix(quote))
+        {
+            return inner;
+        }
+    }
+    value
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceQuery {
+    pub resource: String,
+    pub namespace: Option<String>,
+    pub context: Option<String>,
+    pub filter: String,
+}
+
+impl ResourceQuery {
+    /// Scope options precede `/filter`; everything after the slash belongs to
+    /// the row grammar, including whitespace and selector flags.
+    pub fn parse(input: &str) -> Result<Self, String> {
+        let (scope, filter) = input.split_once(" /").unwrap_or((input, ""));
+        let mut words = scope.split_whitespace();
+        let resource = words.next().ok_or("expected resource")?.to_string();
+        let mut query = Self {
+            resource,
+            namespace: None,
+            context: None,
+            filter: filter.into(),
+        };
+        while let Some(word) = words.next() {
+            let slot = match word {
+                "-n" | "--namespace" => &mut query.namespace,
+                "--context" => &mut query.context,
+                _ if !word.starts_with('-') && query.namespace.is_none() => {
+                    query.namespace = Some(word.into());
+                    continue;
+                }
+                _ => return Err(format!("unexpected scope argument '{word}'")),
+            };
+            let value = words
+                .next()
+                .filter(|s| !s.starts_with('-'))
+                .ok_or_else(|| format!("expected value after {word}"))?;
+            if slot.is_some() {
+                return Err(format!("duplicate {word}"));
+            }
+            *slot = Some(value.into());
+        }
+        if let Some(error) = parse(filter).error() {
+            return Err(error.into());
+        }
+        Ok(query)
+    }
+}
+
+// Find a closing slash at a term boundary. Keep escapes and character classes
+// inside the regex. Keep an invalid class available for the compiler to report.
+fn regex_end(input: &str, start: usize) -> Option<usize> {
+    let mut escaped = false;
+    let mut classes = 0usize;
+    let mut fallback = None;
+    for (offset, c) in input[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '[' => classes += 1,
+            ']' => classes = classes.saturating_sub(1),
+            '/' => {
+                let end = start + offset + 1;
+                if input[end..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| c.is_whitespace() || matches!(c, ')' | '&' | '|'))
+                {
+                    if classes == 0 {
+                        return Some(end);
+                    }
+                    fallback.get_or_insert(end);
+                }
+            }
+            _ => {}
+        }
+    }
+    fallback
+}
+
+/// Classify one text term: `"quoted"` is a literal, `/re/` a regex, anything
+/// else the fuzzy text the filter has always taken.
+fn pattern(tok: &str) -> Result<Pattern, String> {
+    if let Some(rest) = tok.strip_prefix('"') {
+        // The closing quote is optional — the term may still be being typed.
+        let text = rest.strip_suffix('"').unwrap_or(rest);
+        if text.is_empty() {
+            return Err("expected text between the quotes".into());
+        }
+        return Ok(Pattern::Literal(Literal::new(text)));
+    }
+    if is_regex(tok) {
+        let source = &tok[1..tok.len() - 1];
+        if source.is_empty() {
+            return Err("expected a pattern between the slashes".into());
+        }
+        return regex::RegexBuilder::new(source)
+            .case_insensitive(true)
+            .build()
+            .map(|re| Pattern::Regex(Box::new(re)))
+            .map_err(|_| format!("bad regex '{source}'"));
+    }
+    Ok(Pattern::Fuzzy(tok.to_string()))
+}
+
+/// A `/re/` term. Both slashes are required, so a lone `/` and text like
+/// `/healthz` stay fuzzy — the same rule the log filter uses.
+fn is_regex(tok: &str) -> bool {
+    tok.len() >= 2 && tok.starts_with('/') && tok.ends_with('/')
 }
 
 /// The selector of an attached `-l`/`-f` form (`-lapp=api`). Requires an `=`
@@ -239,11 +688,12 @@ fn split_cmp(tok: &str) -> Option<(&str, Op, &str)> {
     if !tok
         .chars()
         .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '%'))
     {
         return None;
     }
-    let key_end = tok.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))?;
+    let key_end = tok
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '%' | '/')))?;
     let (key, rest) = tok.split_at(key_end);
     let (op, value) = if let Some(v) = rest.strip_prefix("!=") {
         (Op::Ne, v)
@@ -304,11 +754,31 @@ fn typed_value(key: &str, raw: &str) -> Result<CmpValue, String> {
         "age" => parse_duration(raw)
             .map(CmpValue::Duration)
             .ok_or_else(|| format!("bad duration '{raw}'")),
-        _ => Ok(raw
-            .parse::<f64>()
-            .map(CmpValue::Num)
-            .unwrap_or_else(|_| CmpValue::Str(fold_lower(raw)))),
+        _ => match raw.parse::<f64>() {
+            Ok(value) if value.is_finite() => Ok(CmpValue::Num(value)),
+            Ok(_) => Err(format!("non-finite number '{raw}'")),
+            Err(_) if key.eq_ignore_ascii_case("restarts") => {
+                Err(format!("bad restart count '{raw}'"))
+            }
+            Err(_) => Ok(crate::views::parse_quantity(raw)
+                .map(|value| CmpValue::Quantity {
+                    value,
+                    text: fold_lower(raw),
+                })
+                .unwrap_or_else(|| CmpValue::Str(fold_lower(raw)))),
+        },
     }
+}
+
+/// Numeric columns may append annotations, but missing cells are not zero.
+pub fn cell_number(cell: &str) -> Option<f64> {
+    let number = cell
+        .trim()
+        .split([' ', '/', '('])
+        .next()?
+        .parse::<f64>()
+        .ok()?;
+    number.is_finite().then_some(number)
 }
 
 /// CPU quantity → millicores: `250m` → 250, `1` → 1000, `500000000n` → 500.
@@ -323,31 +793,16 @@ fn parse_cpu(s: &str) -> Option<i64> {
         _ => (s, 1000.0),
     };
     let v: f64 = num.parse().ok()?;
-    (v >= 0.0).then(|| (v * scale).round() as i64)
+    (v >= 0.0 && (v * scale).is_finite() && v * scale < i64::MAX as f64)
+        .then(|| (v * scale).round() as i64)
 }
 
 /// Memory quantity → bytes: `1Gi`, `512Mi`, `2000000`. Validating twin of
 /// [`crate::columns::parse_mem_bytes`].
 fn parse_mem(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let suffixes: &[(&str, f64)] = &[
-        ("Ki", 1024.0),
-        ("Mi", 1024.0 * 1024.0),
-        ("Gi", 1024.0 * 1024.0 * 1024.0),
-        ("Ti", 1024.0f64.powi(4)),
-        ("K", 1e3),
-        ("M", 1e6),
-        ("G", 1e9),
-        ("T", 1e12),
-    ];
-    for (suf, mult) in suffixes {
-        if let Some(num) = s.strip_suffix(suf) {
-            let v: f64 = num.trim().parse().ok()?;
-            return (v >= 0.0).then(|| (v * mult) as i64);
-        }
-    }
-    let v: f64 = s.parse().ok()?;
-    (v >= 0.0).then_some(v as i64)
+    crate::views::parse_quantity(s)
+        .filter(|n| n.is_finite() && *n >= 0.0 && n.ceil() < i64::MAX as f64)
+        .map(|n| n.ceil() as i64)
 }
 
 /// Duration → seconds: `90s`, `2h`, `1d2h`, `1h30m`, bare `300` (seconds).
@@ -378,7 +833,7 @@ fn parse_duration(s: &str) -> Option<i64> {
         if num.is_empty() {
             return None;
         }
-        total += num.parse::<i64>().ok()? * unit;
+        total = total.checked_add(num.parse::<i64>().ok()?.checked_mul(unit)?)?;
         num.clear();
     }
     // Trailing digits without a unit (`2h30`) are malformed.
@@ -389,6 +844,139 @@ fn parse_duration(s: &str) -> Option<i64> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn boolean_precedence_groups_and_inverse() {
+        let s = structured("api || worker && !canary");
+        assert_eq!(s.error, None);
+        assert_eq!(
+            s.terms,
+            vec![Term::Any(vec![
+                Term::All(vec![Term::Text {
+                    negate: false,
+                    pat: Pattern::Fuzzy("api".into())
+                }]),
+                Term::All(vec![
+                    Term::Text {
+                        negate: false,
+                        pat: Pattern::Fuzzy("worker".into())
+                    },
+                    Term::Text {
+                        negate: true,
+                        pat: Pattern::Fuzzy("canary".into())
+                    }
+                ]),
+            ])]
+        );
+        let s = structured("-l app=api (status=Running||age>2h) !(restarts>=5)");
+        assert_eq!(s.error, None);
+        assert_eq!(s.labels.as_deref(), Some("app=api"));
+        assert!(s.terms.iter().any(Term::time_sensitive));
+        assert_eq!(structured("(name='api server' || !canary)").error, None);
+        for input in [
+            "api ||",
+            "|| api",
+            "api || || worker",
+            "status=Running && ()",
+            "-l app=api || worker",
+            "!(-l app=api)",
+            "(status=Running)junk",
+        ] {
+            assert!(parse(input).error().is_some(), "{input}");
+        }
+        let deep = format!("{}age>2h{}", "(".repeat(40), ")".repeat(40));
+        assert!(parse(&deep).error().is_some());
+    }
+
+    #[test]
+    fn numeric_validation_and_well_known_fields() {
+        for input in ["restarts=NaN", "restarts>inf", "restarts>=oops"] {
+            assert!(parse(input).error().is_some(), "{input}");
+        }
+        assert_eq!(cell_number("-"), None);
+        assert_eq!(cell_number("NaN"), None);
+        assert_eq!(cell_number("5 (2m ago)"), Some(5.0));
+        assert_eq!(
+            structured("spec.nodeName=node-3 metadata.namespace=prod status.phase=Running")
+                .terms
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn sets_quotes_and_explicit_and() {
+        let s = structured("-l app in (api, worker),env=prod && status=Running");
+        assert_eq!(s.labels.as_deref(), Some("app in (api, worker),env=prod"));
+        assert_eq!(s.terms.len(), 1);
+        assert_eq!(s.error, None);
+        assert_eq!(
+            structured("-l 'app notin (api, worker)' !canary")
+                .labels
+                .as_deref(),
+            Some("app notin (api, worker)")
+        );
+        assert_eq!(
+            structured("name='api server'").terms,
+            vec![Term::Cmp(Cmp {
+                key: "name".into(),
+                op: Op::Eq,
+                value: CmpValue::Str("api server".into())
+            })]
+        );
+        for input in [
+            "-l app in (api",
+            "-l app in",
+            "-l 'app=api",
+            "-l -f metadata.name=api",
+            "-f spec.nodeName",
+            "status=Running &&",
+            "&& api",
+        ] {
+            assert!(parse(input).error().is_some(), "{input}");
+        }
+    }
+
+    #[test]
+    fn resource_queries_validate_scope_and_filter() {
+        assert_eq!(
+            ResourceQuery::parse("pods -n prod --context west /-l app=api age<2h").unwrap(),
+            ResourceQuery {
+                resource: "pods".into(),
+                namespace: Some("prod".into()),
+                context: Some("west".into()),
+                filter: "-l app=api age<2h".into(),
+            }
+        );
+        assert_eq!(
+            ResourceQuery::parse("pods all /kube system")
+                .unwrap()
+                .filter,
+            "kube system"
+        );
+        for input in [
+            "pods -n",
+            "pods --context",
+            "pods -n -x",
+            "pods prod extra /api",
+            "pods /cpu>oops",
+        ] {
+            assert!(ResourceQuery::parse(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn quantities_and_durations_reject_overflow() {
+        for input in [
+            "cpu>inf",
+            "cpu>1e100",
+            "memory>inf",
+            "memory>1e100Gi",
+            "age<9223372036854775807w",
+        ] {
+            assert!(parse(input).error().is_some(), "{input}");
+        }
+    }
+
     fn structured(input: &str) -> Structured {
         match parse(input) {
             ParsedFilter::Structured(s) => s,
@@ -396,26 +984,223 @@ mod tests {
         }
     }
 
+    fn fuzzy(pat: &str) -> Term {
+        Term::Text {
+            negate: false,
+            pat: Pattern::Fuzzy(pat.into()),
+        }
+    }
+
+    fn not_fuzzy(pat: &str) -> Term {
+        Term::Text {
+            negate: true,
+            pat: Pattern::Fuzzy(pat.into()),
+        }
+    }
+
+    /// The single text pattern of a one-term filter.
+    fn only_pattern(input: &str) -> Pattern {
+        let s = structured(input);
+        assert_eq!(s.terms.len(), 1, "expected one term in '{input}'");
+        match s.terms.into_iter().next() {
+            Some(Term::Text { negate: false, pat }) => pat,
+            other => panic!("expected a positive text term in '{input}', got {other:?}"),
+        }
+    }
+
     #[test]
     fn plain_text_stays_one_legacy_fuzzy_pattern() {
-        assert_eq!(parse(""), ParsedFilter::Fuzzy(String::new()));
-        assert_eq!(parse("api"), ParsedFilter::Fuzzy("api".into()));
+        assert_eq!(
+            parse(""),
+            ParsedFilter::Fuzzy(Pattern::Fuzzy(String::new()))
+        );
+        assert_eq!(
+            parse("api"),
+            ParsedFilter::Fuzzy(Pattern::Fuzzy("api".into()))
+        );
         // Spaces included: the whole string is the pattern, as before.
         assert_eq!(
             parse("kube system dns"),
-            ParsedFilter::Fuzzy("kube system dns".into())
+            ParsedFilter::Fuzzy(Pattern::Fuzzy("kube system dns".into()))
         );
         // Leading/trailing whitespace is not part of the pattern.
-        assert_eq!(parse("  api "), ParsedFilter::Fuzzy("api".into()));
+        assert_eq!(
+            parse("  api "),
+            ParsedFilter::Fuzzy(Pattern::Fuzzy("api".into()))
+        );
         // A lone dash or dashed name is still fuzzy text, not a flag.
-        assert_eq!(parse("-longname"), ParsedFilter::Fuzzy("-longname".into()));
+        assert_eq!(
+            parse("-longname"),
+            ParsedFilter::Fuzzy(Pattern::Fuzzy("-longname".into()))
+        );
     }
 
     #[test]
     fn inverse_term() {
         let s = structured("!canary");
-        assert_eq!(s.terms, vec![Term::NotFuzzy("canary".into())]);
+        assert_eq!(s.terms, vec![not_fuzzy("canary")]);
         assert_eq!(s.error, None);
+    }
+
+    /// The fix for noisy fuzzy hits: a quoted term matches a contiguous run,
+    /// so it no longer drags in every name with the characters scattered
+    /// through it.
+    #[test]
+    fn quoted_terms_match_contiguously() {
+        let Pattern::Literal(lit) = only_pattern("\"auth\"") else {
+            panic!("expected a literal term");
+        };
+        assert!(lit.matches("default auth-api-0"));
+        assert!(lit.matches("AUTH-API"), "literals fold case");
+        // Fuzzy's subsequence match, which is what the quotes rule out.
+        assert!(!lit.matches("api-gateway-runtime-hash"));
+    }
+
+    /// A quoted term keeps its spaces: the tokenizer splits terms on
+    /// whitespace, but not inside quotes.
+    #[test]
+    fn quoted_terms_keep_their_spaces() {
+        let Pattern::Literal(lit) = only_pattern("\"kube system\"") else {
+            panic!("expected a literal term");
+        };
+        assert_eq!(lit.text(), "kube system");
+        // Still one term when other terms surround it.
+        let s = structured("\"kube system\" status=Running");
+        assert_eq!(s.terms.len(), 2);
+    }
+
+    /// The filter is reparsed on every keystroke, so a term that is still
+    /// being typed has to keep working before its closing quote arrives.
+    #[test]
+    fn an_unterminated_quote_still_narrows() {
+        let Pattern::Literal(lit) = only_pattern("\"auth") else {
+            panic!("expected a literal term");
+        };
+        assert_eq!(lit.text(), "auth");
+    }
+
+    #[test]
+    fn regex_terms_compile_case_insensitively() {
+        let Pattern::Regex(re) = only_pattern("/auth-\\d+/") else {
+            panic!("expected a regex term");
+        };
+        assert!(re.is_match("auth-12"));
+        assert!(re.is_match("AUTH-12"));
+        assert!(!re.is_match("auth-api"));
+    }
+
+    /// Both slashes are required, so the paths and image tags people filter
+    /// on are still plain fuzzy text.
+    #[test]
+    fn a_single_slash_is_not_a_regex() {
+        assert_eq!(
+            parse("/healthz"),
+            ParsedFilter::Fuzzy(Pattern::Fuzzy("/healthz".into()))
+        );
+        assert_eq!(parse("/"), ParsedFilter::Fuzzy(Pattern::Fuzzy("/".into())));
+        assert_eq!(
+            parse("nginx/nginx:1.2"),
+            ParsedFilter::Fuzzy(Pattern::Fuzzy("nginx/nginx:1.2".into()))
+        );
+    }
+
+    #[test]
+    fn quoted_and_regex_terms_invert() {
+        let s = structured("!\"canary\"");
+        assert_eq!(
+            s.terms,
+            vec![Term::Text {
+                negate: true,
+                pat: Pattern::Literal(Literal::new("canary")),
+            }]
+        );
+        assert_eq!(s.error, None);
+
+        let s = structured("!/canary|debug/");
+        let Term::Text { negate, pat } = &s.terms[0] else {
+            panic!("expected a text term");
+        };
+        assert!(negate);
+        assert!(matches!(pat, Pattern::Regex(_)));
+    }
+
+    /// Same contract as the rest of the grammar: a term that cannot be built
+    /// is skipped and reported, never a blank table.
+    #[test]
+    fn malformed_quoted_and_regex_terms_report_without_blanking() {
+        let s = structured("\"\" api");
+        assert_eq!(s.terms, vec![fuzzy("api")]);
+        assert!(s.error.as_deref().is_some_and(|e| e.contains("quotes")));
+
+        let s = structured("// api");
+        assert_eq!(s.terms, vec![fuzzy("api")]);
+        assert!(s.error.as_deref().is_some_and(|e| e.contains("slashes")));
+
+        let s = structured("/[unclosed/ api");
+        assert_eq!(s.terms, vec![fuzzy("api")]);
+        assert!(s.error.as_deref().is_some_and(|e| e.contains("bad regex")));
+    }
+
+    #[test]
+    fn tokenizer_splits_on_whitespace_outside_quotes() {
+        assert_eq!(
+            tokenize("api !canary -l app=api").unwrap(),
+            ["api", "!canary", "-l", "app=api"]
+        );
+        assert_eq!(
+            tokenize("  \"kube system\"  api ").unwrap(),
+            ["\"kube system\"", "api"]
+        );
+        assert_eq!(tokenize("!\"a b\"").unwrap(), ["!\"a b\""]);
+        assert_eq!(
+            tokenize("\"unterminated api").unwrap(),
+            ["\"unterminated api"]
+        );
+        assert!(tokenize("   ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn tokenizer_keeps_regex_contents_in_one_term() {
+        for input in [
+            r#"/a b/ !canary"#,
+            r#"/a"b/ !canary"#,
+            r"/a\/ b/ !canary",
+            r"/[a/ ]/ !canary",
+            r"!/a b/ !canary",
+        ] {
+            let tokens = tokenize(input).unwrap();
+            assert_eq!(tokens.len(), 2, "{input}");
+            assert_eq!(tokens[1], "!canary");
+            let parsed = structured(input);
+            assert_eq!(parsed.error, None, "{input}");
+            assert!(matches!(
+                &parsed.terms[0],
+                Term::Text {
+                    pat: Pattern::Regex(_),
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn literals_fold_both_the_needle_and_the_haystack() {
+        assert!(Literal::new("\u{212a}ube").matches("kube-httpcache-0"));
+        assert!(Literal::new("kube").matches("\u{212a}ube-httpcache-0"));
+        assert!(Literal::new("KUBE").matches("\u{212a}ube-httpcache-0"));
+    }
+
+    /// Highlight positions are char indices into the name, so a multibyte
+    /// name marks the characters the user sees.
+    #[test]
+    fn literal_match_spans_are_char_indices() {
+        let lit = Literal::new("world");
+        assert_eq!(lit.match_span("héllo-world"), Some(6..11));
+        let chars: Vec<char> = "héllo-world".chars().collect();
+        assert_eq!(chars[6], 'w');
+        // Case-insensitive, and absent text has no span to highlight.
+        assert_eq!(Literal::new("AUTH").match_span("auth-api"), Some(0..4));
+        assert_eq!(lit.match_span("héllo"), None);
     }
 
     #[test]
@@ -577,8 +1362,8 @@ mod tests {
         assert_eq!(
             s.terms,
             vec![
-                Term::Fuzzy("api".into()),
-                Term::NotFuzzy("canary".into()),
+                fuzzy("api"),
+                not_fuzzy("canary"),
                 Term::Cmp(Cmp {
                     key: "status".into(),
                     op: Op::Eq,
@@ -608,16 +1393,26 @@ mod tests {
         assert!(s.error.as_deref().is_some_and(|e| e.contains("soon")));
 
         let s = structured("! api");
-        assert_eq!(s.terms, vec![Term::Fuzzy("api".into())]);
+        assert_eq!(s.terms, vec![fuzzy("api")]);
         assert!(s.error.is_some());
     }
 
     #[test]
-    fn fuzzy_needle_prefers_first_positive_term() {
-        assert_eq!(parse("khc").fuzzy_needle(), Some("khc"));
-        assert_eq!(parse("").fuzzy_needle(), None);
-        assert_eq!(parse("!x khc status=Running").fuzzy_needle(), Some("khc"));
-        assert_eq!(parse("-l app=api").fuzzy_needle(), None);
+    fn highlight_pattern_prefers_first_positive_term() {
+        let needle = |input: &str| {
+            parse(input)
+                .highlight_pattern()
+                .map(|p| p.text().to_string())
+        };
+        assert_eq!(needle("khc").as_deref(), Some("khc"));
+        assert_eq!(needle(""), None);
+        assert_eq!(needle("!x khc status=Running").as_deref(), Some("khc"));
+        assert_eq!(needle("-l app=api"), None);
+        // A quoted or regex term highlights too — it is a positive text term.
+        assert_eq!(needle("\"auth\"").as_deref(), Some("auth"));
+        assert_eq!(needle("/auth-\\d/").as_deref(), Some("auth-\\d"));
+        // Negated terms are not what the row matched on, so they never mark it.
+        assert_eq!(needle("!\"canary\""), None);
     }
 
     #[test]

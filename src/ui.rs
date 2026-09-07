@@ -10,7 +10,7 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, DEFAULT_SORT_LABEL, Mode, SuggestKind, TRANSFER_MENU_ITEMS};
+use crate::app::{App, DEFAULT_SORT_LABEL, Mode, Pane, SuggestKind, TRANSFER_MENU_ITEMS};
 use crate::{columns, theme};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -152,6 +152,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::PortForwards => draw_port_forwards(frame, app, chunks[1]),
         Mode::Fleet => draw_fleet(frame, app, chunks[1]),
         Mode::Find => draw_find(frame, app, chunks[1]),
+        Mode::PvcExplore => draw_pvc_explore(frame, app, chunks[1]),
+        // A transfer confirmation or a guardrail prompt raised from the PVC
+        // browser keeps the two panes underneath it, so you can still see what
+        // is being copied where. Only that dialog: drawing an unrelated one
+        // over the panes would suggest it was about them.
+        Mode::Confirm | Mode::Prompt if app.over_pvc_browser() => {
+            draw_pvc_explore(frame, app, chunks[1])
+        }
         // While the palette is open, keep drawing the view it was opened
         // from, so a global `:` never flashes the table underneath it.
         Mode::Command => match app.palette_return {
@@ -168,6 +176,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Mode::PortForwards => draw_port_forwards(frame, app, chunks[1]),
             Mode::Fleet => draw_fleet(frame, app, chunks[1]),
             Mode::Find => draw_find(frame, app, chunks[1]),
+            Mode::PvcExplore => draw_pvc_explore(frame, app, chunks[1]),
             Mode::Containers => {
                 draw_table(frame, app, chunks[1]);
                 draw_containers(frame, app, chunks[1]);
@@ -217,6 +226,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::TransferMenu => draw_transfer_menu(frame, app, chunks[1]),
         Mode::Skins => draw_skins(frame, app, chunks[1]),
         Mode::Snapshots => draw_snapshots(frame, app, chunks[1]),
+        Mode::PortForwardPicker => draw_port_forward_picker(frame, app, chunks[1]),
         _ => {}
     }
 
@@ -392,7 +402,11 @@ fn draw_compact_header(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(app.flash.clone(), style));
     }
 
-    let (synced, sync_color) = sync_indicator(app.mode, app.doc_filter_return, app.store.synced);
+    let (synced, sync_color) = if app.describe_refresh_task.is_some() {
+        ("● refresh", theme::sky())
+    } else {
+        sync_indicator(app.mode, app.doc_filter_return, app.store.synced)
+    };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(10), Constraint::Length(10)])
@@ -512,6 +526,11 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
             hint_line(&[("e", "edit"), ("E", "events"), ("c", "copy name")]),
             hint_line(&[("^d", "delete")]),
         ],
+        "persistentvolumeclaims" => vec![
+            hint_line(&[("x", "browse"), ("s", "shell"), ("d", "describe")]),
+            hint_line(&[("y", "yaml"), ("E", "events"), ("c", "copy name")]),
+            hint_line(&[("^d", "delete")]),
+        ],
         _ => vec![
             hint_line(&[("⏎", "yaml"), ("d", "describe"), ("E", "events")]),
             hint_line(&[("e", "edit"), ("c", "copy name"), ("Y", "copy cell")]),
@@ -540,23 +559,18 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
 
 fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let show_ns = app.show_namespace_column();
-    let metrics_cols = app.metrics_columns();
     let headers = app.display_headers();
-    let pods_view = app.kind_plural == "pods";
     let sort_col = app.sort_column;
     let sort_arrow = if app.sort_desc { " ↓" } else { " ↑" };
-    // Offset from a displayed column index back to the view spec's (the spec
-    // doesn't know about the prepended NAMESPACE or appended CPU/MEM).
+    // The namespace column is added before the view columns.
     let ns_off = usize::from(show_ns);
-    // Horizontal column scroll: everything after the anchored NAMESPACE/NAME
-    // prefix can be shifted off the left edge with ←/→. Clamped here (not
-    // only in the key handler) because the header set can change underneath
-    // the offset (wide toggle, printer columns arriving).
-    let name_col = if show_ns { 1 } else { 0 };
-    let scrollable_cols = headers.len().saturating_sub(name_col + 1);
-    app.col_offset = app.col_offset.min(scrollable_cols.saturating_sub(1));
-    let col_offset = app.col_offset;
-    let col_visible = move |i: usize| i <= name_col || i >= name_col + 1 + col_offset;
+    let name_col = (0..headers.len())
+        .find(|i| {
+            i.checked_sub(ns_off)
+                .and_then(|si| app.view_spec().canonical_header(si))
+                == Some("NAME")
+        })
+        .unwrap_or(ns_off);
     // Per-column custom alignment, precomputed so cells don't re-borrow app.
     let aligns: Vec<Option<Alignment>> = (0..headers.len())
         .map(|i| {
@@ -567,49 +581,59 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     let align_of = |i: usize| aligns.get(i).copied().flatten();
 
-    let header_row = Row::new(
-        headers
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| col_visible(*i))
-            .map(|(i, h)| {
-                // Active sort column gets a direction arrow in the sorter color
-                // (sky, bold), matching k9s; the label inherits the header color.
-                if Some(i) == sort_col {
-                    let mut line = Line::from(vec![
-                        Span::raw(h.clone()),
-                        Span::styled(
-                            sort_arrow,
-                            Style::default()
-                                .fg(theme::sorter())
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]);
-                    if let Some(a) = align_of(i) {
-                        line = line.alignment(a);
-                    }
-                    Cell::from(line)
-                } else {
-                    match align_of(i) {
-                        Some(a) => Cell::from(Text::from(h.clone()).alignment(a)),
-                        None => Cell::from(h.clone()),
-                    }
+    let header_cells = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            // Active sort column gets a direction arrow in the sorter color
+            // (sky, bold), matching k9s; the label inherits the header color.
+            if Some(i) == sort_col {
+                let mut line = Line::from(vec![
+                    Span::raw(h.clone()),
+                    Span::styled(
+                        sort_arrow,
+                        Style::default()
+                            .fg(theme::sorter())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]);
+                if let Some(a) = align_of(i) {
+                    line = line.alignment(a);
                 }
-            })
-            .collect::<Vec<_>>(),
-    )
-    .style(theme::header_row());
+                Cell::from(line)
+            } else {
+                match align_of(i) {
+                    Some(a) => Cell::from(Text::from(h.clone()).alignment(a)),
+                    None => Cell::from(h.clone()),
+                }
+            }
+        })
+        .collect::<Vec<_>>();
 
     // Column indices (fixed for the whole table) for the columns that get
     // their own visibility treatment below, computed once rather than
     // string-compared per cell.
-    let age_idx = headers.iter().position(|h| h == "AGE");
-    let ready_idx = headers.iter().position(|h| h == "READY");
-    let restarts_idx = headers.iter().position(|h| h == "RESTARTS");
-    let cpu_idx = headers.iter().position(|h| h == "CPU");
-    let mem_idx = headers.iter().position(|h| h == "MEM");
-    let pct_cpu_idx = headers.iter().position(|h| h == "%CPU");
-    let pct_mem_idx = headers.iter().position(|h| h == "%MEM");
+    let age_idx = (0..headers.len()).find(|i| {
+        i.checked_sub(ns_off)
+            .and_then(|si| app.view_spec().canonical_header(si))
+            == Some("AGE")
+    });
+    let ready_idx = (0..headers.len()).find(|i| {
+        i.checked_sub(ns_off)
+            .and_then(|si| app.view_spec().canonical_header(si))
+            == Some("READY")
+    });
+    let restarts_idx = (0..headers.len()).find(|i| {
+        i.checked_sub(ns_off)
+            .and_then(|si| app.view_spec().canonical_header(si))
+            == Some("RESTARTS")
+    });
+    let metric_columns: Vec<_> = (0..headers.len())
+        .map(|i| {
+            i.checked_sub(ns_off)
+                .and_then(|si| app.view_spec().metric_at(si))
+        })
+        .collect();
 
     let count = app.row_count();
     let visible_rows = area.height.saturating_sub(3).max(1) as usize;
@@ -638,159 +662,18 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     if let Some(i) = sort_col {
         needed[i] = needed[i].max(cell_width(&headers[i]).saturating_add(2));
     }
-    let visible_objects = app.rows_window(offset, visible_rows);
-    app.ensure_table_cell_cache(&visible_objects);
-    let cell_cache = app.table_cell_cache();
-    let spec = app.view_spec();
-    let thresholds = app.resolved_thresholds();
-    // One clock reading for the whole frame. Every visible AGE/DURATION cell
-    // used to call `Timestamp::now()` for itself, so a full table took one
-    // reading per volatile cell and could show two rows a second apart.
-    let now = crate::columns::now_secs();
-
-    let rows: Vec<Row> = visible_objects
-        .iter()
-        .map(|obj| {
-            let row_key = crate::store::row_key(obj);
-            let marked_row = !app.marked.is_empty() && app.marked.contains(&row_key);
-            let (base_cells, status_idx) = cell_cache
-                .get(&row_key)
-                .expect("visible rows are warmed in the table cell cache");
-            let mut style_idx = status_idx;
-            let mut cells = Vec::with_capacity(headers.len());
-            if show_ns {
-                cells.push(TableCellText::Borrowed(
-                    obj.metadata.namespace.as_deref().unwrap_or_default(),
-                ));
-                style_idx = status_idx.map(|i| i + 1);
-            }
-            for (i, cell) in base_cells.iter().enumerate() {
-                if let Some(value) = spec.volatile(obj, &app.kind_plural, i, now) {
-                    cells.push(TableCellText::Owned(value));
-                } else {
-                    cells.push(TableCellText::Borrowed(cell.as_str()));
-                }
-            }
-            if app.node_capacity_columns() {
-                cells.push(TableCellText::Owned(app.node_pods_cell(obj)));
-            }
-            let mut metrics_raw = None;
-            let mut node_pcts: (Option<i64>, Option<i64>) = (None, None);
-            if metrics_cols {
-                let name = obj.metadata.name.as_deref().unwrap_or_default();
-                let key = if pods_view {
-                    format!(
-                        "{}/{}",
-                        obj.metadata.namespace.as_deref().unwrap_or_default(),
-                        name
-                    )
-                } else {
-                    name.to_string()
-                };
-                let (cpu, mem) = app.metrics.get(&key).copied().unwrap_or((0, 0));
-                metrics_raw = Some((cpu, mem));
-                cells.push(TableCellText::Owned(columns::fmt_cpu(cpu)));
-                cells.push(TableCellText::Owned(columns::fmt_mem(mem)));
-                if app.node_capacity_columns() {
-                    let (alloc_cpu, alloc_mem) = columns::node_allocatable(obj);
-                    node_pcts = (
-                        columns::usage_pct(cpu, alloc_cpu),
-                        columns::usage_pct(mem, alloc_mem),
-                    );
-                    cells.push(TableCellText::Owned(columns::fmt_pct(node_pcts.0)));
-                    cells.push(TableCellText::Owned(columns::fmt_pct(node_pcts.1)));
-                }
-            }
-            // Combined colorer: the whole row takes a k9s-style status tint
-            // (errors red, pending peach, completed/terminating dimmed, healthy
-            // blue), but a handful of columns keep their own visibility
-            // treatment on top: STATUS gets a semantic badge, RESTARTS/CPU/MEM
-            // flag outliers, AGE is dimmed (rarely the interesting signal),
-            // and NAME highlights the active fuzzy filter's matched chars.
-            let status_val = style_idx
-                .and_then(|i| cells.get(i))
-                .map(TableCellText::as_str)
-                .unwrap_or("");
-            // A pod is phase=Running the moment its sandbox starts, long before
-            // every container passes its readiness probe — until READY is n/n,
-            // paint it as transitional, not healthy.
-            let running_not_ready = status_val == "Running"
-                && ready_idx
-                    .and_then(|i| cells.get(i))
-                    .is_some_and(|r| !all_ready(r.as_str()));
-            let status_key = if running_not_ready {
-                "PodInitializing"
-            } else {
-                status_val
-            };
-            let row_color = theme::row_color(status_key);
-            let status_badge = theme::status_color(status_key);
-            let render_cells: Vec<Cell> = cells
-                .into_iter()
-                .enumerate()
-                .filter(|(i, _)| col_visible(*i))
-                .map(|(i, c)| {
-                    let align = align_of(i);
-                    if marked_row {
-                        // Marked rows override everything so a bulk selection
-                        // stands out.
-                        c.into_cell_aligned(align).style(
-                            Style::default()
-                                .fg(theme::mark())
-                                .add_modifier(Modifier::BOLD),
-                        )
-                    } else if Some(i) == style_idx {
-                        c.into_cell_aligned(align)
-                            .style(Style::default().fg(status_badge))
-                    } else if i == name_col {
-                        render_name_cell(app, c.as_str(), row_color)
-                    } else if Some(i) == age_idx {
-                        c.into_cell_aligned(align).style(theme::dim())
-                    } else if Some(i) == restarts_idx {
-                        let n: i64 = c.as_str().trim().parse().unwrap_or(0);
-                        let color = thresholds
-                            .restarts
-                            .severity(n)
-                            .map(theme::severity_fg)
-                            .unwrap_or(row_color);
-                        c.into_cell_aligned(align).style(Style::default().fg(color))
-                    } else if Some(i) == cpu_idx {
-                        let color = metrics_raw
-                            .and_then(|(cpu, _)| thresholds.cpu.severity(cpu))
-                            .map(theme::severity_fg)
-                            .unwrap_or(row_color);
-                        c.into_cell_aligned(align).style(Style::default().fg(color))
-                    } else if Some(i) == mem_idx {
-                        let color = metrics_raw
-                            .and_then(|(_, mem)| thresholds.memory.severity(mem))
-                            .map(theme::severity_fg)
-                            .unwrap_or(row_color);
-                        c.into_cell_aligned(align).style(Style::default().fg(color))
-                    } else if Some(i) == pct_cpu_idx {
-                        let color = util_color(node_pcts.0, thresholds.utilization);
-                        c.into_cell_aligned(align).style(Style::default().fg(color))
-                    } else if Some(i) == pct_mem_idx {
-                        let color = util_color(node_pcts.1, thresholds.utilization);
-                        c.into_cell_aligned(align).style(Style::default().fg(color))
-                    } else {
-                        c.into_cell_aligned(align)
-                            .style(Style::default().fg(row_color))
-                    }
-                })
-                .collect();
-            Row::new(render_cells)
-        })
-        .collect();
-
-    // Content-aware column widths (#166): every column asks for its widest
-    // value in the filtered list, the rules below bound or weight that ask, and
-    // `distribute_column_widths` splits the frame. A `Fill`-style layout is
-    // deliberately avoided — it hands NAME padding it doesn't need while a
-    // long EXTERNAL-IP next to it gets silently trimmed.
+    let status_width = if app.kind_plural == "nodes" { 27 } else { 26 };
+    // Reserve space for the "● " port-forward marker on the NAME column when
+    // any live forward matches the current context+cluster.
+    if !app.port_forwards.is_empty()
+        && let Some(n) = needed.get_mut(name_col)
+    {
+        *n = n.saturating_add(2);
+    }
+    // Compute widths from all columns before applying the viewport offset.
     let col_rules: Vec<(ColWidth, u16)> = headers
         .iter()
         .enumerate()
-        .filter(|(i, _)| col_visible(*i))
         .map(|(i, h)| {
             // A custom column's configured width wins over the curated rules.
             let rule = if let Some(w) = i
@@ -798,6 +681,14 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                 .and_then(|si| app.view_spec().width_at(si))
             {
                 ColWidth::Exact(w)
+            } else if let Some(metric) = metric_columns[i] {
+                ColWidth::Exact(match metric {
+                    columns::MetricColumn::NodePods
+                    | columns::MetricColumn::NodeCpuUtilization
+                    | columns::MetricColumn::NodeMemoryUtilization => 5,
+                    _ if metric.percentage() => 7,
+                    _ => 8,
+                })
             } else {
                 match h.as_str() {
                     // NAME is the column you actually read — its weight takes
@@ -812,9 +703,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                     "CPU" | "MEM" => ColWidth::Exact(8),
                     "%CPU" | "%MEM" => ColWidth::Exact(5),
                     "PODS" => ColWidth::Exact(5),
-                    // Keep status changes from moving the other columns.
-                    // Allow room for CreateContainerConfigError.
-                    "STATUS" => ColWidth::Exact(26),
+                    // Keep status changes from moving the other columns. Nodes
+                    // need one extra cell for NotReady,SchedulingDisabled.
+                    "STATUS" => ColWidth::Exact(status_width),
                     "READY" | "RESTARTS" => ColWidth::Cap(10),
                     // CRD view: group domains run long (e.g.
                     // "kustomize.toolkit.fluxcd.io"), so GROUP/KIND/VERSIONS
@@ -842,9 +733,148 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .saturating_sub(2)
         .saturating_sub(2)
         .saturating_sub(2 * ncols.saturating_sub(1));
-    let widths: Vec<Constraint> = distribute_column_widths(content_budget, &col_rules)
-        .into_iter()
-        .map(Constraint::Length)
+    let mut widths = distribute_column_widths(content_budget, &col_rules);
+    for (i, (rule, needed)) in col_rules.iter().enumerate() {
+        if matches!(rule, ColWidth::Flex(_)) {
+            let minimum = if i <= name_col {
+                (*needed).min(area.width.saturating_sub(4) / (2 * (name_col + 1) as u16))
+            } else {
+                *needed
+            };
+            widths[i] = widths[i].max(minimum);
+        }
+    }
+    let inner = area.inner(ratatui::layout::Margin::new(1, 1));
+    let viewport = TableViewport::new(&widths, name_col + 1, inner.width);
+    app.col_scroll_max = viewport.max_offset;
+    app.col_offset = app.col_offset.min(app.col_scroll_max);
+    let col_offset = app.col_offset;
+
+    let visible_objects = app.rows_window(offset, visible_rows);
+    let spec = app.view_spec();
+    let thresholds = app.resolved_thresholds();
+    // One clock reading for the whole frame. Every visible AGE/DURATION cell
+    // used to call `Timestamp::now()` for itself, so a full table took one
+    // reading per volatile cell and could show two rows a second apart.
+    let now = crate::columns::now_secs();
+    app.ensure_table_cell_cache_at(&visible_objects, now);
+    let cell_cache = app.table_cell_cache();
+
+    let rows: Vec<Vec<Cell>> = visible_objects
+        .iter()
+        .map(|obj| {
+            let row_key = crate::store::row_key(obj);
+            let marked_row = !app.marked.is_empty() && app.marked.contains(&row_key);
+            let pf_ns = obj.metadata.namespace.as_deref().unwrap_or_default();
+            let pf_name = obj.metadata.name.as_deref().unwrap_or_default();
+            let forwarded = app.has_port_forward(pf_ns, pf_name, &app.kind_plural);
+            let (base_cells, status_idx) = cell_cache
+                .get(&row_key)
+                .expect("visible rows are warmed in the table cell cache");
+            let helm_updated = cell_cache.helm_updated(&row_key);
+            let mut style_idx = status_idx;
+            let mut cells = Vec::with_capacity(headers.len());
+            if show_ns {
+                cells.push(TableCellText::Borrowed(
+                    obj.metadata.namespace.as_deref().unwrap_or_default(),
+                ));
+                style_idx = status_idx.map(|i| i + 1);
+            }
+            for (i, cell) in base_cells.iter().enumerate() {
+                if let Some(value) = app
+                    .live_cell(obj, i)
+                    .or_else(|| spec.volatile_cached(obj, &app.kind_plural, i, now, helm_updated))
+                {
+                    cells.push(TableCellText::Owned(value));
+                } else {
+                    cells.push(TableCellText::Borrowed(cell.as_str()));
+                }
+            }
+            // Combined colorer: the whole row takes a k9s-style status tint
+            // (errors red, pending peach, completed/terminating dimmed, healthy
+            // blue), but a handful of columns keep their own visibility
+            // treatment on top: STATUS gets a semantic badge, RESTARTS/CPU/MEM
+            // flag outliers, AGE is dimmed (rarely the interesting signal),
+            // and NAME highlights the active fuzzy filter's matched chars.
+            let status_val = style_idx
+                .and_then(|i| cells.get(i))
+                .map(TableCellText::as_str)
+                .unwrap_or("");
+            // A pod is phase=Running the moment its sandbox starts, long before
+            // every container passes its readiness probe — until READY is n/n,
+            // paint it as transitional, not healthy.
+            let running_not_ready = status_val == "Running"
+                && (ready_idx
+                    .and_then(|i| cells.get(i))
+                    .is_some_and(|r| !all_ready(r.as_str()))
+                    || (app.kind_plural == "pods" && pod_readiness_blocked(obj)));
+            let status_key = if running_not_ready {
+                "PodInitializing"
+            } else {
+                status_val
+            };
+            let row_color = theme::row_color(status_key);
+            let status_badge = theme::status_color(status_key);
+            let render_cells: Vec<Cell> = cells
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let align = align_of(i);
+                    if marked_row {
+                        if i == name_col {
+                            render_name_cell(app, c.as_str(), theme::mark(), forwarded).style(
+                                Style::default()
+                                    .fg(theme::mark())
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                        } else {
+                            c.into_cell_aligned(align).style(
+                                Style::default()
+                                    .fg(theme::mark())
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                        }
+                    } else if Some(i) == style_idx {
+                        c.into_cell_aligned(align)
+                            .style(Style::default().fg(status_badge))
+                    } else if i == name_col {
+                        render_name_cell(app, c.as_str(), row_color, forwarded)
+                    } else if Some(i) == age_idx {
+                        c.into_cell_aligned(align).style(theme::dim())
+                    } else if Some(i) == restarts_idx {
+                        let n: i64 = c.as_str().trim().parse().unwrap_or(0);
+                        let color = thresholds
+                            .restarts
+                            .severity(n)
+                            .map(theme::severity_fg)
+                            .unwrap_or(row_color);
+                        c.into_cell_aligned(align).style(Style::default().fg(color))
+                    } else if let Some(metric) = metric_columns[i] {
+                        let value = app.metric_value(obj, metric);
+                        let color = if metric.percentage() {
+                            util_color(value, thresholds.utilization)
+                        } else if metric == columns::MetricColumn::NodePods {
+                            row_color
+                        } else {
+                            let band = if metric.cpu() {
+                                thresholds.cpu
+                            } else {
+                                thresholds.memory
+                            };
+                            value
+                                .and_then(|v| band.severity(v))
+                                .map(theme::severity_fg)
+                                .unwrap_or(row_color)
+                        };
+                        c.into_cell_aligned(align).style(Style::default().fg(color))
+                    } else {
+                        c.into_cell_aligned(align)
+                            .style(Style::default().fg(row_color))
+                    }
+                })
+                .collect();
+            render_cells
+        })
         .collect();
 
     let kind_label = app.list_title();
@@ -853,9 +883,14 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
         Span::styled(format!(" {kind_label} "), theme::title()),
         Span::styled(format!("[{count}]"), Style::default().fg(theme::counter())),
     ];
-    // Horizontal scroll indicator: how many columns are hidden off the left.
+    if app.faults_filter_active() {
+        title.push(Span::styled(" [faults]", Style::default().fg(theme::red())));
+    }
     if col_offset > 0 {
-        title.push(Span::styled(format!(" ‹{col_offset}"), theme::dim()));
+        title.push(Span::styled(" ←", theme::dim()));
+    }
+    if col_offset < app.col_scroll_max {
+        title.push(Span::styled(" →", theme::dim()));
     }
     if !app.marked.is_empty() {
         title.push(Span::styled(
@@ -873,77 +908,176 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(theme::teal())
         };
         title.push(Span::styled(format!(" /{}", app.filter), style));
-        title.push(Span::styled(
-            if app.filter_server_side() {
-                " ·server"
-            } else {
-                " ·local"
-            },
-            theme::dim(),
-        ));
+        title.push(Span::styled(app.filter_location(), theme::dim()));
     }
     title.push(Span::raw(" "));
 
-    let mut render_state = ratatui::widgets::TableState::default();
-    let render_selected = if count > 0 {
-        selected.map(|i| i.saturating_sub(offset))
-    } else {
-        None
-    };
-    render_state.select(render_selected);
-    // Record the geometry for mouse hit-testing (click-to-select, header-click
-    // sort). Mirrors the Table widget's own column layout: the area inside the
-    // borders, the always-reserved 2-cell highlight symbol, then a horizontal
-    // layout with the same widths, spacing, and default Start flex. Each range
-    // carries the display-header index it shows, since columns can be
-    // scrolled out of view.
-    {
-        use ratatui::layout::{Flex, Margin};
-        let inner = area.inner(Margin::new(1, 1));
-        let sel_w = 2u16; // "▌ " with HighlightSpacing::Always
-        let cols_area = Rect {
-            x: inner.x.saturating_add(sel_w),
-            y: inner.y,
-            width: inner.width.saturating_sub(sel_w),
-            height: inner.height,
+    let render_selected = selected
+        .filter(|_| count > 0)
+        .map(|i| i.saturating_sub(offset));
+    app.record_table_hit(
+        inner.y,
+        inner.y.saturating_add(1),
+        inner.height.saturating_sub(1),
+        inner.x,
+        inner.x.saturating_add(inner.width),
+        viewport
+            .ranges(col_offset)
+            .iter()
+            .map(|&(start, end, i, _)| (inner.x + start, inner.x + end, i))
+            .collect(),
+    );
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(theme::border_focused())
+            .title(Line::from(title)),
+        area,
+    );
+    frame.render_widget(
+        ScrollingTable {
+            header: header_cells,
+            rows,
+            widths,
+            viewport,
+            offset: col_offset,
+            selected: render_selected,
+        },
+        inner,
+    );
+}
+
+/// Positions in the full table, measured from the selection marker.
+struct TableViewport {
+    columns: Vec<(usize, usize)>,
+    anchored: usize,
+    frozen_width: usize,
+    width: usize,
+    max_offset: usize,
+}
+
+impl TableViewport {
+    fn new(widths: &[u16], anchored: usize, width: u16) -> Self {
+        let mut end = 2usize;
+        let columns: Vec<_> = widths
+            .iter()
+            .map(|&width| {
+                let start = end;
+                end += usize::from(width);
+                let range = (start, end);
+                end += 2;
+                range
+            })
+            .collect();
+        let frozen_width = columns.get(anchored).map_or(end.saturating_sub(2), |c| c.0);
+        let width = usize::from(width);
+        let max_offset = if frozen_width < width {
+            end.saturating_sub(2).saturating_sub(width)
+        } else {
+            0
         };
-        let rects = Layout::horizontal(widths.clone())
-            .flex(Flex::Start)
-            .spacing(2)
-            .split(cols_area);
-        app.record_table_hit(
-            inner.y,
-            inner.y.saturating_add(1),
-            inner.height.saturating_sub(1),
-            inner.x,
-            inner.x.saturating_add(inner.width),
-            rects
-                .iter()
-                .zip((0..headers.len()).filter(|&i| col_visible(i)))
-                .map(|(r, i)| (r.x, r.x + r.width, i))
-                .collect(),
-        );
+        Self {
+            columns,
+            anchored,
+            frozen_width,
+            width,
+            max_offset,
+        }
     }
 
-    let table = Table::new(rows, widths)
-        .header(header_row)
-        .row_highlight_style(theme::selected_row())
-        .highlight_symbol("▌ ")
-        // Always reserve the highlight-symbol column so rows never shift right
-        // when a selection appears.
-        .highlight_spacing(HighlightSpacing::Always)
-        // A little breathing room between columns (default is a single space,
-        // easy to lose track of where one column ends and the next starts).
-        .column_spacing(2)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(theme::border_focused())
-                .title(Line::from(title)),
-        );
+    /// Visible ranges plus the source offset within each cell.
+    fn ranges(&self, offset: usize) -> Vec<(u16, u16, usize, u16)> {
+        self.columns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &(start, end))| {
+                let (left, right, shift) = if i < self.anchored {
+                    (0, self.width, 0)
+                } else {
+                    (self.frozen_width + offset, self.width + offset, offset)
+                };
+                let visible_start = start.max(left);
+                let visible_end = end.min(right);
+                (visible_start < visible_end).then_some((
+                    visible_start.saturating_sub(shift) as u16,
+                    visible_end.saturating_sub(shift) as u16,
+                    i,
+                    visible_start.saturating_sub(start) as u16,
+                ))
+            })
+            .collect()
+    }
+}
 
-    frame.render_stateful_widget(table, area, &mut render_state);
+struct ScrollingTable<'a> {
+    header: Vec<Cell<'a>>,
+    rows: Vec<Vec<Cell<'a>>>,
+    widths: Vec<u16>,
+    viewport: TableViewport,
+    offset: usize,
+    selected: Option<usize>,
+}
+
+impl ratatui::widgets::Widget for ScrollingTable<'_> {
+    fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+        use ratatui::widgets::StatefulWidget;
+
+        let ranges = self.viewport.ranges(self.offset);
+        let max_width = ranges
+            .iter()
+            .map(|&(_, _, i, _)| self.widths[i])
+            .max()
+            .unwrap_or(0);
+        // Reuse one row of storage. Long values do not allocate a full table.
+        let mut source = ratatui::buffer::Buffer::empty(Rect::new(0, 0, max_width, 1));
+        for (y, cells) in std::iter::once(self.header)
+            .chain(self.rows)
+            .take(usize::from(area.height))
+            .enumerate()
+        {
+            let y_pos = area.y + y as u16;
+            let selected = y > 0 && self.selected == Some(y - 1);
+            let style = if y == 0 {
+                theme::header_row()
+            } else if selected {
+                theme::selected_row()
+            } else {
+                Style::default()
+            };
+            buf.set_style(Rect::new(area.x, y_pos, area.width, 1), style);
+            if selected {
+                buf.set_stringn(area.x, y_pos, "▌ ", usize::from(area.width), style);
+            }
+            for &(start, end, index, source_start) in &ranges {
+                source.reset();
+                if let Some(bg) = theme::background() {
+                    source.set_style(source.area, Style::default().bg(bg));
+                }
+                let cell_area = Rect::new(0, 0, self.widths[index], 1);
+                let mut state = ratatui::widgets::TableState::default();
+                state.select(selected.then_some(0));
+                let table = Table::new(
+                    [Row::new([cells[index].clone()]).style(style)],
+                    [Constraint::Length(self.widths[index])],
+                )
+                .row_highlight_style(theme::selected_row());
+                StatefulWidget::render(table, cell_area, &mut source, &mut state);
+                let source_end = source_start + (end - start);
+                let mut x = 0;
+                while x < source_end {
+                    let cell = &source[(x, 0)];
+                    let symbol_width = cell.symbol().width().max(1) as u16;
+                    if x >= source_start && x.saturating_add(symbol_width) <= source_end {
+                        let target = &mut buf[(area.x + start + (x - source_start), y_pos)];
+                        target.set_symbol(cell.symbol());
+                        target.set_style(cell.style());
+                    }
+                    x = x.saturating_add(symbol_width);
+                }
+            }
+        }
+    }
 }
 
 /// How a table column's width is decided when splitting the frame (#166).
@@ -1053,13 +1187,45 @@ fn all_ready(ready: &str) -> bool {
     }
 }
 
+fn pod_readiness_blocked(obj: &kube::core::DynamicObject) -> bool {
+    let conditions = obj
+        .data
+        .pointer("/status/conditions")
+        .and_then(serde_json::Value::as_array);
+    let condition = |name: &str| {
+        conditions
+            .and_then(|conditions| conditions.iter().find(|c| c["type"].as_str() == Some(name)))
+    };
+    condition("Ready").is_some_and(|c| c["status"].as_str() != Some("True"))
+        || obj
+            .data
+            .pointer("/spec/readinessGates")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|gates| {
+                gates.iter().any(|gate| {
+                    gate["conditionType"]
+                        .as_str()
+                        .and_then(condition)
+                        .is_none_or(|c| c["status"].as_str() != Some("True"))
+                })
+            })
+}
+
 /// Render the NAME cell, highlighting characters that matched the active
 /// fuzzy row filter (bold yellow) so a scan across many filtered results is
 /// faster — every visible row already matched, this just shows *where*.
 /// Falls back to a flat `base`-colored cell when there's no active filter.
-fn render_name_cell(app: &App, name: &str, base: Color) -> Cell<'static> {
+fn render_name_cell(app: &App, name: &str, base: Color, forwarded: bool) -> Cell<'static> {
+    // A teal ● prepended when a port-forward is active for this row.
+    let marker = if forwarded {
+        vec![Span::styled("● ", Style::default().fg(theme::teal()))]
+    } else {
+        Vec::new()
+    };
     let Some(matched) = app.filter_match_indices(name).filter(|idx| !idx.is_empty()) else {
-        return Cell::from(name.to_string()).style(Style::default().fg(base));
+        let mut spans = marker;
+        spans.push(Span::styled(name.to_string(), Style::default().fg(base)));
+        return Cell::from(Line::from(spans));
     };
     let matched: std::collections::HashSet<usize> = matched.iter().copied().collect();
     let plain = Style::default().fg(base);
@@ -1067,7 +1233,7 @@ fn render_name_cell(app: &App, name: &str, base: Color) -> Cell<'static> {
         .fg(theme::yellow())
         .add_modifier(Modifier::BOLD);
 
-    let mut spans = Vec::new();
+    let mut spans = marker;
     let mut run = String::new();
     let mut run_matched = false;
     for (i, ch) in name.chars().enumerate() {
@@ -2002,7 +2168,10 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         ),
         bind("shift-j", "jump to owner (controller)"),
         bind("o", "show node hosting the pod"),
-        bind("←/→", "scroll columns (NAMESPACE/NAME stay anchored)"),
+        bind(
+            "←/→",
+            "scroll sideways (5 cells; NAMESPACE/NAME stay fixed)",
+        ),
         bind("esc", "go back / pop view / clear filter"),
         bind("j/k g/G", "move · top/bottom"),
         bind(
@@ -2010,14 +2179,21 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             "page tables and documents forward/back (also PgDn/PgUp)",
         ),
         bind("S · I", "sort by column (fuzzy picker) · invert direction"),
-        bind("w", "toggle wide columns (kubectl -o wide)"),
+        bind(
+            "w",
+            "toggle wide columns (kubectl -o wide), including node labels",
+        ),
         bind(
             "ctrl-e",
             "compact mode: collapse header + footer (for tiled panes)",
         ),
         bind(
             "/",
-            "filter: fuzzy · !inverse · -l/-f selectors (server-side on ⏎) · col=val cpu>500m age<2h",
+            "filter: fuzzy · \"exact\" · /regex/ · !inverse · -l/-f selectors (server-side on ⏎) · col=val cpu>500m age<2h · && || !(...)",
+        ),
+        bind(
+            ":resource -n ns --context ctx /filter",
+            "query resource, namespace, context and filter together",
         ),
         bind(
             "ctrl-u · ctrl-w",
@@ -2025,9 +2201,11 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         ),
         bind("n · 0", "namespace switcher · 0 = all namespaces"),
         bind("ctrl-r", "refresh watch"),
+        bind("ctrl-z", "toggle faults filter (pods only)"),
         Line::from(""),
         Line::from(Span::styled("  Inspect", theme::title())),
         bind("y · d", "view YAML · describe (kubectl)"),
+        bind("r (describe)", "turn automatic refresh on/off (5s)"),
         bind("l · p", "logs (workload = all pods) · previous logs"),
         bind(
             "shift-l · :vlogs",
@@ -2044,7 +2222,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         ),
         bind(
             "x",
-            "secrets: show data base64-decoded (also inside YAML/describe)",
+            "secrets: show data base64-decoded (also inside YAML/describe) · PVCs: browse the volume",
         ),
         bind(
             "shift-x · :explain",
@@ -2069,7 +2247,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("  Act", theme::title())),
         bind("e", "edit in $EDITOR (kubectl edit)"),
-        bind("s", "shell into pod / scale workload"),
+        bind("s", "shell into pod / PVC volume · scale workload"),
         bind("a", "attach to pod"),
         bind(
             ":debug",
@@ -2105,6 +2283,28 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         bind(
             "ctrl-d · ctrl-k",
             "delete · force-delete (in confirm: f force, c cascade)",
+        ),
+        Line::from(""),
+        Line::from(Span::styled("  PVC explore (x on a PVC)", theme::title())),
+        bind(
+            "x · s · :pvc-explore",
+            "browse the volume (local left, PVC right; also :pvc-browse) · shell into it at the mount point",
+        ),
+        bind(
+            "tab · ←/→",
+            "switch pane · j/k g/G move · ⏎ open directory · ⌫ or - go up (stops at the mount)",
+        ),
+        bind(
+            "esc · q",
+            "close the browser (and delete the helper pod, if any)",
+        ),
+        bind(
+            "c · r",
+            "copy the selection into the other pane (download or upload) · refresh both",
+        ),
+        bind(
+            ":pvc-clean",
+            "delete helper pods left behind by a session that exited uncleanly (:pvc-cleanup)",
         ),
         Line::from(""),
         Line::from(Span::styled("  Logs view", theme::title())),
@@ -2426,6 +2626,37 @@ fn draw_flux_menu(frame: &mut Frame, app: &mut App, area: Rect) {
         items,
         Span::styled(format!(" {subject}: {target} "), theme::title()),
         &mut app.flux_menu_state,
+    );
+}
+
+/// Port-forward picker (`f` on a pod/service): lists the object's declared
+/// ports for single-select, plus a "Custom…" entry for manual input.
+fn draw_port_forward_picker(frame: &mut Frame, app: &mut App, area: Rect) {
+    let target = app
+        .pf_picker_target
+        .as_ref()
+        .map(|(_, name)| name.clone())
+        .unwrap_or_default();
+    let items: Vec<ListItem> = app
+        .pf_picker_items
+        .iter()
+        .map(|label| {
+            let color = if *label == "Custom…" {
+                theme::overlay1()
+            } else {
+                theme::green()
+            };
+            ListItem::new(Span::styled(label.as_str(), Style::default().fg(color)))
+        })
+        .collect();
+    render_popup_list(
+        frame,
+        area,
+        40,
+        24,
+        items,
+        Span::styled(format!(" Port-forward {target} "), theme::title()),
+        &mut app.pf_picker_state,
     );
 }
 
@@ -3152,6 +3383,193 @@ fn draw_gitops(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+/// The PVC browser: local files on the left, the volume on the right, one
+/// cursor per pane and a copy that always runs from the focused pane into the
+/// other one.
+fn draw_pvc_explore(frame: &mut Frame, app: &mut App, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    let local_title = format!(" local · {} ", app.pvc.local_path.display());
+    let mut remote_title = format!(" {} · {} ", app.pvc.claim, app.pvc.remote_path);
+    if let Some(mount) = &app.pvc.mount {
+        if mount.helper {
+            remote_title.push_str("· helper pod ");
+        } else {
+            remote_title.push_str(&format!("· via {} ", mount.pod));
+        }
+        if mount.read_only {
+            remote_title.push_str("· read-only ");
+        }
+    }
+    if app.pvc.loading {
+        remote_title.push_str("· loading… ");
+    }
+
+    let local_items = pvc_pane_items(
+        &app.pvc.local,
+        app.pvc.local_error.as_deref(),
+        cols[0].width,
+        app.pvc.local_truncated,
+    );
+    let remote_items = pvc_pane_items(
+        &app.pvc.remote,
+        app.pvc.remote_error.as_deref(),
+        cols[1].width,
+        app.pvc.truncated,
+    );
+    let focus = app.pvc.focus;
+
+    render_pvc_pane(
+        frame,
+        cols[0],
+        local_items,
+        local_title,
+        &mut app.pvc.local_state,
+        focus == Pane::Local,
+    );
+    render_pvc_pane(
+        frame,
+        cols[1],
+        remote_items,
+        remote_title,
+        &mut app.pvc.remote_state,
+        focus == Pane::Remote,
+    );
+}
+
+fn render_pvc_pane(
+    frame: &mut Frame,
+    area: Rect,
+    items: Vec<ListItem<'static>>,
+    title: String,
+    state: &mut ListState,
+    focused: bool,
+) {
+    let (border, title_style) = if focused {
+        (theme::border_focused(), theme::title())
+    } else {
+        (theme::border(), theme::dim())
+    };
+    let list = List::new(items)
+        .highlight_style(if focused {
+            theme::selected_row()
+        } else {
+            // The unfocused pane keeps its cursor visible but quiet, so you
+            // can see where a copy would land without it competing for
+            // attention with the pane you are driving.
+            Style::default().add_modifier(Modifier::REVERSED)
+        })
+        .highlight_symbol("▌ ")
+        .highlight_spacing(HighlightSpacing::Always)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(border)
+                .title(Span::styled(title, title_style)),
+        );
+    frame.render_stateful_widget(list, area, state);
+}
+
+/// One pane's rows. Sizes are right-aligned against the pane width so both
+/// sides line up as a pair of columns rather than two ragged lists.
+fn pvc_pane_items(
+    entries: &[crate::pvcexplore::Entry],
+    error: Option<&str>,
+    width: u16,
+    truncated: bool,
+) -> Vec<ListItem<'static>> {
+    use crate::pvcexplore::EntryKind;
+
+    if let Some(e) = error {
+        return vec![ListItem::new(Line::from(Span::styled(
+            e.to_string(),
+            Style::default().fg(theme::red()),
+        )))];
+    }
+    if entries.is_empty() {
+        return vec![ListItem::new(Line::from(Span::styled(
+            "empty".to_string(),
+            theme::dim(),
+        )))];
+    }
+    // 2 borders + the 2-cell highlight symbol.
+    let inner = usize::from(width).saturating_sub(4);
+    let size_width = 8usize;
+    let name_width = inner.saturating_sub(size_width + 1).max(4);
+
+    let mut items: Vec<ListItem<'static>> = entries
+        .iter()
+        .map(|e| {
+            let (label, color) = match e.kind {
+                EntryKind::Dir => (format!("{}/", e.name), theme::sapphire()),
+                EntryKind::Link if !e.link_target.is_empty() => {
+                    (format!("{} → {}", e.name, e.link_target), theme::teal())
+                }
+                EntryKind::Link => (e.name.clone(), theme::teal()),
+                EntryKind::File => (e.name.clone(), theme::text()),
+            };
+            // Padded by terminal columns, not characters: a CJK filename is
+            // twice as wide as it is long, and `{:<n}` would push the size
+            // column through the pane border.
+            let label = clip_to_width(&label, name_width);
+            let pad = name_width.saturating_sub(label.width());
+            let size = match (e.kind, e.size) {
+                (EntryKind::Dir, _) => String::new(),
+                (_, Some(bytes)) => crate::pvcexplore::human_size(bytes),
+                // Nothing could stat it — not the same as an empty file.
+                (_, None) => "?".to_string(),
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{label}{:pad$}", "", pad = pad),
+                    Style::default().fg(color),
+                ),
+                Span::styled(format!(" {size:>size_width$}"), theme::dim()),
+            ]))
+        })
+        .collect();
+    if truncated {
+        // Not "N more": both panes stop at the cap without counting past it —
+        // the volume side because `head` closes the pipe inside the container.
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!(
+                "… showing the first {} entries",
+                crate::pvcexplore::MAX_ENTRIES
+            ),
+            Style::default().fg(theme::peach()),
+        ))));
+    }
+    items
+}
+
+/// Truncate to `max` terminal columns, ending with an ellipsis when cut.
+/// [`crate::text::ellipsize`] counts characters, which is the wrong unit for
+/// arbitrary file names off a volume.
+fn clip_to_width(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > max.saturating_sub(1) {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
 /// Session-local timeline: the state changes observed for one object while
 /// sofka has been watching, oldest first.
 fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -3348,8 +3766,8 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
                     "  ⏎ apply server-side",
                     Style::default().fg(theme::yellow()),
                 ));
-            } else if app.filter_server_side() {
-                spans.push(Span::styled("  ·server", theme::dim()));
+            } else {
+                spans.push(Span::styled(app.filter_location(), theme::dim()));
             }
             Line::from(spans)
         }
@@ -3399,6 +3817,18 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 "  j/k:scroll  ^f/^b:page  h/l:← →  g/G:top/bottom  /:search  n/N:next/prev  w:wrap  c:copy  esc:back"
             };
+            let hint = if app.mode == Mode::Detail && app.describe_source.is_some() {
+                format!(
+                    "{hint}  r:refresh {}",
+                    if app.describe_refresh_task.is_some() {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                )
+            } else {
+                hint.to_string()
+            };
             Line::from(Span::styled(hint, theme::dim()))
         }
         Mode::Help => Line::from(Span::styled("  /:search  ?/esc:back", theme::dim())),
@@ -3418,6 +3848,10 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
             "  j/k: move   enter: confirm   esc: cancel",
             theme::dim(),
         )),
+        Mode::PortForwardPicker => Line::from(Span::styled(
+            "  j/k: move   ⏎: forward this port   esc: cancel",
+            theme::dim(),
+        )),
         Mode::PortForwards => Line::from(Span::styled(
             "  j/k: move   x/s: stop   esc: close (others keep running)",
             theme::dim(),
@@ -3432,6 +3866,10 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
         )),
         Mode::Find => Line::from(Span::styled(
             "  j/k: move   ⏎: open the object   esc: close",
+            theme::dim(),
+        )),
+        Mode::PvcExplore => Line::from(Span::styled(
+            "  tab/←→: pane   j/k: move   ⏎: open   ⌫/-: up   c: copy to other pane   s: shell   r: refresh   esc: back",
             theme::dim(),
         )),
         _ => {
@@ -3466,6 +3904,9 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
 fn sync_indicator(mode: Mode, doc_filter_return: Mode, synced: bool) -> (&'static str, Color) {
     let static_doc = match mode {
         Mode::Detail | Mode::Diff => true,
+        // A directory listing is fetched once by exec, not watched — `r`
+        // re-reads it. Calling it live would be a lie.
+        Mode::PvcExplore => true,
         // `/` search over one of those documents — same underlying snapshot.
         Mode::DocFilter => matches!(doc_filter_return, Mode::Detail | Mode::Diff),
         _ => false,
@@ -3485,7 +3926,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Style::default().fg(theme::subtext0())
     };
-    let (synced, sync_color) = sync_indicator(app.mode, app.doc_filter_return, app.store.synced);
+    let (synced, sync_color) = if app.describe_refresh_task.is_some() {
+        ("● refresh", theme::sky())
+    } else {
+        sync_indicator(app.mode, app.doc_filter_return, app.store.synced)
+    };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(10), Constraint::Length(12)])
@@ -3607,6 +4052,26 @@ fn centered_rect_with_min(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The PVC browser pads file names into a fixed column. A CJK name is
+    /// twice as wide as it is long, so counting characters would push the size
+    /// column through the pane border.
+    #[test]
+    fn clip_to_width_measures_terminal_columns() {
+        assert_eq!(clip_to_width("abc", 5), "abc");
+        assert_eq!(clip_to_width("abcdef", 4), "abc…");
+        // Six characters, twelve columns wide.
+        assert_eq!("日本語ファイル".width(), 14);
+        let clipped = clip_to_width("日本語ファイル", 8);
+        assert!(
+            clipped.width() <= 8,
+            "{clipped:?} is {} wide",
+            clipped.width()
+        );
+        assert!(clipped.ends_with('…'));
+        // No room even for the ellipsis.
+        assert_eq!(clip_to_width("abc", 0), "");
+    }
 
     /// A describe/YAML/diff document is a snapshot — the status bar must not
     /// claim it's live (#175 follow-up report from Discord).

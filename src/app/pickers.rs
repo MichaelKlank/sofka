@@ -267,6 +267,12 @@ impl App {
             }
             KeyCode::Down => list_step(&mut self.sort_picker_state, len, true),
             KeyCode::Up => list_step(&mut self.sort_picker_state, len, false),
+            KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
+                list_step(&mut self.sort_picker_state, len, true)
+            }
+            KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+                list_step(&mut self.sort_picker_state, len, false)
+            }
             KeyCode::Enter => {
                 if let Some(entry) = self
                     .sort_picker_state
@@ -404,6 +410,12 @@ impl App {
             }
             KeyCode::Down => list_step(&mut self.copy_picker_state, len, true),
             KeyCode::Up => list_step(&mut self.copy_picker_state, len, false),
+            KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
+                list_step(&mut self.copy_picker_state, len, true)
+            }
+            KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+                list_step(&mut self.copy_picker_state, len, false)
+            }
             KeyCode::Enter => {
                 if let Some((header, value)) = self
                     .copy_picker_state
@@ -510,6 +522,7 @@ impl App {
     }
 
     pub(super) fn set_namespace(&mut self, sel: String) {
+        self.save_history_filter();
         self.namespace = normalize_ns(&sel);
         self.drop_owner_scope();
         self.note_recent_namespace(&sel);
@@ -756,21 +769,45 @@ impl App {
         if name == self.cluster.context && self.cluster.connected {
             return;
         }
+        // Re-selecting the target of the live connection is also a no-op. A
+        // bookmark, workspace, or query may be waiting for it to land, and a
+        // replacement connection would otherwise invalidate that destination.
+        if self
+            .context_switch_target
+            .as_ref()
+            .is_some_and(|(generation, target)| *generation == self.generation && target == &name)
+        {
+            return;
+        }
+        // One deferred navigation at a time. Whatever asked for this switch
+        // owns what lands when it completes, so anything armed by an earlier
+        // switch is dropped here rather than left to fire on a later one.
+        // Below both no-op returns, deliberately: a re-select that starts no
+        // switch must not disarm one already in flight. Callers that arm a new
+        // deferred action clear its competing slots after this returns.
+        self.pending_resource_query = None;
+        self.pending_bookmark = None;
+        self.pending_workspace = None;
         // Stop the current context's watches and clear stale rows while we
         // reconnect; the new watch starts when the connection lands. The rows
         // are stashed first — if the switch fails we stay on this context,
         // where they're still valid (a successful switch drops the cache).
         // Bump first: this switch's own progress flash belongs to the new
         // generation, and the bump clears any left over from the old one.
+        // The browser (and any helper pod it created) belongs to the context
+        // being left: nothing in the new one can serve it.
+        self.leave_pvc_explore();
         self.bump_generation();
+        self.context_switch_target = Some((self.generation, name.clone()));
         self.set_flash(format!("switching to {name}…"));
         self.stash_view_snapshot();
         self.store.clear();
         self.invalidate_rows();
         let tx = self.tx.clone();
         let genr = self.generation;
+        let allow_v1_client_cert = self.cluster.allow_v1_client_cert;
         tokio::spawn(async move {
-            let result = Cluster::connect_context(&name)
+            let result = Cluster::connect_context(&name, allow_v1_client_cert)
                 .await
                 .map(Box::new)
                 .map_err(|e| e.to_string());
@@ -791,12 +828,14 @@ impl App {
         let resolved = self.config.resolve(&name, &cluster.cluster_name);
         self.user_aliases = resolved.config.aliases;
         self.namespace_favorites = resolved.config.favorite_namespaces;
+        self.remember_sort = resolved.config.remember_sort.unwrap_or(true);
         self.plugins = resolved.config.plugins;
         self.bookmarks = resolved.config.bookmarks;
         self.workspaces = resolved.config.workspaces;
         self.guardrails = resolved.config.guardrails;
         self.debug = resolved.config.debug;
         self.bundle_cfg = resolved.config.bundle;
+        self.pvc_cfg = resolved.config.pvc_explore;
         self.logs_cfg = resolved.config.logs;
         self.fleet_cfg = resolved.config.fleet;
         // Tracked debuggers belong to the previous cluster/context.
@@ -805,6 +844,7 @@ impl App {
         plugin_warnings.extend(crate::config::bookmark_warnings(&self.bookmarks));
         plugin_warnings.extend(crate::config::workspace_warnings(&self.workspaces));
         plugin_warnings.extend(crate::config::guardrail_warnings(&self.guardrails));
+        plugin_warnings.extend(crate::config::pvc_explore_warnings(&self.pvc_cfg));
         let (palette_keys, key_warnings) =
             crate::config::compile_palette_keys(&resolved.config.keys);
         self.palette_keys = palette_keys;
@@ -858,23 +898,24 @@ impl App {
         self.apply_context_skin(resolved.skin_override);
         self.flash = format!("context: {name}");
         self.flash_err = false;
-        if let Some(w) = resolved
+        let first_warning = resolved
             .warnings
             .first()
             .or(view_warnings.first())
             .or(plugin_warnings.first())
             .or(threshold_warnings.first())
             .or(provider_warnings.first())
-        {
-            self.flash_warn(w);
-        }
+            .cloned();
         // Keep `:config` in sync with the layers just resolved for this context.
         self.config_warnings = resolved.warnings;
         self.config_warnings.extend(plugin_warnings);
         self.config_warnings.extend(threshold_warnings);
         // A bookmark/workspace that requested this context lands on its own
         // view(s); a plain switch lands on the context's default resource.
-        if self.pending_workspace.is_some() {
+        if let Some(mut query) = self.pending_resource_query.take() {
+            query.context = None;
+            self.apply_resource_query(query);
+        } else if self.pending_workspace.is_some() {
             self.apply_pending_workspace();
         } else if self.pending_bookmark.is_some() {
             self.apply_pending_bookmark();
@@ -885,6 +926,10 @@ impl App {
                 .unwrap_or_else(|| "pods".into());
             self.switch_kind(&kind);
         }
+        if let Some(w) = &first_warning {
+            self.flash_warn(w);
+        }
+        self.flash_discovery_warnings();
         // Saved forwards for the new context. Running ones from the previous
         // context are deliberately left alone (kubectl pinned their context
         // at spawn); autostart only adds what's missing here.

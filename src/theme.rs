@@ -514,22 +514,61 @@ pub fn accent() -> Style {
 /// (healthy, pending, error) keep a distinct pop color so they stand out
 /// against the row tint.
 pub fn status_color(s: &str) -> Color {
-    match s {
+    if s == "Ready,SchedulingDisabled" {
+        return yellow();
+    }
+    match s.strip_suffix(",SchedulingDisabled").unwrap_or(s) {
+        s if failure_status(s) => red(),
+        s if s.starts_with("Init:") => yellow(),
         "Running" | "Ready" | "Active" | "Bound" | "True" | "deployed" => green(),
         // Faded, not "healthy green" — a finished pod isn't running, and a
         // scaled-to-zero workload isn't serving.
         "Succeeded" | "Completed" | "superseded" | "uninstalled" | "ScaledDown" => overlay0(),
-        "Pending" | "ContainerCreating" | "PodInitializing" | "Progressing" | "pending-install"
-        | "pending-upgrade" | "pending-rollback" => yellow(),
+        "Pending" | "Suspended" | "Completing" | "ContainerCreating" | "PodInitializing"
+        | "SchedulingGated" | "Progressing" | "pending-install" | "pending-upgrade"
+        | "pending-rollback" => yellow(),
         // Matches row_color's killColor — a distinct "on its way out" hue,
         // not the same bucket as Pending.
         "Terminating" | "uninstalling" => mauve(),
-        "Failed" | "Error" | "CrashLoopBackOff" | "ImagePullBackOff" | "ErrImagePull"
-        | "Evicted" | "OOMKilled" | "NotReady" | "False" | "failed" | "Degraded"
-        | "Unavailable" | "Stalled" => red(),
         "Unknown" | "" | "unknown" => overlay1(),
         _ => text(),
     }
+}
+
+fn failure_status(status: &str) -> bool {
+    let status = status.strip_prefix("Init:").unwrap_or(status);
+    matches!(
+        status,
+        "Failed"
+            | "Error"
+            | "CrashLoopBackOff"
+            | "ImagePullBackOff"
+            | "ErrImagePull"
+            | "Evicted"
+            | "OOMKilled"
+            | "NotReady"
+            | "Unhealthy"
+            | "False"
+            | "failed"
+            | "Degraded"
+            | "Unavailable"
+            | "Stalled"
+            | "CreateContainerConfigError"
+            | "CreateContainerError"
+            | "InvalidImageName"
+            | "ContainerCannotRun"
+            | "RunContainerError"
+            | "ErrImageNeverPull"
+            | "StartError"
+            | "DeadlineExceeded"
+            | "Lost"
+            | "ContainerStatusUnknown"
+    ) || status.starts_with("NotReady")
+        || status
+            .strip_prefix("Signal:")
+            .or_else(|| status.strip_prefix("ExitCode:"))
+            .and_then(|n| n.parse::<i64>().ok())
+            .is_some_and(|n| n != 0)
 }
 
 /// k9s-style whole-row color: every table row is tinted a single color chosen
@@ -543,12 +582,12 @@ pub fn status_color(s: &str) -> Color {
 /// - everything healthy (Running/Ready/Bound/…) **or without a status** → the
 ///   standard row color (blue), so healthy rows read blue like k9s, not white.
 pub fn row_color(s: &str) -> Color {
-    match s {
-        "Failed" | "Error" | "CrashLoopBackOff" | "ImagePullBackOff" | "ErrImagePull"
-        | "Evicted" | "OOMKilled" | "NotReady" | "Unhealthy" | "False" | "failed" | "Degraded"
-        | "Unavailable" | "Stalled" => red(),
-        "Pending" | "ContainerCreating" | "PodInitializing" | "Progressing" | "pending-install"
-        | "pending-upgrade" | "pending-rollback" => peach(),
+    match s.strip_suffix(",SchedulingDisabled").unwrap_or(s) {
+        s if failure_status(s) => red(),
+        s if s.starts_with("Init:") => peach(),
+        "Pending" | "Suspended" | "Completing" | "ContainerCreating" | "PodInitializing"
+        | "SchedulingGated" | "Progressing" | "pending-install" | "pending-upgrade"
+        | "pending-rollback" => peach(),
         "Completed" | "Succeeded" | "superseded" | "uninstalled" | "ScaledDown" => overlay0(),
         // k9s killColor — terminating/deleting rows.
         "Terminating" | "uninstalling" => mauve(),
@@ -658,6 +697,9 @@ mod tests {
         assert_eq!(row_color("Pending"), peach());
         assert_eq!(row_color("Completed"), overlay0());
         assert_eq!(row_color("Terminating"), mauve());
+        assert_eq!(row_color("Ready,SchedulingDisabled"), blue());
+        assert_eq!(row_color("NotReady,SchedulingDisabled"), red());
+        assert_eq!(row_color("Unknown,SchedulingDisabled"), blue());
     }
 
     #[test]
@@ -677,6 +719,9 @@ mod tests {
         // Pending pops distinct from the row's peach.
         assert_eq!(status_color("Pending"), yellow());
         assert_ne!(status_color("Pending"), row_color("Pending"));
+        assert_eq!(status_color("Ready,SchedulingDisabled"), yellow());
+        assert_eq!(status_color("NotReady,SchedulingDisabled"), red());
+        assert_eq!(status_color("Unknown,SchedulingDisabled"), overlay1());
     }
 
     #[test]
@@ -737,5 +782,35 @@ mod tests {
         // No TTY in the test harness, so this should return `None` promptly
         // rather than panicking or blocking on the query timeout.
         let _ = detect_terminal_mode();
+    }
+
+    #[test]
+    fn failure_colors_cover_specific_reasons_and_init_failures() {
+        for status in [
+            "CreateContainerConfigError",
+            "CreateContainerError",
+            "InvalidImageName",
+            "ContainerCannotRun",
+            "RunContainerError",
+            "ErrImageNeverPull",
+            "StartError",
+            "DeadlineExceeded",
+            "Lost",
+            "ContainerStatusUnknown",
+            "Init:CrashLoopBackOff",
+            "Init:Error",
+            "Init:ExitCode:42",
+            "Signal:9",
+            "ExitCode:42",
+        ] {
+            assert_eq!(row_color(status), red(), "{status}");
+            assert_eq!(status_color(status), red(), "{status}");
+        }
+        for status in ["Init:0/2", "Init:1/2", "SchedulingGated"] {
+            assert_eq!(row_color(status), peach(), "{status}");
+            assert_eq!(status_color(status), yellow(), "{status}");
+        }
+        assert_ne!(row_color("ExitCode:0"), red());
+        assert_ne!(status_color("ExitCode:0"), red());
     }
 }

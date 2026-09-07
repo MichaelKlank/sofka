@@ -10,12 +10,24 @@ failed probes), and recent Warning events. No AI, no external service.
 `j`/`k` move, `⏎` goes to the resource behind a finding, `E` its events, `l` its
 logs, `r` gathers again. A finding you can drill into has a trailing `→`.
 
+For Nodes, memory, disk, and PID pressure are warnings when their conditions
+are `True`. `NetworkUnavailable=True` is also a warning. These conditions do
+not produce warnings when they are `False`. `Unknown` remains a warning, and
+the `Ready` condition is assessed separately.
+
+The DaemonSet rollout summary reads available pods from `status.numberAvailable`.
+
 ## Timeline (`T`)
 
 A per-object timestamped log of every state change the watch saw this session:
 generation bumps, replica and readiness changes, pod phase, restarts, waiting
 reasons, condition flips. Diffed from the watch stream, bounded in size, never
 written to disk.
+
+Restart history includes normal init containers and native sidecars. It keeps
+completed init restart counts in its total, so the end of initialization does
+not reset the count. The pod table excludes normal init restarts after
+initialization is complete.
 
 ## Diff (`:diff`)
 
@@ -68,9 +80,15 @@ the buffer size, and an optional `since` lookback:
 [logs]
 tail = 300         # initial lines fetched per stream (kubectl --tail)
 buffer = 5000      # max lines kept while following (oldest dropped)
-since = "1h"       # optional: only logs newer than this — replaces tail
+since = "1h"       # optional: only logs newer than this, within the tail limit
 fullscreen = false # open log views fullscreen (F toggles per session)
 ```
+
+The `since` window and the `1`–`5` time anchors keep the initial line limit.
+A pod stream requests at most `tail` initial lines per container. Workload and
+Service streams request at most `min(tail, 100)` initial lines per container.
+The time window can reduce this number. Live following continues after these
+initial lines. Previous-container logs keep their full history.
 
 In the view, `/` filters with a case-insensitive substring, a `/regex/`, or a
 leading `!` to invert (keep lines that don't match). A malformed regex is flagged
@@ -232,3 +250,79 @@ Every value is redacted on the way in - bearer tokens, kubeconfig credentials,
 log can be attached to a bug report as it is. Writing happens on its own thread
 behind a bounded queue: a stalled filesystem drops lines (counted in `:info`)
 rather than stalling the UI.
+
+If a kind is missing, check the discovery line first. When sofka cannot read an
+API group, it shows a warning at startup:
+`warning: API discovery could not read <group>/<version>: <reason>`. `:info`
+shows the same warnings under the cluster discovery status. `sofka --check`
+also prints the warnings and the number of API groups that sofka did not read.
+Sofka cannot skip the core API group. If it cannot read `v1`, the connection
+fails with the reason. If aggregated discovery fails, sofka shows the reason
+and reads each API group separately.
+
+## X.509 v1 client certificates
+
+Some MicroK8s kubeconfigs contain an X.509 v1 client certificate. The standard
+rustls client certificate loader rejects this format. Sofka identifies this
+failure as a client certificate error and rejects the connection by default.
+
+To allow this format for one run, pass the explicit flag:
+
+```sh
+sofka --allow-v1-client-cert
+sofka --allow-v1-client-cert --check
+sofka --allow-v1-client-cert --context microk8s
+```
+
+The flag applies to context switches, fleet connections, and bundled plugin
+adapters in that run. It is not saved to configuration and does not change
+kubeconfig. It supports static `client-certificate-data` / `client-key-data`
+and `client-certificate` / `client-key` files. It does not support v1
+certificates returned by exec credential plugins. Exec plugins with supported
+certificates continue to use the standard client path.
+
+Sofka checks that the v1 certificate matches its private key. The flag does not
+disable server certificate verification or change TLS versions and ciphers.
+Existing kubeconfig trust settings still apply. X.509 v1 is a certificate
+format, not TLS 1.0. V1 certificates cannot contain usage restrictions such as
+an extended key usage for client authentication. The API server still decides
+whether to accept the client certificate.
+
+To check an inline client certificate for the selected context:
+
+```sh
+kubectl config view --raw --minify -o jsonpath='{.users[0].user.client-certificate-data}' \
+  | openssl base64 -d -A | openssl x509 -noout -text
+```
+
+For a certificate file, use `openssl x509 -in client.crt -noout -text`.
+`Version: 1 (0x0)` identifies a v1 certificate. To remove the need for the
+flag, have the cluster administrator issue a v3 client certificate and update
+your kubeconfig. Keep the existing identity and required permissions.
+
+## Teleport local Kubernetes proxy certificates
+
+`tsh proxy kube` can serve a CA certificate as its server certificate. Some TLS
+clients reject this with `CaUsedAsEndEntity`, even when the kubeconfig trusts
+that exact certificate.
+
+Sofka accepts this setup when the server certificate exactly matches a CA
+certificate in the selected kubeconfig's `certificate-authority` file or
+`certificate-authority-data`. No extra flag is required. This also applies when
+you change contexts or use fleet mode.
+
+Sofka still checks the certificate dates, hostname (including `tls-server-name`),
+allowed usage, and TLS signatures. A different certificate with the same key or
+subject does not qualify for this exception. Certificates with name constraints
+or unsupported critical extensions do not qualify either. Other server
+certificates use standard verification. System trust and in-cluster CA file
+reloads continue to use the kube client verifier.
+
+Kubeconfigs with exec credential plugins or `auth-provider` entries also keep
+standard verification. The CA server certificate exception is not enabled for
+these configurations. This avoids extra credential-plugin calls during client
+construction. The static certificates generated by `tsh proxy kube` do not have
+this limit.
+
+The `--allow-v1-client-cert` flag is separate. It controls the format of the
+client certificate and is not needed for a Teleport CA server certificate.

@@ -17,6 +17,38 @@ fn node_pods_watch_forbidden(error: &watcher::Error) -> bool {
 impl App {
     // ----- navigation ----------------------------------------------------
 
+    pub(super) fn apply_resource_query(&mut self, query: crate::filter::ResourceQuery) {
+        if let Some(context) = &query.context
+            && (context != &self.cluster.context || !self.cluster.connected)
+        {
+            let context = context.clone();
+            self.switch_context(context);
+            self.pending_bookmark = None;
+            self.pending_workspace = None;
+            self.pending_resource_query = Some(query);
+            return;
+        }
+        let Some(kind) = self.cluster.resolve(&query.resource) else {
+            self.flash_warn(&format!("No resource matches '{}'", query.resource));
+            return;
+        };
+        self.save_history_filter();
+        if let Some(ns) = &query.namespace {
+            self.namespace = normalize_ns(ns);
+            self.note_recent_namespace(ns);
+            self.remember_namespace();
+        }
+        self.set_root_view(kind);
+        self.filter = query.filter;
+        self.record_history();
+        self.start_watch();
+        self.set_flash(format!(
+            "Viewing {} in {}",
+            self.kind_plural,
+            self.namespace_label()
+        ));
+    }
+
     /// Switch the active resource kind by user input. Pushes the current view
     /// so `esc` can return.
     pub fn switch_kind(&mut self, input: &str) {
@@ -28,6 +60,7 @@ impl App {
     pub fn switch_kind_ns(&mut self, input: &str, ns: Option<&str>) {
         match self.cluster.resolve(input) {
             Some(kind) => {
+                self.save_history_filter();
                 if let Some(ns) = ns {
                     self.namespace = normalize_ns(ns);
                     self.note_recent_namespace(ns);
@@ -148,6 +181,16 @@ impl App {
 
     // ----- view history (`[` / `]`) ---------------------------------------
 
+    pub(super) fn save_history_filter(&mut self) {
+        if self.stack.is_empty()
+            && let Some(entry) = self.history.get_mut(self.history_pos)
+            && entry.kind_plural == self.kind_plural
+            && entry.namespace == self.namespace
+        {
+            entry.filter = self.filter.clone();
+        }
+    }
+
     /// Record the current root view (kind + namespace). Called after every
     /// root switch; navigating with `[`/`]` bypasses this so hopping through
     /// history doesn't rewrite it. A new entry truncates the forward tail.
@@ -158,6 +201,7 @@ impl App {
         let entry = ViewEntry {
             kind_plural: self.kind_plural.clone(),
             namespace: self.namespace.clone(),
+            filter: self.filter.clone(),
         };
         if self.history.get(self.history_pos) == Some(&entry) {
             return;
@@ -175,6 +219,7 @@ impl App {
             self.flash_warn("already at oldest view");
             return;
         }
+        self.save_history_filter();
         self.history_pos -= 1;
         self.apply_history_entry();
     }
@@ -184,6 +229,7 @@ impl App {
             self.flash_warn("already at newest view");
             return;
         }
+        self.save_history_filter();
         self.history_pos += 1;
         self.apply_history_entry();
     }
@@ -199,6 +245,7 @@ impl App {
         self.namespace = entry.namespace;
         let title = kind.title();
         self.set_root_view(kind);
+        self.filter = entry.filter;
         self.flash = format!(
             "history {}/{}: {title} in {}",
             self.history_pos + 1,
@@ -210,6 +257,7 @@ impl App {
     }
 
     pub(super) fn push_frame(&mut self) {
+        self.save_history_filter();
         if self.kind.is_none() {
             return;
         }
@@ -264,6 +312,13 @@ impl App {
                 parsed.fields().map(str::to_string),
             )
         };
+        // This watch replaces any pending context connection. Its result
+        // becomes stale when the generation changes below.
+        if self.context_switch_target.take().is_some() {
+            self.pending_resource_query = None;
+            self.pending_bookmark = None;
+            self.pending_workspace = None;
+        }
         self.applied_filter_labels = filter_labels;
         self.applied_filter_fields = filter_fields;
         self.clear_progress_flash();
@@ -280,6 +335,7 @@ impl App {
         let watch_labels = join_selectors(&self.labels, &self.applied_filter_labels);
         let watch_fields = join_selectors(&self.fields, &self.applied_filter_fields);
         let key = ViewKey {
+            resource: kind.resource_key(),
             kind_plural: self.kind_plural.clone(),
             namespace: self.namespace.clone(),
             labels: watch_labels.clone(),
@@ -314,10 +370,10 @@ impl App {
         );
         self.tasks.push(handle);
 
-        if matches!(self.kind_plural.as_str(), "pods" | "nodes") {
+        if self.metrics_columns() {
             self.spawn_metrics_poll();
         }
-        if self.kind_plural == "nodes" {
+        if self.node_capacity_columns() {
             self.spawn_node_pods_poll();
         }
 
@@ -382,15 +438,15 @@ impl App {
     /// For a custom resource with neither curated columns nor a user view,
     /// fetch its CRD off-thread and read `additionalPrinterColumns` for the
     /// watched version — a better automatic fallback than NAME/AGE. Results
-    /// (including "nothing usable") are cached per plural for the session.
+    /// (including "nothing usable") are cached per API resource for the session.
     fn maybe_fetch_printer_columns(&mut self, kind: &Kind) {
         let user_has_columns = self
             .active_user_view()
             .is_some_and(|v| !v.columns.is_empty());
-        if crate::columns::has_curated(&self.kind_plural)
+        if crate::columns::has_curated(&kind.ar.group, &self.kind_plural)
             || kind.ar.group.is_empty()
             || kind.ar.plural.to_lowercase() != self.kind_plural
-            || self.crd_views.contains_key(&self.kind_plural)
+            || self.crd_views.contains_key(&kind.resource_key())
             || user_has_columns
         {
             return;
@@ -401,7 +457,7 @@ impl App {
         let client = self.cluster.client.clone();
         let name = format!("{}.{}", self.kind_plural, kind.ar.group);
         let version = kind.ar.version.clone();
-        let plural = self.kind_plural.clone();
+        let resource = kind.resource_key();
         let tx = self.tx.clone();
         let genr = self.generation;
         let handle = tokio::spawn(async move {
@@ -414,7 +470,7 @@ impl App {
             let _ = tx
                 .send(Msg::PrinterColumns {
                     generation: genr,
-                    plural,
+                    resource,
                     view: Box::new(view),
                 })
                 .await;
@@ -782,6 +838,8 @@ impl App {
     }
 
     pub(super) fn bump_generation(&mut self) {
+        self.stop_describe_refresh();
+        self.describe_source = None;
         self.stop_event_stream();
         self.clear_progress_flash();
         self.stop_plugins();
@@ -792,7 +850,44 @@ impl App {
         }
     }
 
+    /// Fold one background message into the app, then tidy up after any view
+    /// it displaced. The key path has the same sweep in `handle_key`; a
+    /// message that opens a document view (a finished describe, a plugin
+    /// report, a bundle) can displace the PVC browser without a keystroke
+    /// being involved at all.
     pub fn handle_msg(&mut self, msg: Msg) {
+        self.handle_msg_inner(msg);
+        self.check_describe_refresh();
+        let overlay = matches!(
+            self.mode,
+            Mode::PvcExplore
+                | Mode::Command
+                | Mode::Help
+                | Mode::Filter
+                | Mode::Confirm
+                | Mode::Prompt
+        );
+        if self.pvc.active && !overlay {
+            self.leave_pvc_explore();
+        }
+    }
+
+    fn handle_msg_inner(&mut self, msg: Msg) {
+        let preserve_selection = self.faults_filter_active()
+            && matches!(
+                &msg,
+                Msg::Applied { generation, .. }
+                    | Msg::Deleted { generation, .. }
+                    | Msg::Reset { generation }
+                    | Msg::Synced { generation }
+                    if *generation == self.generation
+            );
+        let selected_pod = if preserve_selection {
+            self.selected_ref()
+                .map(|o| (crate::store::row_key(o), o.metadata.uid.clone()))
+        } else {
+            None
+        };
         match msg {
             Msg::Reset { generation } if generation == self.generation => {
                 // A reset after the view already synced is the watcher healing
@@ -908,14 +1003,18 @@ impl App {
                         let headers = self.display_headers();
                         headers.get(i).cloned()
                     })
-                    .is_some_and(|h| matches!(h.as_str(), "CPU" | "MEM" | "%CPU" | "%MEM"));
+                    .is_some_and(|h| self.spec.metric(&h).is_some());
                 if !data.is_empty() || !containers.is_empty() {
                     self.metrics_seen = true;
                 }
                 self.metrics_error = None;
                 self.metrics = data;
                 self.container_metrics = containers;
-                if sort_uses_metrics {
+                if sort_uses_metrics
+                    || self
+                        .parsed_filter()
+                        .uses_metrics(&|key| self.spec.metric(key).is_some())
+                {
                     self.invalidate_rows();
                 }
             }
@@ -923,9 +1022,15 @@ impl App {
                 let sort_uses_pods = self
                     .sort_column
                     .and_then(|i| self.display_headers().get(i).cloned())
-                    .is_some_and(|h| h == "PODS");
+                    .is_some_and(|h| {
+                        self.spec.metric(&h) == Some(crate::columns::MetricColumn::NodePods)
+                    });
                 self.node_pods = Some(counts);
-                if sort_uses_pods {
+                if sort_uses_pods
+                    || self.parsed_filter().uses_metrics(&|key| {
+                        self.spec.metric(key) == Some(crate::columns::MetricColumn::NodePods)
+                    })
+                {
                     self.invalidate_rows();
                 }
             }
@@ -934,16 +1039,21 @@ impl App {
             }
             Msg::PrinterColumns {
                 generation,
-                plural,
+                resource,
                 view,
             } if generation == self.generation => {
-                let for_current = plural == self.kind_plural;
-                self.crd_views.insert(plural, *view);
+                let for_current = self
+                    .kind
+                    .as_ref()
+                    .is_some_and(|kind| kind.resource_key() == resource)
+                    && resource.resource == self.kind_plural;
+                self.crd_views.insert(resource, *view);
                 if for_current {
                     self.refresh_view_spec();
                     // A remembered sort on a printer column only becomes
                     // resolvable now that the CRD's columns are known.
                     self.apply_remembered_sort();
+                    self.apply_view_sort();
                 }
             }
             Msg::FindResults {
@@ -1002,10 +1112,16 @@ impl App {
             }
             Msg::Explain {
                 generation,
+                request,
                 claim,
                 title,
+                source,
                 findings,
-            } if generation == self.generation => {
+            } if generation == self.generation && request == self.explain_request => {
+                self.explain_claim = None;
+                if let Some(source) = source {
+                    self.explain_source = Some(*source);
+                }
                 self.explain_items = findings;
                 self.explain_title = title;
                 // Land the cursor on the first navigable finding, else the top.
@@ -1016,17 +1132,22 @@ impl App {
                     .unwrap_or(0);
                 self.explain_state
                     .select((!self.explain_items.is_empty()).then_some(first));
-                self.mode = Mode::Explain;
                 // As in the `Msg::Gitops` arm below: the "explaining X…"
                 // progress flash has done its job now the findings are up.
                 self.clear_claimed_status(claim);
             }
             Msg::Gitops {
                 generation,
+                request,
                 claim,
                 title,
+                source,
                 findings,
-            } if generation == self.generation => {
+            } if generation == self.generation && request == self.gitops_request => {
+                self.gitops_claim = None;
+                if let Some(source) = source {
+                    self.gitops_source = Some(*source);
+                }
                 self.gitops_items = findings;
                 self.gitops_title = title;
                 let first = self
@@ -1036,7 +1157,6 @@ impl App {
                     .unwrap_or(0);
                 self.gitops_state
                     .select((!self.gitops_items.is_empty()).then_some(first));
-                self.mode = Mode::Gitops;
                 self.clear_claimed_status(claim);
             }
             Msg::PluginOutput {
@@ -1047,6 +1167,8 @@ impl App {
                 lines,
                 warn,
             } if generation == self.generation && run == self.plugin_run => {
+                self.stop_describe_refresh();
+                self.describe_source = None;
                 self.plugin_task = None;
                 self.plugin_claim = None;
                 self.detail = Scrollable {
@@ -1169,6 +1291,15 @@ impl App {
                 lines,
                 warn,
             } if generation == self.generation => {
+                self.stop_describe_refresh();
+                if warn.is_some()
+                    || self
+                        .describe_source
+                        .as_ref()
+                        .is_none_or(|(id, _)| *id != claim)
+                {
+                    self.describe_source = None;
+                }
                 self.detail = Scrollable {
                     title,
                     lines: lines.into(),
@@ -1180,6 +1311,21 @@ impl App {
                     // The "describing X…" progress flash has served its
                     // purpose once the document arrives.
                     None => self.clear_claimed_status(claim),
+                }
+            }
+            Msg::DescribeRefresh { generation, result }
+                if generation == self.describe_refresh_generation
+                    && self.describe_refresh_task.is_some()
+                    && (self.mode == Mode::Detail
+                        || (self.mode == Mode::DocFilter
+                            && self.doc_filter_return == Mode::Detail)) =>
+            {
+                match result {
+                    Ok(lines) => self.detail.replace_lines(lines.into()),
+                    Err(error) => {
+                        self.stop_describe_refresh();
+                        self.flash_warn(&error);
+                    }
                 }
             }
             Msg::Events {
@@ -1199,9 +1345,72 @@ impl App {
                 claim,
                 result,
             } if generation == self.generation => match result {
-                Ok(summary) => self.set_claimed_status(claim, summary, false),
+                Ok(summary) => {
+                    self.set_claimed_status(claim, summary, false);
+                    // A copy made in the PVC browser changed one of the two
+                    // panes; show the file where it landed.
+                    self.refresh_pvc_panes();
+                }
                 Err(e) => self.set_claimed_status(claim, format!("cp failed: {e}"), true),
             },
+            // Deliberately not generation-guarded: a helper pod may already
+            // exist by the time this lands, and the stale branch is the only
+            // thing that can clean it up.
+            Msg::PvcTarget {
+                generation,
+                run,
+                namespace,
+                context,
+                claim,
+                result,
+            } => {
+                if generation == self.generation {
+                    self.handle_pvc_target(run, namespace, claim, result);
+                } else {
+                    self.discard_pvc_target(namespace, context, result);
+                }
+            }
+            Msg::PvcListing {
+                generation,
+                run,
+                path,
+                result,
+            } => {
+                if generation == self.generation {
+                    self.handle_pvc_listing(run, path, result);
+                } else if run == self.pvc.run {
+                    // A watch restart under an in-flight listing. The result
+                    // belongs to a generation that is over, but the pane is
+                    // still waiting on it — without this it says "loading…"
+                    // until the user presses `r`.
+                    self.pvc.loading = false;
+                }
+            }
+            Msg::PvcHelpersCleaned {
+                generation,
+                claim,
+                deleted,
+                failed,
+            } if generation == self.generation => {
+                if failed.is_empty() {
+                    self.set_claimed_status(
+                        claim,
+                        format!("removed {deleted} PVC helper pod(s)"),
+                        false,
+                    );
+                } else {
+                    let shown: Vec<&str> = failed.iter().take(3).map(String::as_str).collect();
+                    self.set_claimed_status(
+                        claim,
+                        format!(
+                            "pvc-clean: removed {deleted}, {} failed — {}",
+                            failed.len(),
+                            shown.join("; ")
+                        ),
+                        true,
+                    );
+                }
+            }
             Msg::LogsSaved {
                 generation,
                 claim,
@@ -1280,18 +1489,38 @@ impl App {
                 generation,
                 name,
                 result,
-            } if generation == self.generation => match result {
-                Ok(cluster) => self.apply_context_switch(name, cluster),
-                Err(e) => {
-                    self.flash_warn(&format!("context switch failed: {e}"));
-                    // Never connected anywhere yet — put the picker back up
-                    // instead of stranding the user on an empty table.
-                    if !self.cluster.connected {
-                        self.open_contexts();
+            } if generation == self.generation => {
+                self.context_switch_target = None;
+                match result {
+                    Ok(cluster) => self.apply_context_switch(name, cluster),
+                    Err(e) => {
+                        self.pending_resource_query = None;
+                        self.pending_bookmark = None;
+                        self.pending_workspace = None;
+                        self.flash_warn(&format!("context switch failed: {e}"));
+                        // Never connected anywhere yet — put the picker back up
+                        // instead of stranding the user on an empty table.
+                        if !self.cluster.connected {
+                            self.open_contexts();
+                        }
                     }
                 }
-            },
+            }
             _ => {} // stale generation, drop
+        }
+        if preserve_selection {
+            let index = selected_pod.and_then(|(key, uid)| {
+                self.ensure_rows_cache();
+                if self.store.get(&key)?.metadata.uid != uid {
+                    return None;
+                }
+                self.rows_cache
+                    .borrow()
+                    .keys
+                    .iter()
+                    .position(|k| k.as_ref() == key)
+            });
+            self.table_state.select(index);
         }
     }
 }

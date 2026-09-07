@@ -1,6 +1,18 @@
 use super::*;
 
 impl App {
+    fn retain_filter_selectors(&mut self) {
+        let parsed = self.parsed_filter();
+        let mut selectors = Vec::new();
+        if let Some(labels) = parsed.labels() {
+            selectors.push(format!("-l '{labels}'"));
+        }
+        if let Some(fields) = parsed.fields() {
+            selectors.push(format!("-f '{fields}'"));
+        }
+        drop(parsed);
+        self.filter = selectors.join(" ");
+    }
     // ----- drill-down ----------------------------------------------------
 
     pub(super) fn drill(&mut self) {
@@ -63,13 +75,13 @@ impl App {
     /// The JSON Pointer holding the current kind's node name, if it has one.
     pub(super) fn node_pointer(&self) -> Option<String> {
         let ar = &self.kind.as_ref()?.ar;
-        crate::views::node_pointer(&self.user_views, ar).map(str::to_string)
+        crate::views::node_pointer(&self.user_views, ar, self.view_namespace()).map(str::to_string)
     }
 
     /// The `[views."…"].drill` for the current kind, if one is configured.
     fn configured_drill(&self) -> Option<crate::views::Drill> {
         let ar = &self.kind.as_ref()?.ar;
-        crate::views::drill_for(&self.user_views, ar).cloned()
+        crate::views::drill_for(&self.user_views, ar, self.view_namespace()).cloned()
     }
 
     /// Drill from a row into the kind its view's `drill` names, scoped by the
@@ -112,7 +124,7 @@ impl App {
             uid: obj.metadata.uid.clone(),
         });
         self.scope_label = Some(format!("cronjob/{name}"));
-        self.filter.clear();
+        self.retain_filter_selectors();
         self.reset_sort();
         self.table_state.select(Some(0));
         self.flash = format!("↳ jobs of {name}");
@@ -143,7 +155,7 @@ impl App {
         self.fields = Some("type=helm.sh/release.v1".into());
         self.owner = None;
         self.scope_label = Some(format!("helm/{release}"));
-        self.filter.clear();
+        self.retain_filter_selectors();
         self.reset_sort();
         self.table_state.select(Some(0));
         self.flash = format!("↳ {release} history");
@@ -169,7 +181,7 @@ impl App {
         self.fields = Some("type=helm.sh/release.v1".into());
         self.owner = None;
         self.scope_label = Some(format!("helm/{release}"));
-        self.filter.clear();
+        self.retain_filter_selectors();
         self.reset_sort();
         self.table_state.select(Some(0));
         self.flash = format!("↳ {release} history");
@@ -252,7 +264,7 @@ impl App {
         // We already hold the CRD, so seed its printer-column fallback here
         // instead of re-fetching it when the watch starts.
         self.crd_views
-            .entry(kind.ar.plural.to_lowercase())
+            .entry(kind.resource_key())
             .or_insert_with(|| crate::views::printer_columns_view(d, &kind.ar.version));
         self.push_frame();
         self.kind_plural = kind.ar.plural.to_lowercase();
@@ -262,7 +274,7 @@ impl App {
         self.fields = None;
         self.owner = None;
         self.scope_label = Some(format!("crd/{crd_name}"));
-        self.filter.clear();
+        self.retain_filter_selectors();
         self.reset_sort();
         self.table_state.select(Some(0));
         self.flash = format!("↳ {plural}");
@@ -304,7 +316,7 @@ impl App {
         self.fields = fields;
         self.owner = None;
         self.scope_label = Some(scope);
-        self.filter.clear();
+        self.retain_filter_selectors();
         self.reset_sort();
         self.table_state.select(Some(0));
         self.flash = format!("↳ drilled into {plural}");
@@ -340,7 +352,7 @@ impl App {
         self.fields = Some(format!("metadata.name={}", t.name));
         self.owner = None;
         self.scope_label = Some(t.name.clone());
-        self.filter.clear();
+        self.retain_filter_selectors();
         self.reset_sort();
         self.table_state.select(Some(0));
         self.mode = Mode::Table;

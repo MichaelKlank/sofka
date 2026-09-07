@@ -65,6 +65,22 @@ fn filter(c: &mut Criterion) {
             });
         });
     }
+    let (mut app, _rx) = bs::pods_app(n);
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+        .unwrap();
+    app.filter = "workload-0004".into();
+    black_box(app.row_count());
+    g.bench_function("edit/2000", |b| {
+        b.iter(|| {
+            app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
+                .unwrap();
+            black_box(app.row_count());
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+                .unwrap();
+            black_box(app.row_count());
+        })
+    });
     g.finish();
 }
 
@@ -74,7 +90,7 @@ fn cells(c: &mut Criterion) {
     let mut g = c.benchmark_group("cells");
 
     let pods: Vec<_> = (0..256).map(bs::pod).collect();
-    let pod_spec = columns::build_spec("pods", None, None, false);
+    let pod_spec = columns::build_spec("", "pods", None, None, false);
     let now = columns::now_secs();
     g.bench_function("pods_256", |b| {
         b.iter(|| {
@@ -86,7 +102,7 @@ fn cells(c: &mut Criterion) {
 
     // Helm is two orders of magnitude slower per row, so it gets far fewer.
     let helm: Vec<_> = (0..16).map(bs::helm_secret).collect();
-    let helm_spec = columns::build_spec("helm", None, None, false);
+    let helm_spec = columns::build_spec("", "helm", None, None, false);
     g.bench_function("helm_16", |b| {
         b.iter(|| {
             for o in &helm {
@@ -223,7 +239,11 @@ fn filter_cmp(c: &mut Criterion) {
     ] {
         let (mut app, _rx) = bs::pods_app(n);
         app.filter = pat.to_string();
-        black_box(app.row_count());
+        let count = app.row_count();
+        assert!(
+            count > 0 && count < n,
+            "comparison fixture must exercise real column values"
+        );
         g.bench_with_input(BenchmarkId::new(label, n), &n, |b, &n| {
             let mut i = 0usize;
             b.iter(|| {
@@ -320,7 +340,7 @@ fn helm_decode(c: &mut Criterion) {
 fn cell_extract(c: &mut Criterion) {
     let mut g = c.benchmark_group("cell_extract");
     let pods: Vec<_> = (0..2_000).map(bs::pod).collect();
-    let spec = columns::build_spec("pods", None, None, true);
+    let spec = columns::build_spec("", "pods", None, None, true);
 
     g.bench_function("borrowed_ip_2000", |b| {
         b.iter(|| {
@@ -352,7 +372,7 @@ fn cell_extract(c: &mut Criterion) {
 fn frame_clock(c: &mut Criterion) {
     let mut g = c.benchmark_group("frame_clock");
     let pods: Vec<_> = (0..2_000).map(bs::pod).collect();
-    let spec = columns::build_spec("pods", None, None, false);
+    let spec = columns::build_spec("", "pods", None, None, false);
     // AGE is the elapsed cell this measures, and it is not column 0 — that is
     // NAME, which is not volatile, so both sides would have returned `None`
     // and timed the clock call against an empty result.
