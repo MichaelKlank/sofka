@@ -10260,6 +10260,164 @@ async fn help_search_uses_own_buffer() {
 }
 
 #[tokio::test]
+async fn help_pages_use_the_rendered_height() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for (height, page) in [(12, 1), (19, 8), (24, 13), (40, 29)] {
+        let (mut app, _rx) = test_app();
+        app.handle_key(press(KeyCode::Char('?'))).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.help_viewport_h, page);
+        for forward in [
+            press(KeyCode::PageDown),
+            press(KeyCode::Char(' ')),
+            ctrl(KeyCode::Char('f')),
+        ] {
+            for backward in [press(KeyCode::PageUp), ctrl(KeyCode::Char('b'))] {
+                app.handle_key(forward).unwrap();
+                term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+                assert_eq!(app.help_scroll, page);
+                app.handle_key(backward).unwrap();
+                assert_eq!(app.help_scroll, 0);
+                app.handle_key(backward).unwrap();
+                assert_eq!(app.help_scroll, 0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn help_scrolls_and_resets_on_reopen() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, _rx) = test_app();
+    app.handle_key(press(KeyCode::Char('?'))).unwrap();
+    let mut term = Terminal::new(TestBackend::new(120, 19)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert!(app.help_max_scroll > app.help_viewport_h);
+
+    for (down, up) in [
+        (KeyCode::Char('j'), KeyCode::Char('k')),
+        (KeyCode::Down, KeyCode::Up),
+    ] {
+        app.handle_key(press(down)).unwrap();
+        assert_eq!(app.help_scroll, 1);
+        app.handle_key(press(up)).unwrap();
+        assert_eq!(app.help_scroll, 0);
+        app.handle_key(press(up)).unwrap();
+        assert_eq!(app.help_scroll, 0);
+    }
+    for (bottom, top) in [
+        (KeyCode::Char('G'), KeyCode::Char('g')),
+        (KeyCode::End, KeyCode::Home),
+    ] {
+        app.handle_key(press(bottom)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.help_scroll, app.help_max_scroll);
+        let text: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("close help and return to the previous screen"));
+        for key in [
+            press(KeyCode::Down),
+            press(KeyCode::PageDown),
+            press(KeyCode::Char(' ')),
+            ctrl(KeyCode::Char('f')),
+        ] {
+            app.handle_key(key).unwrap();
+            assert_eq!(app.help_scroll, app.help_max_scroll);
+        }
+        app.handle_key(press(top)).unwrap();
+        assert_eq!(app.help_scroll, 0);
+    }
+
+    app.handle_key(press(KeyCode::End)).unwrap();
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    assert_eq!(app.help_scroll, 0);
+    for c in "help".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.help_max_scroll, 0);
+    app.handle_key(press(KeyCode::End)).unwrap();
+    assert_eq!(app.help_scroll, 0);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.mode, Mode::Help);
+    assert!(app.help_filter.is_empty());
+    assert_eq!(app.help_scroll, 0);
+    assert!(app.help_max_scroll > 0);
+
+    app.handle_key(press(KeyCode::End)).unwrap();
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    app.handle_key(press(KeyCode::Char('?'))).unwrap();
+    assert_eq!(app.help_scroll, 0);
+}
+
+#[tokio::test]
+async fn help_pages_use_new_dimensions_immediately_after_resize() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for (before, after, page) in [(24, 19, 8), (19, 24, 13)] {
+        let (mut app, _rx) = test_app();
+        app.handle_key(press(KeyCode::Char('?'))).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, before)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        term.backend_mut().resize(120, after);
+        crate::ui::resize(&mut term, &mut app).unwrap();
+        app.handle_key(press(KeyCode::PageDown)).unwrap();
+        assert_eq!(app.help_scroll, page);
+        app.handle_key(press(KeyCode::PageUp)).unwrap();
+        assert_eq!(app.help_scroll, 0);
+        app.handle_key(press(KeyCode::End)).unwrap();
+        assert_eq!(app.help_scroll, app.help_max_scroll);
+    }
+}
+
+#[tokio::test]
+async fn help_paging_updates_after_resize_and_compact_mode() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, _rx) = test_app();
+    app.handle_key(press(KeyCode::Char('?'))).unwrap();
+    let mut term = Terminal::new(TestBackend::new(120, 19)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    app.handle_key(press(KeyCode::End)).unwrap();
+    let old_max = app.help_max_scroll;
+
+    term.backend_mut().resize(120, 24);
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.help_viewport_h, 13);
+    assert_eq!(app.help_max_scroll, old_max - 5);
+    assert_eq!(app.help_scroll, app.help_max_scroll);
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::PageDown)).unwrap();
+    assert_eq!(app.help_scroll, 13);
+
+    app.handle_key(ctrl(KeyCode::Char('e'))).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.help_viewport_h, 21);
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::PageDown)).unwrap();
+    assert_eq!(app.help_scroll, 21);
+
+    term.backend_mut().resize(120, 200);
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.help_scroll, 0);
+    assert_eq!(app.help_max_scroll, 0);
+    app.handle_key(press(KeyCode::PageDown)).unwrap();
+    assert_eq!(app.help_scroll, 0);
+}
+
+#[tokio::test]
 async fn copy_doc_copies_the_whole_document() {
     let (mut app, _rx) = test_app();
     app.detail = Scrollable {

@@ -1695,6 +1695,12 @@ pub struct App {
     pub help_filter: String,
     /// Which view help was opened from, so closing it returns to that view.
     pub help_return: Mode,
+    /// First visible line of the help view (`?`).
+    pub help_scroll: u16,
+    /// Maximum help offset, calculated during rendering.
+    pub help_max_scroll: u16,
+    /// Number of visible help content rows, recorded during rendering.
+    pub help_viewport_h: u16,
     /// Which doc view (`Detail`/`Diff`/`Events`/`Help`) the `/` search prompt
     /// was opened from, so the renderer keeps drawing it underneath and
     /// enter/esc return to it.
@@ -2081,6 +2087,9 @@ impl App {
             describe_refresh_generation: 0,
             help_filter: String::new(),
             help_return: Mode::Table,
+            help_scroll: 0,
+            help_max_scroll: 0,
+            help_viewport_h: 0,
             doc_filter_return: Mode::Detail,
             palette_return: Mode::Table,
             logs: LogsView::default(),

@@ -1013,8 +1013,10 @@ async fn run(
                         dirty = true;
                     }
                     Some(Err(_)) | None => return Ok(()),
-                    // Resize (and any other terminal event) still needs a
-                    // redraw, just not an urgent one.
+                    Some(Ok(Event::Resize(_, _))) => {
+                        ui::resize(terminal, app)?;
+                        dirty = false;
+                    }
                     _ => dirty = true,
                 }
             }

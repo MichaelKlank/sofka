@@ -56,6 +56,15 @@ fn cell_alignment(align: crate::views::Align) -> Alignment {
     }
 }
 
+/// Refresh layout after a resize before another input event can use its dimensions.
+pub fn resize<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut App,
+) -> Result<(), B::Error> {
+    terminal.draw(|frame| draw(frame, app))?;
+    Ok(())
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     // Fill the whole frame with the skin's background first (when enabled), so
     // every view that only sets foreground colors sits on it. Widgets that set
@@ -2147,7 +2156,7 @@ fn value_style(value: &str) -> Style {
     Style::default().fg(theme::text())
 }
 
-fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
     let bind = |k: &str, d: &str| {
         Line::from(vec![
             Span::styled(format!("  {k:<14}"), Style::default().fg(theme::yellow())),
@@ -2361,7 +2370,18 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             "cancel the active plugin and its temporary forward",
         ),
         bind(":q / ctrl-c", "quit"),
-        bind("?", "global help — close to return to the previous screen"),
+        Line::from(""),
+        Line::from(Span::styled("  Help view", theme::title())),
+        bind("j/k · ↑/↓", "scroll one line"),
+        bind("ctrl-f · PgDn", "next page (space also moves forward)"),
+        bind("ctrl-b · PgUp", "previous page"),
+        bind("g/G · Home/End", "go to the top/bottom"),
+        bind("/", "filter help bindings"),
+        bind(
+            "esc",
+            "clear the filter, or close help if no filter is active",
+        ),
+        bind("q · ?", "close help and return to the previous screen"),
     ];
     // Config-defined plugins, with their (possibly modified) key chords.
     if !app.plugins.is_empty() {
@@ -2439,8 +2459,20 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         let title = format!(" Help · /{} [{}] ", app.help_filter, shown.len());
         (shown, title)
     };
+    // Record the content height for paging and clamp the offset after layout changes.
+    let inner_h = area.height.saturating_sub(2);
+    app.help_viewport_h = inner_h;
+    let max_scroll = (lines.len() as u16).saturating_sub(inner_h);
+    app.help_max_scroll = max_scroll;
+    let scroll = app.help_scroll.min(max_scroll);
+    app.help_scroll = scroll;
+    let title = if max_scroll > 0 {
+        format!("{title}· j/k scroll · / search ")
+    } else {
+        title
+    };
     frame.render_widget(
-        Paragraph::new(lines).block(
+        Paragraph::new(lines).scroll((scroll, 0)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)

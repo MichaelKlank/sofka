@@ -86,6 +86,13 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   `events`, `pf`, `notify`, `find`, `vlogs`, `rightsize`, `fleet`, `skin`,
   `reload`, `config`, `info`). `:` and `?` open the palette and help from every
   navigation screen, then close back to the screen where they were opened.
+- **Help scrolling** (`?`) - browse all bindings, including plugins, bookmarks,
+  and workspaces. `j` / `k` and `↑` / `↓` scroll one line. `ctrl-f`, `PgDn`,
+  and `space` move forward one page; `ctrl-b` and `PgUp` move back one page.
+  Each page uses the visible content height. `g` / `Home` go to the top;
+  `G` / `End` go to the bottom. `/` filters the bindings and resets the scroll
+  position. `esc` clears the filter first, then closes help. `q` or `?` closes
+  help and returns to the previous screen.
 - **Filtering** (`/`) with matched-character highlighting: fuzzy text, `"text"`
   contiguous match, `/re/` regular expression (both case-insensitive), `!text`
   inverse match (also `!"text"` and `!/re/`), `-l`/`-f` label and field selectors (evaluated server-side on
