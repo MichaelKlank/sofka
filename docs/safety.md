@@ -24,7 +24,14 @@ Each rule matches on `contexts`, `namespaces`, `resources`, and `actions` globs
 (block the action), `confirmation` (require confirmation), and `max_bulk`
 (a row limit for one action). The gated `actions` are the destructive verbs sofka
 performs directly: `delete`, `force-delete`, `drain`, `restart`, `shell` (exec),
-`debug`, `node-debug`, and `transfer` (a file upload into a pod).
+`debug`, `node-debug`, `transfer` (a file upload into a pod), `pvc-explore`
+(creating a helper pod to mount an unmounted PVC, and the `:pvc-clean` sweep
+that deletes them - both matched against `persistentvolumeclaims`), and
+`pvc-upload` (a file upload into a volume, matched the same way). The PVC
+shell and the PVC upload also pass the `shell` and `transfer` rules for the
+pod they reach the volume through, exactly like `s` and `t` on that pod's row -
+a rule that already blocks shells or uploads in prod is not defeated by
+reaching the same pod through a claim it mounts.
 
 sofka combines the restrictions from all matching rules:
 
@@ -94,3 +101,18 @@ The pattern `plugin:*` matches all plugins.
 Read-only mode blocks mutating plugins and plugins with `network_load = true`.
 Network-load plugins require confirmation, even when they do not change Kubernetes resources.
 See [Plugin safety controls](plugin-authoring.md#safety-controls).
+
+## Node drain
+
+A drain first cordons the node, then checks its pods. It stops for that node
+if an eligible pod has no controller, uses an `emptyDir` volume, or has no UID.
+The error identifies the pod and the reason. No pods on that node are evicted
+when this check fails. The node remains cordoned. Other selected nodes can
+still be processed.
+
+Drain uses the eviction API with the listed pod's UID. It does not use direct
+pod deletion if eviction fails. This preserves PodDisruptionBudget checks and
+prevents eviction of a replacement pod with the same name. A pod-specific
+not-found response means the original pod is already gone. Other API errors
+are reported, including an unavailable eviction endpoint. Drain has no override
+for unmanaged pods or `emptyDir` data loss.

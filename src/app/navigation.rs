@@ -252,7 +252,7 @@ impl App {
         // We already hold the CRD, so seed its printer-column fallback here
         // instead of re-fetching it when the watch starts.
         self.crd_views
-            .entry(kind.ar.plural.to_lowercase())
+            .entry(kind.resource_key())
             .or_insert_with(|| crate::views::printer_columns_view(d, &kind.ar.version));
         self.push_frame();
         self.kind_plural = kind.ar.plural.to_lowercase();

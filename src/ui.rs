@@ -10,7 +10,7 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, DEFAULT_SORT_LABEL, Mode, SuggestKind, TRANSFER_MENU_ITEMS};
+use crate::app::{App, DEFAULT_SORT_LABEL, Mode, Pane, SuggestKind, TRANSFER_MENU_ITEMS};
 use crate::{columns, theme};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -152,6 +152,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::PortForwards => draw_port_forwards(frame, app, chunks[1]),
         Mode::Fleet => draw_fleet(frame, app, chunks[1]),
         Mode::Find => draw_find(frame, app, chunks[1]),
+        Mode::PvcExplore => draw_pvc_explore(frame, app, chunks[1]),
+        // A transfer confirmation or a guardrail prompt raised from the PVC
+        // browser keeps the two panes underneath it, so you can still see what
+        // is being copied where. Only that dialog: drawing an unrelated one
+        // over the panes would suggest it was about them.
+        Mode::Confirm | Mode::Prompt if app.over_pvc_browser() => {
+            draw_pvc_explore(frame, app, chunks[1])
+        }
         // While the palette is open, keep drawing the view it was opened
         // from, so a global `:` never flashes the table underneath it.
         Mode::Command => match app.palette_return {
@@ -168,6 +176,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Mode::PortForwards => draw_port_forwards(frame, app, chunks[1]),
             Mode::Fleet => draw_fleet(frame, app, chunks[1]),
             Mode::Find => draw_find(frame, app, chunks[1]),
+            Mode::PvcExplore => draw_pvc_explore(frame, app, chunks[1]),
             Mode::Containers => {
                 draw_table(frame, app, chunks[1]);
                 draw_containers(frame, app, chunks[1]);
@@ -217,6 +226,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::TransferMenu => draw_transfer_menu(frame, app, chunks[1]),
         Mode::Skins => draw_skins(frame, app, chunks[1]),
         Mode::Snapshots => draw_snapshots(frame, app, chunks[1]),
+        Mode::PortForwardPicker => draw_port_forward_picker(frame, app, chunks[1]),
         _ => {}
     }
 
@@ -512,6 +522,11 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
             hint_line(&[("e", "edit"), ("E", "events"), ("c", "copy name")]),
             hint_line(&[("^d", "delete")]),
         ],
+        "persistentvolumeclaims" => vec![
+            hint_line(&[("x", "browse"), ("s", "shell"), ("d", "describe")]),
+            hint_line(&[("y", "yaml"), ("E", "events"), ("c", "copy name")]),
+            hint_line(&[("^d", "delete")]),
+        ],
         _ => vec![
             hint_line(&[("⏎", "yaml"), ("d", "describe"), ("E", "events")]),
             hint_line(&[("e", "edit"), ("c", "copy name"), ("Y", "copy cell")]),
@@ -542,7 +557,6 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let show_ns = app.show_namespace_column();
     let metrics_cols = app.metrics_columns();
     let headers = app.display_headers();
-    let pods_view = app.kind_plural == "pods";
     let sort_col = app.sort_column;
     let sort_arrow = if app.sort_desc { " ↓" } else { " ↑" };
     // Offset from a displayed column index back to the view spec's (the spec
@@ -627,6 +641,13 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
         needed[i] = needed[i].max(cell_width(&headers[i]).saturating_add(2));
     }
     let status_width = if app.kind_plural == "nodes" { 27 } else { 26 };
+    // Reserve space for the "● " port-forward marker on the NAME column when
+    // any live forward matches the current context+cluster.
+    if !app.port_forwards.is_empty()
+        && let Some(n) = needed.get_mut(name_col)
+    {
+        *n = n.saturating_add(2);
+    }
     // Compute widths from all columns before applying the viewport offset.
     let col_rules: Vec<(ColWidth, u16)> = headers
         .iter()
@@ -700,23 +721,27 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let col_offset = app.col_offset;
 
     let visible_objects = app.rows_window(offset, visible_rows);
-    app.ensure_table_cell_cache(&visible_objects);
-    let cell_cache = app.table_cell_cache();
     let spec = app.view_spec();
     let thresholds = app.resolved_thresholds();
     // One clock reading for the whole frame. Every visible AGE/DURATION cell
     // used to call `Timestamp::now()` for itself, so a full table took one
     // reading per volatile cell and could show two rows a second apart.
     let now = crate::columns::now_secs();
+    app.ensure_table_cell_cache_at(&visible_objects, now);
+    let cell_cache = app.table_cell_cache();
 
     let rows: Vec<Vec<Cell>> = visible_objects
         .iter()
         .map(|obj| {
             let row_key = crate::store::row_key(obj);
             let marked_row = !app.marked.is_empty() && app.marked.contains(&row_key);
+            let pf_ns = obj.metadata.namespace.as_deref().unwrap_or_default();
+            let pf_name = obj.metadata.name.as_deref().unwrap_or_default();
+            let forwarded = app.has_port_forward(pf_ns, pf_name, &app.kind_plural);
             let (base_cells, status_idx) = cell_cache
                 .get(&row_key)
                 .expect("visible rows are warmed in the table cell cache");
+            let helm_updated = cell_cache.helm_updated(&row_key);
             let mut style_idx = status_idx;
             let mut cells = Vec::with_capacity(headers.len());
             if show_ns {
@@ -726,7 +751,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                 style_idx = status_idx.map(|i| i + 1);
             }
             for (i, cell) in base_cells.iter().enumerate() {
-                if let Some(value) = spec.volatile(obj, &app.kind_plural, i, now) {
+                if let Some(value) =
+                    spec.volatile_cached(obj, &app.kind_plural, i, now, helm_updated)
+                {
                     cells.push(TableCellText::Owned(value));
                 } else {
                     cells.push(TableCellText::Borrowed(cell.as_str()));
@@ -738,25 +765,16 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
             let mut metrics_raw = None;
             let mut node_pcts: (Option<i64>, Option<i64>) = (None, None);
             if metrics_cols {
-                let name = obj.metadata.name.as_deref().unwrap_or_default();
-                let key = if pods_view {
-                    format!(
-                        "{}/{}",
-                        obj.metadata.namespace.as_deref().unwrap_or_default(),
-                        name
-                    )
-                } else {
-                    name.to_string()
-                };
-                let (cpu, mem) = app.metrics.get(&key).copied().unwrap_or((0, 0));
-                metrics_raw = Some((cpu, mem));
-                cells.push(TableCellText::Owned(columns::fmt_cpu(cpu)));
-                cells.push(TableCellText::Owned(columns::fmt_mem(mem)));
+                metrics_raw = app.metrics_for(obj);
+                let cpu = metrics_raw.map(|(cpu, _)| cpu);
+                let mem = metrics_raw.map(|(_, mem)| mem);
+                cells.push(TableCellText::Owned(columns::fmt_cpu_sample(cpu)));
+                cells.push(TableCellText::Owned(columns::fmt_mem_sample(mem)));
                 if app.node_capacity_columns() {
                     let (alloc_cpu, alloc_mem) = columns::node_allocatable(obj);
                     node_pcts = (
-                        columns::usage_pct(cpu, alloc_cpu),
-                        columns::usage_pct(mem, alloc_mem),
+                        cpu.and_then(|cpu| columns::usage_pct(cpu, alloc_cpu)),
+                        mem.and_then(|mem| columns::usage_pct(mem, alloc_mem)),
                     );
                     cells.push(TableCellText::Owned(columns::fmt_pct(node_pcts.0)));
                     cells.push(TableCellText::Owned(columns::fmt_pct(node_pcts.1)));
@@ -776,9 +794,10 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
             // every container passes its readiness probe — until READY is n/n,
             // paint it as transitional, not healthy.
             let running_not_ready = status_val == "Running"
-                && ready_idx
+                && (ready_idx
                     .and_then(|i| cells.get(i))
-                    .is_some_and(|r| !all_ready(r.as_str()));
+                    .is_some_and(|r| !all_ready(r.as_str()))
+                    || (app.kind_plural == "pods" && pod_readiness_blocked(obj)));
             let status_key = if running_not_ready {
                 "PodInitializing"
             } else {
@@ -792,18 +811,24 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                 .map(|(i, c)| {
                     let align = align_of(i);
                     if marked_row {
-                        // Marked rows override everything so a bulk selection
-                        // stands out.
-                        c.into_cell_aligned(align).style(
-                            Style::default()
-                                .fg(theme::mark())
-                                .add_modifier(Modifier::BOLD),
-                        )
+                        if i == name_col {
+                            render_name_cell(app, c.as_str(), theme::mark(), forwarded).style(
+                                Style::default()
+                                    .fg(theme::mark())
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                        } else {
+                            c.into_cell_aligned(align).style(
+                                Style::default()
+                                    .fg(theme::mark())
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                        }
                     } else if Some(i) == style_idx {
                         c.into_cell_aligned(align)
                             .style(Style::default().fg(status_badge))
                     } else if i == name_col {
-                        render_name_cell(app, c.as_str(), row_color)
+                        render_name_cell(app, c.as_str(), row_color, forwarded)
                     } else if Some(i) == age_idx {
                         c.into_cell_aligned(align).style(theme::dim())
                     } else if Some(i) == restarts_idx {
@@ -1159,13 +1184,45 @@ fn all_ready(ready: &str) -> bool {
     }
 }
 
+fn pod_readiness_blocked(obj: &kube::core::DynamicObject) -> bool {
+    let conditions = obj
+        .data
+        .pointer("/status/conditions")
+        .and_then(serde_json::Value::as_array);
+    let condition = |name: &str| {
+        conditions
+            .and_then(|conditions| conditions.iter().find(|c| c["type"].as_str() == Some(name)))
+    };
+    condition("Ready").is_some_and(|c| c["status"].as_str() != Some("True"))
+        || obj
+            .data
+            .pointer("/spec/readinessGates")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|gates| {
+                gates.iter().any(|gate| {
+                    gate["conditionType"]
+                        .as_str()
+                        .and_then(condition)
+                        .is_none_or(|c| c["status"].as_str() != Some("True"))
+                })
+            })
+}
+
 /// Render the NAME cell, highlighting characters that matched the active
 /// fuzzy row filter (bold yellow) so a scan across many filtered results is
 /// faster — every visible row already matched, this just shows *where*.
 /// Falls back to a flat `base`-colored cell when there's no active filter.
-fn render_name_cell(app: &App, name: &str, base: Color) -> Cell<'static> {
+fn render_name_cell(app: &App, name: &str, base: Color, forwarded: bool) -> Cell<'static> {
+    // A teal ● prepended when a port-forward is active for this row.
+    let marker = if forwarded {
+        vec![Span::styled("● ", Style::default().fg(theme::teal()))]
+    } else {
+        Vec::new()
+    };
     let Some(matched) = app.filter_match_indices(name).filter(|idx| !idx.is_empty()) else {
-        return Cell::from(name.to_string()).style(Style::default().fg(base));
+        let mut spans = marker;
+        spans.push(Span::styled(name.to_string(), Style::default().fg(base)));
+        return Cell::from(Line::from(spans));
     };
     let matched: std::collections::HashSet<usize> = matched.iter().copied().collect();
     let plain = Style::default().fg(base);
@@ -1173,7 +1230,7 @@ fn render_name_cell(app: &App, name: &str, base: Color) -> Cell<'static> {
         .fg(theme::yellow())
         .add_modifier(Modifier::BOLD);
 
-    let mut spans = Vec::new();
+    let mut spans = marker;
     let mut run = String::new();
     let mut run_matched = false;
     for (i, ch) in name.chars().enumerate() {
@@ -2157,7 +2214,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         ),
         bind(
             "x",
-            "secrets: show data base64-decoded (also inside YAML/describe)",
+            "secrets: show data base64-decoded (also inside YAML/describe) · PVCs: browse the volume",
         ),
         bind(
             "shift-x · :explain",
@@ -2182,7 +2239,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("  Act", theme::title())),
         bind("e", "edit in $EDITOR (kubectl edit)"),
-        bind("s", "shell into pod / scale workload"),
+        bind("s", "shell into pod / PVC volume · scale workload"),
         bind("a", "attach to pod"),
         bind(
             ":debug",
@@ -2218,6 +2275,28 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         bind(
             "ctrl-d · ctrl-k",
             "delete · force-delete (in confirm: f force, c cascade)",
+        ),
+        Line::from(""),
+        Line::from(Span::styled("  PVC explore (x on a PVC)", theme::title())),
+        bind(
+            "x · s · :pvc-explore",
+            "browse the volume (local left, PVC right; also :pvc-browse) · shell into it at the mount point",
+        ),
+        bind(
+            "tab · ←/→",
+            "switch pane · j/k g/G move · ⏎ open directory · ⌫ or - go up (stops at the mount)",
+        ),
+        bind(
+            "esc · q",
+            "close the browser (and delete the helper pod, if any)",
+        ),
+        bind(
+            "c · r",
+            "copy the selection into the other pane (download or upload) · refresh both",
+        ),
+        bind(
+            ":pvc-clean",
+            "delete helper pods left behind by a session that exited uncleanly (:pvc-cleanup)",
         ),
         Line::from(""),
         Line::from(Span::styled("  Logs view", theme::title())),
@@ -2539,6 +2618,37 @@ fn draw_flux_menu(frame: &mut Frame, app: &mut App, area: Rect) {
         items,
         Span::styled(format!(" {subject}: {target} "), theme::title()),
         &mut app.flux_menu_state,
+    );
+}
+
+/// Port-forward picker (`f` on a pod/service): lists the object's declared
+/// ports for single-select, plus a "Custom…" entry for manual input.
+fn draw_port_forward_picker(frame: &mut Frame, app: &mut App, area: Rect) {
+    let target = app
+        .pf_picker_target
+        .as_ref()
+        .map(|(_, name)| name.clone())
+        .unwrap_or_default();
+    let items: Vec<ListItem> = app
+        .pf_picker_items
+        .iter()
+        .map(|label| {
+            let color = if *label == "Custom…" {
+                theme::overlay1()
+            } else {
+                theme::green()
+            };
+            ListItem::new(Span::styled(label.as_str(), Style::default().fg(color)))
+        })
+        .collect();
+    render_popup_list(
+        frame,
+        area,
+        40,
+        24,
+        items,
+        Span::styled(format!(" Port-forward {target} "), theme::title()),
+        &mut app.pf_picker_state,
     );
 }
 
@@ -3265,6 +3375,193 @@ fn draw_gitops(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+/// The PVC browser: local files on the left, the volume on the right, one
+/// cursor per pane and a copy that always runs from the focused pane into the
+/// other one.
+fn draw_pvc_explore(frame: &mut Frame, app: &mut App, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    let local_title = format!(" local · {} ", app.pvc.local_path.display());
+    let mut remote_title = format!(" {} · {} ", app.pvc.claim, app.pvc.remote_path);
+    if let Some(mount) = &app.pvc.mount {
+        if mount.helper {
+            remote_title.push_str("· helper pod ");
+        } else {
+            remote_title.push_str(&format!("· via {} ", mount.pod));
+        }
+        if mount.read_only {
+            remote_title.push_str("· read-only ");
+        }
+    }
+    if app.pvc.loading {
+        remote_title.push_str("· loading… ");
+    }
+
+    let local_items = pvc_pane_items(
+        &app.pvc.local,
+        app.pvc.local_error.as_deref(),
+        cols[0].width,
+        app.pvc.local_truncated,
+    );
+    let remote_items = pvc_pane_items(
+        &app.pvc.remote,
+        app.pvc.remote_error.as_deref(),
+        cols[1].width,
+        app.pvc.truncated,
+    );
+    let focus = app.pvc.focus;
+
+    render_pvc_pane(
+        frame,
+        cols[0],
+        local_items,
+        local_title,
+        &mut app.pvc.local_state,
+        focus == Pane::Local,
+    );
+    render_pvc_pane(
+        frame,
+        cols[1],
+        remote_items,
+        remote_title,
+        &mut app.pvc.remote_state,
+        focus == Pane::Remote,
+    );
+}
+
+fn render_pvc_pane(
+    frame: &mut Frame,
+    area: Rect,
+    items: Vec<ListItem<'static>>,
+    title: String,
+    state: &mut ListState,
+    focused: bool,
+) {
+    let (border, title_style) = if focused {
+        (theme::border_focused(), theme::title())
+    } else {
+        (theme::border(), theme::dim())
+    };
+    let list = List::new(items)
+        .highlight_style(if focused {
+            theme::selected_row()
+        } else {
+            // The unfocused pane keeps its cursor visible but quiet, so you
+            // can see where a copy would land without it competing for
+            // attention with the pane you are driving.
+            Style::default().add_modifier(Modifier::REVERSED)
+        })
+        .highlight_symbol("▌ ")
+        .highlight_spacing(HighlightSpacing::Always)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(border)
+                .title(Span::styled(title, title_style)),
+        );
+    frame.render_stateful_widget(list, area, state);
+}
+
+/// One pane's rows. Sizes are right-aligned against the pane width so both
+/// sides line up as a pair of columns rather than two ragged lists.
+fn pvc_pane_items(
+    entries: &[crate::pvcexplore::Entry],
+    error: Option<&str>,
+    width: u16,
+    truncated: bool,
+) -> Vec<ListItem<'static>> {
+    use crate::pvcexplore::EntryKind;
+
+    if let Some(e) = error {
+        return vec![ListItem::new(Line::from(Span::styled(
+            e.to_string(),
+            Style::default().fg(theme::red()),
+        )))];
+    }
+    if entries.is_empty() {
+        return vec![ListItem::new(Line::from(Span::styled(
+            "empty".to_string(),
+            theme::dim(),
+        )))];
+    }
+    // 2 borders + the 2-cell highlight symbol.
+    let inner = usize::from(width).saturating_sub(4);
+    let size_width = 8usize;
+    let name_width = inner.saturating_sub(size_width + 1).max(4);
+
+    let mut items: Vec<ListItem<'static>> = entries
+        .iter()
+        .map(|e| {
+            let (label, color) = match e.kind {
+                EntryKind::Dir => (format!("{}/", e.name), theme::sapphire()),
+                EntryKind::Link if !e.link_target.is_empty() => {
+                    (format!("{} → {}", e.name, e.link_target), theme::teal())
+                }
+                EntryKind::Link => (e.name.clone(), theme::teal()),
+                EntryKind::File => (e.name.clone(), theme::text()),
+            };
+            // Padded by terminal columns, not characters: a CJK filename is
+            // twice as wide as it is long, and `{:<n}` would push the size
+            // column through the pane border.
+            let label = clip_to_width(&label, name_width);
+            let pad = name_width.saturating_sub(label.width());
+            let size = match (e.kind, e.size) {
+                (EntryKind::Dir, _) => String::new(),
+                (_, Some(bytes)) => crate::pvcexplore::human_size(bytes),
+                // Nothing could stat it — not the same as an empty file.
+                (_, None) => "?".to_string(),
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{label}{:pad$}", "", pad = pad),
+                    Style::default().fg(color),
+                ),
+                Span::styled(format!(" {size:>size_width$}"), theme::dim()),
+            ]))
+        })
+        .collect();
+    if truncated {
+        // Not "N more": both panes stop at the cap without counting past it —
+        // the volume side because `head` closes the pipe inside the container.
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!(
+                "… showing the first {} entries",
+                crate::pvcexplore::MAX_ENTRIES
+            ),
+            Style::default().fg(theme::peach()),
+        ))));
+    }
+    items
+}
+
+/// Truncate to `max` terminal columns, ending with an ellipsis when cut.
+/// [`crate::text::ellipsize`] counts characters, which is the wrong unit for
+/// arbitrary file names off a volume.
+fn clip_to_width(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > max.saturating_sub(1) {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
 /// Session-local timeline: the state changes observed for one object while
 /// sofka has been watching, oldest first.
 fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -3531,6 +3828,10 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
             "  j/k: move   enter: confirm   esc: cancel",
             theme::dim(),
         )),
+        Mode::PortForwardPicker => Line::from(Span::styled(
+            "  j/k: move   ⏎: forward this port   esc: cancel",
+            theme::dim(),
+        )),
         Mode::PortForwards => Line::from(Span::styled(
             "  j/k: move   x/s: stop   esc: close (others keep running)",
             theme::dim(),
@@ -3545,6 +3846,10 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
         )),
         Mode::Find => Line::from(Span::styled(
             "  j/k: move   ⏎: open the object   esc: close",
+            theme::dim(),
+        )),
+        Mode::PvcExplore => Line::from(Span::styled(
+            "  tab/←→: pane   j/k: move   ⏎: open   ⌫/-: up   c: copy to other pane   s: shell   r: refresh   esc: back",
             theme::dim(),
         )),
         _ => {
@@ -3579,6 +3884,9 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
 fn sync_indicator(mode: Mode, doc_filter_return: Mode, synced: bool) -> (&'static str, Color) {
     let static_doc = match mode {
         Mode::Detail | Mode::Diff => true,
+        // A directory listing is fetched once by exec, not watched — `r`
+        // re-reads it. Calling it live would be a lie.
+        Mode::PvcExplore => true,
         // `/` search over one of those documents — same underlying snapshot.
         Mode::DocFilter => matches!(doc_filter_return, Mode::Detail | Mode::Diff),
         _ => false,
@@ -3720,6 +4028,26 @@ fn centered_rect_with_min(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The PVC browser pads file names into a fixed column. A CJK name is
+    /// twice as wide as it is long, so counting characters would push the size
+    /// column through the pane border.
+    #[test]
+    fn clip_to_width_measures_terminal_columns() {
+        assert_eq!(clip_to_width("abc", 5), "abc");
+        assert_eq!(clip_to_width("abcdef", 4), "abc…");
+        // Six characters, twelve columns wide.
+        assert_eq!("日本語ファイル".width(), 14);
+        let clipped = clip_to_width("日本語ファイル", 8);
+        assert!(
+            clipped.width() <= 8,
+            "{clipped:?} is {} wide",
+            clipped.width()
+        );
+        assert!(clipped.ends_with('…'));
+        // No room even for the ellipsis.
+        assert_eq!(clip_to_width("abc", 0), "");
+    }
 
     /// A describe/YAML/diff document is a snapshot — the status bar must not
     /// claim it's live (#175 follow-up report from Discord).

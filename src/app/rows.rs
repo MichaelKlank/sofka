@@ -158,7 +158,7 @@ impl App {
             .get(key)
             .is_none_or(|e| e.plural != self.kind_plural || e.resource_version != resource_version);
         if stale {
-            let (rendered, status_idx) = self.spec.cells(o, now);
+            let (rendered, status_idx, helm_updated) = self.spec.cells_with_helm_time(o, now);
             let cell_masks: Vec<u64> = rendered.iter().map(|c| subseq_mask(c)).collect();
             let row_mask = cell_masks.iter().fold(0u64, |a, m| a | m);
             cells.insert(
@@ -168,6 +168,7 @@ impl App {
                     resource_version,
                     cells: rendered,
                     status_idx,
+                    helm_updated,
                     cell_masks,
                     row_mask,
                 },
@@ -199,8 +200,12 @@ impl App {
     fn eval_cmp(&self, o: &DynamicObject, cmp: &crate::filter::Cmp, now: i64) -> bool {
         use crate::filter::CmpValue;
         match &cmp.value {
-            CmpValue::Cpu(want) => cmp.op.eval(self.metrics_for(o).0.cmp(want)),
-            CmpValue::Mem(want) => cmp.op.eval(self.metrics_for(o).1.cmp(want)),
+            CmpValue::Cpu(want) => self
+                .metrics_for(o)
+                .is_some_and(|(cpu, _)| cmp.op.eval(cpu.cmp(want))),
+            CmpValue::Mem(want) => self
+                .metrics_for(o)
+                .is_some_and(|(_, mem)| cmp.op.eval(mem.cmp(want))),
             CmpValue::Duration(want) => match crate::columns::age_secs(o, now) {
                 Some(age) => cmp.op.eval(age.cmp(want)),
                 None => false,
@@ -541,13 +546,15 @@ impl App {
             }
             let entry = self.cell_entry(key, obj, cells, now);
             for (i, cell) in entry.cells.iter().enumerate() {
-                let cell_width =
-                    if let Some(value) = self.spec.volatile(obj, &self.kind_plural, i, now) {
-                        // Reserve space for elapsed times as the clock advances.
-                        width(&value).max(7)
-                    } else {
-                        width(cell)
-                    };
+                let cell_width = if let Some(value) =
+                    self.spec
+                        .volatile_cached(obj, &self.kind_plural, i, now, entry.helm_updated)
+                {
+                    // Reserve space for elapsed times as the clock advances.
+                    width(&value).max(7)
+                } else {
+                    width(cell)
+                };
                 needed[i + ns_off] = needed[i + ns_off].max(cell_width);
             }
         }
@@ -558,9 +565,14 @@ impl App {
         needed
     }
 
+    #[cfg(test)]
     pub(crate) fn ensure_table_cell_cache(&self, rows: &[&DynamicObject]) {
-        let mut cache = self.rows_cache.borrow_mut();
         let now = crate::columns::now_secs();
+        self.ensure_table_cell_cache_at(rows, now);
+    }
+
+    pub(crate) fn ensure_table_cell_cache_at(&self, rows: &[&DynamicObject], now: i64) {
+        let mut cache = self.rows_cache.borrow_mut();
         for obj in rows {
             // Shares `cell_entry` with the filter pass, so a row rendered for
             // filtering is already warm for the renderer (and vice versa) and
@@ -632,6 +644,10 @@ impl App {
     /// is opened for.
     pub fn node_capacity_columns(&self) -> bool {
         self.kind_plural == "nodes"
+            && self
+                .kind
+                .as_ref()
+                .is_some_and(|kind| kind.ar.group.is_empty())
     }
 
     pub(crate) fn view_spec(&self) -> &crate::columns::ViewSpec {
@@ -658,11 +674,14 @@ impl App {
         let sort_header = self
             .sort_column
             .and_then(|i| self.display_headers().get(i).cloned());
+        let resource = self.kind.as_ref().map(Kind::resource_key);
         let spec = crate::columns::build_spec(
+            self.kind.as_ref().map_or("", |kind| kind.ar.group.as_str()),
             &self.kind_plural,
             self.active_user_view(),
-            self.crd_views
-                .get(&self.kind_plural)
+            resource
+                .as_ref()
+                .and_then(|resource| self.crd_views.get(resource))
                 .and_then(Option::as_ref),
             self.wide,
         );
@@ -737,17 +756,41 @@ impl App {
 
     pub fn metrics_columns(&self) -> bool {
         matches!(self.kind_plural.as_str(), "pods" | "nodes")
+            && self
+                .kind
+                .as_ref()
+                .is_some_and(|kind| kind.ar.group.is_empty())
     }
 
     /// Latest (cpu_millicores, mem_bytes) for an object from the metrics map.
-    pub(super) fn metrics_for(&self, o: &DynamicObject) -> (i64, i64) {
+    pub(crate) fn metrics_for(&self, o: &DynamicObject) -> Option<(i64, i64)> {
         let name = o.metadata.name.clone().unwrap_or_default();
         let key = if self.kind_plural == "pods" {
             format!("{}/{}", o.metadata.namespace.as_deref().unwrap_or(""), name)
         } else {
             name
         };
-        self.metrics.get(&key).copied().unwrap_or((0, 0))
+        self.metrics.get(&key).copied()
+    }
+
+    pub(super) fn metric_cells(&self, obj: &DynamicObject) -> Vec<String> {
+        let metrics = self.metrics_for(obj);
+        let cpu = metrics.map(|(cpu, _)| cpu);
+        let mem = metrics.map(|(_, mem)| mem);
+        let mut cells = vec![
+            crate::columns::fmt_cpu_sample(cpu),
+            crate::columns::fmt_mem_sample(mem),
+        ];
+        if self.node_capacity_columns() {
+            let (alloc_cpu, alloc_mem) = crate::columns::node_allocatable(obj);
+            cells.push(crate::columns::fmt_pct(
+                cpu.and_then(|cpu| crate::columns::usage_pct(cpu, alloc_cpu)),
+            ));
+            cells.push(crate::columns::fmt_pct(
+                mem.and_then(|mem| crate::columns::usage_pct(mem, alloc_mem)),
+            ));
+        }
+        cells
     }
 
     /// Latest pod count for a node from the pods poll; `None` before the
@@ -789,32 +832,45 @@ impl App {
             ),
             // Unknown timestamps sort last (oldest-unknown) in ascending order.
             "AGE" => SortKey::Num(crate::columns::age_secs(o, now).unwrap_or(i64::MAX) as f64),
-            "CPU" => SortKey::Num(self.metrics_for(o).0 as f64),
-            "MEM" => SortKey::Num(self.metrics_for(o).1 as f64),
+            "CPU" => SortKey::Num(
+                self.metrics_for(o)
+                    .map(|(cpu, _)| cpu as f64)
+                    .unwrap_or(-1.0),
+            ),
+            "MEM" => SortKey::Num(
+                self.metrics_for(o)
+                    .map(|(_, mem)| mem as f64)
+                    .unwrap_or(-1.0),
+            ),
             // Unknown counts (poll hasn't landed) sort below every real count.
             "PODS" if self.node_capacity_columns() => {
                 SortKey::Num(self.node_pods_for(o).map(|c| c as f64).unwrap_or(-1.0))
             }
             // Unknown allocatable sorts below every real percentage.
             "%CPU" if self.node_capacity_columns() => SortKey::Num(
-                crate::columns::usage_pct(
-                    self.metrics_for(o).0,
-                    crate::columns::node_allocatable(o).0,
-                )
-                .map(|p| p as f64)
-                .unwrap_or(-1.0),
+                self.metrics_for(o)
+                    .and_then(|(cpu, _)| {
+                        crate::columns::usage_pct(cpu, crate::columns::node_allocatable(o).0)
+                    })
+                    .map(|p| p as f64)
+                    .unwrap_or(-1.0),
             ),
             "%MEM" if self.node_capacity_columns() => SortKey::Num(
-                crate::columns::usage_pct(
-                    self.metrics_for(o).1,
-                    crate::columns::node_allocatable(o).1,
-                )
-                .map(|p| p as f64)
-                .unwrap_or(-1.0),
+                self.metrics_for(o)
+                    .and_then(|(_, mem)| {
+                        crate::columns::usage_pct(mem, crate::columns::node_allocatable(o).1)
+                    })
+                    .map(|p| p as f64)
+                    .unwrap_or(-1.0),
             ),
             // Humanized time cells ("5d23h") must sort by the underlying
             // timestamp, never the rendered string. Negated epoch seconds so
             // ascending = most recent first, matching AGE; unknowns last.
+            "LAST-SEEN" if self.kind_plural == "events" => SortKey::Num(
+                crate::columns::event_last_seen_secs(o)
+                    .map(|s| -(s as f64))
+                    .unwrap_or(f64::INFINITY),
+            ),
             "UPDATED" => SortKey::Num(
                 crate::helm::decode_summary(o)
                     .and_then(|r| r.last_deployed_secs)
@@ -941,11 +997,11 @@ impl App {
             values.push(obj.metadata.namespace.clone().unwrap_or_default());
         }
         let now = crate::columns::now_secs();
-        let (cells, _) = self.spec.cells(obj, now);
+        let (cells, _, helm_updated) = self.spec.cells_with_helm_time(obj, now);
         for (i, cell) in cells.into_iter().enumerate() {
             values.push(
                 self.spec
-                    .volatile(obj, &self.kind_plural, i, now)
+                    .volatile_cached(obj, &self.kind_plural, i, now, helm_updated)
                     .unwrap_or(cell),
             );
         }
@@ -953,18 +1009,7 @@ impl App {
             values.push(self.node_pods_cell(obj));
         }
         if self.metrics_columns() {
-            let (cpu, mem) = self.metrics_for(obj);
-            values.push(crate::columns::fmt_cpu(cpu));
-            values.push(crate::columns::fmt_mem(mem));
-            if self.node_capacity_columns() {
-                let (alloc_cpu, alloc_mem) = crate::columns::node_allocatable(obj);
-                values.push(crate::columns::fmt_pct(crate::columns::usage_pct(
-                    cpu, alloc_cpu,
-                )));
-                values.push(crate::columns::fmt_pct(crate::columns::usage_pct(
-                    mem, alloc_mem,
-                )));
-            }
+            values.extend(self.metric_cells(obj));
         }
         self.display_headers()
             .iter()

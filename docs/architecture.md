@@ -24,6 +24,9 @@ explain.rs   Deterministic "why is this unhealthy?" analysis — pure, turns
              an object + its pods + events into ranked findings, unit-tested.
 timeline.rs  Session-local per-object state-change history diffed from the
              watch stream (pure transition logic, unit-tested).
+pvcexplore.rs PVC browsing: which pod already mounts a claim, the helper pod
+             for one nothing mounts, and the `ls` parser, all pure and
+             unit-tested. `app/pvcexplore.rs` drives it.
 ui.rs        All ratatui rendering: header, table, scrollable views, popups,
              status bar.
 theme.rs     Palette + semantic styles, skin resolution.

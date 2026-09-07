@@ -18,10 +18,9 @@ use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use kube::Client;
 use kube::api::{
-    Api, DeleteParams, EvictParams, ListParams, LogParams, Patch, PatchParams, PostParams,
-    PropagationPolicy,
+    Api, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams, PropagationPolicy,
 };
-use kube::core::{DynamicObject, TypeMeta};
+use kube::core::{DynamicObject, GroupVersionResource, TypeMeta};
 use kube::discovery::ApiResource;
 use kube::runtime::{utils::Backoff, watcher};
 use ratatui::widgets::{ListState, TableState};
@@ -33,6 +32,7 @@ use crate::k8s::{Cluster, Kind};
 use crate::store::{Msg, Pulse, RowKey, StatusClaim, Store, StoreMutation, XrayItem, row_key};
 
 pub(crate) use guardrails::ConfirmLevel;
+pub use pvcexplore::{Pane, PvcExplore, PvcIntent};
 
 impl App {
     /// Mark the row ordering stale without touching the store — the shape of a
@@ -187,6 +187,13 @@ pub enum Mode {
     Fleet,
     /// Global fuzzy-find results picker (`:find <text>`).
     Find,
+    /// Split-pane PVC browser (`x` on a PVC): local files on the left, the
+    /// volume's contents on the right.
+    PvcExplore,
+    /// Port-forward target picker (`f` on a pod/service): lists the object's
+    /// declared ports for single-select, plus a "Custom…" entry that falls
+    /// through to the typed prompt.
+    PortForwardPicker,
 }
 
 /// A request for the run loop to suspend the TUI and run an interactive
@@ -201,6 +208,8 @@ pub enum Suspend {
 /// a quit (or panic-unwind) never leaves an orphaned `kubectl` holding the
 /// local port open.
 pub struct PortForward {
+    context: String,
+    cluster_url: String,
     ns: String,
     target: String,
     ports: String,
@@ -220,6 +229,19 @@ impl Drop for PortForward {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
     }
+}
+
+/// Spawns a background `kubectl port-forward` child. Overridable in tests
+/// so the unit suite doesn't require `kubectl` on PATH.
+type PortForwardSpawner = fn(&[String]) -> std::io::Result<tokio::process::Child>;
+
+fn default_pf_spawner(argv: &[String]) -> std::io::Result<tokio::process::Child> {
+    tokio::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
 }
 
 /// How dependents are handled on delete (kubectl `--cascade`, k9s propagation
@@ -264,13 +286,17 @@ enum ConfirmAction {
     Edit { argv: Vec<String> },
     /// Shell into a pod, once a guardrail confirmation is satisfied.
     Exec { ns: String, name: String },
-    /// Upload a local file into a pod (`kubectl cp`), once a guardrail
-    /// confirmation is satisfied. Upload only — a download doesn't mutate
-    /// the pod, so it never needs confirming.
+    /// Copy a file between a pod and the local filesystem (`kubectl cp`),
+    /// once its confirmation is satisfied. An upload is confirmed because a
+    /// guardrail asked; a download because it would overwrite a local file.
+    /// The direction has to travel with the action — running a download as an
+    /// upload would write into the cluster, past every check the upload path
+    /// makes.
     Transfer {
         ns: String,
         pod: String,
         container: Option<String>,
+        upload: bool,
         src: String,
         dest: String,
     },
@@ -305,6 +331,25 @@ enum ConfirmAction {
     },
     /// Delete the node debugger pods sofka launched this session (`:debug-clean`).
     CleanupDebuggers,
+    /// Create a temporary pod that mounts a PVC nothing else mounts, so it can
+    /// be browsed or shelled into.
+    PvcHelper {
+        ns: String,
+        claim: String,
+        intent: PvcIntent,
+    },
+    /// Shell into the pod a PVC is reachable through, once the `shell`
+    /// guardrail is satisfied.
+    PvcShell {
+        ns: String,
+        pod: String,
+        container: String,
+        path: String,
+        claim: String,
+    },
+    /// Delete the PVC-explore helper pods left behind by earlier sessions.
+    /// `None` sweeps every namespace, matching an all-namespaces view.
+    PvcClean { scope: Option<String> },
     /// Run a confirmed plugin (`confirm`/`dangerous`) once accepted — one job
     /// (label, argv) per target, so a bulk run confirms once.
     Plugin {
@@ -534,6 +579,8 @@ enum PaletteAction {
     Info,
     Fleet,
     Rightsize,
+    PvcExplore,
+    PvcClean,
     Find,
     Diff,
     Events,
@@ -654,6 +701,19 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         action: PaletteAction::Rightsize,
         names: &["rightsize", "sizing", "vpa"],
+    },
+    PaletteCommand {
+        action: PaletteAction::PvcExplore,
+        // Both names stay prefixed. A bare "pvc" is the kubectl alias for
+        // the PVC list, and a palette command outranks a kind, so claiming it
+        // would stop `:pvc` navigating; bare "explore"/"browse" are words a
+        // user plugin may already have taken, and the palette reserves what
+        // it names.
+        names: &["pvc-explore", "pvc-browse"],
+    },
+    PaletteCommand {
+        action: PaletteAction::PvcClean,
+        names: &["pvc-clean", "pvc-cleanup"],
     },
     PaletteCommand {
         action: PaletteAction::Quit,
@@ -1373,6 +1433,7 @@ struct CellCacheEntry {
     resource_version: Option<String>,
     cells: Vec<String>,
     status_idx: Option<usize>,
+    helm_updated: Option<i64>,
     /// Per-cell character-presence masks, and their union across the row.
     /// See [`subseq_mask`]: a cheap necessary condition for a fuzzy
     /// subsequence match, used to skip cells (and whole rows) without paying
@@ -1415,6 +1476,13 @@ impl TableCellCache<'_> {
             .get(key)
             .map(|entry| (entry.cells.as_slice(), entry.status_idx))
     }
+
+    pub(crate) fn helm_updated(&self, key: &str) -> Option<i64> {
+        self.cache
+            .cells
+            .get(key)
+            .and_then(|entry| entry.helm_updated)
+    }
 }
 
 /// Maximum root views kept in the `[`/`]` history.
@@ -1438,6 +1506,7 @@ const VIEW_CACHE_MAX_OBJECTS: usize = 10_000;
 /// filter terms).
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ViewKey {
+    resource: GroupVersionResource,
     kind_plural: String,
     namespace: String,
     labels: Option<String>,
@@ -1743,10 +1812,29 @@ pub struct App {
     pub transfer_menu_state: ListState,
     pub transfer_target: Option<(String, String, Option<String>)>,
 
+    /// Split-pane PVC browser state (`x` on a PVC row, `:pvc-explore`).
+    pub pvc: PvcExplore,
+    /// `[pvc_explore]` helper-pod defaults.
+    pub pvc_cfg: crate::config::PvcExploreConfig,
+
+    /// Where a confirm/guardrail overlay returns to once it is answered. Only
+    /// the PVC browser sets it away from the table: every other guarded action
+    /// is launched from the table and returns there.
+    pub(super) confirm_return: Mode,
+
     /// Background `kubectl port-forward` processes started with `f`/`F`.
     /// Viewed/stopped via `:pf`; killed automatically on drop.
     pub port_forwards: Vec<PortForward>,
+    /// Injectable spawner for `kubectl port-forward` children. Tests override
+    /// this to avoid depending on `kubectl` being on PATH.
+    pf_spawner: PortForwardSpawner,
     pub pf_state: ListState,
+    /// Port-forward picker (`f`): the declared ports of the selected object,
+    /// each as a `LOCAL:REMOTE` string, plus a trailing "Custom…" entry.
+    pub pf_picker_items: Vec<String>,
+    pub pf_picker_state: ListState,
+    /// The `(ns, name)` target the port-forward picker is acting on.
+    pub(super) pf_picker_target: Option<(String, String)>,
     /// Saved `[[forwards]]` from config: shown in `:pf` even while stopped,
     /// startable with one keystroke, autostarted on connect when configured.
     pub forwards_cfg: Vec<crate::config::Forward>,
@@ -1806,6 +1894,9 @@ pub struct App {
     pub explain_title: String,
     /// The object the explain view is investigating, kept so `r` can re-gather.
     pub explain_source: Option<DynamicObject>,
+    /// Latest Explain request, independent of the table watch generation.
+    explain_request: u64,
+    explain_claim: Option<StatusClaim>,
     /// Parent of the explain view. Kept separately because an evidence view
     /// (logs/events) temporarily uses `return_mode` to return to Explain.
     explain_return: Mode,
@@ -1815,6 +1906,9 @@ pub struct App {
     pub gitops_state: ListState,
     pub gitops_title: String,
     pub gitops_source: Option<DynamicObject>,
+    /// Latest GitOps request, independent of the table watch generation.
+    gitops_request: u64,
+    gitops_claim: Option<StatusClaim>,
     /// Session-local per-object state-change history, fed by the table watch.
     pub timeline: crate::timeline::Timeline,
     /// Table geometry from the last frame, for mouse hit-testing. A RefCell
@@ -1875,9 +1969,9 @@ pub struct App {
     /// Compiled warning/critical coloring thresholds from config, re-resolved
     /// on context switch and `:reload`.
     pub thresholds: crate::thresholds::Compiled,
-    /// CRD printer-column fallbacks fetched per plural for this cluster
+    /// CRD printer-column fallbacks fetched per API resource for this cluster
     /// (`None` = fetched, nothing usable). Cleared on context switch.
-    crd_views: HashMap<String, Option<crate::views::View>>,
+    crd_views: HashMap<GroupVersionResource, Option<crate::views::View>>,
     /// Wide mode (`w`): show wide-only columns.
     pub wide: bool,
     /// Compact mode (`ctrl-e`): collapse the header to one line and hide the
@@ -2010,8 +2104,15 @@ impl App {
             flux_menu_state: ListState::default(),
             transfer_menu_state: ListState::default(),
             transfer_target: None,
+            pvc: PvcExplore::default(),
+            pvc_cfg: crate::config::PvcExploreConfig::default(),
+            confirm_return: Mode::Table,
             port_forwards: Vec::new(),
+            pf_spawner: default_pf_spawner,
             forwards_cfg: Vec::new(),
+            pf_picker_items: Vec::new(),
+            pf_picker_state: ListState::default(),
+            pf_picker_target: None,
             notify_cfg: crate::config::NotifyConfig::default(),
             palette_keys: crate::config::PaletteKeys::default(),
             pf_state: ListState::default(),
@@ -2041,11 +2142,15 @@ impl App {
             explain_state: ListState::default(),
             explain_title: String::new(),
             explain_source: None,
+            explain_request: 0,
+            explain_claim: None,
             explain_return: Mode::Table,
             gitops_items: Vec::new(),
             gitops_state: ListState::default(),
             gitops_title: String::new(),
             gitops_source: None,
+            gitops_request: 0,
+            gitops_claim: None,
             timeline: crate::timeline::Timeline::default(),
             table_hit: RefCell::new(None),
             notify_tasks: HashMap::new(),
@@ -2084,7 +2189,7 @@ impl App {
             crd_views: HashMap::new(),
             wide: false,
             compact: false,
-            spec: crate::columns::build_spec("", None, None, false),
+            spec: crate::columns::build_spec("", "", None, None, false),
         }
     }
 
@@ -2102,6 +2207,31 @@ impl App {
     /// renderer keeps the picker underneath it and esc/enter return there.
     pub fn prompt_over_contexts(&self) -> bool {
         matches!(self.prompt_kind, Some(PromptKind::RenameContext { .. }))
+    }
+
+    /// Where a confirm dialog returns to. Not every `Mode::Confirm` goes
+    /// through `begin_guarded` (`:debug-clean` sets it directly), so a stale
+    /// `confirm_return` must never send us to a browser that isn't open.
+    pub(super) fn overlay_return(&self) -> Mode {
+        if self.confirm_return == Mode::PvcExplore && self.pvc.active {
+            Mode::PvcExplore
+        } else {
+            Mode::Table
+        }
+    }
+
+    /// Whether the open dialog belongs to the PVC browser, so the renderer
+    /// keeps the two panes underneath it.
+    pub fn over_pvc_browser(&self) -> bool {
+        self.pvc.active && self.confirm_return == Mode::PvcExplore
+    }
+
+    /// Whether the active prompt is a guardrail confirmation raised from the
+    /// PVC browser, so esc/enter return to the browser instead of the table.
+    pub(super) fn prompt_over_pvc(&self) -> bool {
+        self.pvc.active
+            && self.confirm_return == Mode::PvcExplore
+            && matches!(self.prompt_kind, Some(PromptKind::GuardConfirm { .. }))
     }
 
     /// Whether the logs view is showing the external log provider (enables
@@ -2134,6 +2264,7 @@ mod notify;
 mod overlays;
 mod pickers;
 mod plugins;
+mod pvcexplore;
 mod rightsize;
 mod rows;
 mod snapshot;
