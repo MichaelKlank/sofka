@@ -2,9 +2,12 @@
 //! resolution, and async watch streams that feed the in-memory store.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::Duration;
+use std::task::{Context as TaskContext, Poll};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -17,6 +20,7 @@ use kube::{Client, Config, ResourceExt};
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 
+use crate::diagnostics::Op;
 use crate::store::{Msg, row_key};
 
 mod discovery;
@@ -38,7 +42,148 @@ pub(crate) fn build_client(config: Config, allow_v1_client_cert: bool) -> Result
             }
             request
         });
-    Ok(builder.with_layer(&layer).build())
+    Ok(builder.with_layer(&layer).with_layer(&MeterLayer).build())
+}
+
+/// Times every Kubernetes API request into [`crate::diagnostics`] and, at
+/// `debug`, logs one line per request.
+///
+/// Latency is measured to response *headers*, not to the end of the body: a
+/// watch's body stays open for the life of the view, and a list's decode time
+/// belongs to us rather than to the API server.
+#[derive(Clone, Copy)]
+struct MeterLayer;
+
+impl<S> tower::Layer<S> for MeterLayer {
+    type Service = Meter<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        Meter { inner }
+    }
+}
+
+#[derive(Clone)]
+struct Meter<S> {
+    inner: S,
+}
+
+impl<S, B> tower::Service<http::Request<kube::client::Body>> for Meter<S>
+where
+    S: tower::Service<http::Request<kube::client::Body>, Response = http::Response<B>>,
+    S::Error: std::fmt::Display,
+    // kube's default stack is a `BoxService`, whose future is already pinned on
+    // the heap. Requiring `Unpin` inherits that and lets the wrapper project
+    // safely, so metering adds no allocation of its own.
+    S::Future: Unpin,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Metered<S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: http::Request<kube::client::Body>) -> Self::Future {
+        let uri = request.uri();
+        let path = uri.path();
+        let op = Op::classify(request.method(), path, uri.query());
+        crate::log_debug!(
+            "request.start",
+            op = op.as_str(),
+            method = request.method(),
+            path = path
+        );
+        Metered::new(self.inner.call(request), op)
+    }
+}
+
+/// The in-flight half of [`Meter`]: records the elapsed time once, either when
+/// the response arrives or when its caller cancels the request.
+struct Metered<F> {
+    inner: F,
+    op: Op,
+    start: Instant,
+    completed: bool,
+}
+
+impl<F> Metered<F> {
+    fn new(inner: F, op: Op) -> Self {
+        Self {
+            inner,
+            op,
+            start: Instant::now(),
+            completed: false,
+        }
+    }
+}
+
+impl<F, B, E> Future for Metered<F>
+where
+    F: Future<Output = Result<http::Response<B>, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        // Safe projection: every field is `Unpin`, so `Self` is too.
+        let this = self.get_mut();
+        let result = match Pin::new(&mut this.inner).poll(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(result) => result,
+        };
+        this.completed = true;
+        let elapsed = this.start.elapsed();
+        let ok = result
+            .as_ref()
+            .is_ok_and(|response| !response.status().is_server_error());
+        crate::diagnostics::record(this.op, elapsed, ok);
+        match &result {
+            Ok(response) => crate::log_debug!(
+                "request.done",
+                op = this.op.as_str(),
+                status = response.status().as_u16(),
+                ms = elapsed.as_millis()
+            ),
+            Err(e) => crate::log_warn!(
+                "request.failed",
+                op = this.op.as_str(),
+                ms = elapsed.as_millis(),
+                error = e
+            ),
+        }
+        Poll::Ready(result)
+    }
+}
+
+impl<F> Drop for Metered<F> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        let elapsed = self.start.elapsed();
+        crate::diagnostics::record(self.op, elapsed, false);
+        crate::log_warn!(
+            "request.cancelled",
+            op = self.op.as_str(),
+            ms = elapsed.as_millis()
+        );
+    }
+}
+
+/// Outcome of [`Cluster::probe_watch`].
+pub enum WatchProbe {
+    /// The resource is not in this cluster's discovery.
+    Unresolved,
+    Ran {
+        /// Time until the initial sync and watch headers arrive; `None` on failure.
+        synced: Option<Duration>,
+        /// Objects in the initial list.
+        objects: usize,
+        errors: usize,
+        last_error: Option<String>,
+    },
 }
 
 /// A resolvable Kubernetes resource type.
@@ -193,10 +338,25 @@ impl Cluster {
         // keep the cluster usable if an unusual API proxy rejects `/version`.
         let version = tokio::time::timeout(VERSION_TIMEOUT, version_client.apiserver_version());
         let (discovery, version) = tokio::join!(cluster.discover(), version);
+        if let Err(e) = &discovery {
+            crate::log_error!(
+                "cluster.connect.failed",
+                context = cluster.context,
+                error = format!("{e:#}")
+            );
+        }
         discovery?;
         if let Ok(Ok(info)) = version {
             cluster.server_version = sanitize_server_version(&info.git_version);
         }
+        crate::log_info!(
+            "cluster.connected",
+            context = cluster.context,
+            cluster = cluster.cluster_name,
+            server = cluster.cluster_url,
+            k8s = cluster.server_version,
+            kinds = cluster.catalog.len()
+        );
         Ok(cluster)
     }
 
@@ -369,98 +529,123 @@ impl Cluster {
         generation: u64,
         tx: Sender<Msg>,
     ) -> JoinHandle<()> {
+        let api = watch_api(self.client.clone(), kind, namespace);
+        let mut cfg = watcher::Config::default().any_semantic();
+        if let Some(l) = labels {
+            cfg = cfg.labels(&l);
+        }
+        if let Some(f) = fields {
+            cfg = cfg.fields(&f);
+        }
+        spawn_watch_task(
+            api,
+            kind.ar.plural.clone(),
+            namespace.to_string(),
+            cfg,
+            Arc::clone(&self.streaming_lists),
+            generation,
+            tx,
+        )
+    }
+
+    /// Open the watch a launch would open, wait for its initial sync, and
+    /// report what happened. For `sofka info`, which has no session to count
+    /// watches over and so runs one instead.
+    ///
+    /// Discovery working says nothing about whether watches do: a proxy or
+    /// load balancer that closes long-lived connections passes every other
+    /// check and still leaves the TUI with an empty, never-syncing table.
+    pub async fn probe_watch(
+        &self,
+        resource: &str,
+        namespace: &str,
+        timeout: Duration,
+    ) -> WatchProbe {
+        let Some(kind) = self.resolve(resource) else {
+            return WatchProbe::Unresolved;
+        };
+        let ns = if kind.namespaced { namespace } else { "" };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+        let started = std::time::Instant::now();
+        let (headers_tx, mut headers_rx) = tokio::sync::watch::channel(false);
         let client = self.client.clone();
-        let ar = kind.ar.clone();
-        let namespaced = kind.namespaced;
-        let ns = namespace.to_string();
-        let streaming_lists = Arc::clone(&self.streaming_lists);
-
-        tokio::spawn(async move {
-            let api: Api<DynamicObject> = if namespaced && !ns.is_empty() {
-                Api::namespaced_with(client, &ns, &ar)
-            } else {
-                Api::all_with(client, &ar)
-            };
-
-            let mut cfg = watcher::Config::default().any_semantic();
-            if let Some(l) = labels {
-                cfg = cfg.labels(&l);
-            }
-            if let Some(f) = fields {
-                cfg = cfg.fields(&f);
-            }
-            let mut using_streaming =
-                streaming_lists.load(Ordering::Acquire) != STREAMING_UNSUPPORTED;
-            let mut initializing = true;
-            let mut stream = watcher(
-                api.clone(),
-                if using_streaming {
-                    cfg.clone().streaming_lists()
-                } else {
-                    cfg.clone()
-                },
-            )
-            .modify(|obj| obj.managed_fields_mut().clear())
-            .boxed();
-            if tx.send(Msg::Reset { generation }).await.is_err() {
-                return;
-            }
-
-            while let Some(event) = stream.next().await {
-                if using_streaming
-                    && initializing
-                    && event.as_ref().is_err_and(streaming_lists_unsupported)
-                {
-                    streaming_lists.store(STREAMING_UNSUPPORTED, Ordering::Release);
-                    using_streaming = false;
-                    stream = watcher(api.clone(), cfg.clone())
-                        .modify(|obj| obj.managed_fields_mut().clear())
-                        .boxed();
-                    continue;
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let client = client.clone();
+            let headers_tx = headers_tx.clone();
+            async move {
+                // A list clears evidence from an earlier streaming-list attempt.
+                headers_tx.send_replace(false);
+                let watch = request.uri().query().is_some_and(|q| {
+                    form_urlencoded::parse(q.as_bytes())
+                        .any(|(key, value)| key == "watch" && value == "true")
+                });
+                let response = client.send(request).await?;
+                if watch && response.status().is_success() {
+                    headers_tx.send_replace(true);
                 }
-                let msg = match event {
-                    Ok(watcher::Event::Apply(obj)) | Ok(watcher::Event::InitApply(obj)) => {
-                        Msg::Applied {
-                            generation,
-                            key: row_key(&obj),
-                            obj: Box::new(obj),
-                        }
+                Ok::<_, kube::Error>(response)
+            }
+        });
+        let client = Client::new(service, self.default_namespace.clone());
+        let task = spawn_watch_task(
+            watch_api(client, &kind, ns),
+            kind.ar.plural.clone(),
+            ns.to_string(),
+            watcher::Config::default().any_semantic(),
+            Arc::clone(&self.streaming_lists),
+            1,
+            tx,
+        );
+
+        let mut probe = WatchProbe::Ran {
+            synced: None,
+            objects: 0,
+            errors: 0,
+            last_error: None,
+        };
+        let WatchProbe::Ran {
+            synced,
+            objects,
+            errors,
+            last_error,
+        } = &mut probe
+        else {
+            unreachable!("just constructed")
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        while synced.is_none() || !*headers_rx.borrow() {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                changed = headers_rx.changed() => {
+                    if changed.is_err() {
+                        break;
                     }
-                    Ok(watcher::Event::Delete(obj)) => Msg::Deleted {
-                        generation,
-                        key: row_key(&obj),
-                    },
-                    Ok(watcher::Event::Init) => Msg::Reset { generation },
-                    Ok(watcher::Event::InitDone) => {
-                        initializing = false;
-                        if using_streaming {
-                            // Unsupported is sticky if two startup watches
-                            // negotiate concurrently and only one endpoint
-                            // rejects the extension.
-                            let _ = streaming_lists.compare_exchange(
-                                STREAMING_UNKNOWN,
-                                STREAMING_SUPPORTED,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            );
-                        }
-                        Msg::Synced { generation }
+                }
+                msg = rx.recv() => match msg {
+                    Some(Msg::Applied { .. }) => *objects += 1,
+                    Some(Msg::Synced { .. }) => *synced = Some(started.elapsed()),
+                    Some(Msg::Reset { .. }) => {
+                        *objects = 0;
+                        *synced = None;
                     }
-                    // The watcher heals a desync by re-listing on its own
-                    // (the stream continues with Init/…/InitDone), so the
-                    // "too old resource version: Expired" error is routine —
-                    // the sync dot already shows the re-list. No error flash.
-                    Err(e) if watch_error_is_benign(&e) => continue,
-                    Err(e) => Msg::Error {
-                        generation,
-                        error: e.to_string(),
-                    },
-                };
-                if tx.send(msg).await.is_err() {
-                    break; // UI gone
+                    Some(Msg::Error { error, .. }) => {
+                        *errors += 1;
+                        *last_error = Some(error);
+                        break;
+                    }
+                    Some(_) => {}
+                    None => break,
                 }
             }
-        })
+        }
+        if synced.is_some() && *headers_rx.borrow() && *errors == 0 {
+            *synced = Some(started.elapsed());
+        } else {
+            *synced = None;
+        }
+        task.abort();
+        let _ = task.await;
+        probe
     }
 
     /// List namespaces for the namespace switcher.
@@ -504,6 +689,122 @@ fn streaming_lists_unsupported(e: &watcher::Error) -> bool {
     }
 }
 
+fn watch_api(client: Client, kind: &Kind, namespace: &str) -> Api<DynamicObject> {
+    if kind.namespaced && !namespace.is_empty() {
+        Api::namespaced_with(client, namespace, &kind.ar)
+    } else {
+        Api::all_with(client, &kind.ar)
+    }
+}
+
+fn spawn_watch_task(
+    api: Api<DynamicObject>,
+    kind: String,
+    ns: String,
+    cfg: watcher::Config,
+    streaming_lists: Arc<AtomicU8>,
+    generation: u64,
+    tx: Sender<Msg>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut using_streaming = streaming_lists.load(Ordering::Acquire) != STREAMING_UNSUPPORTED;
+        let mut initializing = true;
+        // Distinct from `initializing`, which drives the streaming-list
+        // fallback and must keep its current lifetime: this only records
+        // that a full sync has happened, so a later re-list is a reconnect.
+        let mut synced_once = false;
+        let mut stream = watcher(
+            api.clone(),
+            if using_streaming {
+                cfg.clone().streaming_lists()
+            } else {
+                cfg.clone()
+            },
+        )
+        .modify(|obj| obj.managed_fields_mut().clear())
+        .boxed();
+        crate::log_info!(
+            "watch.start",
+            kind = kind,
+            ns = if ns.is_empty() { "*" } else { ns.as_str() },
+            generation = generation
+        );
+        if tx.send(Msg::Reset { generation }).await.is_err() {
+            return;
+        }
+
+        while let Some(event) = stream.next().await {
+            if using_streaming
+                && initializing
+                && event.as_ref().is_err_and(streaming_lists_unsupported)
+            {
+                streaming_lists.store(STREAMING_UNSUPPORTED, Ordering::Release);
+                using_streaming = false;
+                stream = watcher(api.clone(), cfg.clone())
+                    .modify(|obj| obj.managed_fields_mut().clear())
+                    .boxed();
+                continue;
+            }
+            let msg = match event {
+                Ok(watcher::Event::Apply(obj)) | Ok(watcher::Event::InitApply(obj)) => {
+                    Msg::Applied {
+                        generation,
+                        key: row_key(&obj),
+                        obj: Box::new(obj),
+                    }
+                }
+                Ok(watcher::Event::Delete(obj)) => Msg::Deleted {
+                    generation,
+                    key: row_key(&obj),
+                },
+                Ok(watcher::Event::Init) => {
+                    if synced_once {
+                        // The watcher healed a desync by re-listing. The
+                        // UI counts this as a reconnect off the same
+                        // message, so nothing extra crosses the channel.
+                        crate::log_info!("watch.relist", kind = kind, generation = generation);
+                    }
+                    Msg::Reset { generation }
+                }
+                Ok(watcher::Event::InitDone) => {
+                    initializing = false;
+                    synced_once = true;
+                    if using_streaming {
+                        // Unsupported is sticky if two startup watches
+                        // negotiate concurrently and only one endpoint
+                        // rejects the extension.
+                        let _ = streaming_lists.compare_exchange(
+                            STREAMING_UNKNOWN,
+                            STREAMING_SUPPORTED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                    }
+                    Msg::Synced { generation }
+                }
+                // The watcher heals a desync by re-listing on its own
+                // (the stream continues with Init/…/InitDone), so the
+                // "too old resource version: Expired" error is routine —
+                // the sync dot already shows the re-list. No error flash.
+                Err(e) if watch_error_is_benign(&e) => {
+                    crate::log_debug!("watch.desync", kind = kind, error = e);
+                    continue;
+                }
+                Err(e) => {
+                    crate::log_warn!("watch.error", kind = kind, error = e);
+                    Msg::Error {
+                        generation,
+                        error: e.to_string(),
+                    }
+                }
+            };
+            if tx.send(msg).await.is_err() {
+                break; // UI gone
+            }
+        }
+    })
+}
+
 /// Higher wins when two API groups expose the same bare plural/kind (e.g.
 /// core `pods` should beat `pods.metrics.k8s.io`).
 fn group_priority(group: &str) -> u8 {
@@ -524,27 +825,47 @@ fn current_context_name() -> Option<String> {
     kubeconfig.current_context
 }
 
-/// The current kubeconfig context, its cluster name, and API-server URL, read
-/// offline (no connection). For `--info`. `None` when there's no kubeconfig or
-/// no current context. The server URL never carries credentials.
-pub fn current_context_info() -> Option<(String, String, String)> {
-    let kubeconfig = kube::config::Kubeconfig::read().ok()?;
-    let context = kubeconfig.current_context.clone()?;
+/// A requested kubeconfig context (or the current one when none was requested),
+/// its cluster name, and API-server URL, read offline. For `sofka info` when no
+/// live connection is available. The server URL never carries credentials.
+pub fn context_info(requested: Option<&str>) -> Option<(String, String, String)> {
+    let kubeconfig = kube::config::Kubeconfig::read().ok();
+    context_info_from(kubeconfig.as_ref(), requested)
+}
+
+fn context_info_from(
+    kubeconfig: Option<&kube::config::Kubeconfig>,
+    requested: Option<&str>,
+) -> Option<(String, String, String)> {
+    let context = requested
+        .map(str::to_owned)
+        .or_else(|| kubeconfig.and_then(|config| config.current_context.clone()))?;
     let cluster_name = kubeconfig
-        .contexts
-        .iter()
-        .find(|c| c.name == context)
+        .and_then(|config| config.contexts.iter().find(|c| c.name == context))
         .and_then(|c| c.context.as_ref())
         .map(|c| c.cluster.clone())
         .unwrap_or_default();
     let server = kubeconfig
-        .clusters
-        .iter()
-        .find(|c| c.name == cluster_name)
+        .and_then(|config| config.clusters.iter().find(|c| c.name == cluster_name))
         .and_then(|c| c.cluster.as_ref())
         .and_then(|c| c.server.clone())
         .unwrap_or_default();
     Some((context, cluster_name, server))
+}
+
+/// The namespace a kubeconfig context pins, if any. For the offline
+/// diagnostics report, which has no live client to ask.
+pub fn context_namespace(context: &str) -> Option<String> {
+    let kubeconfig = kube::config::Kubeconfig::read().ok()?;
+    kubeconfig
+        .contexts
+        .iter()
+        .find(|c| c.name == context)?
+        .context
+        .as_ref()?
+        .namespace
+        .clone()
+        .filter(|ns| !ns.is_empty())
 }
 
 /// Public wrapper over [`cluster_name_for`] for resolving per-context config
@@ -735,6 +1056,194 @@ impl Cluster {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn probe_cluster(streaming: bool, status: u16, delay: Duration) -> Cluster {
+        let mut cluster = Cluster::fake();
+        cluster.client = Client::new(
+            tower::service_fn(move |req: http::Request<kube::client::Body>| async move {
+                let query = req.uri().query().unwrap_or("");
+                let watch = query.contains("watch=true");
+                let initial = query.contains("sendInitialEvents=true");
+                let (code, body) = if initial && streaming {
+                    (200, concat!(
+                    "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"one\",\"resourceVersion\":\"1\"}}}\n",
+                    "{\"type\":\"BOOKMARK\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"resourceVersion\":\"1\",\"annotations\":{\"k8s.io/initial-events-end\":\"true\"}}}}\n"
+                ).to_string())
+                } else if initial {
+                    (400, r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"BadRequest","message":"streaming lists unsupported","code":400}"#.into())
+                } else if watch {
+                    tokio::time::sleep(delay).await;
+                    (
+                        status,
+                        if status == 200 {
+                            String::new()
+                        } else {
+                            serde_json::json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","message":"watch forbidden","code":status}).to_string()
+                        },
+                    )
+                } else {
+                    (200, r#"{"kind":"PodList","apiVersion":"v1","metadata":{"resourceVersion":"1"},"items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"one","resourceVersion":"1"}}]}"#.into())
+                };
+                let keep_open = watch && code == 200;
+                let frames = futures_util::stream::iter([Ok::<_, std::io::Error>(
+                    hyper::body::Frame::data(hyper::body::Bytes::from(body)),
+                )])
+                .chain(futures_util::stream::poll_fn(move |_| {
+                    if keep_open {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(None)
+                    }
+                }));
+                Ok::<_, std::io::Error>(
+                    http::Response::builder()
+                        .status(code)
+                        .body(http_body_util::StreamBody::new(frames))
+                        .unwrap(),
+                )
+            }),
+            "default",
+        );
+        cluster
+    }
+
+    #[tokio::test]
+    async fn probe_requires_watch_headers_after_a_successful_list() {
+        let cluster = probe_cluster(false, 403, Duration::from_millis(20));
+        let probe = cluster
+            .probe_watch("pods", "default", Duration::from_secs(1))
+            .await;
+        assert!(
+            matches!(&probe, WatchProbe::Ran { synced: None, objects: 1, errors: 1, last_error: Some(error) } if error.contains("watch forbidden"))
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_bounds_the_wait_for_watch_headers() {
+        let cluster = probe_cluster(false, 200, Duration::from_secs(1));
+        let probe = cluster
+            .probe_watch("pods", "default", Duration::from_millis(30))
+            .await;
+        assert!(matches!(
+            probe,
+            WatchProbe::Ran {
+                synced: None,
+                objects: 1,
+                errors: 0,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_a_quiet_watch_after_the_fallback_list() {
+        let cluster = probe_cluster(false, 200, Duration::from_millis(20));
+        let probe = cluster
+            .probe_watch("pods", "default", Duration::from_secs(1))
+            .await;
+        assert!(
+            matches!(probe, WatchProbe::Ran { synced: Some(elapsed), objects: 1, errors: 0, .. } if elapsed >= Duration::from_millis(20))
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_a_complete_streaming_list() {
+        let cluster = probe_cluster(true, 403, Duration::ZERO);
+        let probe = cluster
+            .probe_watch("pods", "default", Duration::from_secs(1))
+            .await;
+        assert!(matches!(
+            probe,
+            WatchProbe::Ran {
+                synced: Some(_),
+                objects: 1,
+                errors: 0,
+                ..
+            }
+        ));
+    }
+
+    fn exec_latency() -> (u64, u64, f64) {
+        crate::diagnostics::latency_summary()
+            .into_iter()
+            .find(|summary| summary.op == Op::Exec)
+            .map(|summary| (summary.count, summary.errors, summary.max_ms))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn meter_records_completed_and_cancelled_requests_once() {
+        let _guard = crate::diagnostics::LATENCY_TEST_LOCK.lock().unwrap();
+        let before = exec_latency();
+        let waker = futures_util::task::noop_waker_ref();
+        let mut cx = TaskContext::from_waker(waker);
+
+        let mut completed = Metered::new(
+            std::future::ready(Ok::<_, std::io::Error>(http::Response::new(()))),
+            Op::Exec,
+        );
+        assert!(matches!(
+            Pin::new(&mut completed).poll(&mut cx),
+            Poll::Ready(Ok(_))
+        ));
+        drop(completed);
+        let after_completed = exec_latency();
+        assert_eq!(after_completed.0, before.0 + 1);
+        assert_eq!(after_completed.1, before.1);
+
+        let mut cancelled = Metered::new(
+            std::future::pending::<Result<http::Response<()>, std::io::Error>>(),
+            Op::Exec,
+        );
+        assert!(Pin::new(&mut cancelled).poll(&mut cx).is_pending());
+        std::thread::sleep(Duration::from_millis(2));
+        drop(cancelled);
+        let after_cancelled = exec_latency();
+        assert_eq!(after_cancelled.0, after_completed.0 + 1);
+        assert_eq!(after_cancelled.1, after_completed.1 + 1);
+        assert!(after_cancelled.2 >= 1.0, "max {}", after_cancelled.2);
+    }
+
+    #[test]
+    fn offline_context_info_prefers_the_requested_context() {
+        let kubeconfig: Kubeconfig = serde_yaml::from_str(
+            r#"
+current-context: dev
+contexts:
+  - name: dev
+    context: { cluster: dev-cluster }
+  - name: prod
+    context: { cluster: prod-cluster }
+clusters:
+  - name: dev-cluster
+    cluster: { server: https://dev.example }
+  - name: prod-cluster
+    cluster: { server: https://prod.example }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            context_info_from(Some(&kubeconfig), Some("prod")),
+            Some((
+                "prod".into(),
+                "prod-cluster".into(),
+                "https://prod.example".into()
+            ))
+        );
+        assert_eq!(
+            context_info_from(Some(&kubeconfig), None),
+            Some((
+                "dev".into(),
+                "dev-cluster".into(),
+                "https://dev.example".into()
+            ))
+        );
+        assert_eq!(
+            context_info_from(None, Some("prod")),
+            Some(("prod".into(), String::new(), String::new()))
+        );
+    }
 
     #[tokio::test]
     async fn client_accepts_socks5_proxy() {

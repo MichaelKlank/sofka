@@ -409,13 +409,18 @@ pod is rejected; browse through a pod that already mounts the claim instead.
 - **Snapshots** (`:snapshot`, `:snapshots`) - capture the current table view to
   text, JSON, or YAML, then browse and open saved captures. See
   [Snapshots](debugging.md#snapshots).
-- **Runtime diagnostics** (`:info`, or `sofka --info`) - version and build,
-  config sources, live context/cluster/API server and Kubernetes revision,
-  discovery status with the API groups that sofka could not read, Metrics API
-  status, watch error counts, and the state/snapshot/bundle directories.
-  The connected Kubernetes revision also
+- **Runtime diagnostics** (`:info`, or `sofka info`) - version and build, config
+  sources, live context/cluster/API server and Kubernetes revision, discovery
+  with warnings for unread API groups, Metrics API status, watch error and reconnect counts, API request latency
+  per class, active skin, loaded plugins and views, and the
+  state/log/snapshot/bundle directories. The connected Kubernetes revision also
   stays visible in the main header.
-  Identifiers and counts only, never credentials, tokens, or Secret values.
+  Identifiers, paths, and counts only, never credentials, tokens, or Secret
+  values. See [Runtime diagnostics](debugging.md#runtime-diagnostics).
+- **Structured logging** (`[logging]`, or `SOFKA_LOG=debug`) - sofka's own
+  session log as logfmt lines under the state directory, with every value
+  redacted on the way in and writes off the UI thread. Off by default. See
+  [Structured logging](debugging.md#structured-logging).
 
 ## Bundled plugins
 
