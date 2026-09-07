@@ -1823,8 +1823,25 @@ async fn pod_status_changes_keep_column_positions_stable() {
 }
 
 #[tokio::test]
-async fn cordoned_node_renders_scheduling_disabled_status() {
-    use ratatui::{Terminal, backend::TestBackend};
+async fn cordoned_node_statuses_keep_readiness_colors() {
+    use crate::theme;
+    use ratatui::{Terminal, backend::TestBackend, style::Color};
+
+    fn cell_text(terminal: &Terminal<TestBackend>, start: u16, end: u16, y: u16) -> String {
+        (start..end)
+            .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+            .collect::<String>()
+            .trim()
+            .to_string()
+    }
+
+    fn cell_color(terminal: &Terminal<TestBackend>, start: u16, end: u16, y: u16) -> Color {
+        (start..end)
+            .map(|x| &terminal.backend().buffer()[(x, y)])
+            .find(|cell| !cell.symbol().trim().is_empty())
+            .map(|cell| cell.fg)
+            .unwrap()
+    }
 
     let (mut app, _rx) = test_app();
     app.handle_key(press(KeyCode::Char(':'))).unwrap();
@@ -1834,35 +1851,95 @@ async fn cordoned_node_renders_scheduling_disabled_status() {
     app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.kind_plural, "nodes");
 
-    apply(
-        &mut app,
+    let node = |name: &str, ready: Option<&str>| {
+        let conditions = ready.map_or_else(
+            || json!([]),
+            |status| json!([{"type": "Ready", "status": status}]),
+        );
         json!({
             "apiVersion": "v1", "kind": "Node",
-            "metadata": {"name": "worker-1"},
+            "metadata": {"name": name},
             "spec": {"unschedulable": true},
-            "status": {"conditions": [{"type": "Ready", "status": "True"}]}
-        }),
-    );
+            "status": {"conditions": conditions}
+        })
+    };
+    apply(&mut app, node("a-ready", Some("True")));
+    apply(&mut app, node("b-not-ready", Some("False")));
+    apply(&mut app, node("c-unknown", None));
 
+    // Select the last row so the first two retain their semantic foregrounds.
+    app.handle_key(press(KeyCode::End)).unwrap();
     let mut terminal = Terminal::new(TestBackend::new(160, 24)).unwrap();
     terminal
         .draw(|frame| crate::ui::draw(frame, &mut app))
         .unwrap();
     let hit = app.table_hit.borrow().clone().unwrap();
-    let status_index = app
-        .display_headers()
-        .iter()
-        .position(|header| header == "STATUS")
+    let headers = app.display_headers();
+    let column_range = |header: &str| {
+        let index = headers.iter().position(|h| h == header).unwrap();
+        hit.cols
+            .iter()
+            .find(|(_, _, i)| *i == index)
+            .map(|&(start, end, _)| (start, end))
+            .unwrap()
+    };
+    let (name_start, name_end) = column_range("NAME");
+    let (status_start, status_end) = column_range("STATUS");
+    let ready_y = hit.rows_y;
+    let not_ready_y = ready_y + 1;
+    let unknown_y = ready_y + 2;
+
+    assert_eq!(
+        cell_text(&terminal, name_start, name_end, ready_y),
+        "a-ready"
+    );
+    assert_eq!(
+        cell_text(&terminal, status_start, status_end, ready_y),
+        "Ready,SchedulingDisabled"
+    );
+    assert_eq!(
+        cell_color(&terminal, name_start, name_end, ready_y),
+        theme::blue()
+    );
+    assert_eq!(
+        cell_color(&terminal, status_start, status_end, ready_y),
+        theme::green()
+    );
+
+    assert_eq!(
+        cell_text(&terminal, name_start, name_end, not_ready_y),
+        "b-not-ready"
+    );
+    assert_eq!(
+        cell_text(&terminal, status_start, status_end, not_ready_y),
+        "NotReady,SchedulingDisabled"
+    );
+    assert_eq!(
+        cell_color(&terminal, name_start, name_end, not_ready_y),
+        theme::red()
+    );
+    assert_eq!(
+        cell_color(&terminal, status_start, status_end, not_ready_y),
+        theme::red()
+    );
+
+    // Move selection away from Unknown and redraw before checking its colors.
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
         .unwrap();
-    let &(start, end, _) = hit
-        .cols
-        .iter()
-        .find(|(_, _, index)| *index == status_index)
-        .unwrap();
-    let status_cell: String = (start..end)
-        .map(|x| terminal.backend().buffer()[(x, hit.rows_y)].symbol())
-        .collect();
-    assert_eq!(status_cell.trim(), "Ready,SchedulingDisabled");
+    assert_eq!(
+        cell_text(&terminal, status_start, status_end, unknown_y),
+        "Unknown,SchedulingDisabled"
+    );
+    assert_eq!(
+        cell_color(&terminal, name_start, name_end, unknown_y),
+        theme::blue()
+    );
+    assert_eq!(
+        cell_color(&terminal, status_start, status_end, unknown_y),
+        theme::overlay1()
+    );
 }
 
 #[tokio::test]

@@ -626,6 +626,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     if let Some(i) = sort_col {
         needed[i] = needed[i].max(cell_width(&headers[i]).saturating_add(2));
     }
+    let status_width = if app.kind_plural == "nodes" { 27 } else { 26 };
     // Compute widths from all columns before applying the viewport offset.
     let col_rules: Vec<(ColWidth, u16)> = headers
         .iter()
@@ -651,9 +652,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                     "CPU" | "MEM" => ColWidth::Exact(8),
                     "%CPU" | "%MEM" => ColWidth::Exact(5),
                     "PODS" => ColWidth::Exact(5),
-                    // Keep status changes from moving the other columns.
-                    // Allow room for CreateContainerConfigError.
-                    "STATUS" => ColWidth::Exact(26),
+                    // Keep status changes from moving the other columns. Nodes
+                    // need one extra cell for NotReady,SchedulingDisabled.
+                    "STATUS" => ColWidth::Exact(status_width),
                     "READY" | "RESTARTS" => ColWidth::Cap(10),
                     // CRD view: group domains run long (e.g.
                     // "kustomize.toolkit.fluxcd.io"), so GROUP/KIND/VERSIONS
