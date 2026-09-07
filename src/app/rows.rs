@@ -838,6 +838,11 @@ impl App {
         self.col_scroll_max = 0;
     }
 
+    pub(super) fn view_namespace(&self) -> Option<&str> {
+        self.kind.as_ref().filter(|kind| kind.namespaced)?;
+        (!self.all_namespaces()).then_some(self.namespace.as_str())
+    }
+
     /// The user-configured view matching the current kind, if any. Synthetic
     /// views (helm/helmhistory) are backed by an unrelated kind (`secrets`),
     /// so they never match.
@@ -846,7 +851,7 @@ impl App {
         if kind.ar.plural.to_lowercase() != self.kind_plural {
             return None;
         }
-        crate::views::lookup(&self.user_views, &kind.ar)
+        crate::views::lookup(&self.user_views, &kind.ar, self.view_namespace())
     }
 
     /// Apply a view's configured initial sort, unless a sort is already
