@@ -52,7 +52,7 @@ Each of these is documented where the feature itself is:
 
 | Section               | What it does                                | Docs                                                       |
 | --------------------- | ------------------------------------------- | ---------------------------------------------------------- |
-| `[views]`             | custom table columns per resource           | [Views and thresholds](views.md)                           |
+| `[views]`             | custom columns per resource and namespace   | [Views and thresholds](views.md)                           |
 | `[thresholds]`        | RESTARTS/CPU/MEM/utilization coloring bands | [Views and thresholds](views.md#thresholds)                |
 | `[[plugins]]`         | shell-out commands bound to key chords      | [Plugins](plugins.md)                                      |
 | `[[bookmarks]]`       | saved navigation commands                   | [Plugins](plugins.md#bookmarks)                            |

@@ -75,13 +75,13 @@ impl App {
     /// The JSON Pointer holding the current kind's node name, if it has one.
     pub(super) fn node_pointer(&self) -> Option<String> {
         let ar = &self.kind.as_ref()?.ar;
-        crate::views::node_pointer(&self.user_views, ar).map(str::to_string)
+        crate::views::node_pointer(&self.user_views, ar, self.view_namespace()).map(str::to_string)
     }
 
     /// The `[views."…"].drill` for the current kind, if one is configured.
     fn configured_drill(&self) -> Option<crate::views::Drill> {
         let ar = &self.kind.as_ref()?.ar;
-        crate::views::drill_for(&self.user_views, ar).cloned()
+        crate::views::drill_for(&self.user_views, ar, self.view_namespace()).cloned()
     }
 
     /// Drill from a row into the kind its view's `drill` names, scoped by the

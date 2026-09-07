@@ -47,6 +47,55 @@ the layout. By default columns overlay the curated ones: a matching header
 replaces it in place, new columns go before AGE. Invalid entries are skipped with
 a warning in the app - they never take down the TUI.
 
+### Namespace-specific views
+
+Add `@<namespace>` to a view key to select a layout for one namespace:
+
+```toml
+[[views."v1/pods".columns]]
+name = "OWNERKIND"
+path = "/metadata/ownerReferences/0/kind"
+
+[[views."v1/pods@matlab".columns]]
+name = "TENANT"
+path = "/metadata/annotations/ops.example.com~1tenant"
+
+[[views."v1/pods@matlab".columns]]
+name = "MODEL"
+path = "/metadata/annotations/ops.example.com~1model"
+```
+
+When a namespaced resource view is set to one namespace, sofka tries these
+keys in order:
+
+1. `apiVersion/plural@namespace`
+2. `group/plural@namespace`
+3. `plural@namespace`
+4. `kind@namespace`
+5. The same resource keys without a namespace, in the same order.
+
+For example, `pods@matlab` has priority over `v1/pods`.
+All-namespaces mode and cluster-scoped resources use only unqualified keys.
+A row filter does not change the namespace used for this lookup.
+
+The selected layout does not inherit columns, `replace`, or `sort` from
+another view key. Columns still overlay the built-in layout unless
+`replace = true`. In this example, the `matlab` view adds TENANT and MODEL,
+but does not add OWNERKIND. Wide mode works as usual. An active sort stays
+on its column if that column is still present. A saved user sort has priority
+over the configured initial sort.
+
+The `node` and `drill` settings use the same key order, but each setting
+falls back separately. A view that sets only columns does not hide a
+`node` or `drill` setting on a less specific key. Built-in navigation rules
+still apply.
+
+Namespace selection works with `sofka pods -n matlab`, the namespace picker,
+resource commands, bookmarks, and view history. The namespace suffix must
+be a valid namespace name: 1 to 63 lowercase letters, digits, or hyphens,
+with a letter or digit at each end. Invalid suffixes produce a configuration
+warning and the view is ignored.
+
 ### Pods and nodes
 
 Custom columns also overlay sofka's curated core-resource views. Pods already

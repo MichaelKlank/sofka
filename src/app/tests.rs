@@ -17291,3 +17291,171 @@ async fn refresh_key_reads_pods_through_a_configured_ca_server_certificate() {
     app.handle_key(press(KeyCode::Char('q'))).unwrap();
     server.abort();
 }
+
+#[tokio::test]
+async fn namespace_views_follow_navigation_bookmarks_and_wide_mode() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [[views."v1/pods".columns]]
+        name = "OWNER"
+        path = "/metadata/ownerReferences/0/kind"
+
+        [views."pods@matlab"]
+        sort = "TENANT:desc"
+        [[views."pods@matlab".columns]]
+        name = "TENANT"
+        path = "/metadata/annotations/ops.example.com~1tenant"
+        [[views."pods@matlab".columns]]
+        name = "MODEL"
+        path = "/metadata/annotations/ops.example.com~1model"
+        wide = true
+
+        [views."pods@python"]
+        replace = true
+        [[views."pods@python".columns]]
+        name = "NAME"
+        path = "/metadata/name"
+
+        [[views."nodes@matlab".columns]]
+        name = "WRONG"
+        path = "/metadata/name"
+    "#,
+    );
+    // Startup sets the CLI namespace before it opens the resource.
+    app.namespace = "matlab".into();
+    app.switch_kind("pods");
+    assert!(app.display_headers().contains(&"TENANT".to_string()));
+    assert!(!app.display_headers().contains(&"OWNER".to_string()));
+    assert_eq!(app.display_headers()[app.sort_column.unwrap()], "TENANT");
+    assert!(app.sort_desc);
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "job", "namespace": "matlab",
+                "annotations": {"ops.example.com/tenant": "team-a"}}
+        }),
+    );
+    let rows = app.rows();
+    app.ensure_table_cell_cache(&rows);
+    let index = app
+        .display_headers()
+        .iter()
+        .position(|h| h == "TENANT")
+        .unwrap();
+    assert_eq!(
+        app.table_cell_cache().get(&row_key(rows[0])).unwrap().0[index],
+        "team-a"
+    );
+    drop(rows);
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert!(app.display_headers().contains(&"MODEL".to_string()));
+    assert_eq!(app.display_headers()[app.sort_column.unwrap()], "TENANT");
+
+    palette(&mut app, "pods all");
+    assert!(app.all_namespaces());
+    assert!(app.display_headers().contains(&"OWNER".to_string()));
+    assert!(!app.display_headers().contains(&"TENANT".to_string()));
+    app.handle_key(press(KeyCode::Char('['))).unwrap();
+    assert_eq!(app.namespace, "matlab");
+    assert!(app.display_headers().contains(&"TENANT".to_string()));
+
+    app.bookmarks = vec![crate::config::Bookmark {
+        key: Some("z".into()),
+        name: "batch".into(),
+        resource: "pods".into(),
+        namespace: Some("python".into()),
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.namespace, "python");
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "CPU", "MEM"]);
+    assert!(app.sort_column.is_none());
+    palette(&mut app, "pods other");
+    assert!(app.display_headers().contains(&"OWNER".to_string()));
+    palette(&mut app, "nodes matlab");
+    assert!(!app.display_headers().contains(&"WRONG".to_string()));
+}
+
+#[tokio::test]
+async fn namespace_view_picker_keeps_the_user_sort() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."pods@matlab"]
+        sort = "TENANT:desc"
+        [[views."pods@matlab".columns]]
+        name = "TENANT"
+        path = "/metadata/name"
+    "#,
+    );
+    palette(&mut app, "pods other");
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let header = app.display_headers()[app.sort_column.unwrap()].clone();
+    let desc = app.sort_desc;
+    app.ns_list = vec!["<all>".into(), "matlab".into(), "other".into()];
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    for c in "matlab".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.namespace, "matlab");
+    assert!(app.display_headers().contains(&"TENANT".to_string()));
+    assert_eq!(app.display_headers()[app.sort_column.unwrap()], header);
+    assert_eq!(app.sort_desc, desc);
+}
+
+#[tokio::test]
+async fn namespace_view_navigation_settings_fall_back_separately() {
+    for (namespace, expected_node, expected_target) in [
+        ("matlab", "batch-node", "secrets"),
+        ("other", "base-node", "pods"),
+        ("all", "base-node", "pods"),
+    ] {
+        let (mut app, _rx) = test_app();
+        install_views(
+            &mut app,
+            r#"
+            [views.certificates]
+            node = "/status/baseNode"
+            drill = { kind = "pods", labels = "cert={name}" }
+            [views."certificates@matlab"]
+            node = "/status/batchNode"
+            drill = { kind = "secrets", labels = "cert={name}" }
+            [[views."cert-manager.io/v1/certificates@matlab".columns]]
+            name = "EXTRA"
+            path = "/metadata/name"
+        "#,
+        );
+        palette(&mut app, &format!("certificates {namespace}"));
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "cert-manager.io/v1", "kind": "Certificate",
+                "metadata": {"name": "tls", "namespace": "matlab"},
+                "status": {"baseNode": "base-node", "batchNode": "batch-node"}
+            }),
+        );
+        app.table_state.select(Some(0));
+        app.handle_key(press(KeyCode::Char('o'))).unwrap();
+        assert_eq!(app.kind_plural, "nodes");
+        assert_eq!(app.fields, Some(format!("metadata.name={expected_node}")));
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "cert-manager.io/v1", "kind": "Certificate",
+                "metadata": {"name": "tls", "namespace": "matlab"}
+            }),
+        );
+        app.table_state.select(Some(0));
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.kind_plural, expected_target);
+        assert_eq!(app.labels.as_deref(), Some("cert=tls"));
+    }
+}
