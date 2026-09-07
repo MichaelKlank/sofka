@@ -118,10 +118,11 @@ impl App {
                 ns,
                 pod,
                 container,
+                upload,
                 src,
                 dest,
             } => {
-                self.start_transfer(ns, pod, container, true, src, dest);
+                self.start_transfer(ns, pod, container, upload, src, dest);
             }
             ConfirmAction::Drain { targets } => {
                 self.do_drain_nodes(targets);
@@ -156,16 +157,34 @@ impl App {
             } => {
                 self.launch_plugin(jobs, name, mode, timeout);
             }
+            ConfirmAction::PvcHelper { ns, claim, intent } => {
+                self.create_pvc_helper(ns, claim, intent);
+            }
+            ConfirmAction::PvcShell {
+                ns,
+                pod,
+                container,
+                path,
+                claim,
+            } => self.do_pvc_shell(ns, pod, container, path, claim),
+            ConfirmAction::PvcClean { scope } => self.cleanup_pvc_helpers(scope),
         }
     }
 
     pub(super) fn key_confirm(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                let back = self.overlay_return();
                 if let Some(action) = self.confirm_action.take() {
                     self.run_confirm_action(action);
                 }
-                self.mode = Mode::Table;
+                // An action that opened a view of its own (a shell suspend, a
+                // fresh browser) has already set the mode; only fall back to
+                // where the dialog came from if it didn't.
+                if self.mode == Mode::Confirm {
+                    self.mode = back;
+                }
+                self.confirm_return = Mode::Table;
             }
             KeyCode::Char('f') | KeyCode::Char('F') => {
                 let update = match self.confirm_action.as_mut() {
@@ -214,8 +233,14 @@ impl App {
                 }
             }
             _ => {
-                self.confirm_action = None;
-                self.mode = Mode::Table;
+                // A cancelled PVC shell leaves state (possibly a helper pod)
+                // that only the suspend-and-return path would have cleaned up.
+                let cancelled = self.confirm_action.take();
+                if matches!(cancelled, Some(ConfirmAction::PvcShell { .. })) {
+                    self.pvc_shell_cancelled();
+                }
+                self.mode = self.overlay_return();
+                self.confirm_return = Mode::Table;
             }
         }
     }
@@ -233,10 +258,20 @@ impl App {
                     Mode::Logs
                 } else if self.prompt_over_contexts() {
                     Mode::Contexts
+                } else if self.prompt_over_pvc() {
+                    Mode::PvcExplore
                 } else {
                     Mode::Table
                 };
-                self.prompt_kind = None;
+                let cancelled = self.prompt_kind.take();
+                if matches!(
+                    cancelled,
+                    Some(PromptKind::GuardConfirm { ref action, .. })
+                        if matches!(**action, ConfirmAction::PvcShell { .. })
+                ) {
+                    self.pvc_shell_cancelled();
+                }
+                self.confirm_return = Mode::Table;
             }
             KeyCode::Enter => {
                 let input = self.prompt_input.trim().to_string();
@@ -244,6 +279,8 @@ impl App {
                     Mode::Logs
                 } else if self.prompt_over_contexts() {
                     Mode::Contexts
+                } else if self.prompt_over_pvc() {
+                    Mode::PvcExplore
                 } else {
                     Mode::Table
                 };
@@ -335,6 +372,12 @@ impl App {
                             self.run_confirm_action(*action);
                         } else {
                             self.flash_warn("guardrail: input did not match — cancelled");
+                            // Same teardown as an Esc: the action is dropped
+                            // here too, so anything it was holding — a helper
+                            // pod, a pending suspend — has to be released.
+                            if matches!(*action, ConfirmAction::PvcShell { .. }) {
+                                self.pvc_shell_cancelled();
+                            }
                         }
                     }
                     // Empty input = cancel, keep the old name.
@@ -344,6 +387,10 @@ impl App {
                     Some(PromptKind::RenameContext { .. }) => {}
                     None => {}
                 }
+                // The prompt is done with, whichever way it went; leaving the
+                // marker set would aim the next confirm dialog at a view that
+                // has nothing to do with it.
+                self.confirm_return = Mode::Table;
             }
             KeyCode::Backspace => {
                 self.prompt_input.pop();

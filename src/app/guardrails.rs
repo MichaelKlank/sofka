@@ -69,6 +69,29 @@ impl App {
         Some(base.max(found.confirmation))
     }
 
+    /// Whether a guardrail denies `action` outright, without flashing or
+    /// otherwise touching the app. For looking ahead: a caller that is about
+    /// to do expensive setup for an action can find out it will be refused
+    /// before paying for it. [`Self::guard`] is still the gate — this only
+    /// avoids the wasted work.
+    pub(super) fn guard_denies(
+        &self,
+        action: &str,
+        plural: &str,
+        targets: &[(String, String)],
+    ) -> bool {
+        restrictions(
+            &self.guardrails,
+            &self.cluster.context,
+            action,
+            plural,
+            targets,
+            false,
+        )
+        .deny
+        .is_some()
+    }
+
     /// Route an about-to-run action through its required confirmation. `Plain`
     /// uses the y/n dialog; the typed levels use a prompt that must match a
     /// resource name (`name_hint`) or the context; `None` runs immediately.
@@ -79,6 +102,14 @@ impl App {
         level: ConfirmLevel,
         name_hint: String,
     ) {
+        // The PVC browser is the only full-screen view that launches guarded
+        // actions, so it is the only one the dialog has to return to; every
+        // other guarded action starts (and belongs) at the table.
+        self.confirm_return = if self.mode == Mode::PvcExplore {
+            Mode::PvcExplore
+        } else {
+            Mode::Table
+        };
         match level {
             ConfirmLevel::None => self.run_confirm_action(action),
             ConfirmLevel::Plain => {

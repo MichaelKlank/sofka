@@ -12346,6 +12346,1351 @@ async fn faults_watch_changes_preserve_pod_identity_or_clear_selection() {
     assert_eq!(app.table_state.selected(), None);
 }
 
+// ----- PVC explore -------------------------------------------------------
+
+/// A PVC view with one bound claim selected. PVCs aren't in `Cluster::fake`'s
+/// standing registry, so the fixture declares the kind itself.
+fn app_with_pvc(phase: &str) -> (App, Receiver<Msg>) {
+    let (mut app, rx) = test_app();
+    app.cluster
+        .register_kind("", "PersistentVolumeClaim", "persistentvolumeclaims", true);
+    app.switch_kind("persistentvolumeclaims");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+               "metadata": {"name": "data", "namespace": "default"},
+               "status": {"phase": phase}}),
+    );
+    app.table_state.select(Some(0));
+    (app, rx)
+}
+
+fn pvc_mount() -> crate::pvcexplore::Mount {
+    crate::pvcexplore::Mount {
+        pod: "api-0".into(),
+        container: "app".into(),
+        path: "/srv".into(),
+        read_only: false,
+        helper: false,
+    }
+}
+
+fn pvc_entry(
+    name: &str,
+    kind: crate::pvcexplore::EntryKind,
+    size: u64,
+) -> crate::pvcexplore::Entry {
+    crate::pvcexplore::Entry {
+        name: name.into(),
+        kind,
+        size: Some(size),
+        link_target: String::new(),
+    }
+}
+
+/// Hand the browser the target its resolve task would have produced.
+fn resolve_pvc(app: &mut App, result: Result<Option<crate::pvcexplore::Mount>, String>) {
+    let claim = current_claim(app);
+    app.handle_msg(Msg::PvcTarget {
+        generation: app.generation,
+        run: app.pvc.run,
+        namespace: "default".into(),
+        context: app.cluster.context.clone(),
+        claim,
+        result,
+    });
+}
+
+fn listing(entries: Vec<crate::pvcexplore::Entry>) -> crate::pvcexplore::Listing {
+    crate::pvcexplore::Listing {
+        entries,
+        unparsed: 0,
+        unnameable: 0,
+        truncated: false,
+        status: Some(0),
+    }
+}
+
+fn list_pvc(app: &mut App, path: &str, entries: Vec<crate::pvcexplore::Entry>) {
+    app.handle_msg(Msg::PvcListing {
+        generation: app.generation,
+        run: app.pvc.run,
+        path: path.into(),
+        result: Ok((listing(entries), None)),
+    });
+}
+
+#[tokio::test]
+async fn pvc_browser_opens_once_a_mounting_pod_resolves() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    // Nothing is on screen until we know which pod can serve the volume.
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash.contains("finding a pod"), "{}", app.flash);
+
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert_eq!(app.mode, Mode::PvcExplore);
+    assert!(app.pvc.active);
+    // The remote pane starts at the mount point, not at "/".
+    assert_eq!(app.pvc.remote_path, "/srv");
+    assert_eq!(app.pvc.focus, Pane::Remote);
+}
+
+#[tokio::test]
+async fn pvc_listing_fills_the_remote_pane_and_enter_descends() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![
+            pvc_entry("logs", EntryKind::Dir, 0),
+            pvc_entry("a.txt", EntryKind::File, 12),
+        ],
+    );
+    assert_eq!(app.pvc.remote.len(), 2);
+    assert_eq!(app.pvc.remote_state.selected(), Some(0));
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.pvc.remote_path, "/srv/logs");
+    assert!(app.pvc.loading);
+
+    // A file is not a directory: enter does nothing rather than erroring.
+    list_pvc(
+        &mut app,
+        "/srv/logs",
+        vec![pvc_entry("app.log", EntryKind::File, 4)],
+    );
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.pvc.remote_path, "/srv/logs");
+}
+
+#[tokio::test]
+async fn pvc_browser_will_not_walk_above_the_mount_point() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(&mut app, "/srv", vec![pvc_entry("logs", EntryKind::Dir, 0)]);
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    list_pvc(&mut app, "/srv/logs", vec![]);
+    app.handle_key(press(KeyCode::Backspace)).unwrap();
+    assert_eq!(app.pvc.remote_path, "/srv");
+
+    list_pvc(&mut app, "/srv", vec![]);
+    app.handle_key(press(KeyCode::Backspace)).unwrap();
+    assert_eq!(app.pvc.remote_path, "/srv");
+    assert!(app.flash.contains("top of the volume"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn a_listing_for_a_directory_already_left_is_dropped() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(&mut app, "/srv", vec![pvc_entry("logs", EntryKind::Dir, 0)]);
+    app.handle_key(press(KeyCode::Enter)).unwrap(); // bumps the run counter
+
+    let stale = app.pvc.run - 1;
+    app.handle_msg(Msg::PvcListing {
+        generation: app.generation,
+        run: stale,
+        path: "/srv".into(),
+        result: Ok((
+            listing(vec![pvc_entry("stale.txt", EntryKind::File, 1)]),
+            None,
+        )),
+    });
+    assert_eq!(app.pvc.remote_path, "/srv/logs");
+    assert!(app.pvc.remote.iter().all(|e| e.name != "stale.txt"));
+}
+
+#[tokio::test]
+async fn tab_switches_panes_and_copy_follows_the_focus() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("a.txt", EntryKind::File, 12)],
+    );
+
+    // Focus starts on the volume, so `c` copies out of it.
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert!(app.flash.contains("api-0:/srv/a.txt"), "{}", app.flash);
+
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    assert_eq!(app.pvc.focus, Pane::Local);
+}
+
+#[tokio::test]
+async fn uploading_into_a_read_only_mount_is_refused() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    let mount = crate::pvcexplore::Mount {
+        read_only: true,
+        ..pvc_mount()
+    };
+    resolve_pvc(&mut app, Ok(Some(mount)));
+    app.pvc.local = vec![pvc_entry(
+        "notes.txt",
+        crate::pvcexplore::EntryKind::File,
+        3,
+    )];
+    app.pvc.local_state.select(Some(0));
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert!(app.flash.contains("read-only"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn a_claim_nothing_mounts_offers_a_helper_pod() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(None));
+    assert_eq!(app.mode, Mode::Confirm);
+    assert!(
+        app.confirm_label.contains("Nothing mounts data"),
+        "{}",
+        app.confirm_label
+    );
+    assert!(
+        app.confirm_label.contains(&app.pvc_cfg.image),
+        "{}",
+        app.confirm_label
+    );
+}
+
+#[tokio::test]
+async fn read_only_mode_refuses_the_helper_pod_rather_than_creating_one() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.readonly = true;
+    // Browsing itself is a read: `x` is allowed, the write it would need isn't.
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(None));
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash.contains("read-only"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn an_unbound_claim_is_not_browsable() {
+    let (mut app, _rx) = app_with_pvc("Pending");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash.contains("not Bound"), "{}", app.flash);
+    assert!(app.flash_err);
+}
+
+#[tokio::test]
+async fn shell_on_a_pvc_row_execs_at_the_mount_point() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    // The shell is requested from the resolve message, not the keystroke, so
+    // the run loop has to pick it up there too.
+    let Some(Suspend::Shell(argv)) = app.pending.take() else {
+        panic!("no shell queued");
+    };
+    assert_eq!(&argv[..3], ["kubectl", "--context", "test"]);
+    assert!(argv.contains(&"api-0".to_string()));
+    assert_eq!(argv.last().unwrap(), "/srv");
+    // Never opens the browser — `s` asked for a terminal.
+    assert_eq!(app.mode, Mode::Table);
+    assert!(!app.pvc.active);
+}
+
+#[tokio::test]
+async fn esc_leaves_the_pvc_browser() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(!app.pvc.active);
+}
+
+#[tokio::test]
+async fn a_failed_resolve_reports_the_error_instead_of_opening_the_browser() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Err("listing pods in default: forbidden".into()));
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash.contains("forbidden"), "{}", app.flash);
+    assert!(app.flash_err);
+}
+
+#[tokio::test]
+async fn navigating_out_of_the_pvc_browser_tears_it_down() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert!(app.pvc.active);
+
+    // The palette stays over the browser…
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    assert!(app.pvc.active);
+    // …but jumping to another kind leaves it, so no helper pod is orphaned and
+    // the overlays stop drawing panes that are gone.
+    for c in "pods".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.kind_plural, "pods");
+    assert!(!app.pvc.active);
+}
+
+#[tokio::test]
+async fn a_shell_from_a_pvc_row_keeps_its_pod_until_the_shell_returns() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    let helper = crate::pvcexplore::Mount {
+        pod: "sofka-pvc-explore-abc".into(),
+        container: "explore".into(),
+        path: "/pvc".into(),
+        read_only: false,
+        helper: true,
+    };
+    resolve_pvc(&mut app, Ok(Some(helper)));
+    // The shell is queued but has not run yet: the pod it needs is still held.
+    assert!(app.pending.is_some());
+    assert!(app.pvc.mount.as_ref().is_some_and(|m| m.helper));
+
+    app.pending.take();
+    app.after_suspend(); // the run loop's post-suspend hook
+    assert!(app.pvc.mount.is_none());
+    assert!(!app.pvc.shell_pending);
+}
+
+#[tokio::test]
+async fn a_shell_from_inside_the_browser_keeps_the_browser_and_its_pod() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    let helper = crate::pvcexplore::Mount {
+        pod: "sofka-pvc-explore-abc".into(),
+        container: "explore".into(),
+        path: "/pvc".into(),
+        read_only: false,
+        helper: true,
+    };
+    resolve_pvc(&mut app, Ok(Some(helper)));
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    assert!(app.pending.is_some());
+    app.pending.take();
+    app.after_suspend();
+    // Still browsing, so the pod stays.
+    assert!(app.pvc.active);
+    assert!(app.pvc.mount.as_ref().is_some_and(|m| m.helper));
+}
+
+#[tokio::test]
+async fn a_shell_guardrail_covers_the_pvc_shell_too() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    // "no shells in this context" must not be defeated by reaching the same
+    // pod through a claim it mounts.
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["shell".into()],
+        deny: true,
+        reason: Some("prod is locked".into()),
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert!(app.pending.is_none(), "guardrail did not block the exec");
+    assert!(app.flash.contains("prod is locked"), "{}", app.flash);
+    // Nothing is left holding a pod for a shell that will never run.
+    assert!(!app.pvc.shell_pending);
+    assert!(app.pvc.mount.is_none());
+}
+
+#[tokio::test]
+async fn a_confirmed_pvc_shell_can_be_cancelled_without_stranding_state() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["shell".into()],
+        confirmation: Some("confirm".into()),
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert_eq!(app.mode, Mode::Confirm);
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    assert!(app.pending.is_none());
+    assert!(!app.pvc.shell_pending);
+    assert!(app.pvc.mount.is_none());
+}
+
+#[tokio::test]
+async fn pvc_clean_is_a_mutation_and_is_gated_like_one() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.readonly = true;
+    palette(&mut app, "pvc-clean");
+    assert_ne!(app.mode, Mode::Confirm);
+    assert!(app.flash.contains("read-only"), "{}", app.flash);
+
+    app.readonly = false;
+    palette(&mut app, "pvc-clean");
+    assert_eq!(app.mode, Mode::Confirm);
+    assert!(
+        app.confirm_label.contains("helper pod"),
+        "{}",
+        app.confirm_label
+    );
+    // The current namespace, not a hardcoded default.
+    assert!(
+        app.confirm_label.contains("default"),
+        "{}",
+        app.confirm_label
+    );
+
+    // An all-namespaces view sweeps all namespaces, or a helper leaked
+    // elsewhere would be invisible to the command meant to find it.
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.namespace.clear();
+    palette(&mut app, "pvc-clean");
+    assert!(
+        app.confirm_label.contains("all namespaces"),
+        "{}",
+        app.confirm_label
+    );
+}
+
+/// Run a palette command by typing it, the way a user would.
+fn palette(app: &mut App, command: &str) {
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in command.chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+}
+
+#[tokio::test]
+async fn a_namespace_guardrail_still_covers_a_cluster_wide_pvc_clean() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.guardrails = vec![crate::config::Guardrail {
+        namespaces: vec!["prod".into()],
+        actions: vec!["pvc-explore".into()],
+        deny: true,
+        reason: Some("prod volumes are hands-off".into()),
+        ..Default::default()
+    }];
+    // An all-namespaces sweep has no single namespace to match against, so
+    // without the all-namespaces scope the rule would simply be skipped.
+    app.namespace.clear();
+    palette(&mut app, "pvc-clean");
+    assert_ne!(app.mode, Mode::Confirm);
+    assert!(
+        app.flash.contains("prod volumes are hands-off"),
+        "{}",
+        app.flash
+    );
+}
+
+#[tokio::test]
+async fn pvc_is_still_the_kubectl_alias_for_the_resource() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.cluster.add_aliases(&std::collections::HashMap::from([(
+        "pvc".to_string(),
+        "persistentvolumeclaims".to_string(),
+    )]));
+    app.switch_kind("pods");
+    // A palette command outranks a kind, so `:pvc-explore` must not claim the
+    // bare `pvc` alias people already use to navigate.
+    palette(&mut app, "pvc");
+    assert_eq!(app.kind_plural, "persistentvolumeclaims");
+    assert_eq!(app.mode, Mode::Table);
+}
+
+#[tokio::test]
+async fn a_helper_pod_that_lands_after_a_generation_bump_is_not_stranded() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    let claim = current_claim(&app);
+    let run = app.pvc.run;
+    let context = app.cluster.context.clone();
+    let helper = crate::pvcexplore::Mount {
+        pod: "sofka-pvc-explore-xyz".into(),
+        container: "explore".into(),
+        path: "/pvc".into(),
+        read_only: false,
+        helper: true,
+    };
+    // Anything that restarts the watch (`:pulse`, `:ctx`, ctrl-r) bumps the
+    // generation while the helper pod is still coming up. The message must
+    // still reach the delete path, not the generic stale-message arm.
+    let stale = app.generation;
+    app.bump_generation();
+    let journal_before = app.journal.len();
+    app.handle_msg(Msg::PvcTarget {
+        generation: stale,
+        run,
+        namespace: "default".into(),
+        context,
+        claim,
+        result: Ok(Some(helper)),
+    });
+    assert!(!app.pvc.active);
+    assert_eq!(
+        app.journal.len(),
+        journal_before + 1,
+        "the abandoned helper pod was not deleted"
+    );
+    let logged = app.journal.lines().join("\n");
+    assert!(logged.contains("helper pod removed"), "{logged}");
+    assert!(logged.contains("sofka-pvc-explore-xyz"), "{logged}");
+}
+
+#[tokio::test]
+async fn a_helper_pod_from_another_cluster_is_left_alone() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    let claim = current_claim(&app);
+    let run = app.pvc.run;
+    let stale = app.generation;
+    app.bump_generation();
+    let journal_before = app.journal.len();
+    // A `:ctx` switch bumps the generation *and* swaps the client, so the pod
+    // name would resolve against the wrong cluster.
+    app.handle_msg(Msg::PvcTarget {
+        generation: stale,
+        run,
+        namespace: "default".into(),
+        context: "some-other-cluster".into(),
+        claim,
+        result: Ok(Some(crate::pvcexplore::Mount {
+            pod: "sofka-pvc-explore-xyz".into(),
+            container: "explore".into(),
+            path: "/pvc".into(),
+            read_only: false,
+            helper: true,
+        })),
+    });
+    assert_eq!(
+        app.journal.len(),
+        journal_before,
+        "deleted a pod against a cluster it was never created in"
+    );
+}
+
+#[tokio::test]
+async fn a_mismatched_typed_confirmation_does_not_strand_the_shell_state() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["shell".into()],
+        confirmation: Some("type-resource-name".into()),
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert_eq!(app.mode, Mode::Prompt);
+    // Enter on an empty prompt is the natural way to back out.
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(app.pending.is_none());
+    assert!(!app.pvc.shell_pending);
+    assert!(app.pvc.mount.is_none());
+}
+
+#[tokio::test]
+async fn a_failed_listing_steps_back_to_the_directory_it_came_from() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(&mut app, "/srv", vec![pvc_entry("logs", EntryKind::Dir, 0)]);
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    app.handle_msg(Msg::PvcListing {
+        generation: app.generation,
+        run: app.pvc.run,
+        path: "/srv/logs".into(),
+        result: Err("not a directory, or permission denied".into()),
+    });
+    // The entries on screen still belong to /srv, so the title must too.
+    assert_eq!(app.pvc.remote_path, "/srv");
+    assert_eq!(app.pvc.remote.len(), 1);
+    assert!(app.flash.contains("permission denied"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn a_block_volume_is_refused_before_anything_is_created() {
+    let (mut app, _rx) = test_app();
+    app.cluster
+        .register_kind("", "PersistentVolumeClaim", "persistentvolumeclaims", true);
+    app.switch_kind("persistentvolumeclaims");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+               "metadata": {"name": "raw", "namespace": "default"},
+               "spec": {"volumeMode": "Block"},
+               "status": {"phase": "Bound"}}),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash.contains("block volume"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn a_resolve_landing_after_the_user_moved_on_does_not_hijack_the_screen() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    // The resolve is slow; meanwhile the user opens the YAML view.
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    assert_eq!(app.mode, Mode::Detail);
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert_eq!(app.mode, Mode::Detail);
+    assert!(!app.pvc.active);
+}
+
+#[tokio::test]
+async fn a_superseded_resolve_never_opens_the_browser() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    let claim = current_claim(&app);
+    let stale = app.pvc.run;
+    app.handle_key(press(KeyCode::Char('x'))).unwrap(); // supersedes it
+    app.handle_msg(Msg::PvcTarget {
+        generation: app.generation,
+        run: stale,
+        namespace: "default".into(),
+        context: app.cluster.context.clone(),
+        claim,
+        result: Ok(Some(pvc_mount())),
+    });
+    assert!(!app.pvc.active);
+    assert!(app.pvc.mount.is_none());
+}
+
+#[tokio::test]
+async fn downloading_over_an_existing_local_file_asks_first() {
+    use crate::pvcexplore::EntryKind;
+    let dir = std::env::temp_dir().join(format!("sofka-pvc-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), b"old").unwrap();
+
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.pvc.local_path = dir.clone();
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("a.txt", EntryKind::File, 12)],
+    );
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+    assert!(
+        app.confirm_label.contains("Overwrite"),
+        "{}",
+        app.confirm_label
+    );
+    // Declining returns to the browser, not to the table underneath it.
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    assert_eq!(app.mode, Mode::PvcExplore);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn escaping_a_pvc_shell_dialog_with_the_palette_releases_its_pod() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["shell".into()],
+        confirmation: Some("confirm".into()),
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    resolve_pvc(
+        &mut app,
+        Ok(Some(crate::pvcexplore::Mount {
+            pod: "sofka-pvc-explore-xyz".into(),
+            container: "explore".into(),
+            path: "/pvc".into(),
+            read_only: false,
+            helper: true,
+        })),
+    );
+    assert_eq!(app.mode, Mode::Confirm);
+    // `:` is accepted from a confirm dialog and simply abandons the action —
+    // nothing else will ever run the suspend the pod was created for.
+    let journal_before = app.journal.len();
+    palette(&mut app, "pods");
+    assert!(!app.pvc.shell_pending);
+    assert!(app.pvc.mount.is_none());
+    assert!(app.pending.is_none());
+    assert_eq!(
+        app.journal.len(),
+        journal_before + 1,
+        "the abandoned helper pod was not deleted"
+    );
+}
+
+#[tokio::test]
+async fn a_background_message_that_takes_the_screen_leaves_the_browser() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert!(app.pvc.active);
+
+    // A describe requested before the browser opened finally lands. It takes
+    // the screen without a keystroke, so the key-path sweep never sees it.
+    let claim = app.claim_status("describing…");
+    app.handle_msg(Msg::Detail {
+        generation: app.generation,
+        claim,
+        title: "data — describe".into(),
+        lines: vec!["Name: data".into()],
+        warn: None,
+    });
+    assert_eq!(app.mode, Mode::Detail);
+    assert!(
+        !app.pvc.active,
+        "the browser was left drawing behind a document"
+    );
+}
+
+#[tokio::test]
+async fn only_the_browsers_own_dialog_draws_over_its_panes() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    // A dialog raised from somewhere else must not be drawn as though it were
+    // about the two panes.
+    app.confirm_return = Mode::Table;
+    assert!(!app.over_pvc_browser());
+    app.confirm_return = Mode::PvcExplore;
+    assert!(app.over_pvc_browser());
+}
+
+#[tokio::test]
+async fn pvc_explore_is_reachable_from_the_palette() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    palette(&mut app, "pvc-explore");
+    assert!(app.flash.contains("finding a pod"), "{}", app.flash);
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert_eq!(app.mode, Mode::PvcExplore);
+}
+
+#[tokio::test]
+async fn a_denied_shell_never_creates_a_helper_pod_to_be_refused_in() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["shell".into()],
+        deny: true,
+        reason: Some("prod is locked".into()),
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    // Nothing mounts the claim, so this would normally offer a helper pod —
+    // one that exists only to host a shell the guardrail is going to refuse.
+    resolve_pvc(&mut app, Ok(None));
+    assert_ne!(app.mode, Mode::Confirm, "offered a pod for a denied shell");
+    assert!(app.flash.contains("blocked by guardrail"), "{}", app.flash);
+    assert!(
+        app.journal.is_empty(),
+        "created something for a denied shell"
+    );
+}
+
+#[tokio::test]
+async fn browsing_still_offers_a_helper_pod_when_only_shells_are_denied() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["shell".into()],
+        deny: true,
+        ..Default::default()
+    }];
+    // Browsing is not shelling: the lookahead must not over-reach.
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(None));
+    assert_eq!(app.mode, Mode::Confirm);
+    assert!(
+        app.confirm_label.contains("Nothing mounts data"),
+        "{}",
+        app.confirm_label
+    );
+}
+
+#[tokio::test]
+async fn confirming_an_overwrite_downloads_rather_than_uploading() {
+    use crate::pvcexplore::EntryKind;
+    let dir = std::env::temp_dir().join(format!("sofka-pvc-dl-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), b"old").unwrap();
+
+    let (mut app, _rx) = app_with_pvc("Bound");
+    // Read-only mode must not change the answer: a download writes to the
+    // user's own disk, never to the cluster.
+    app.readonly = true;
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.pvc.local_path = dir.clone();
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("a.txt", EntryKind::File, 12)],
+    );
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+
+    // Accepting it must run the copy in the direction that was asked for.
+    // `ConfirmAction::Transfer` used to be upload-only, so confirming a
+    // download here wrote the local file *into the cluster* — past read-only
+    // mode and both upload guardrails.
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    let dest = dir.join("a.txt");
+    assert!(
+        app.flash
+            .contains(&format!("api-0:/srv/a.txt → {}", dest.display())),
+        "{}",
+        app.flash
+    );
+    assert!(!app.journal.lines().join("\n").contains("cp upload"));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn names_kubectl_cp_cannot_address_are_refused_with_a_reason() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+
+    // `kubectl cp` splits each argument on the first ':' to separate pod from
+    // path, so an ISO-8601 timestamped log — which is what volumes are full of
+    // — cannot be addressed however it is quoted.
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("2026-01-01T00:00:00Z.log", EntryKind::File, 12)],
+    );
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert_ne!(app.mode, Mode::Confirm);
+    assert!(
+        app.flash.contains("kubectl cp cannot address"),
+        "{}",
+        app.flash
+    );
+
+    // A name that lost bytes to lossy UTF-8 decoding names nothing at all.
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("caf\u{FFFD}.txt", EntryKind::File, 12)],
+    );
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert!(app.flash.contains("not valid UTF-8"), "{}", app.flash);
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(app.flash.contains("not valid UTF-8"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn a_failed_listing_never_mislabels_the_entries_on_screen() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![
+            pvc_entry("a", EntryKind::Dir, 0),
+            pvc_entry("b", EntryKind::Dir, 0),
+        ],
+    );
+    // Two descents in flight: the first never lands, the second fails. The
+    // title must return to the directory whose entries are actually shown,
+    // not to the one the first descent was heading for.
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    app.pvc.remote_state.select(Some(1));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    app.handle_msg(Msg::PvcListing {
+        generation: app.generation,
+        run: app.pvc.run,
+        path: "/srv/b".into(),
+        result: Err("not a directory, or permission denied".into()),
+    });
+    assert_eq!(app.pvc.remote_path, "/srv");
+    assert_eq!(app.pvc.remote.len(), 2);
+}
+
+#[tokio::test]
+async fn a_transfer_guardrail_on_pods_still_covers_a_pvc_upload() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    // The rule an operator already wrote to stop `t` uploads into prod pods.
+    // Reaching the same pod through a claim it mounts must not defeat it.
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["transfer".into()],
+        resources: vec!["pods".into()],
+        deny: true,
+        reason: Some("no uploads into prod".into()),
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.pvc.local = vec![pvc_entry("notes.txt", EntryKind::File, 3)];
+    app.pvc.local_state.select(Some(0));
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert!(app.flash.contains("no uploads into prod"), "{}", app.flash);
+    assert!(app.status_claim.is_none(), "the copy started anyway");
+}
+
+#[tokio::test]
+async fn refreshing_keeps_the_cursor_where_it_was() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    let entries = || {
+        vec![
+            pvc_entry("a.txt", EntryKind::File, 1),
+            pvc_entry("b.txt", EntryKind::File, 2),
+            pvc_entry("c.txt", EntryKind::File, 3),
+        ]
+    };
+    list_pvc(&mut app, "/srv", entries());
+    app.pvc.remote_state.select(Some(2));
+
+    // `r` — and the reload after every completed copy — must not send the
+    // cursor back to the top; in a real directory that means re-finding your
+    // place after every single file.
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    list_pvc(&mut app, "/srv", entries());
+    assert_eq!(app.pvc.remote_state.selected(), Some(2));
+    assert_eq!(
+        app.pvc.selected_remote().map(|e| e.name.as_str()),
+        Some("c.txt")
+    );
+
+    // An entry that has gone away falls back to the top rather than to a
+    // stale index.
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("a.txt", EntryKind::File, 1)],
+    );
+    assert_eq!(app.pvc.remote_state.selected(), Some(0));
+
+    // Stepping into a *new* directory starts at the top, even though the
+    // entry it lands on has the same name as the one the cursor was on.
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![
+            pvc_entry("logs", EntryKind::Dir, 0),
+            pvc_entry("a.txt", EntryKind::File, 1),
+        ],
+    );
+    app.pvc.remote_state.select(Some(0));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.pvc.remote_path, "/srv/logs", "did not descend");
+    list_pvc(
+        &mut app,
+        "/srv/logs",
+        vec![
+            pvc_entry("x.log", EntryKind::File, 1),
+            pvc_entry("logs", EntryKind::File, 1),
+        ],
+    );
+    // Row 0, not the row named "logs": a new directory starts at the top even
+    // when the name the cursor was on happens to exist there too.
+    assert_eq!(app.pvc.remote_state.selected(), Some(0));
+    assert_eq!(
+        app.pvc.selected_remote().map(|e| e.name.as_str()),
+        Some("x.log")
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn a_failed_local_navigation_keeps_both_the_path_and_the_cursor() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("sofka-local-nav-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("locked")).unwrap();
+    std::fs::write(dir.join("a.txt"), b"x").unwrap();
+
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.pvc.local_path = dir.clone();
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    // Put the cursor on a directory that is about to become unreadable.
+    let idx = app
+        .pvc
+        .local
+        .iter()
+        .position(|e| e.name == "locked")
+        .expect("the directory is listed");
+    app.pvc.local_state.select(Some(idx));
+    // Still there, just not readable — so the rollback listing does contain
+    // the row the cursor was on.
+    std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(dir.join("locked")).is_ok() {
+        // Running as root (a devcontainer, a root CI image): the directory is
+        // readable anyway, so there is no failed navigation to assert on.
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o755)).ok();
+        std::fs::remove_dir_all(&dir).ok();
+        return;
+    }
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    // Back where it started, cursor included — the rollback re-read would
+    // otherwise land on row 0.
+    assert_eq!(app.pvc.local_path, dir);
+    assert_eq!(
+        app.pvc.selected_local().map(|e| e.name.as_str()),
+        Some("locked"),
+        "the rollback lost the cursor"
+    );
+
+    std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o755)).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn a_failed_first_listing_leaves_the_title_on_the_mount_root() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    // Nothing has ever listed successfully. Restoring "the previously shown
+    // directory" would blank the path — and `cd -- ""` succeeds in every
+    // shell, so `r` would then list the container's working directory under
+    // an empty title.
+    app.handle_msg(Msg::PvcListing {
+        generation: app.generation,
+        run: app.pvc.run,
+        path: "/srv".into(),
+        result: Err("permission denied".into()),
+    });
+    assert_eq!(app.pvc.remote_path, "/srv");
+    assert!(!app.pvc.loading);
+}
+
+#[tokio::test]
+async fn a_watch_restart_does_not_leave_the_pane_loading_forever() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert!(app.pvc.loading);
+    let stale = app.generation;
+    app.bump_generation();
+    app.handle_msg(Msg::PvcListing {
+        generation: stale,
+        run: app.pvc.run,
+        path: "/srv".into(),
+        result: Ok((listing(vec![]), None)),
+    });
+    assert!(!app.pvc.loading, "the pane would say loading… until `r`");
+}
+
+#[tokio::test]
+async fn a_resolve_landing_over_a_dialog_does_not_discard_the_decision() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    // A confirmation the user has not answered yet.
+    app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    assert_eq!(
+        app.mode,
+        Mode::Confirm,
+        "the browser took over a live dialog"
+    );
+    assert!(app.confirm_action.is_some());
+    assert!(!app.pvc.active);
+}
+
+#[tokio::test]
+async fn an_unreadable_volume_root_says_so_instead_of_reading_empty() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.handle_msg(Msg::PvcListing {
+        generation: app.generation,
+        run: app.pvc.run,
+        path: "/srv".into(),
+        result: Err("ls: cannot open directory '.': Permission denied".into()),
+    });
+    // The flash expires after eight seconds; the pane is what the user is
+    // still looking at after that, and "empty" is the one thing an unreadable
+    // volume must never claim.
+    assert_eq!(
+        app.pvc.remote_error.as_deref(),
+        Some("ls: cannot open directory '.': Permission denied")
+    );
+    assert!(app.pvc.remote.is_empty());
+}
+
+#[tokio::test]
+async fn a_later_good_listing_clears_the_error() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.handle_msg(Msg::PvcListing {
+        generation: app.generation,
+        run: app.pvc.run,
+        path: "/srv".into(),
+        result: Err("permission denied".into()),
+    });
+    assert!(app.pvc.remote_error.is_some());
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("a.txt", EntryKind::File, 1)],
+    );
+    assert!(app.pvc.remote_error.is_none());
+}
+
+#[tokio::test]
+async fn stepping_out_of_a_directory_lands_back_on_it() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    let parent = || {
+        vec![
+            pvc_entry("archive", EntryKind::Dir, 0),
+            pvc_entry("logs", EntryKind::Dir, 0),
+            pvc_entry("uploads", EntryKind::Dir, 0),
+        ]
+    };
+    list_pvc(&mut app, "/srv", parent());
+    app.pvc.remote_state.select(Some(2)); // "uploads"
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    list_pvc(&mut app, "/srv/uploads", vec![]);
+
+    // `⌫` returns to the parent — and to the row you came out of, not row 0.
+    app.handle_key(press(KeyCode::Backspace)).unwrap();
+    list_pvc(&mut app, "/srv", parent());
+    assert_eq!(app.pvc.remote_path, "/srv");
+    assert_eq!(
+        app.pvc.selected_remote().map(|e| e.name.as_str()),
+        Some("uploads")
+    );
+}
+
+#[tokio::test]
+async fn an_action_taken_mid_listing_targets_the_directory_on_screen() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![
+            pvc_entry("logs", EntryKind::Dir, 0),
+            pvc_entry("a.txt", EntryKind::File, 12),
+        ],
+    );
+    // Step into `logs` and act before the listing lands. The pane still shows
+    // /srv, so /srv is what the action must use — targeting the directory
+    // being navigated to would copy from, and write into, a directory the
+    // user has never seen.
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(app.pvc.loading);
+    app.pvc.remote_state.select(Some(1)); // a.txt
+
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert!(app.flash.contains("api-0:/srv/a.txt"), "{}", app.flash);
+    assert!(!app.flash.contains("/srv/logs/"), "{}", app.flash);
+
+    // Same for a shell…
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    let Some(Suspend::Shell(argv)) = app.pending.take() else {
+        panic!("no shell queued");
+    };
+    assert_eq!(argv.last().unwrap(), "/srv");
+}
+
+#[tokio::test]
+async fn an_upload_mid_listing_writes_where_the_user_is_looking() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(&mut app, "/srv", vec![pvc_entry("logs", EntryKind::Dir, 0)]);
+    app.pvc.local = vec![pvc_entry("notes.txt", EntryKind::File, 3)];
+    app.pvc.local_state.select(Some(0));
+
+    app.handle_key(press(KeyCode::Enter)).unwrap(); // into logs, still loading
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    // With no guardrail this runs immediately, with no dialog naming the
+    // destination — so the destination had better be the visible one.
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert!(app.flash.contains("api-0:/srv/notes.txt"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn a_failed_step_out_does_not_steer_the_next_listing() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    let parent = || {
+        vec![
+            pvc_entry("a.txt", EntryKind::File, 1),
+            pvc_entry("logs", EntryKind::Dir, 0),
+        ]
+    };
+    list_pvc(&mut app, "/srv", parent());
+    app.pvc.remote_state.select(Some(1));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    list_pvc(
+        &mut app,
+        "/srv/logs",
+        vec![pvc_entry("x.log", EntryKind::File, 1)],
+    );
+
+    // Step out — which asks the next listing to land on "logs" — and have that
+    // listing fail. The request is over, so its hint must die with it.
+    app.handle_key(press(KeyCode::Backspace)).unwrap();
+    app.handle_msg(Msg::PvcListing {
+        generation: app.generation,
+        run: app.pvc.run,
+        path: "/srv".into(),
+        result: Err("permission denied".into()),
+    });
+    // Now an ordinary refresh of the directory we never left.
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    list_pvc(
+        &mut app,
+        "/srv/logs",
+        vec![pvc_entry("x.log", EntryKind::File, 1)],
+    );
+    assert_eq!(app.pvc.remote_path, "/srv/logs");
+    assert_eq!(
+        app.pvc.selected_remote().map(|e| e.name.as_str()),
+        Some("x.log"),
+        "a stale step-out hint steered an unrelated listing"
+    );
+    // …and a failed step-out must not label the directory on screen unreadable.
+    assert!(app.pvc.remote_error.is_none());
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn the_local_pane_steps_out_onto_the_directory_it_left() {
+    let dir = std::env::temp_dir().join(format!("sofka-local-up-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("work")).unwrap();
+    std::fs::create_dir_all(dir.join("zzz")).unwrap();
+    // A name shared by parent and child: reselecting "the child's cursor" in
+    // the parent would land here instead of on "work".
+    std::fs::write(dir.join("notes.md"), b"x").unwrap();
+    std::fs::write(dir.join("work/notes.md"), b"x").unwrap();
+
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.pvc.local_path = dir.join("work");
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert_eq!(
+        app.pvc.selected_local().map(|e| e.name.as_str()),
+        Some("notes.md")
+    );
+
+    app.handle_key(press(KeyCode::Backspace)).unwrap();
+    assert_eq!(app.pvc.local_path, dir);
+    assert_eq!(
+        app.pvc.selected_local().map(|e| e.name.as_str()),
+        Some("work"),
+        "stepping out must land on the directory left, not on a name coincidence"
+    );
+
+    // And stepping back in starts at the top, not on a name coincidence.
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.pvc.local_path, dir.join("work"));
+    assert_eq!(app.pvc.local_state.selected(), Some(0));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn a_failed_local_navigation_says_why() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("sofka-local-why-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("locked")).unwrap();
+
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.pvc.local_path = dir.clone();
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(dir.join("locked")).is_ok() {
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o755)).ok();
+        std::fs::remove_dir_all(&dir).ok();
+        return; // running as root: nothing fails, nothing to report
+    }
+
+    // The rollback re-read succeeds and clears the error, so without carrying
+    // the reason across it the keystroke is a silent no-op — while the remote
+    // pane flashes on the identical failure.
+    app.flash.clear();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(
+        app.flash.contains("locked"),
+        "silent no-op: {:?}",
+        app.flash
+    );
+    assert!(app.flash_err);
+    assert_eq!(app.pvc.local_path, dir);
+
+    std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o755)).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn a_failed_step_out_on_the_local_pane_says_why_too() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("sofka-local-up-why-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("child")).unwrap();
+
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.pvc.local_path = dir.join("child");
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    // Traversable but not readable: `⌫` into it fails where `cd` would not.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o111)).unwrap();
+    if std::fs::read_dir(&dir).is_ok() {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).ok();
+        std::fs::remove_dir_all(&dir).ok();
+        return; // running as root
+    }
+
+    app.flash.clear();
+    app.handle_key(press(KeyCode::Backspace)).unwrap();
+    assert!(app.flash_err, "stepping out failed silently");
+    assert!(!app.flash.is_empty(), "stepping out failed silently");
+    assert_eq!(app.pvc.local_path, dir.join("child"));
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 async fn drain_api_case(
     pods: serde_json::Value,
     eviction_code: u16,

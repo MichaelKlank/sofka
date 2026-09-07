@@ -10,7 +10,7 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, DEFAULT_SORT_LABEL, Mode, SuggestKind, TRANSFER_MENU_ITEMS};
+use crate::app::{App, DEFAULT_SORT_LABEL, Mode, Pane, SuggestKind, TRANSFER_MENU_ITEMS};
 use crate::{columns, theme};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -152,6 +152,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::PortForwards => draw_port_forwards(frame, app, chunks[1]),
         Mode::Fleet => draw_fleet(frame, app, chunks[1]),
         Mode::Find => draw_find(frame, app, chunks[1]),
+        Mode::PvcExplore => draw_pvc_explore(frame, app, chunks[1]),
+        // A transfer confirmation or a guardrail prompt raised from the PVC
+        // browser keeps the two panes underneath it, so you can still see what
+        // is being copied where. Only that dialog: drawing an unrelated one
+        // over the panes would suggest it was about them.
+        Mode::Confirm | Mode::Prompt if app.over_pvc_browser() => {
+            draw_pvc_explore(frame, app, chunks[1])
+        }
         // While the palette is open, keep drawing the view it was opened
         // from, so a global `:` never flashes the table underneath it.
         Mode::Command => match app.palette_return {
@@ -168,6 +176,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Mode::PortForwards => draw_port_forwards(frame, app, chunks[1]),
             Mode::Fleet => draw_fleet(frame, app, chunks[1]),
             Mode::Find => draw_find(frame, app, chunks[1]),
+            Mode::PvcExplore => draw_pvc_explore(frame, app, chunks[1]),
             Mode::Containers => {
                 draw_table(frame, app, chunks[1]);
                 draw_containers(frame, app, chunks[1]);
@@ -511,6 +520,11 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
         "secrets" => vec![
             hint_line(&[("x", "decode"), ("y", "yaml"), ("d", "describe")]),
             hint_line(&[("e", "edit"), ("E", "events"), ("c", "copy name")]),
+            hint_line(&[("^d", "delete")]),
+        ],
+        "persistentvolumeclaims" => vec![
+            hint_line(&[("x", "browse"), ("s", "shell"), ("d", "describe")]),
+            hint_line(&[("y", "yaml"), ("E", "events"), ("c", "copy name")]),
             hint_line(&[("^d", "delete")]),
         ],
         _ => vec![
@@ -2181,7 +2195,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         ),
         bind(
             "x",
-            "secrets: show data base64-decoded (also inside YAML/describe)",
+            "secrets: show data base64-decoded (also inside YAML/describe) · PVCs: browse the volume",
         ),
         bind(
             "shift-x · :explain",
@@ -2206,7 +2220,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("  Act", theme::title())),
         bind("e", "edit in $EDITOR (kubectl edit)"),
-        bind("s", "shell into pod / scale workload"),
+        bind("s", "shell into pod / PVC volume · scale workload"),
         bind("a", "attach to pod"),
         bind(
             ":debug",
@@ -2242,6 +2256,28 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         bind(
             "ctrl-d · ctrl-k",
             "delete · force-delete (in confirm: f force, c cascade)",
+        ),
+        Line::from(""),
+        Line::from(Span::styled("  PVC explore (x on a PVC)", theme::title())),
+        bind(
+            "x · s · :pvc-explore",
+            "browse the volume (local left, PVC right; also :pvc-browse) · shell into it at the mount point",
+        ),
+        bind(
+            "tab · ←/→",
+            "switch pane · j/k g/G move · ⏎ open directory · ⌫ or - go up (stops at the mount)",
+        ),
+        bind(
+            "esc · q",
+            "close the browser (and delete the helper pod, if any)",
+        ),
+        bind(
+            "c · r",
+            "copy the selection into the other pane (download or upload) · refresh both",
+        ),
+        bind(
+            ":pvc-clean",
+            "delete helper pods left behind by a session that exited uncleanly (:pvc-cleanup)",
         ),
         Line::from(""),
         Line::from(Span::styled("  Logs view", theme::title())),
@@ -3320,6 +3356,193 @@ fn draw_gitops(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+/// The PVC browser: local files on the left, the volume on the right, one
+/// cursor per pane and a copy that always runs from the focused pane into the
+/// other one.
+fn draw_pvc_explore(frame: &mut Frame, app: &mut App, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    let local_title = format!(" local · {} ", app.pvc.local_path.display());
+    let mut remote_title = format!(" {} · {} ", app.pvc.claim, app.pvc.remote_path);
+    if let Some(mount) = &app.pvc.mount {
+        if mount.helper {
+            remote_title.push_str("· helper pod ");
+        } else {
+            remote_title.push_str(&format!("· via {} ", mount.pod));
+        }
+        if mount.read_only {
+            remote_title.push_str("· read-only ");
+        }
+    }
+    if app.pvc.loading {
+        remote_title.push_str("· loading… ");
+    }
+
+    let local_items = pvc_pane_items(
+        &app.pvc.local,
+        app.pvc.local_error.as_deref(),
+        cols[0].width,
+        app.pvc.local_truncated,
+    );
+    let remote_items = pvc_pane_items(
+        &app.pvc.remote,
+        app.pvc.remote_error.as_deref(),
+        cols[1].width,
+        app.pvc.truncated,
+    );
+    let focus = app.pvc.focus;
+
+    render_pvc_pane(
+        frame,
+        cols[0],
+        local_items,
+        local_title,
+        &mut app.pvc.local_state,
+        focus == Pane::Local,
+    );
+    render_pvc_pane(
+        frame,
+        cols[1],
+        remote_items,
+        remote_title,
+        &mut app.pvc.remote_state,
+        focus == Pane::Remote,
+    );
+}
+
+fn render_pvc_pane(
+    frame: &mut Frame,
+    area: Rect,
+    items: Vec<ListItem<'static>>,
+    title: String,
+    state: &mut ListState,
+    focused: bool,
+) {
+    let (border, title_style) = if focused {
+        (theme::border_focused(), theme::title())
+    } else {
+        (theme::border(), theme::dim())
+    };
+    let list = List::new(items)
+        .highlight_style(if focused {
+            theme::selected_row()
+        } else {
+            // The unfocused pane keeps its cursor visible but quiet, so you
+            // can see where a copy would land without it competing for
+            // attention with the pane you are driving.
+            Style::default().add_modifier(Modifier::REVERSED)
+        })
+        .highlight_symbol("▌ ")
+        .highlight_spacing(HighlightSpacing::Always)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(border)
+                .title(Span::styled(title, title_style)),
+        );
+    frame.render_stateful_widget(list, area, state);
+}
+
+/// One pane's rows. Sizes are right-aligned against the pane width so both
+/// sides line up as a pair of columns rather than two ragged lists.
+fn pvc_pane_items(
+    entries: &[crate::pvcexplore::Entry],
+    error: Option<&str>,
+    width: u16,
+    truncated: bool,
+) -> Vec<ListItem<'static>> {
+    use crate::pvcexplore::EntryKind;
+
+    if let Some(e) = error {
+        return vec![ListItem::new(Line::from(Span::styled(
+            e.to_string(),
+            Style::default().fg(theme::red()),
+        )))];
+    }
+    if entries.is_empty() {
+        return vec![ListItem::new(Line::from(Span::styled(
+            "empty".to_string(),
+            theme::dim(),
+        )))];
+    }
+    // 2 borders + the 2-cell highlight symbol.
+    let inner = usize::from(width).saturating_sub(4);
+    let size_width = 8usize;
+    let name_width = inner.saturating_sub(size_width + 1).max(4);
+
+    let mut items: Vec<ListItem<'static>> = entries
+        .iter()
+        .map(|e| {
+            let (label, color) = match e.kind {
+                EntryKind::Dir => (format!("{}/", e.name), theme::sapphire()),
+                EntryKind::Link if !e.link_target.is_empty() => {
+                    (format!("{} → {}", e.name, e.link_target), theme::teal())
+                }
+                EntryKind::Link => (e.name.clone(), theme::teal()),
+                EntryKind::File => (e.name.clone(), theme::text()),
+            };
+            // Padded by terminal columns, not characters: a CJK filename is
+            // twice as wide as it is long, and `{:<n}` would push the size
+            // column through the pane border.
+            let label = clip_to_width(&label, name_width);
+            let pad = name_width.saturating_sub(label.width());
+            let size = match (e.kind, e.size) {
+                (EntryKind::Dir, _) => String::new(),
+                (_, Some(bytes)) => crate::pvcexplore::human_size(bytes),
+                // Nothing could stat it — not the same as an empty file.
+                (_, None) => "?".to_string(),
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{label}{:pad$}", "", pad = pad),
+                    Style::default().fg(color),
+                ),
+                Span::styled(format!(" {size:>size_width$}"), theme::dim()),
+            ]))
+        })
+        .collect();
+    if truncated {
+        // Not "N more": both panes stop at the cap without counting past it —
+        // the volume side because `head` closes the pipe inside the container.
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!(
+                "… showing the first {} entries",
+                crate::pvcexplore::MAX_ENTRIES
+            ),
+            Style::default().fg(theme::peach()),
+        ))));
+    }
+    items
+}
+
+/// Truncate to `max` terminal columns, ending with an ellipsis when cut.
+/// [`crate::text::ellipsize`] counts characters, which is the wrong unit for
+/// arbitrary file names off a volume.
+fn clip_to_width(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > max.saturating_sub(1) {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
 /// Session-local timeline: the state changes observed for one object while
 /// sofka has been watching, oldest first.
 fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -3606,6 +3829,10 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
             "  j/k: move   ⏎: open the object   esc: close",
             theme::dim(),
         )),
+        Mode::PvcExplore => Line::from(Span::styled(
+            "  tab/←→: pane   j/k: move   ⏎: open   ⌫/-: up   c: copy to other pane   s: shell   r: refresh   esc: back",
+            theme::dim(),
+        )),
         _ => {
             // Per-resource verbs live in the header hint column when it
             // fits; only repeat the full line when the header dropped it.
@@ -3638,6 +3865,9 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
 fn sync_indicator(mode: Mode, doc_filter_return: Mode, synced: bool) -> (&'static str, Color) {
     let static_doc = match mode {
         Mode::Detail | Mode::Diff => true,
+        // A directory listing is fetched once by exec, not watched — `r`
+        // re-reads it. Calling it live would be a lie.
+        Mode::PvcExplore => true,
         // `/` search over one of those documents — same underlying snapshot.
         Mode::DocFilter => matches!(doc_filter_return, Mode::Detail | Mode::Diff),
         _ => false,
@@ -3779,6 +4009,26 @@ fn centered_rect_with_min(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The PVC browser pads file names into a fixed column. A CJK name is
+    /// twice as wide as it is long, so counting characters would push the size
+    /// column through the pane border.
+    #[test]
+    fn clip_to_width_measures_terminal_columns() {
+        assert_eq!(clip_to_width("abc", 5), "abc");
+        assert_eq!(clip_to_width("abcdef", 4), "abc…");
+        // Six characters, twelve columns wide.
+        assert_eq!("日本語ファイル".width(), 14);
+        let clipped = clip_to_width("日本語ファイル", 8);
+        assert!(
+            clipped.width() <= 8,
+            "{clipped:?} is {} wide",
+            clipped.width()
+        );
+        assert!(clipped.ends_with('…'));
+        // No room even for the ellipsis.
+        assert_eq!(clip_to_width("abc", 0), "");
+    }
 
     /// A describe/YAML/diff document is a snapshot — the status bar must not
     /// claim it's live (#175 follow-up report from Discord).

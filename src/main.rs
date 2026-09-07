@@ -278,6 +278,7 @@ async fn run_main(args: Args) -> Result<()> {
     app.guardrails = cfg.guardrails.clone();
     app.debug = cfg.debug.clone();
     app.bundle_cfg = cfg.bundle.clone();
+    app.pvc_cfg = cfg.pvc_explore.clone();
     app.logs_cfg = cfg.logs.clone();
     // Seed the session toggle once; later `F` presses (and per-context config
     // reloads) don't fight the user's in-session choice.
@@ -292,6 +293,7 @@ async fn run_main(args: Args) -> Result<()> {
         .chain(config::guardrail_warnings(&app.guardrails))
         .chain(config::forward_warnings(&app.forwards_cfg))
         .chain(config::notify_warnings(&app.notify_cfg))
+        .chain(config::pvc_explore_warnings(&app.pvc_cfg))
     {
         eprintln!("warning: {w}");
         config_warnings.push(w);
@@ -381,6 +383,9 @@ async fn run_main(args: Args) -> Result<()> {
     }
     install_panic_hook(panic_tx);
     let result = run(&mut terminal, &mut app, &mut rx, mouse).await;
+    // Still inside the runtime, so this actually completes — a spawned delete
+    // would not, and the helper pod would sit out its TTL holding the volume.
+    app.shutdown_pvc_helper().await;
     // Disable before leaving the alternate screen so the shell never sees
     // mouse-report sequences (harmless if capture was never enabled).
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
@@ -651,14 +656,24 @@ fn dispatch(
     }
     for key in keys {
         app.handle_key(key)?;
-        if let Some(app::Suspend::Shell(argv)) = app.pending.take() {
-            suspend_and_run(terminal, &argv, captured);
-            app.flash = format!("ran: {}", argv.join(" "));
-            app.flash_err = false;
-        }
+        take_suspend(terminal, app, captured);
     }
     terminal.draw(|f| ui::draw(f, app))?;
     Ok(true)
+}
+
+/// Run whatever interactive command the app just queued, if any. Called after
+/// every path that can queue one — a keystroke, a mouse click, and a background
+/// message (the PVC browser resolves which pod to exec into asynchronously, so
+/// its shell is requested from a message, not from the keystroke that asked
+/// for it).
+fn take_suspend(terminal: &mut ratatui::DefaultTerminal, app: &mut App, captured: bool) {
+    if let Some(app::Suspend::Shell(argv)) = app.pending.take() {
+        suspend_and_run(terminal, &argv, captured);
+        app.flash = format!("ran: {}", argv.join(" "));
+        app.flash_err = false;
+        app.after_suspend();
+    }
 }
 
 async fn run(
@@ -726,11 +741,7 @@ async fn run(
                     }
                     Some(Ok(Event::Mouse(m))) => {
                         app.handle_mouse(m)?;
-                        if let Some(app::Suspend::Shell(argv)) = app.pending.take() {
-                            suspend_and_run(terminal, &argv, captured);
-                            app.flash = format!("ran: {}", argv.join(" "));
-                            app.flash_err = false;
-                        }
+                        take_suspend(terminal, app, captured);
                         dirty = true;
                     }
                     Some(Err(_)) | None => return Ok(()),
@@ -749,6 +760,7 @@ async fn run(
                     app.run_notify_command(&text);
                     ring_notification(&text, &app.notify_cfg);
                 }
+                take_suspend(terminal, app, captured);
                 dirty = true;
             }
             _ = frame.tick(), if dirty => {

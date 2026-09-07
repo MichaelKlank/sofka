@@ -792,7 +792,28 @@ impl App {
         }
     }
 
+    /// Fold one background message into the app, then tidy up after any view
+    /// it displaced. The key path has the same sweep in `handle_key`; a
+    /// message that opens a document view (a finished describe, a plugin
+    /// report, a bundle) can displace the PVC browser without a keystroke
+    /// being involved at all.
     pub fn handle_msg(&mut self, msg: Msg) {
+        self.handle_msg_inner(msg);
+        let overlay = matches!(
+            self.mode,
+            Mode::PvcExplore
+                | Mode::Command
+                | Mode::Help
+                | Mode::Filter
+                | Mode::Confirm
+                | Mode::Prompt
+        );
+        if self.pvc.active && !overlay {
+            self.leave_pvc_explore();
+        }
+    }
+
+    fn handle_msg_inner(&mut self, msg: Msg) {
         let preserve_selection = self.faults_filter_active()
             && matches!(
                 &msg,
@@ -1205,9 +1226,72 @@ impl App {
                 claim,
                 result,
             } if generation == self.generation => match result {
-                Ok(summary) => self.set_claimed_status(claim, summary, false),
+                Ok(summary) => {
+                    self.set_claimed_status(claim, summary, false);
+                    // A copy made in the PVC browser changed one of the two
+                    // panes; show the file where it landed.
+                    self.refresh_pvc_panes();
+                }
                 Err(e) => self.set_claimed_status(claim, format!("cp failed: {e}"), true),
             },
+            // Deliberately not generation-guarded: a helper pod may already
+            // exist by the time this lands, and the stale branch is the only
+            // thing that can clean it up.
+            Msg::PvcTarget {
+                generation,
+                run,
+                namespace,
+                context,
+                claim,
+                result,
+            } => {
+                if generation == self.generation {
+                    self.handle_pvc_target(run, namespace, claim, result);
+                } else {
+                    self.discard_pvc_target(namespace, context, result);
+                }
+            }
+            Msg::PvcListing {
+                generation,
+                run,
+                path,
+                result,
+            } => {
+                if generation == self.generation {
+                    self.handle_pvc_listing(run, path, result);
+                } else if run == self.pvc.run {
+                    // A watch restart under an in-flight listing. The result
+                    // belongs to a generation that is over, but the pane is
+                    // still waiting on it — without this it says "loading…"
+                    // until the user presses `r`.
+                    self.pvc.loading = false;
+                }
+            }
+            Msg::PvcHelpersCleaned {
+                generation,
+                claim,
+                deleted,
+                failed,
+            } if generation == self.generation => {
+                if failed.is_empty() {
+                    self.set_claimed_status(
+                        claim,
+                        format!("removed {deleted} PVC helper pod(s)"),
+                        false,
+                    );
+                } else {
+                    let shown: Vec<&str> = failed.iter().take(3).map(String::as_str).collect();
+                    self.set_claimed_status(
+                        claim,
+                        format!(
+                            "pvc-clean: removed {deleted}, {} failed — {}",
+                            failed.len(),
+                            shown.join("; ")
+                        ),
+                        true,
+                    );
+                }
+            }
             Msg::LogsSaved {
                 generation,
                 claim,

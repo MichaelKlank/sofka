@@ -10,6 +10,11 @@ use kube::core::DynamicObject;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StatusClaim(pub(crate) u64);
 
+/// One remote directory read, or why there isn't one. Named because the
+/// tuple inside the `Result` would otherwise need a type-complexity waiver
+/// every time it is written out.
+pub type PvcListingResult = Result<(crate::pvcexplore::Listing, Option<String>), String>;
+
 /// Messages flowing from watch tasks to the UI loop. Tagged with a
 /// `generation` so messages from a superseded watch can be discarded.
 pub enum Msg {
@@ -189,6 +194,39 @@ pub enum Msg {
         claim: StatusClaim,
         deleted: usize,
         failed: Vec<String>,
+    },
+    /// Result of a `:pvc-clean` sweep for leftover PVC-explore helper pods.
+    PvcHelpersCleaned {
+        generation: u64,
+        claim: StatusClaim,
+        deleted: usize,
+        failed: Vec<String>,
+    },
+    /// The pod a PVC can be browsed through, resolved off-thread. `Ok(None)`
+    /// means nothing running mounts the claim — the cue to offer a helper pod.
+    PvcTarget {
+        generation: u64,
+        /// Matched against the browser's own counter so a resolve for a claim
+        /// the user has already navigated away from is dropped.
+        run: u64,
+        /// Namespace the resolve ran in, so a helper pod that arrives after
+        /// the browser moved on can still be deleted rather than leaked.
+        namespace: String,
+        /// Context it ran against. A `:ctx` switch bumps the generation *and*
+        /// swaps the client, so a late helper is only safe to delete when this
+        /// still names the cluster it was created in.
+        context: String,
+        claim: StatusClaim,
+        result: Result<Option<crate::pvcexplore::Mount>, String>,
+    },
+    /// One directory listing for the remote pane of the PVC browser.
+    PvcListing {
+        generation: u64,
+        run: u64,
+        path: String,
+        /// The listing, plus a warning when `ls` produced it but could not
+        /// stat every entry in it.
+        result: PvcListingResult,
     },
     /// An assembled diagnostic bundle (`:bundle`), ready to preview and save.
     Bundle {
