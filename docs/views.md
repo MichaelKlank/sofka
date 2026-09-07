@@ -152,7 +152,11 @@ columns therefore doesn't hide a `node` or `drill` set under a broader key.
 
 A custom resource with no explicit view picks up its CRD
 `additionalPrinterColumns` automatically (columns with `priority > 0` become
-wide-only). A condition lookup
+wide-only). Built-in columns match both the API group and resource name.
+For example, core Services keep their network columns, while
+`services.serving.knative.dev` uses the Knative CRD columns. Printer columns
+and cached resource rows stay separate for each API group and version.
+An explicit user view with columns still takes precedence. A condition lookup
 (`.status.conditions[?(@.type=="Ready")].status` - how most CRDs express their
 READY column) becomes a `condition` column, found by type name. The same filter
 selecting another field (`.reason`, `.message`, `.lastTransitionTime`, …) keeps

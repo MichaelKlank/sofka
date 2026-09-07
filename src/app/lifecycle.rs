@@ -280,6 +280,7 @@ impl App {
         let watch_labels = join_selectors(&self.labels, &self.applied_filter_labels);
         let watch_fields = join_selectors(&self.fields, &self.applied_filter_fields);
         let key = ViewKey {
+            resource: kind.resource_key(),
             kind_plural: self.kind_plural.clone(),
             namespace: self.namespace.clone(),
             labels: watch_labels.clone(),
@@ -314,10 +315,10 @@ impl App {
         );
         self.tasks.push(handle);
 
-        if matches!(self.kind_plural.as_str(), "pods" | "nodes") {
+        if self.metrics_columns() {
             self.spawn_metrics_poll();
         }
-        if self.kind_plural == "nodes" {
+        if self.node_capacity_columns() {
             self.spawn_node_pods_poll();
         }
 
@@ -382,15 +383,15 @@ impl App {
     /// For a custom resource with neither curated columns nor a user view,
     /// fetch its CRD off-thread and read `additionalPrinterColumns` for the
     /// watched version — a better automatic fallback than NAME/AGE. Results
-    /// (including "nothing usable") are cached per plural for the session.
+    /// (including "nothing usable") are cached per API resource for the session.
     fn maybe_fetch_printer_columns(&mut self, kind: &Kind) {
         let user_has_columns = self
             .active_user_view()
             .is_some_and(|v| !v.columns.is_empty());
-        if crate::columns::has_curated(&self.kind_plural)
+        if crate::columns::has_curated(&kind.ar.group, &self.kind_plural)
             || kind.ar.group.is_empty()
             || kind.ar.plural.to_lowercase() != self.kind_plural
-            || self.crd_views.contains_key(&self.kind_plural)
+            || self.crd_views.contains_key(&kind.resource_key())
             || user_has_columns
         {
             return;
@@ -401,7 +402,7 @@ impl App {
         let client = self.cluster.client.clone();
         let name = format!("{}.{}", self.kind_plural, kind.ar.group);
         let version = kind.ar.version.clone();
-        let plural = self.kind_plural.clone();
+        let resource = kind.resource_key();
         let tx = self.tx.clone();
         let genr = self.generation;
         let handle = tokio::spawn(async move {
@@ -414,7 +415,7 @@ impl App {
             let _ = tx
                 .send(Msg::PrinterColumns {
                     generation: genr,
-                    plural,
+                    resource,
                     view: Box::new(view),
                 })
                 .await;
@@ -961,11 +962,15 @@ impl App {
             }
             Msg::PrinterColumns {
                 generation,
-                plural,
+                resource,
                 view,
             } if generation == self.generation => {
-                let for_current = plural == self.kind_plural;
-                self.crd_views.insert(plural, *view);
+                let for_current = self
+                    .kind
+                    .as_ref()
+                    .is_some_and(|kind| kind.resource_key() == resource)
+                    && resource.resource == self.kind_plural;
+                self.crd_views.insert(resource, *view);
                 if for_current {
                     self.refresh_view_spec();
                     // A remembered sort on a printer column only becomes

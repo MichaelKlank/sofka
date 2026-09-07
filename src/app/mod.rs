@@ -20,7 +20,7 @@ use kube::Client;
 use kube::api::{
     Api, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams, PropagationPolicy,
 };
-use kube::core::{DynamicObject, TypeMeta};
+use kube::core::{DynamicObject, GroupVersionResource, TypeMeta};
 use kube::discovery::ApiResource;
 use kube::runtime::{utils::Backoff, watcher};
 use ratatui::widgets::{ListState, TableState};
@@ -1506,6 +1506,7 @@ const VIEW_CACHE_MAX_OBJECTS: usize = 10_000;
 /// filter terms).
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ViewKey {
+    resource: GroupVersionResource,
     kind_plural: String,
     namespace: String,
     labels: Option<String>,
@@ -1968,9 +1969,9 @@ pub struct App {
     /// Compiled warning/critical coloring thresholds from config, re-resolved
     /// on context switch and `:reload`.
     pub thresholds: crate::thresholds::Compiled,
-    /// CRD printer-column fallbacks fetched per plural for this cluster
+    /// CRD printer-column fallbacks fetched per API resource for this cluster
     /// (`None` = fetched, nothing usable). Cleared on context switch.
-    crd_views: HashMap<String, Option<crate::views::View>>,
+    crd_views: HashMap<GroupVersionResource, Option<crate::views::View>>,
     /// Wide mode (`w`): show wide-only columns.
     pub wide: bool,
     /// Compact mode (`ctrl-e`): collapse the header to one line and hide the
@@ -2188,7 +2189,7 @@ impl App {
             crd_views: HashMap::new(),
             wide: false,
             compact: false,
-            spec: crate::columns::build_spec("", None, None, false),
+            spec: crate::columns::build_spec("", "", None, None, false),
         }
     }
 

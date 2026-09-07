@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use kube::core::DynamicObject;
+use kube::core::{DynamicObject, GroupVersionResource};
 
 /// Identity of an asynchronous operation's claim on the shared status bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,11 +51,11 @@ pub enum Msg {
         generation: u64,
         counts: HashMap<String, usize>,
     },
-    /// CRD `additionalPrinterColumns` fallback for a custom-resource plural,
+    /// CRD `additionalPrinterColumns` fallback for an API resource,
     /// fetched off-thread (`None` = CRD had nothing usable for the version).
     PrinterColumns {
         generation: u64,
-        plural: String,
+        resource: GroupVersionResource,
         view: Box<Option<crate::views::View>>,
     },
     PulseData {

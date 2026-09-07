@@ -644,6 +644,10 @@ impl App {
     /// is opened for.
     pub fn node_capacity_columns(&self) -> bool {
         self.kind_plural == "nodes"
+            && self
+                .kind
+                .as_ref()
+                .is_some_and(|kind| kind.ar.group.is_empty())
     }
 
     pub(crate) fn view_spec(&self) -> &crate::columns::ViewSpec {
@@ -670,11 +674,14 @@ impl App {
         let sort_header = self
             .sort_column
             .and_then(|i| self.display_headers().get(i).cloned());
+        let resource = self.kind.as_ref().map(Kind::resource_key);
         let spec = crate::columns::build_spec(
+            self.kind.as_ref().map_or("", |kind| kind.ar.group.as_str()),
             &self.kind_plural,
             self.active_user_view(),
-            self.crd_views
-                .get(&self.kind_plural)
+            resource
+                .as_ref()
+                .and_then(|resource| self.crd_views.get(resource))
                 .and_then(Option::as_ref),
             self.wide,
         );
@@ -749,6 +756,10 @@ impl App {
 
     pub fn metrics_columns(&self) -> bool {
         matches!(self.kind_plural.as_str(), "pods" | "nodes")
+            && self
+                .kind
+                .as_ref()
+                .is_some_and(|kind| kind.ar.group.is_empty())
     }
 
     /// Latest (cpu_millicores, mem_bytes) for an object from the metrics map.
