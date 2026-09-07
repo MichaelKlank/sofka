@@ -786,8 +786,7 @@ impl WorkloadCounts {
             counts.updated = counts.desired;
         } else {
             let partition = iget(d, &["spec", "updateStrategy", "rollingUpdate", "partition"]);
-            let start = iget(d, &["spec", "ordinals", "start"]);
-            counts.updated += (partition - start).clamp(0, counts.desired.max(0));
+            counts.updated += partition.clamp(0, counts.desired.max(0));
         }
         counts
     }

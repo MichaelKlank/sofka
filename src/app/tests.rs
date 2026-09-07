@@ -13936,7 +13936,7 @@ async fn workload_table_reports_rollout_generation_and_desired_readiness() {
         (
             "statefulsets",
             "StatefulSet",
-            json!({"replicas": 3, "ordinals": {"start": 5}, "updateStrategy": {"rollingUpdate": {"partition": 6}}}),
+            json!({"replicas": 3, "ordinals": {"start": 5}, "updateStrategy": {"rollingUpdate": {"partition": 1}}}),
             json!({"replicas": 3, "readyReplicas": 3, "updatedReplicas": 2, "observedGeneration": 2}),
             2,
             "3/3",
