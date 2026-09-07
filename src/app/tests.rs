@@ -15172,3 +15172,80 @@ async fn leaving_health_view_rejects_its_pending_response() {
         }
     }
 }
+
+async fn next_log_query(rx: &mut Receiver<String>) -> HashMap<String, String> {
+    let query = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .expect("log request");
+    form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect()
+}
+
+#[tokio::test]
+async fn log_lookback_keys_keep_tail_limits_in_api_requests() {
+    for aggregate in [false, true] {
+        for tail in [40, 300] {
+            let (mut app, _rx) = test_app();
+            app.switch_kind(if aggregate { "deployments" } else { "pods" });
+            let pod = json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"web","namespace":"default"},"spec":{"containers":[{"name":"app","image":"test"}]},"status":{"phase":"Running"}});
+            apply(
+                &mut app,
+                if aggregate {
+                    expression_workload(true)
+                } else {
+                    pod.clone()
+                },
+            );
+            app.table_state.select(Some(0));
+            app.logs_cfg.tail = tail;
+            app.logs_cfg.since = Some("4h".into());
+            let (tx, mut queries) = mpsc::channel(32);
+            app.cluster.client = kube::Client::new(
+                tower::service_fn(move |request: http::Request<kube::client::Body>| {
+                    assert_eq!(request.method(), http::Method::GET);
+                    let response = if request.uri().path().ends_with("/log") {
+                        tx.try_send(request.uri().query().unwrap_or_default().to_owned())
+                            .unwrap();
+                        "line\n".to_owned()
+                    } else {
+                        assert_eq!(request.uri().path(), "/api/v1/namespaces/default/pods");
+                        json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":[pod]})
+                            .to_string()
+                    };
+                    async move {
+                        Ok::<_, std::convert::Infallible>(http::Response::new(
+                            http_body_util::Full::new(hyper::body::Bytes::from(response)),
+                        ))
+                    }
+                }),
+                "default",
+            );
+            app.handle_key(press(KeyCode::Char('l'))).unwrap();
+            let expected_tail = if aggregate { tail.min(100) } else { tail }.to_string();
+            let query = next_log_query(&mut queries).await;
+            assert_eq!(query.get("tailLines"), Some(&expected_tail));
+            assert_eq!(query.get("sinceSeconds").map(String::as_str), Some("14400"));
+            assert_eq!(query.get("follow").map(String::as_str), Some("true"));
+            app.handle_key(press(KeyCode::Char('2'))).unwrap();
+            let query = next_log_query(&mut queries).await;
+            assert_eq!(query.get("tailLines"), Some(&expected_tail));
+            assert_eq!(query.get("sinceSeconds").map(String::as_str), Some("300"));
+            app.handle_key(press(KeyCode::Char('0'))).unwrap();
+            let query = next_log_query(&mut queries).await;
+            assert_eq!(query.get("tailLines"), Some(&expected_tail));
+            assert!(!query.contains_key("sinceSeconds"));
+            app.handle_key(press(KeyCode::Esc)).unwrap();
+            if !aggregate {
+                app.handle_key(press(KeyCode::Char('p'))).unwrap();
+                let query = next_log_query(&mut queries).await;
+                assert_eq!(query.get("previous").map(String::as_str), Some("true"));
+                assert!(!query.contains_key("tailLines"));
+                assert!(!query.contains_key("sinceSeconds"));
+                assert!(!query.contains_key("follow"));
+                app.handle_key(press(KeyCode::Esc)).unwrap();
+            }
+        }
+    }
+}
