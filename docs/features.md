@@ -275,6 +275,12 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   watch saw, so "what just changed?" has an answer. The last revision of up to
   256 changed objects is kept in memory.
 
+In the describe view, `r` turns automatic refresh on or off. Refresh is off
+when the view opens. When on, it runs `kubectl describe` immediately and then
+5 seconds after each result. This updates the full document, including events.
+The resource, scroll position, and search stay the same. Refresh stops when
+you leave the view or a request fails. A failed request keeps the last result.
+
 ## PVC explore
 
 A PersistentVolumeClaim has no API that returns its contents: the only way to

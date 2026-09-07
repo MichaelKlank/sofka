@@ -838,6 +838,8 @@ impl App {
     }
 
     pub(super) fn bump_generation(&mut self) {
+        self.stop_describe_refresh();
+        self.describe_source = None;
         self.stop_event_stream();
         self.clear_progress_flash();
         self.stop_plugins();
@@ -855,6 +857,7 @@ impl App {
     /// being involved at all.
     pub fn handle_msg(&mut self, msg: Msg) {
         self.handle_msg_inner(msg);
+        self.check_describe_refresh();
         let overlay = matches!(
             self.mode,
             Mode::PvcExplore
@@ -1144,6 +1147,8 @@ impl App {
                 lines,
                 warn,
             } if generation == self.generation && run == self.plugin_run => {
+                self.stop_describe_refresh();
+                self.describe_source = None;
                 self.plugin_task = None;
                 self.plugin_claim = None;
                 self.detail = Scrollable {
@@ -1266,6 +1271,15 @@ impl App {
                 lines,
                 warn,
             } if generation == self.generation => {
+                self.stop_describe_refresh();
+                if warn.is_some()
+                    || self
+                        .describe_source
+                        .as_ref()
+                        .is_none_or(|(id, _)| *id != claim)
+                {
+                    self.describe_source = None;
+                }
                 self.detail = Scrollable {
                     title,
                     lines: lines.into(),
@@ -1277,6 +1291,21 @@ impl App {
                     // The "describing X…" progress flash has served its
                     // purpose once the document arrives.
                     None => self.clear_claimed_status(claim),
+                }
+            }
+            Msg::DescribeRefresh { generation, result }
+                if generation == self.describe_refresh_generation
+                    && self.describe_refresh_task.is_some()
+                    && (self.mode == Mode::Detail
+                        || (self.mode == Mode::DocFilter
+                            && self.doc_filter_return == Mode::Detail)) =>
+            {
+                match result {
+                    Ok(lines) => self.detail.replace_lines(lines.into()),
+                    Err(error) => {
+                        self.stop_describe_refresh();
+                        self.flash_warn(&error);
+                    }
                 }
             }
             Msg::Events {

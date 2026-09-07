@@ -16,6 +16,7 @@ impl App {
         };
         let run = self.plugin_run;
         let result = self.handle_key_inner(key);
+        self.check_describe_refresh();
         let overlay = matches!(
             self.mode,
             Mode::Command
@@ -28,6 +29,9 @@ impl App {
                 | Mode::SortPicker
                 | Mode::CopyPicker
         );
+        if before == Mode::Detail && self.mode != Mode::Detail && !overlay {
+            self.describe_source = None;
+        }
         if self.should_quit || (self.plugin_run == run && self.mode != before && !overlay) {
             self.stop_plugins();
         }
@@ -959,6 +963,8 @@ impl App {
                 } else if self.mode == Mode::Events {
                     self.stop_event_stream();
                 }
+                self.stop_describe_refresh();
+                self.describe_source = None;
                 self.mode = self.return_mode;
                 if self.return_mode == Mode::Table {
                     self.restore_selection();
@@ -975,6 +981,7 @@ impl App {
             // when no search is active.
             KeyCode::Char('n') if detail => target.step_match(true),
             KeyCode::Char('N') if detail => target.step_match(false),
+            KeyCode::Char('r') if self.mode == Mode::Detail => self.toggle_describe_refresh(),
             // Copy the document to the clipboard (k9s `c`), same as the logs
             // view: an active search copies only the matching lines.
             KeyCode::Char('c') if detail => {

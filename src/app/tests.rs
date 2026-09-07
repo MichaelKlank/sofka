@@ -17502,3 +17502,172 @@ async fn namespace_view_navigation_settings_fall_back_separately() {
         assert_eq!(app.labels.as_deref(), Some("cert=tls"));
     }
 }
+
+fn describe_refresh_app() -> (App, Receiver<Msg>) {
+    let (mut app, rx) = test_app();
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Pod",
+        "metadata":{"name":"web", "namespace":"default"}}),
+    );
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    let claim = app.claim_status("describing web");
+    app.describe_source = Some((
+        claim,
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf 'Events:\nnew event\n'".into(),
+        ],
+    ));
+    app.handle_msg(Msg::Detail {
+        generation: app.generation,
+        claim,
+        title: "web describe".into(),
+        lines: vec!["Events:".into(), "old event".into()],
+        warn: None,
+    });
+    (app, rx)
+}
+
+#[tokio::test]
+async fn describe_refresh_toggle_updates_and_rejects_stopped_results() {
+    let (mut app, mut rx) = describe_refresh_app();
+    assert!(app.describe_refresh_task.is_none());
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "event".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    let scroll = app.detail.scroll;
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert!(app.describe_refresh_task.is_some());
+    let generation = app.describe_refresh_generation;
+    let msg = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    app.handle_msg(msg);
+    assert_eq!(app.detail.lines[1], "new event");
+    assert_eq!(app.detail.filter, "event");
+    assert_eq!(app.detail.scroll, scroll);
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert!(app.describe_refresh_task.is_none());
+    app.handle_msg(Msg::DescribeRefresh {
+        generation,
+        result: Ok(vec!["late".into()]),
+    });
+    assert_eq!(app.detail.lines[1], "new event");
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.describe_refresh_task.is_none());
+    assert!(app.describe_source.is_none());
+}
+
+#[tokio::test]
+async fn describe_refresh_failure_keeps_document_and_search_accepts_updates() {
+    let (mut app, _rx) = describe_refresh_app();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    let generation = app.describe_refresh_generation;
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    app.handle_msg(Msg::DescribeRefresh {
+        generation,
+        result: Ok(vec!["updated".into()]),
+    });
+    assert_eq!(app.mode, Mode::DocFilter);
+    assert_eq!(app.detail.lines[0], "updated");
+    app.handle_msg(Msg::DescribeRefresh {
+        generation,
+        result: Err("request failed".into()),
+    });
+    assert_eq!(app.detail.lines[0], "updated");
+    assert!(app.describe_refresh_task.is_none());
+    assert!(app.flash.contains("request failed"));
+}
+
+#[tokio::test]
+async fn describe_refresh_is_unavailable_in_yaml_and_stops_on_palette_navigation() {
+    let (mut app, _rx) = describe_refresh_app();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    assert!(app.describe_refresh_task.is_none());
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert!(app.describe_source.is_none());
+    assert!(app.describe_refresh_task.is_none());
+}
+
+#[tokio::test]
+async fn describe_refresh_repeats_for_the_original_resource() {
+    let (mut app, mut rx) = describe_refresh_app();
+    let (_, argv) = app.describe_source.as_mut().unwrap();
+    *argv = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "printf '%s' \"$1\"".into(),
+        "describe".into(),
+        "web".into(),
+    ];
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Pod",
+        "metadata":{"name":"another", "namespace":"default"}}),
+    );
+    app.table_state.select(Some(0));
+    assert_eq!(
+        app.selected_ref().unwrap().metadata.name.as_deref(),
+        Some("another")
+    );
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    for _ in 0..2 {
+        let msg = tokio::time::timeout(Duration::from_secs(8), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_msg(msg);
+        assert_eq!(app.detail.lines[0], "web");
+    }
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+}
+
+#[tokio::test]
+async fn describe_refresh_does_not_replace_plugin_output_or_yaml_fallback() {
+    let (mut app, _rx) = describe_refresh_app();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    let generation = app.describe_refresh_generation;
+    let claim = app.claim_status("plugin");
+    app.handle_msg(Msg::PluginOutput {
+        run: app.plugin_run,
+        generation: app.generation,
+        claim,
+        title: "plugin".into(),
+        lines: vec!["report".into()],
+        warn: None,
+    });
+    app.handle_msg(Msg::DescribeRefresh {
+        generation,
+        result: Ok(vec!["late".into()]),
+    });
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert_eq!(app.detail.lines[0], "report");
+    assert!(app.describe_refresh_task.is_none());
+    assert!(app.describe_source.is_none());
+
+    let (mut app, _rx) = describe_refresh_app();
+    let claim = app.describe_source.as_ref().unwrap().0;
+    app.handle_msg(Msg::Detail {
+        generation: app.generation,
+        claim,
+        title: "web YAML".into(),
+        lines: vec!["fallback".into()],
+        warn: Some("describe failed".into()),
+    });
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert!(app.describe_refresh_task.is_none());
+    assert!(app.describe_source.is_none());
+    assert_eq!(app.detail.lines[0], "fallback");
+}
