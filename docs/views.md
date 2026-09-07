@@ -163,7 +163,9 @@ The selected layout does not inherit columns, `replace`, or `sort` from
 another resource key. If it has no `sort`, `[views."*"].sort` supplies the
 global default. The `"*"` key supports only the default sort; it does not
 supply columns or navigation settings. A table without the specified column
-ignores the global sort. Columns still overlay the built-in layout unless
+ignores the global sort until that column is available. The default sort is
+checked again when CRD printer columns arrive or wide mode changes. An active
+sort keeps its priority. Columns still overlay the built-in layout unless
 `replace = true`. In this example, the `matlab` view adds TENANT and MODEL,
 but does not add OWNERKIND. Wide mode works as usual. An active sort stays
 on its column if that column is still present. A saved user sort has priority

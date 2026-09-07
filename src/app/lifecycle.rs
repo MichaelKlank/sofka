@@ -1044,6 +1044,7 @@ impl App {
                     // A remembered sort on a printer column only becomes
                     // resolvable now that the CRD's columns are known.
                     self.apply_remembered_sort();
+                    self.apply_view_sort();
                 }
             }
             Msg::FindResults {

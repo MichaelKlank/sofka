@@ -6374,6 +6374,66 @@ async fn wildcard_sort_skips_missing_columns() {
 }
 
 #[tokio::test]
+async fn wildcard_sort_applies_when_wide_columns_appear() {
+    for remember in [true, false] {
+        let (mut app, _rx) = test_app();
+        app.remember_sort = remember;
+        install_views(&mut app, "[views.\"*\"]\nsort = \"IP:desc\"\n");
+        palette(&mut app, "pods");
+        assert_eq!(app.sort_column, None);
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        assert_eq!(
+            app.sort_column,
+            app.display_headers().iter().position(|h| h == "IP")
+        );
+        assert!(app.sort_column.is_some());
+        assert!(app.sort_desc);
+
+        app.handle_key(press(KeyCode::Char('I'))).unwrap();
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        assert_eq!(app.sort_column, None);
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        assert_eq!(app.sort_desc, !remember);
+    }
+}
+
+#[tokio::test]
+async fn wildcard_sort_applies_when_printer_columns_arrive_without_replacing_user_sort() {
+    for choose_name in [false, true] {
+        let (mut app, _rx) = test_app();
+        app.remember_sort = false;
+        install_views(&mut app, "[views.\"*\"]\nsort = \"READY:desc\"\n");
+        palette(&mut app, "certificates");
+        assert_eq!(app.sort_column, None);
+        if choose_name {
+            app.handle_key(press(KeyCode::Char('S'))).unwrap();
+            for c in "name".chars() {
+                app.handle_key(press(KeyCode::Char(c))).unwrap();
+            }
+            app.handle_key(press(KeyCode::Enter)).unwrap();
+        }
+        let crd = json!({"spec": {"versions": [{
+            "name": "v1", "served": true, "storage": true,
+            "additionalPrinterColumns": [
+                {"name": "Ready", "type": "string", "jsonPath": ".status.ready"}
+            ]
+        }]}});
+        app.handle_msg(Msg::PrinterColumns {
+            generation: app.generation,
+            resource: app.cluster.resolve("certificates").unwrap().resource_key(),
+            view: Box::new(crate::views::printer_columns_view(&crd, "v1")),
+        });
+        let header = if choose_name { "NAME" } else { "READY" };
+        assert_eq!(
+            app.sort_column,
+            app.display_headers().iter().position(|h| h == header)
+        );
+        assert!(app.sort_column.is_some());
+        assert_eq!(app.sort_desc, !choose_name);
+    }
+}
+
+#[tokio::test]
 async fn disabled_sort_memory_keeps_changes_local_and_preserves_saved_state() {
     let dir = std::env::temp_dir().join(format!("sofka-sort-option-{}", std::process::id()));
     write_config(&dir, "remember_sort = false\n");

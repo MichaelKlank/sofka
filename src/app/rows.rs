@@ -906,6 +906,7 @@ impl App {
         // A remembered sort on a wide-only column comes back the moment its
         // column does.
         self.apply_remembered_sort();
+        self.apply_view_sort();
         self.flash = format!("wide columns: {}", if self.wide { "on" } else { "off" });
         self.flash_err = false;
     }
