@@ -357,7 +357,7 @@ pub fn compile(
             })
         });
         let mut refs = Vec::new();
-        for r in &cfg.refs {
+        for (index, r) in cfg.refs.iter().enumerate() {
             let path = r.path.trim();
             let kind = r.kind.trim();
             let mut problem = None;
@@ -385,7 +385,7 @@ pub fn compile(
             if let Some(why) = problem {
                 warnings.push(format!(
                     "views.\"{key}\": ref {}: {why}; skipped",
-                    refs.len() + 1
+                    index + 1
                 ));
                 continue;
             }
@@ -1371,8 +1371,14 @@ mod tests {
             warnings[0].contains("ref 2") && warnings[0].contains("JSON Pointer"),
             "{warnings:?}"
         );
-        assert!(warnings[1].contains("kind is empty"), "{warnings:?}");
-        assert!(warnings[2].contains("reverse 'everywhere'"), "{warnings:?}");
+        assert!(
+            warnings[1].contains("ref 3") && warnings[1].contains("kind is empty"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[2].contains("ref 4") && warnings[2].contains("reverse 'everywhere'"),
+            "{warnings:?}"
+        );
     }
 
     #[test]

@@ -315,8 +315,8 @@ pub enum Msg {
 /// the object itself so `y`/`d` need no second read.
 #[derive(Clone, Debug)]
 pub struct AdjacentItem {
-    /// How it relates, with the direction: `↑ owned by`, `↓ owns`,
-    /// `→ mounts`, `← mounts`.
+    pub direction: crate::adjacent::Direction,
+    /// How it relates: `owned by`, `owns`, `mounts`, `runs on`.
     pub relation: String,
     pub kind: String,
     pub plural: String,

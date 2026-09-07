@@ -3079,6 +3079,7 @@ async fn find_opens_picker_and_enter_navigates_to_the_object() {
 // ----- adjacent view ------------------------------------------------------
 
 fn adjacent_item(
+    direction: crate::adjacent::Direction,
     relation: &str,
     kind: &str,
     plural: &str,
@@ -3090,6 +3091,7 @@ fn adjacent_item(
         meta["namespace"] = json!(ns);
     }
     crate::store::AdjacentItem {
+        direction,
         relation: relation.into(),
         kind: kind.into(),
         plural: plural.into(),
@@ -3132,22 +3134,25 @@ fn deliver_adjacent(app: &mut App, items: Vec<crate::store::AdjacentItem>, warn:
 }
 
 fn pod_neighbours() -> Vec<crate::store::AdjacentItem> {
+    use crate::adjacent::Direction::{Names, Owner};
     vec![
         adjacent_item(
-            "↑ owned by",
+            Owner,
+            "owned by",
             "StatefulSet",
             "statefulsets",
             Some("db"),
             "db",
         ),
         adjacent_item(
-            "→ mounts",
+            Names,
+            "mounts",
             "PersistentVolumeClaim",
             "persistentvolumeclaims",
             Some("db"),
             "data-db-0",
         ),
-        adjacent_item("→ runs on", "Node", "nodes", None, "ip-10-0-1-2"),
+        adjacent_item(Names, "runs on", "Node", "nodes", None, "ip-10-0-1-2"),
     ]
 }
 
@@ -3307,15 +3312,27 @@ async fn adjacent_opens_from_the_palette_and_refuses_helm_rows() {
 }
 
 #[tokio::test]
-async fn adjacent_view_keys_resolve_to_their_group() {
-    let (app, _rx) = test_app();
-    assert!(app.resolve_view_key("pods").is_some());
-    assert!(app.resolve_view_key("v1/pods").is_some());
-    assert!(app.resolve_view_key("apps/deployments").is_some());
-    assert!(app.resolve_view_key("apps/v1/deployments").is_some());
-    // A key that names another group must not resolve to the core kind.
-    assert!(app.resolve_view_key("metrics.k8s.io/pods").is_none());
-    assert!(app.resolve_view_key("nope").is_none());
+async fn adjacent_owner_resolves_within_its_group() {
+    let (mut app, _rx) = test_app();
+    app.cluster
+        .register_kind("postgresql.cnpg.io", "Cluster", "clusters", true);
+    app.cluster
+        .register_kind("cluster.x-k8s.io", "Cluster", "clusters", true);
+    let cnpg = app
+        .cluster
+        .resolve_in_group("Cluster", "postgresql.cnpg.io")
+        .unwrap();
+    assert_eq!(cnpg.ar.group, "postgresql.cnpg.io");
+    let capi = app
+        .cluster
+        .resolve_in_group("cluster", "cluster.x-k8s.io")
+        .unwrap();
+    assert_eq!(capi.ar.group, "cluster.x-k8s.io");
+    assert_eq!(
+        app.cluster.resolve_in_group("Pod", "").unwrap().ar.plural,
+        "pods"
+    );
+    assert!(app.cluster.resolve_in_group("Cluster", "nope.io").is_none());
 }
 
 #[tokio::test]

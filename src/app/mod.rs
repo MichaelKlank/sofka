@@ -1917,6 +1917,9 @@ pub struct App {
     pub adjacent_source: Option<DynamicObject>,
     adjacent_request: u64,
     adjacent_claim: Option<StatusClaim>,
+    /// Parent of the adjacent view, kept separately because a YAML/describe
+    /// opened from it uses `return_mode` to come back to the list.
+    adjacent_return: Mode,
     /// GitOps view: the reconciliation-chain findings, cursor, title, and the
     /// object being investigated (kept so `r` can re-gather).
     pub gitops_items: Vec<crate::explain::Finding>,
@@ -2168,6 +2171,7 @@ impl App {
             adjacent_source: None,
             adjacent_request: 0,
             adjacent_claim: None,
+            adjacent_return: Mode::Table,
             gitops_items: Vec::new(),
             gitops_state: ListState::default(),
             gitops_title: String::new(),

@@ -161,7 +161,7 @@ relation = "shaped by"               # row label; default "references"
 reverse = "cluster"                  # usages listed: namespace (default) | cluster | none
 ```
 
-`reverse` decides how far the lookup goes when the *target* is selected: with
+`reverse` decides how far the lookup goes when the _target_ is selected: with
 `namespace`, the referencing kind is listed in the row's namespace (the
 namespace the table shows, for a cluster-scoped row); with `cluster`, across the
 cluster; `none` skips it. A `namespace_path` names where the target's namespace

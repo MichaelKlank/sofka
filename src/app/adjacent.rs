@@ -1,31 +1,29 @@
 use super::*;
 
-use crate::adjacent::{RefRule, Reverse, all_rules, children_for, pointer_values, rules_for};
+use crate::adjacent::{
+    Backward, Direction, Forward, KindRef, Kinds, dedup, names_source, owned_by,
+};
 use crate::store::AdjacentItem;
 
-/// A kind resolved on the UI thread, ready to move into the gather task —
-/// the registry isn't available there.
-#[derive(Clone)]
-pub(super) struct Resolved {
-    ar: ApiResource,
-    namespaced: bool,
-    plural: String,
+/// The cluster's registry, answering the plan's kind lookups.
+struct ClusterKinds<'a>(&'a crate::k8s::Cluster);
+
+impl Kinds for ClusterKinds<'_> {
+    fn by_name(&self, name: &str) -> Option<KindRef> {
+        self.0.resolve(name).map(kind_ref)
+    }
+
+    fn by_kind_in_group(&self, kind: &str, group: &str) -> Option<KindRef> {
+        self.0.resolve_in_group(kind, group).map(kind_ref)
+    }
 }
 
-/// A rule read forwards from the selection: the objects it names, as
-/// (name, namespace) pairs to read.
-struct Forward {
-    rule: RefRule,
-    target: Resolved,
-    refs: Vec<(String, String)>,
-}
-
-/// A rule read backwards: list `from` in `scope` and keep the objects whose
-/// pointer names the selection.
-struct Backward {
-    rule: RefRule,
-    from: Resolved,
-    scope: String,
+fn kind_ref(k: crate::k8s::Kind) -> KindRef {
+    KindRef {
+        plural: k.ar.plural.to_lowercase(),
+        ar: k.ar,
+        namespaced: k.namespaced,
+    }
 }
 
 impl App {
@@ -49,6 +47,7 @@ impl App {
             return;
         };
         self.set_return_mode();
+        self.adjacent_return = self.return_mode;
         let name = obj.metadata.name.clone().unwrap_or_default();
         self.adjacent_title = format!("{name} — adjacent");
         self.adjacent_items.clear();
@@ -70,27 +69,8 @@ impl App {
         self.adjacent_claim.is_some()
     }
 
-    fn resolved(&self, kind: &str) -> Option<Resolved> {
-        self.cluster.resolve(kind).map(|k| Resolved {
-            plural: k.ar.plural.to_lowercase(),
-            ar: k.ar,
-            namespaced: k.namespaced,
-        })
-    }
-
-    /// Resolve a `[views."…"]`-style key (`v1/pods`, `apps/deployments`,
-    /// `pods`) to a kind, holding it to the group or apiVersion the key names.
-    pub(super) fn resolve_view_key(&self, key: &str) -> Option<Resolved> {
-        let resolved = self.resolved(crate::views::key_plural(key))?;
-        let Some((prefix, _)) = key.rsplit_once('/') else {
-            return Some(resolved);
-        };
-        let prefix = prefix.to_lowercase();
-        let ar = &resolved.ar;
-        (prefix == ar.api_version.to_lowercase() || prefix == ar.group.to_lowercase())
-            .then_some(resolved)
-    }
-
+    /// Decide what to read on the UI thread (the kind registry lives here),
+    /// then read it off-thread and send one [`Msg::Adjacent`].
     fn spawn_adjacent(&mut self) {
         let Some(obj) = self.adjacent_source.clone() else {
             return;
@@ -98,81 +78,18 @@ impl App {
         let Some(kind) = self.kind.clone() else {
             return;
         };
-        let source = Resolved {
+        let source = KindRef {
             plural: self.kind_plural.clone(),
             ar: kind.ar.clone(),
             namespaced: kind.namespaced,
         };
-        let ns = obj.metadata.namespace.clone().unwrap_or_default();
-        // A cluster-scoped row has no namespace of its own: its usages are
-        // looked up where the table is looking.
-        let scope_ns = if ns.is_empty() {
-            self.namespace.clone()
-        } else {
-            ns.clone()
-        };
-        let mut warn: Option<String> = None;
-
-        let owners: Vec<(Resolved, String)> = obj
-            .metadata
-            .owner_references
-            .iter()
-            .flatten()
-            .filter_map(|o| match self.resolved(&o.kind.to_lowercase()) {
-                Some(r) => Some((r, o.name.clone())),
-                None => {
-                    warn.get_or_insert(format!("owner kind {} is not served here", o.kind));
-                    None
-                }
-            })
-            .collect();
-        let children: Vec<Resolved> = children_for(&self.user_views, &kind.ar)
-            .iter()
-            .filter_map(|p| self.resolved(p))
-            .collect();
-        let value = serde_json::to_value(&obj).unwrap_or(Value::Null);
-        // A rule whose target kind isn't served here — a class from a CSI
-        // driver that isn't installed — simply contributes nothing.
-        let forward: Vec<Forward> = rules_for(&self.user_views, &kind.ar)
-            .into_iter()
-            .filter_map(|rule| {
-                let target = self.resolved(&rule.kind)?;
-                let names = pointer_values(&value, &rule.path);
-                if names.is_empty() {
-                    return None;
-                }
-                let namespaces = rule
-                    .namespace_path
-                    .as_deref()
-                    .map(|p| pointer_values(&value, p))
-                    .unwrap_or_default();
-                let refs = names
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, name)| {
-                        let target_ns = namespaces.get(i).cloned().unwrap_or_else(|| ns.clone());
-                        (name, target_ns)
-                    })
-                    .collect();
-                Some(Forward { rule, target, refs })
-            })
-            .collect();
-        let backward: Vec<Backward> = all_rules(&self.user_views)
-            .into_iter()
-            .filter(|rule| rule.reverse != Reverse::None)
-            .filter_map(|rule| {
-                let target = self.resolved(&rule.kind)?;
-                if target.ar.plural != source.ar.plural || target.ar.group != source.ar.group {
-                    return None;
-                }
-                let from = self.resolve_view_key(&rule.from)?;
-                let scope = match rule.reverse {
-                    Reverse::Namespace if from.namespaced => scope_ns.clone(),
-                    _ => String::new(),
-                };
-                Some(Backward { rule, from, scope })
-            })
-            .collect();
+        let plan = crate::adjacent::plan(
+            &self.user_views,
+            &ClusterKinds(&self.cluster),
+            &source,
+            &obj,
+            &self.namespace,
+        );
 
         let client = self.cluster.client.clone();
         let tx = self.tx.clone();
@@ -187,75 +104,47 @@ impl App {
         let request = self.adjacent_request;
 
         tokio::spawn(async move {
+            let mut warn = plan.warn;
             let mut items: Vec<AdjacentItem> = Vec::new();
+            let ns = obj.metadata.namespace.clone().unwrap_or_default();
             let source_uid = obj.metadata.uid.clone();
             let source_name = obj.metadata.name.clone().unwrap_or_default();
+            let source_ns = source.namespaced.then_some(ns.as_str());
 
-            for (r, name) in owners {
+            for (r, name) in plan.owners {
                 let owner_ns = if r.namespaced { ns.as_str() } else { "" };
                 if let Some(o) = get_or_warn(&client, &r, owner_ns, &name, &mut warn).await {
-                    items.push(item("↑ owned by", &r, o));
+                    items.push(item(Direction::Owner, "owned by", &r, o));
                 }
             }
-            for r in children {
+            for r in plan.children {
                 let scope = if r.namespaced { ns.as_str() } else { "" };
                 for o in list_or_warn(&client, &r.ar, r.namespaced, scope, &mut warn).await {
-                    let owned = source_uid.is_some()
-                        && o.metadata
-                            .owner_references
-                            .iter()
-                            .flatten()
-                            .any(|own| Some(&own.uid) == source_uid.as_ref());
-                    if owned {
-                        items.push(item("↓ owns", &r, o));
+                    if owned_by(&o, source_uid.as_deref()) {
+                        items.push(item(Direction::Child, "owns", &r, o));
                     }
                 }
             }
-            for Forward {
-                rule,
-                target: r,
-                refs,
-            } in forward
-            {
+            for Forward { rule, target, refs } in plan.forward {
                 for (name, target_ns) in refs {
-                    let scope = if r.namespaced { target_ns.as_str() } else { "" };
-                    if let Some(o) = get_or_warn(&client, &r, scope, &name, &mut warn).await {
-                        items.push(item(&format!("→ {}", rule.relation), &r, o));
+                    let scope = if target.namespaced {
+                        target_ns.as_str()
+                    } else {
+                        ""
+                    };
+                    if let Some(o) = get_or_warn(&client, &target, scope, &name, &mut warn).await {
+                        items.push(item(Direction::Names, &rule.relation, &target, o));
                     }
                 }
             }
-            for Backward {
-                rule,
-                from: r,
-                scope,
-            } in backward
-            {
-                for o in list_or_warn(&client, &r.ar, r.namespaced, &scope, &mut warn).await {
-                    let v = serde_json::to_value(&o).unwrap_or(Value::Null);
-                    if !pointer_values(&v, &rule.path).contains(&source_name) {
-                        continue;
+            for Backward { rule, from, scope } in plan.backward {
+                for o in list_or_warn(&client, &from.ar, from.namespaced, &scope, &mut warn).await {
+                    if names_source(&o, &rule, &source_name, source_ns) {
+                        items.push(item(Direction::NamedBy, &rule.relation, &from, o));
                     }
-                    // A namespaced target is named within a namespace: the
-                    // rule's namespace path when it has one, else the
-                    // referencing object's own.
-                    if source.namespaced {
-                        let named_ns = match &rule.namespace_path {
-                            Some(p) => pointer_values(&v, p).into_iter().next(),
-                            None => o.metadata.namespace.clone(),
-                        };
-                        if named_ns.as_deref() != Some(ns.as_str()) {
-                            continue;
-                        }
-                    }
-                    items.push(item(&format!("← {}", rule.relation), &r, o));
                 }
             }
-            items.dedup_by(|a, b| {
-                a.relation == b.relation
-                    && a.plural == b.plural
-                    && a.namespace == b.namespace
-                    && a.name == b.name
-            });
+            dedup(&mut items);
             let _ = tx
                 .send(Msg::Adjacent {
                     generation: genr,
@@ -280,8 +169,12 @@ impl App {
         let len = self.adjacent_items.len();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.mode = Mode::Table;
-                self.restore_selection();
+                let destination = self.adjacent_return;
+                self.mode = destination;
+                self.adjacent_return = Mode::Table;
+                if destination == Mode::Table {
+                    self.restore_selection();
+                }
             }
             KeyCode::Char('j') | KeyCode::Down => list_step(&mut self.adjacent_state, len, true),
             KeyCode::Char('k') | KeyCode::Up => list_step(&mut self.adjacent_state, len, false),
@@ -348,8 +241,9 @@ impl App {
     }
 }
 
-fn item(relation: &str, r: &Resolved, o: DynamicObject) -> AdjacentItem {
+fn item(direction: Direction, relation: &str, r: &KindRef, o: DynamicObject) -> AdjacentItem {
     AdjacentItem {
+        direction,
         relation: relation.to_string(),
         kind: r.ar.kind.clone(),
         plural: r.plural.clone(),
@@ -363,7 +257,7 @@ fn item(relation: &str, r: &Resolved, o: DynamicObject) -> AdjacentItem {
 /// gone), any other failure is recorded in `warn`.
 async fn get_or_warn(
     client: &Client,
-    r: &Resolved,
+    r: &KindRef,
     ns: &str,
     name: &str,
     warn: &mut Option<String>,
