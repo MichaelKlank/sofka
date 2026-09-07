@@ -887,7 +887,7 @@ fn col_service_ports<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
 }
 
 fn col_node_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
-    Cow::Borrowed(node_ready(ctx.data))
+    Cow::Borrowed(node_status(ctx.data))
 }
 
 fn col_node_roles<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
@@ -1492,8 +1492,9 @@ fn svc_ports(d: &Value) -> String {
         .unwrap_or_else(|| "<none>".into())
 }
 
-fn node_ready(d: &Value) -> &'static str {
-    d.pointer("/status/conditions")
+fn node_status(d: &Value) -> &'static str {
+    let ready = d
+        .pointer("/status/conditions")
         .and_then(Value::as_array)
         .and_then(|conds| {
             conds
@@ -1507,7 +1508,17 @@ fn node_ready(d: &Value) -> &'static str {
                 "NotReady"
             }
         })
-        .unwrap_or("Unknown")
+        .unwrap_or("Unknown");
+
+    if d.pointer("/spec/unschedulable").and_then(Value::as_bool) == Some(true) {
+        match ready {
+            "Ready" => "Ready,SchedulingDisabled",
+            "NotReady" => "NotReady,SchedulingDisabled",
+            _ => "Unknown,SchedulingDisabled",
+        }
+    } else {
+        ready
+    }
 }
 
 fn node_roles(obj: &DynamicObject) -> String {
@@ -2136,6 +2147,35 @@ mod tests {
         let bare = obj(json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": "w-1"}}));
         let (bare_cells, _) = cells(&bare, "nodes", now_secs());
         assert_eq!(bare_cells[3], "0");
+    }
+
+    #[test]
+    fn node_status_matches_kubernetes_state_matrix() {
+        let cases = [
+            (Some("True"), false, "Ready"),
+            (Some("True"), true, "Ready,SchedulingDisabled"),
+            (Some("False"), false, "NotReady"),
+            (Some("False"), true, "NotReady,SchedulingDisabled"),
+            (Some("Unknown"), false, "NotReady"),
+            (Some("Unknown"), true, "NotReady,SchedulingDisabled"),
+            (None, false, "Unknown"),
+            (None, true, "Unknown,SchedulingDisabled"),
+        ];
+
+        for (ready, unschedulable, expected) in cases {
+            let conditions = ready.map_or_else(
+                || json!([]),
+                |status| json!([{"type": "Ready", "status": status}]),
+            );
+            let n = obj(json!({
+                "apiVersion": "v1", "kind": "Node",
+                "metadata": {"name": "worker-1"},
+                "spec": {"unschedulable": unschedulable},
+                "status": {"conditions": conditions}
+            }));
+
+            assert_eq!(cells(&n, "nodes", now_secs()).0[1], expected);
+        }
     }
 
     #[test]

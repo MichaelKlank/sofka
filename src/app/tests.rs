@@ -1823,6 +1823,49 @@ async fn pod_status_changes_keep_column_positions_stable() {
 }
 
 #[tokio::test]
+async fn cordoned_node_renders_scheduling_disabled_status() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, _rx) = test_app();
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "nodes".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.kind_plural, "nodes");
+
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "worker-1"},
+            "spec": {"unschedulable": true},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+        }),
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(160, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let hit = app.table_hit.borrow().clone().unwrap();
+    let status_index = app
+        .display_headers()
+        .iter()
+        .position(|header| header == "STATUS")
+        .unwrap();
+    let &(start, end, _) = hit
+        .cols
+        .iter()
+        .find(|(_, _, index)| *index == status_index)
+        .unwrap();
+    let status_cell: String = (start..end)
+        .map(|x| terminal.backend().buffer()[(x, hit.rows_y)].symbol())
+        .collect();
+    assert_eq!(status_cell.trim(), "Ready,SchedulingDisabled");
+}
+
+#[tokio::test]
 async fn scrolling_pods_keeps_column_positions_stable() {
     use ratatui::{Terminal, backend::TestBackend};
 
