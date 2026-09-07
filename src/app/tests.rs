@@ -6241,6 +6241,32 @@ async fn sort_picker_esc_clears_filter_then_closes() {
 }
 
 #[tokio::test]
+async fn sort_picker_ctrl_n_p_navigate_without_touching_filter() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    assert_eq!(app.sort_picker_state.selected(), Some(0));
+
+    app.handle_key(ctrl(KeyCode::Char('n'))).unwrap();
+    assert_eq!(app.sort_picker_state.selected(), Some(1));
+    app.handle_key(ctrl(KeyCode::Char('p'))).unwrap();
+    assert_eq!(app.sort_picker_state.selected(), Some(0));
+    assert!(
+        app.sort_picker_filter.is_empty(),
+        "ctrl-n/p must not fall through to the type-to-filter buffer"
+    );
+
+    // ctrl-alt-n is a distinct chord, left to typing "n" into the filter —
+    // not a nav move (see ctrl_alt_f leaves paging alone).
+    let ctrl_alt_n = KeyEvent::new(
+        KeyCode::Char('n'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    app.handle_key(ctrl_alt_n).unwrap();
+    assert_eq!(app.sort_picker_filter, "n");
+}
+
+#[tokio::test]
 async fn copy_picker_lists_full_row_fields_and_filters_on_values() {
     let (mut app, _rx) = test_app();
     app.switch_kind("services");
@@ -6282,6 +6308,40 @@ async fn copy_picker_lists_full_row_fields_and_filters_on_values() {
     assert!(app.copy_picker_filter.is_empty());
     app.handle_key(press(KeyCode::Esc)).unwrap();
     assert_eq!(app.mode, Mode::Table);
+}
+
+#[tokio::test]
+async fn copy_picker_ctrl_n_p_navigate_without_touching_filter() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Service",
+               "metadata": {"name": "web", "namespace": "default"},
+               "spec": {"type": "ClusterIP", "clusterIP": "10.96.13.5",
+                        "ports": [{"port": 80, "protocol": "TCP"}]}}),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('Y'))).unwrap();
+    assert_eq!(app.copy_picker_state.selected(), Some(0));
+
+    app.handle_key(ctrl(KeyCode::Char('n'))).unwrap();
+    assert_eq!(app.copy_picker_state.selected(), Some(1));
+    app.handle_key(ctrl(KeyCode::Char('p'))).unwrap();
+    assert_eq!(app.copy_picker_state.selected(), Some(0));
+    assert!(
+        app.copy_picker_filter.is_empty(),
+        "ctrl-n/p must not fall through to the type-to-filter buffer"
+    );
+
+    // ctrl-alt-n is a distinct chord, left to typing "n" into the filter —
+    // not a nav move (see ctrl_alt_f leaves paging alone).
+    let ctrl_alt_n = KeyEvent::new(
+        KeyCode::Char('n'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    app.handle_key(ctrl_alt_n).unwrap();
+    assert_eq!(app.copy_picker_filter, "n");
 }
 
 #[tokio::test]
