@@ -5523,6 +5523,63 @@ async fn crd_plural_outranks_builtin_command() {
 }
 
 #[tokio::test]
+async fn palette_completion_accepts_minus_chords() {
+    let (mut app, _rx) = test_app();
+    let config: crate::config::Config = toml::from_str(
+        r#"
+        [keys]
+        palette_next = "ctrl--"
+        palette_prev = "alt--"
+        "#,
+    )
+    .unwrap();
+    let (palette_keys, warnings) = crate::config::compile_palette_keys(&config.keys);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    app.palette_keys = palette_keys;
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    assert_eq!(app.mode, Mode::Command);
+    assert!(app.cmd_suggestions.len() > 1);
+    assert_eq!(app.cmd_sel, 0);
+    app.handle_key(ctrl(KeyCode::Char('-'))).unwrap();
+    assert_eq!(app.cmd_sel, 1);
+    app.handle_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::ALT))
+        .unwrap();
+    assert_eq!(app.cmd_sel, 0);
+    assert!(app.command.is_empty());
+}
+
+#[tokio::test]
+async fn palette_shifted_minus_uses_the_resulting_character() {
+    for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+        let (mut app, _rx) = test_app();
+        let config: crate::config::Config = toml::from_str(
+            r#"
+            [keys]
+            palette_next = ["shift--", "_"]
+            "#,
+        )
+        .unwrap();
+        let (palette_keys, warnings) = crate::config::compile_palette_keys(&config.keys);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("bind the resulting character"));
+        app.palette_keys = palette_keys;
+
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        app.handle_key(press(KeyCode::Char('-'))).unwrap();
+        assert_eq!(app.command, "-");
+        app.handle_key(ctrl(KeyCode::Char('u'))).unwrap();
+        assert!(app.command.is_empty());
+        assert!(app.cmd_suggestions.len() > 1);
+        assert_eq!(app.cmd_sel, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('_'), modifiers))
+            .unwrap();
+        assert_eq!(app.cmd_sel, 1);
+        assert!(app.command.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn palette_completion_keys_are_rebindable() {
     let (mut app, _rx) = test_app();
     let keys_cfg: crate::config::Config = toml::from_str(

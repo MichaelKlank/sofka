@@ -46,12 +46,16 @@ impl KeyChord {
             });
         }
 
-        let parts: Vec<&str> = trimmed.split('-').collect();
-        let (mods, key) = parts.split_at(parts.len() - 1);
-        let key = key[0];
+        let (mods, key) = if let Some(mods) = trimmed.strip_suffix("--") {
+            (Some(mods), "-")
+        } else if let Some((mods, key)) = trimmed.rsplit_once('-') {
+            (Some(mods), key)
+        } else {
+            (None, trimmed)
+        };
 
         let (mut ctrl, mut alt, mut shift) = (false, false, false);
-        for m in mods {
+        for m in mods.into_iter().flat_map(|mods| mods.split('-')) {
             match m.to_ascii_lowercase().as_str() {
                 "ctrl" | "control" | "c" => ctrl = true,
                 "alt" | "option" | "opt" | "meta" | "a" | "m" => alt = true,
@@ -62,6 +66,11 @@ impl KeyChord {
         }
 
         let mut code = parse_key(key).ok_or_else(|| format!("{s:?}: unknown key {key:?}"))?;
+        if shift && code == KeyCode::Char('-') {
+            return Err(format!(
+                "{s:?}: Shift with minus is not supported; bind the resulting character instead (for example, \"_\")"
+            ));
+        }
 
         // Fold shift into a letter's case so matching stays case-based (like the
         // built-in bindings); keep it as a flag for function/named keys.
@@ -220,6 +229,54 @@ mod tests {
             KeyChord::parse("option-x").unwrap(),
             KeyChord::parse("alt-x").unwrap()
         );
+    }
+
+    #[test]
+    fn parses_minus_chords() {
+        for (input, modifiers) in [
+            ("-", KeyModifiers::NONE),
+            ("ctrl--", KeyModifiers::CONTROL),
+            ("alt--", KeyModifiers::ALT),
+            ("ctrl-alt--", KeyModifiers::CONTROL | KeyModifiers::ALT),
+        ] {
+            let chord = KeyChord::parse(input).unwrap();
+            assert_eq!(chord.code, KeyCode::Char('-'));
+            assert_eq!(chord.ctrl, modifiers.contains(KeyModifiers::CONTROL));
+            assert_eq!(chord.alt, modifiers.contains(KeyModifiers::ALT));
+            assert_eq!(chord.shift, modifiers.contains(KeyModifiers::SHIFT));
+            assert!(chord.matches(&ev(KeyCode::Char('-'), modifiers)));
+            assert_eq!(chord.label(), input);
+            assert_eq!(KeyChord::parse(&chord.label()).unwrap(), chord);
+        }
+        assert_eq!(
+            KeyChord::parse(" CONTROL-option-- ").unwrap(),
+            KeyChord::parse("ctrl-alt--").unwrap()
+        );
+        for input in ["--", "---", "ctrl-", "ctrl---", "ctrl--g", "-alt--"] {
+            assert!(KeyChord::parse(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn shifted_minus_requires_the_resulting_character() {
+        for input in ["shift--", "s--", "SHIFT--", "ctrl-shift--", "shift-alt--"] {
+            let error = KeyChord::parse(input).unwrap_err();
+            assert!(error.contains("bind the resulting character"), "{error}");
+        }
+        for input in ["_", "ctrl-_", "alt-_"] {
+            let chord = KeyChord::parse(input).unwrap();
+            let modifiers = if chord.ctrl {
+                KeyModifiers::CONTROL
+            } else if chord.alt {
+                KeyModifiers::ALT
+            } else {
+                KeyModifiers::NONE
+            };
+            for shift in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+                assert!(chord.matches(&ev(KeyCode::Char('_'), modifiers | shift)));
+                assert!(!chord.matches(&ev(KeyCode::Char('-'), modifiers | shift)));
+            }
+        }
     }
 
     #[test]
