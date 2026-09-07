@@ -32,20 +32,20 @@ use x509_parser::prelude::*;
 type Builder = ClientBuilder<BoxService<Request<Body>, Response<Box<DynBody>>, BoxError>>;
 
 pub(crate) fn client_builder(config: Config, allow_v1: bool) -> Result<Builder> {
-    let pinned_ca = crate::server_tls::configured_roots(&config);
-    let (mut tls, valid_until) = match ClientBuilder::try_from(config.clone()) {
-        Ok(builder) if pinned_ca.is_none() => return Ok(builder),
-        Ok(builder) => {
-            // Keep the expiration metadata that kube-rs obtains from exec credentials.
-            let valid_until = *builder.build().valid_until();
-            (config.rustls_client_config()?, valid_until)
-        }
-        Err(error) => (v1_config(&config, allow_v1, error)?, None),
-    };
-    if let Some(roots) = pinned_ca {
+    let tls = if let Some(roots) = crate::server_tls::configured_roots(&config) {
+        let mut tls = match config.rustls_client_config() {
+            Ok(tls) => tls,
+            Err(error) => v1_config(&config, allow_v1, error)?,
+        };
         crate::server_tls::install(&mut tls, roots)?;
-    }
-    Ok(connect(config, tls)?.with_valid_until(valid_until))
+        tls
+    } else {
+        match ClientBuilder::try_from(config.clone()) {
+            Ok(builder) => return Ok(builder),
+            Err(error) => v1_config(&config, allow_v1, error)?,
+        }
+    };
+    connect(config, tls)
 }
 
 fn v1_config(config: &Config, allow_v1: bool, original_error: kube::Error) -> Result<ClientConfig> {
@@ -537,34 +537,69 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn configured_ca_preserves_exec_client_credentials_and_expiration() {
-        let (url, task) = server(PROXY, &rustls::version::TLS13).await;
-        let credential = serde_json::json!({
-            "apiVersion": "client.authentication.k8s.io/v1", "kind": "ExecCredential",
-            "status": {
-                "expirationTimestamp": "2099-01-01T00:00:00Z",
-                "clientCertificateData": std::str::from_utf8(CLIENT_V3).unwrap(),
-                "clientKeyData": std::str::from_utf8(KEY).unwrap()
-            }
-        });
+    async fn exec_credentials_keep_standard_resolution_and_expiration() {
+        let (url, task) = server(SERVER, &rustls::version::TLS13).await;
+        let directory = std::env::temp_dir().join(format!(
+            "sofka-exec-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let counter = directory.join("count");
+        let credential = |expiration| {
+            serde_json::json!({
+                "apiVersion": "client.authentication.k8s.io/v1", "kind": "ExecCredential",
+                "status": {
+                    "expirationTimestamp": expiration,
+                    "clientCertificateData": std::str::from_utf8(CLIENT_V3).unwrap(),
+                    "clientKeyData": std::str::from_utf8(KEY).unwrap()
+                }
+            })
+            .to_string()
+        };
         let mut config = without_identity(&config());
         config.cluster_url = url;
-        config.root_cert = Some(vec![
-            CertificateDer::from_pem_slice(PROXY).unwrap().to_vec(),
-        ]);
+        config
+            .root_cert
+            .as_mut()
+            .unwrap()
+            .push(CertificateDer::from_pem_slice(PROXY).unwrap().to_vec());
         config.auth_info.exec = Some(
             serde_json::from_value(serde_json::json!({
                 "apiVersion": "client.authentication.k8s.io/v1", "command": "sh",
-                "args": ["-c", "printf '%s' \"$SOFKA_TEST_EXEC_CREDENTIAL\""],
+                "args": ["-c", r#"
+set -eu
+count=0
+if test -f "$1"; then read -r count < "$1"; fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$1"
+case "$count" in
+    1|2) printf '%s' "$SOFKA_TEST_EXEC_FIRST" ;;
+    3) printf '%s' "$SOFKA_TEST_EXEC_LAST" ;;
+    *) exit 1 ;;
+esac
+"#, "sofka-exec-test", counter.to_str().unwrap()],
                 "interactiveMode": "Never",
-                "env": [{"name": "SOFKA_TEST_EXEC_CREDENTIAL", "value": credential.to_string()}]
+                "env": [
+                    {"name": "SOFKA_TEST_EXEC_FIRST", "value": credential("2099-01-01T00:00:00Z")},
+                    {"name": "SOFKA_TEST_EXEC_LAST", "value": credential("2098-01-01T00:00:00Z")}
+                ]
             }))
             .unwrap(),
         );
-        let client = crate::k8s::build_client(config, false).unwrap();
+        let result = crate::k8s::build_client(config, false);
+        let count = std::fs::read_to_string(&counter).unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
+        let client = result.unwrap();
+        // The kube builder resolves auth, TLS identity, and expiration. The
+        // configured CA must not add another credential-plugin invocation.
+        assert_eq!(count.trim(), "3");
         assert_eq!(
             client.valid_until().unwrap().to_string(),
-            "2099-01-01T00:00:00Z"
+            "2098-01-01T00:00:00Z"
         );
         tokio::time::timeout(
             std::time::Duration::from_secs(5),

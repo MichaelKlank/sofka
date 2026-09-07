@@ -20,8 +20,12 @@ use x509_parser::{
 };
 
 pub(crate) fn configured_roots(config: &Config) -> Option<&[Vec<u8>]> {
-    // Leave platform trust, explicit insecure mode, and in-cluster CA reloads to kube-rs.
-    if config.accept_invalid_certs || config.root_cert_file.is_some() {
+    // These paths must retain kube-rs credential resolution and CA reload behavior.
+    if config.accept_invalid_certs
+        || config.root_cert_file.is_some()
+        || config.auth_info.exec.is_some()
+        || config.auth_info.auth_provider.is_some()
+    {
         return None;
     }
     config.root_cert.as_deref().filter(|roots| {
