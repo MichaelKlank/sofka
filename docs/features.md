@@ -127,6 +127,9 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   `ScaledDown`, `Terminating`), and the whole row is tinted by it - so a
   workload whose pods are crashing or whose desired replicas aren't met reads
   red/peach in the list, like k9s, instead of looking uniformly healthy.
+- **Job execution status** distinguishes pending, running, suspended, failed,
+  completing, completed, and terminating jobs. Failed jobs use the error color even when
+  no pod is active.
 - **Explain-unhealthy view** (`X` / `:explain`) - a deterministic, evidence-based
   explanation of why the selection is unhealthy: rollout state, degraded
   conditions, blocking pods and their container failure reasons

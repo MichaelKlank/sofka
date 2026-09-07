@@ -15447,3 +15447,72 @@ async fn missing_node_metrics_stay_distinct_in_render_capture_and_sort() {
         );
     }
 }
+
+#[tokio::test]
+async fn job_status_distinguishes_execution_states_through_navigation() {
+    for (spec, status, deleting, expected) in [
+        (
+            json!({"completions":1}),
+            json!({"active":0,"succeeded":1,"terminating":1,"conditions":[{"type":"SuccessCriteriaMet","status":"True"}]}),
+            false,
+            "Completing",
+        ),
+        (json!({}), json!({}), false, "Pending"),
+        (
+            json!({}),
+            json!({"active": 1, "failed": 2}),
+            false,
+            "Running",
+        ),
+        (
+            json!({}),
+            json!({"conditions": [{"type": "Failed", "status": "True"}]}),
+            false,
+            "Failed",
+        ),
+        (
+            json!({}),
+            json!({"active": 1, "conditions": [{"type": "FailureTarget", "status": "True"}]}),
+            false,
+            "Failed",
+        ),
+        (
+            json!({}),
+            json!({"conditions": [{"type": "Complete", "status": "True"}]}),
+            false,
+            "Completed",
+        ),
+        (json!({"suspend": true}), json!({}), false, "Suspended"),
+        (
+            json!({}),
+            json!({"conditions": [{"type": "Suspended", "status": "True"}]}),
+            false,
+            "Suspended",
+        ),
+        (
+            json!({}),
+            json!({"conditions": [{"type": "Complete", "status": "True"}]}),
+            true,
+            "Terminating",
+        ),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for ch in "jobs".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        apply(
+            &mut app,
+            json!({"apiVersion":"batch/v1", "kind":"Job", "metadata":{"name":"job", "namespace":"default", "deletionTimestamp": deleting.then_some("2026-09-07T10:00:00Z")}, "spec":spec, "status":status}),
+        );
+        let rows = app.rows();
+        app.ensure_table_cell_cache(&rows);
+        let cache = app.table_cell_cache();
+        let (cells, status_idx) = cache.get(&row_key(rows[0])).unwrap();
+        assert_eq!(cells[status_idx.unwrap()], expected);
+        if expected == "Failed" {
+            assert_eq!(crate::theme::row_color(expected), crate::theme::red());
+        }
+    }
+}
