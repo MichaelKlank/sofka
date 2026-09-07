@@ -25,7 +25,7 @@ impl App {
         self.explain_title = format!("{name} — explain");
         self.explain_items.clear();
         self.explain_state.select(None);
-        self.gitops_request = self.gitops_request.wrapping_add(1);
+        self.cancel_gitops_request();
         self.explain_source = Some(obj);
         self.mode = Mode::Explain;
         self.spawn_explain();
@@ -64,6 +64,7 @@ impl App {
             obj.metadata.name.clone().unwrap_or_default()
         ));
 
+        self.explain_claim = Some(claim);
         self.explain_request = self.explain_request.wrapping_add(1);
         let request = self.explain_request;
         tokio::spawn(async move {
@@ -122,11 +123,18 @@ impl App {
         });
     }
 
+    pub(super) fn cancel_explain_request(&mut self) {
+        self.explain_request = self.explain_request.wrapping_add(1);
+        if let Some(claim) = self.explain_claim.take() {
+            self.clear_claimed_status(claim);
+        }
+    }
+
     pub(super) fn key_explain(&mut self, key: KeyEvent) {
         let len = self.explain_items.len();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.explain_request = self.explain_request.wrapping_add(1);
+                self.cancel_explain_request();
                 let destination = self.explain_return;
                 self.mode = destination;
                 self.explain_return = Mode::Table;

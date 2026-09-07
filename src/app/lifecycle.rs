@@ -1035,6 +1035,7 @@ impl App {
                 source,
                 findings,
             } if generation == self.generation && request == self.explain_request => {
+                self.explain_claim = None;
                 if let Some(source) = source {
                     self.explain_source = Some(*source);
                 }
@@ -1061,6 +1062,7 @@ impl App {
                 source,
                 findings,
             } if generation == self.generation && request == self.gitops_request => {
+                self.gitops_claim = None;
                 if let Some(source) = source {
                     self.gitops_source = Some(*source);
                 }

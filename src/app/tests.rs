@@ -14904,17 +14904,38 @@ async fn health_refresh_keys_preserve_the_newest_error_over_older_success() {
 #[tokio::test]
 async fn leaving_health_view_rejects_its_pending_response() {
     for gitops in [false, true] {
-        let root = expression_workload(true);
-        let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
-        responses.lock().unwrap().insert(
-            "/apis/apps/v1/namespaces/default/deployments/web".into(),
-            (200, root),
-        );
-        open_health_report_key(&mut app, gitops);
-        let reply = take_health_report(&mut rx, gitops).await;
-        app.handle_key(press(KeyCode::Esc)).unwrap();
-        assert_eq!(app.mode, Mode::Table);
-        app.handle_msg(reply);
-        assert_eq!(app.mode, Mode::Table);
+        for close in [KeyCode::Esc, KeyCode::Char('q')] {
+            for newer_status in [false, true] {
+                let root = expression_workload(true);
+                let (mut app, mut rx, responses, _) =
+                    health_report_app("deployments", root.clone());
+                responses.lock().unwrap().insert(
+                    "/apis/apps/v1/namespaces/default/deployments/web".into(),
+                    (200, root),
+                );
+                open_health_report_key(&mut app, gitops);
+                let reply = take_health_report(&mut rx, gitops).await;
+                assert!(app.status_claim.as_ref().unwrap().pending);
+                let newer_claim = newer_status.then(|| app.claim_status("loading another report"));
+                app.handle_key(press(close)).unwrap();
+                assert_eq!(app.mode, Mode::Table);
+                if let Some(claim) = newer_claim {
+                    assert_eq!(current_claim(&app), claim);
+                    assert_eq!(app.flash, "loading another report");
+                } else {
+                    assert!(app.status_claim.is_none(), "closing must release progress");
+                    assert!(app.flash.is_empty(), "closing must clear report progress");
+                }
+                app.handle_msg(reply);
+                assert_eq!(app.mode, Mode::Table);
+                if let Some(claim) = newer_claim {
+                    assert_eq!(current_claim(&app), claim);
+                    assert_eq!(app.flash, "loading another report");
+                } else {
+                    assert!(app.status_claim.is_none());
+                    assert!(app.flash.is_empty());
+                }
+            }
+        }
     }
 }

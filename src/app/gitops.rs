@@ -29,7 +29,7 @@ impl App {
         self.gitops_title = format!("{name} — GitOps");
         self.gitops_items.clear();
         self.gitops_state.select(None);
-        self.explain_request = self.explain_request.wrapping_add(1);
+        self.cancel_explain_request();
         self.gitops_source = Some(obj);
         self.mode = Mode::Gitops;
         self.spawn_gitops();
@@ -62,6 +62,7 @@ impl App {
         let genr = self.generation;
         let claim = self.claim_status(format!("GitOps: {}…", subject));
 
+        self.gitops_claim = Some(claim);
         self.gitops_request = self.gitops_request.wrapping_add(1);
         let request = self.gitops_request;
         tokio::spawn(async move {
@@ -171,11 +172,18 @@ impl App {
         m
     }
 
+    pub(super) fn cancel_gitops_request(&mut self) {
+        self.gitops_request = self.gitops_request.wrapping_add(1);
+        if let Some(claim) = self.gitops_claim.take() {
+            self.clear_claimed_status(claim);
+        }
+    }
+
     pub(super) fn key_gitops(&mut self, key: KeyEvent) {
         let len = self.gitops_items.len();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.gitops_request = self.gitops_request.wrapping_add(1);
+                self.cancel_gitops_request();
                 self.mode = self.return_mode;
                 if self.return_mode == Mode::Table {
                     self.restore_selection();
