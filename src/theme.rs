@@ -514,6 +514,9 @@ pub fn accent() -> Style {
 /// (healthy, pending, error) keep a distinct pop color so they stand out
 /// against the row tint.
 pub fn status_color(s: &str) -> Color {
+    if s == "Ready,SchedulingDisabled" {
+        return yellow();
+    }
     match s.strip_suffix(",SchedulingDisabled").unwrap_or(s) {
         s if failure_status(s) => red(),
         s if s.starts_with("Init:") => yellow(),
@@ -560,11 +563,12 @@ fn failure_status(status: &str) -> bool {
             | "DeadlineExceeded"
             | "Lost"
             | "ContainerStatusUnknown"
-    ) || status
-        .strip_prefix("Signal:")
-        .or_else(|| status.strip_prefix("ExitCode:"))
-        .and_then(|n| n.parse::<i64>().ok())
-        .is_some_and(|n| n != 0)
+    ) || status.starts_with("NotReady")
+        || status
+            .strip_prefix("Signal:")
+            .or_else(|| status.strip_prefix("ExitCode:"))
+            .and_then(|n| n.parse::<i64>().ok())
+            .is_some_and(|n| n != 0)
 }
 
 /// k9s-style whole-row color: every table row is tinted a single color chosen
@@ -715,7 +719,7 @@ mod tests {
         // Pending pops distinct from the row's peach.
         assert_eq!(status_color("Pending"), yellow());
         assert_ne!(status_color("Pending"), row_color("Pending"));
-        assert_eq!(status_color("Ready,SchedulingDisabled"), green());
+        assert_eq!(status_color("Ready,SchedulingDisabled"), yellow());
         assert_eq!(status_color("NotReady,SchedulingDisabled"), red());
         assert_eq!(status_color("Unknown,SchedulingDisabled"), overlay1());
     }
