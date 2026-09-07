@@ -855,6 +855,11 @@ impl App {
             // Humanized time cells ("5d23h") must sort by the underlying
             // timestamp, never the rendered string. Negated epoch seconds so
             // ascending = most recent first, matching AGE; unknowns last.
+            "LAST-SEEN" if self.kind_plural == "events" => SortKey::Num(
+                crate::columns::event_last_seen_secs(o)
+                    .map(|s| -(s as f64))
+                    .unwrap_or(f64::INFINITY),
+            ),
             "UPDATED" => SortKey::Num(
                 crate::helm::decode_summary(o)
                     .and_then(|r| r.last_deployed_secs)

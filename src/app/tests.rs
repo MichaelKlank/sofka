@@ -15773,3 +15773,70 @@ fn helm_updated_custom_columns_keep_their_own_type_and_clock() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn event_last_seen_sorts_recent_occurrences_and_advances_with_time() {
+    let now = "2026-09-07T11:00:00Z"
+        .parse::<k8s_openapi::jiff::Timestamp>()
+        .unwrap()
+        .as_second();
+    for (query, api_version, recent) in [
+        (
+            "events",
+            "v1",
+            json!({"lastTimestamp":"2026-09-07T10:59:55Z", "count":20}),
+        ),
+        (
+            "events.events.k8s.io",
+            "events.k8s.io/v1",
+            json!({"eventTime":"2026-09-07T10:00:00Z", "series":{"lastObservedTime":"2026-09-07T10:59:55Z", "count":20}}),
+        ),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind(query);
+        let mut repeated = json!({"apiVersion":api_version,"kind":"Event","metadata":{"name":"repeat","namespace":"default","resourceVersion":"1","creationTimestamp":"2026-09-07T10:00:00Z"}});
+        repeated
+            .as_object_mut()
+            .unwrap()
+            .extend(recent.as_object().unwrap().clone());
+        apply(&mut app, repeated);
+        apply(
+            &mut app,
+            json!({"apiVersion":api_version,"kind":"Event","metadata":{"name":"single","namespace":"default","resourceVersion":"1","creationTimestamp":"2026-09-07T10:50:00Z"},"eventTime":"2026-09-07T10:50:00Z"}),
+        );
+        app.handle_key(press(KeyCode::Char('S'))).unwrap();
+        for ch in "lastseen".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(row_names(&app), ["repeat", "single"]);
+        let idx = app
+            .display_headers()
+            .iter()
+            .position(|h| h == "LAST-SEEN")
+            .unwrap();
+        let age_idx = app
+            .display_headers()
+            .iter()
+            .position(|h| h == "AGE")
+            .unwrap();
+        {
+            let rows = app.rows();
+            let (cells, _) = app.spec.cells(rows[0], now);
+            assert_eq!(cells[idx], "5s");
+            assert_eq!(cells[age_idx], "1h");
+            assert_eq!(
+                app.spec.volatile(rows[0], "events", idx, now + 30),
+                Some("35s".into())
+            );
+        }
+        apply(
+            &mut app,
+            json!({"apiVersion":api_version,"kind":"Event","metadata":{"name":"single","namespace":"default","resourceVersion":"2","creationTimestamp":"2026-09-07T10:50:00Z"},"series":{"lastObservedTime":"2026-09-07T11:00:01Z","count":2}}),
+        );
+        assert_eq!(row_names(&app), ["single", "repeat"]);
+        app.handle_key(press(KeyCode::Char('S'))).unwrap();
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(row_names(&app), ["repeat", "single"]);
+    }
+}
