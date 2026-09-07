@@ -1716,7 +1716,17 @@ fn node_roles(obj: &DynamicObject) -> String {
                 .collect()
         })
         .unwrap_or_default();
+    if let Some(role) = obj
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get("kubernetes.io/role"))
+        .filter(|role| !role.is_empty())
+    {
+        roles.push(role.clone());
+    }
     roles.sort();
+    roles.dedup();
     if roles.is_empty() {
         "<none>".into()
     } else {

@@ -15611,3 +15611,38 @@ async fn service_endpoint_columns_include_names_addresses_and_node_ports() {
         );
     }
 }
+
+#[tokio::test]
+async fn node_roles_include_legacy_labels_without_duplicates() {
+    for (labels, expected) in [
+        (json!({"kubernetes.io/role":"worker"}), "worker"),
+        (
+            json!({"kubernetes.io/role":"worker", "node-role.kubernetes.io/worker":"", "node-role.kubernetes.io/control-plane":""}),
+            "control-plane,worker",
+        ),
+        (
+            json!({"kubernetes.io/role":"", "node-role.kubernetes.io/":""}),
+            "<none>",
+        ),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for ch in "nodes".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1", "kind":"Node", "metadata":{"name":"worker","labels":labels}}),
+        );
+        let headers = app.display_headers().to_vec();
+        let rows = app.rows();
+        app.ensure_table_cell_cache(&rows);
+        let cache = app.table_cell_cache();
+        let (cells, _) = cache.get(&row_key(rows[0])).unwrap();
+        assert_eq!(
+            cells[headers.iter().position(|h| h == "ROLES").unwrap()],
+            expected
+        );
+    }
+}
