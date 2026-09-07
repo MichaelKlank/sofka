@@ -17221,3 +17221,73 @@ async fn bundled_plugin_receives_v1_consent_only_when_enabled() {
         assert_eq!(app.mode, Mode::Table);
     }
 }
+
+#[tokio::test]
+async fn refresh_key_reads_pods_through_a_configured_ca_server_certificate() {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let pem = include_bytes!("../../tests/fixtures/tls/proxy-ca.pem");
+    let der = CertificateDer::from_pem_slice(pem).unwrap();
+    let tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![der.clone()],
+            PrivateKeyDer::from_pem_slice(include_bytes!("../../tests/fixtures/tls/server.key"))
+                .unwrap(),
+        )
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = kube::Config::new(
+        format!("https://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap(),
+    );
+    config.root_cert = Some(vec![der.to_vec()]);
+    config.tls_server_name = Some("localhost".into());
+    config.default_retry = false;
+    let (request_tx, mut requests) = mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let acceptor = acceptor.clone();
+            let request_tx = request_tx.clone();
+            connections.spawn(async move {
+                let Ok(mut stream) = acceptor.accept(socket).await else { return };
+                let mut bytes = Vec::new();
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    let Ok(byte) = stream.read_u8().await else { return };
+                    bytes.push(byte);
+                    assert!(bytes.len() < 16384);
+                }
+                let request = String::from_utf8(bytes).unwrap();
+                if !request.lines().next().unwrap().contains("/pods?") {
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
+                    return;
+                }
+                request_tx.send(request).unwrap();
+                let body = concat!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                    "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"proxy-pod\",\"namespace\":\"default\",\"resourceVersion\":\"1\"}}}\n",
+                    "{\"type\":\"BOOKMARK\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"resourceVersion\":\"1\",\"annotations\":{\"k8s.io/initial-events-end\":\"true\"}}}}\n",
+                );
+                stream.write_all(body.as_bytes()).await.unwrap();
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    let (mut app, mut rx) = test_app();
+    app.cluster.client = crate::k8s::build_client(config, false).unwrap();
+    app.kind = app.cluster.resolve("pods");
+    app.kind_plural = "pods".into();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    sync_selector_view(&mut app, &mut rx).await;
+    assert_eq!(row_names(&app), ["proxy-pod"]);
+    let request = requests.recv().await.unwrap().to_ascii_lowercase();
+    assert!(request.contains("watch=true"), "{request}");
+    assert!(request.contains("accept-encoding: identity"), "{request}");
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    server.abort();
+}

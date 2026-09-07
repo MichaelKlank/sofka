@@ -34,6 +34,7 @@ pub mod providers;
 pub mod pvcexplore;
 pub mod rightsize;
 pub mod sanitize;
+mod server_tls;
 pub mod snapshot;
 pub mod sortmem;
 pub mod state_writer;
