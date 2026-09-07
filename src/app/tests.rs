@@ -6434,6 +6434,58 @@ async fn wildcard_sort_applies_when_printer_columns_arrive_without_replacing_use
 }
 
 #[tokio::test]
+async fn saved_printer_sort_replaces_config_default_but_not_a_new_user_choice() {
+    for (remember, invert) in [(true, false), (true, true), (false, false), (false, true)] {
+        let (mut app, _rx) = test_app();
+        app.remember_sort = remember;
+        app.sort_memory.set("certificates", "READY", false);
+        install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+        palette(&mut app, "certificates");
+        assert_eq!(app.sort_column, Some(1));
+        assert!(app.sort_from_config);
+        if invert {
+            app.handle_key(press(KeyCode::Char('I'))).unwrap();
+            assert!(!app.sort_from_config);
+        }
+        let crd = json!({"spec": {"versions": [{
+            "name": "v1", "served": true, "storage": true,
+            "additionalPrinterColumns": [
+                {"name": "Ready", "type": "string", "jsonPath": ".status.ready"}
+            ]
+        }]}});
+        app.handle_msg(Msg::PrinterColumns {
+            generation: app.generation,
+            resource: app.cluster.resolve("certificates").unwrap().resource_key(),
+            view: Box::new(crate::views::printer_columns_view(&crd, "v1")),
+        });
+        let header = if remember && !invert { "READY" } else { "AGE" };
+        assert_eq!(
+            app.sort_column,
+            app.display_headers().iter().position(|h| h == header)
+        );
+        assert_eq!(app.sort_desc, !remember && !invert);
+    }
+}
+
+#[tokio::test]
+async fn saved_wide_sort_replaces_config_default_when_its_column_appears() {
+    let (mut app, _rx) = test_app();
+    app.sort_memory.set("pods", "IP", false);
+    install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+    palette(&mut app, "pods");
+    assert!(app.sort_from_config);
+    assert!(app.sort_desc);
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "IP")
+    );
+    assert!(app.sort_column.is_some());
+    assert!(!app.sort_from_config);
+    assert!(!app.sort_desc);
+}
+
+#[tokio::test]
 async fn disabled_sort_memory_keeps_changes_local_and_preserves_saved_state() {
     let dir = std::env::temp_dir().join(format!("sofka-sort-option-{}", std::process::id()));
     write_config(&dir, "remember_sort = false\n");

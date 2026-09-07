@@ -890,6 +890,7 @@ impl App {
             Some(i) => {
                 self.sort_column = Some(i);
                 self.sort_desc = desc;
+                self.sort_from_config = true;
                 self.invalidate_rows();
             }
             None if is_specific => {
@@ -1050,6 +1051,7 @@ impl App {
     pub(super) fn reset_sort(&mut self) {
         self.sort_column = None;
         self.sort_desc = false;
+        self.sort_from_config = false;
     }
 
     /// Record the active sort for the current kind (and persist it), so the
@@ -1058,6 +1060,7 @@ impl App {
     /// kind's entry is forgotten instead. View switches call `reset_sort`
     /// directly and must NOT land here — a switch isn't a sort choice.
     pub(super) fn remember_sort(&mut self) {
+        self.sort_from_config = false;
         if !self.remember_sort || self.kind_plural.is_empty() {
             return;
         }
@@ -1081,14 +1084,14 @@ impl App {
         }
     }
 
-    /// Restore the remembered sort for the current kind, unless a sort is
-    /// already active (a bookmark's sort spec, or a header repinned across a
-    /// spec refresh, must win). A remembered header missing from the current
+    /// Restore the remembered sort for the current kind. It can replace a
+    /// configured default, but an active user or bookmark sort has priority.
+    /// A remembered header missing from the current
     /// layout is left in memory untouched: CRD printer columns arrive after
     /// the watch starts (see `Msg::PrinterColumns`, which retries this), and
     /// a wide-only column simply stays dormant until `w`.
     pub(super) fn apply_remembered_sort(&mut self) {
-        if !self.remember_sort || self.sort_column.is_some() {
+        if !self.remember_sort || (self.sort_column.is_some() && !self.sort_from_config) {
             return;
         }
         let Some((header, desc)) = self.sort_memory.get(&self.kind_plural) else {
@@ -1097,6 +1100,7 @@ impl App {
         if let Some(i) = self.display_headers().iter().position(|h| *h == header) {
             self.sort_column = Some(i);
             self.sort_desc = desc;
+            self.sort_from_config = false;
             self.invalidate_rows();
         }
     }

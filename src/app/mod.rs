@@ -1623,6 +1623,7 @@ pub struct App {
     /// Column index (into the displayed headers) to sort the table by, or
     /// `None` for the natural namespace/name order.
     pub sort_column: Option<usize>,
+    pub sort_from_config: bool,
     pub sort_desc: bool,
     /// Horizontal offset in terminal cells after NAMESPACE/NAME.
     /// The renderer clamps this when the viewport or columns change.
@@ -2029,6 +2030,7 @@ impl App {
             table_page_rows: 10,
             marked: HashSet::new(),
             sort_column: None,
+            sort_from_config: false,
             sort_desc: false,
             col_offset: 0,
             col_scroll_max: 0,
