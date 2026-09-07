@@ -530,8 +530,9 @@ pub struct Plan {
     pub children: Vec<KindRef>,
     pub forward: Vec<Forward>,
     pub backward: Vec<Backward>,
-    /// A reference the plan couldn't follow — an owner kind that isn't served.
-    pub warn: Option<String>,
+    /// References the plan couldn't follow — an owner kind that isn't served,
+    /// a rule with nowhere to read. Each is a line the view shows.
+    pub warns: Vec<String>,
 }
 
 /// Build the plan for `obj`, an object of `source`. `table_ns` is the
@@ -554,7 +555,7 @@ pub fn plan(
         match kinds.by_kind_in_group(&o.kind, group) {
             Some(kind) => plan.owners.push((kind, o.name.clone())),
             None => {
-                plan.warn.get_or_insert(format!(
+                plan.warns.push(format!(
                     "owner kind {} ({}) is not served here",
                     o.kind, o.api_version
                 ));
@@ -574,14 +575,27 @@ pub fn plan(
             continue;
         };
         if let Some(why) = unreachable_namespace(&rule, source.namespaced, target.namespaced) {
-            plan.warn.get_or_insert(why);
+            plan.warns.push(why);
             continue;
         }
-        let refs: Vec<(String, String)> =
-            pointer_pairs(&value, &rule.path, rule.namespace_path.as_deref())
-                .into_iter()
-                .map(|(name, target_ns)| (name, target_ns.unwrap_or_else(|| ns.clone())))
-                .collect();
+        let mut refs: Vec<(String, String)> = Vec::new();
+        for (name, target_ns) in pointer_pairs(&value, &rule.path, rule.namespace_path.as_deref()) {
+            match target_ns {
+                Some(target_ns) => refs.push((name, target_ns)),
+                // The row's own namespace covers a missing one — unless the
+                // row has none: then there is nowhere to read, and a GET in
+                // no namespace would quietly find nothing.
+                None if !target.namespaced || !ns.is_empty() => refs.push((name, ns.clone())),
+                None => {
+                    plan.warns.push(format!(
+                        "ref {} → {}: {name} has no namespace at {}",
+                        rule.from,
+                        rule.kind,
+                        rule.namespace_path.as_deref().unwrap_or_default()
+                    ));
+                }
+            }
+        }
         if !refs.is_empty() {
             plan.forward.push(Forward { rule, target, refs });
         }
@@ -600,7 +614,7 @@ pub fn plan(
             continue;
         };
         if let Some(why) = unreachable_namespace(&rule, from.namespaced, source.namespaced) {
-            plan.warn.get_or_insert(why);
+            plan.warns.push(why);
             continue;
         }
         // A rule declared under `kind@namespace` describes that namespace's
@@ -1003,14 +1017,32 @@ mod tests {
             .find(|f| f.target.plural == "secrets")
             .unwrap();
         assert_eq!(secret.refs, [("tls".to_string(), "edge".to_string())]);
+        // A row whose namespace annotation is missing can't be followed
+        // either: the ref is dropped and named in the warning.
+        let bare = obj(json!({"apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "n2", "annotations": {"example.com/secret": "tls"}}}));
+        let plan_bare = self::plan(&views, &kinds, &kind("", "Node", "nodes", false), &bare, "");
+        assert!(
+            plan_bare
+                .forward
+                .iter()
+                .all(|f| f.target.plural != "secrets")
+        );
+        assert!(
+            plan_bare.warns.join("; ").contains(
+                "tls has no namespace at /metadata/annotations/example.com~1secret-namespace"
+            ),
+            "{:?}",
+            plan_bare.warns
+        );
         // …the one without is skipped, and the view says why instead of
         // quietly reading in no namespace and finding nothing.
         assert!(plan.forward.iter().all(|f| f.target.plural != "configmaps"));
         assert!(
-            plan.warn.as_deref().unwrap().contains("nodes → configmaps")
-                && plan.warn.as_deref().unwrap().contains("namespace_path"),
+            plan.warns.join("; ").contains("nodes → configmaps")
+                && plan.warns.join("; ").contains("namespace_path"),
             "{:?}",
-            plan.warn
+            plan.warns
         );
         // Read backwards from a ConfigMap, the same rule is skipped for the
         // same reason; the pods-mount-configmaps rule still runs.
@@ -1026,7 +1058,7 @@ mod tests {
         );
         assert!(plan.backward.iter().all(|b| b.from.plural != "nodes"));
         assert!(plan.backward.iter().any(|b| b.from.plural == "pods"));
-        assert!(plan.warn.as_deref().unwrap().contains("namespace_path"));
+        assert!(plan.warns.join("; ").contains("namespace_path"));
     }
 
     #[test]
@@ -1065,12 +1097,9 @@ mod tests {
         assert_eq!(plan.owners[0].0.ar.group, "postgresql.cnpg.io");
         assert_eq!(plan.owners[0].1, "db");
         assert!(
-            plan.warn
-                .as_deref()
-                .unwrap()
-                .contains("Widget (unknown.io/v1)"),
+            plan.warns.join("; ").contains("Widget (unknown.io/v1)"),
             "{:?}",
-            plan.warn
+            plan.warns
         );
         // Pods own nothing.
         assert!(plan.children.is_empty());

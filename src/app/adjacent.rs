@@ -110,7 +110,7 @@ impl App {
         let request = self.adjacent_request;
 
         tokio::spawn(async move {
-            let mut warn = plan.warn;
+            let mut warn = (!plan.warns.is_empty()).then(|| plan.warns.join("; "));
             let mut items: Vec<AdjacentItem> = Vec::new();
             let ns = obj.metadata.namespace.clone().unwrap_or_default();
             let source_uid = obj.metadata.uid.clone();
