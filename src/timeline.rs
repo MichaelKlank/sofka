@@ -326,15 +326,14 @@ fn i_at(obj: &DynamicObject, ptr: &str) -> i64 {
 }
 
 fn restarts_sum(obj: &DynamicObject) -> i64 {
-    obj.data
-        .pointer("/status/containerStatuses")
-        .and_then(Value::as_array)
-        .map(|cs| {
-            cs.iter()
-                .filter_map(|c| c.get("restartCount").and_then(Value::as_i64))
-                .sum()
-        })
-        .unwrap_or(0)
+    // Keep completed init counts in history so initialization does not reset
+    // the baseline or hide a restart in the same update that completes init.
+    ["/status/containerStatuses", "/status/initContainerStatuses"]
+        .into_iter()
+        .filter_map(|path| obj.data.pointer(path).and_then(Value::as_array))
+        .flatten()
+        .filter_map(|c| c.get("restartCount").and_then(Value::as_i64))
+        .sum()
 }
 
 fn waiting_reason(obj: &DynamicObject) -> Option<String> {
@@ -530,5 +529,31 @@ mod tests {
     fn clock_formats_hms() {
         // 08:45:12 UTC on 2026-07-13 → 1_752_396_312.
         assert_eq!(clock(1_752_396_312), "08:45:12");
+    }
+
+    #[test]
+    fn init_restart_history_survives_initialization_completion() {
+        let before = obj(
+            json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p"},
+            "status": {"phase": "Pending", "initContainerStatuses": [
+                {"name": "init", "restartCount": 2, "state": {"running": {}}}],
+                "containerStatuses": [{"name": "app", "restartCount": 0}]}}),
+        );
+        let mut after = before.clone();
+        after.data["status"]["phase"] = json!("Running");
+        after.data["status"]["initContainerStatuses"][0] = json!({"name": "init", "restartCount": 3,
+            "state": {"terminated": {"exitCode": 0}}});
+        let changes = transitions(&before, &after, "pods");
+        assert!(changes.iter().any(
+            |(level, text)| *level == Level::Warn && text == "container restart (2 → 3 total)"
+        ));
+        let mut app_restart = after.clone();
+        app_restart.data["status"]["containerStatuses"][0]["restartCount"] = json!(1);
+        assert!(
+            transitions(&after, &app_restart, "pods")
+                .iter()
+                .any(|(_, text)| text == "container restart (3 → 4 total)")
+        );
+        assert!(transitions(&app_restart, &app_restart, "pods").is_empty());
     }
 }

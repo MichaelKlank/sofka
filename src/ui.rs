@@ -800,9 +800,10 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
             // every container passes its readiness probe — until READY is n/n,
             // paint it as transitional, not healthy.
             let running_not_ready = status_val == "Running"
-                && ready_idx
+                && (ready_idx
                     .and_then(|i| cells.get(i))
-                    .is_some_and(|r| !all_ready(r.as_str()));
+                    .is_some_and(|r| !all_ready(r.as_str()))
+                    || (app.kind_plural == "pods" && pod_readiness_blocked(obj)));
             let status_key = if running_not_ready {
                 "PodInitializing"
             } else {
@@ -1187,6 +1188,30 @@ fn all_ready(ready: &str) -> bool {
         Some((r, t)) => r == t,
         None => true,
     }
+}
+
+fn pod_readiness_blocked(obj: &kube::core::DynamicObject) -> bool {
+    let conditions = obj
+        .data
+        .pointer("/status/conditions")
+        .and_then(serde_json::Value::as_array);
+    let condition = |name: &str| {
+        conditions
+            .and_then(|conditions| conditions.iter().find(|c| c["type"].as_str() == Some(name)))
+    };
+    condition("Ready").is_some_and(|c| c["status"].as_str() != Some("True"))
+        || obj
+            .data
+            .pointer("/spec/readinessGates")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|gates| {
+                gates.iter().any(|gate| {
+                    gate["conditionType"]
+                        .as_str()
+                        .and_then(condition)
+                        .is_none_or(|c| c["status"].as_str() != Some("True"))
+                })
+            })
 }
 
 /// Render the NAME cell, highlighting characters that matched the active
