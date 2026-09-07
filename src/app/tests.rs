@@ -11075,6 +11075,73 @@ async fn fleet_seeds_connecting_rows_and_applies_summaries() {
 }
 
 #[tokio::test]
+async fn fleet_command_counts_terminating_pods_as_unhealthy() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, _rx) = test_app();
+    app.fleet_cfg.contexts = vec!["staging".into()];
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for ch in "fleet".chars() {
+        app.handle_key(press(KeyCode::Char(ch))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Fleet);
+
+    for deleting in [false, true] {
+        if deleting {
+            app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        }
+        assert_eq!(
+            app.fleet_rows[0].status,
+            crate::fleet::FleetStatus::Connecting
+        );
+        let pods = [
+            ("running", "Running", false),
+            ("completed", "Succeeded", false),
+            ("deleting-running", "Running", deleting),
+            ("deleting-completed", "Succeeded", deleting),
+        ]
+        .map(|(name, phase, terminating)| {
+            obj(json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": name,
+                    "deletionTimestamp": terminating.then_some("2026-09-07T10:00:00Z"),
+                },
+                "status": {
+                    "phase": phase,
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                },
+            }))
+        });
+        let mut row = crate::fleet::FleetRow::connecting("staging".into(), false);
+        super::fleet::update_pod_counts(&mut row, &pods);
+        row.status = crate::fleet::FleetStatus::Ok;
+        app.handle_msg(Msg::FleetRow {
+            generation: app.generation,
+            row: Box::new(row),
+        });
+
+        let expected_unhealthy = if deleting { 2 } else { 0 };
+        assert_eq!(app.fleet_rows[0].pods_total, 4);
+        assert_eq!(app.fleet_rows[0].pods_unhealthy, expected_unhealthy);
+        assert_eq!(app.fleet_rows[0].is_healthy(), !deleting);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect();
+        assert!(
+            screen.contains(&format!("pods {expected_unhealthy}✗/4")),
+            "{screen}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn ctrl_e_toggles_compact_mode_from_any_mode() {
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
@@ -16640,6 +16707,22 @@ fn explain_selected_with_pure_evidence(app: &mut App) {
         source: None,
         findings,
     });
+}
+
+#[tokio::test]
+async fn explain_key_reports_terminating_ready_pods_as_unhealthy() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let mut pod = health_test_pod("web");
+    pod["metadata"]["deletionTimestamp"] = json!("2026-09-07T10:00:00Z");
+    apply(&mut app, pod);
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    explain_selected_with_pure_evidence(&mut app);
+    assert_eq!(app.explain_items[0].level, crate::explain::Level::Warn);
+    assert_eq!(
+        app.explain_items[0].text,
+        "Pod/web is Terminating (1/1 ready)"
+    );
 }
 
 #[tokio::test]
