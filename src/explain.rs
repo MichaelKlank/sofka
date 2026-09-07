@@ -106,7 +106,6 @@ fn explain_workload(ev: &Evidence, name: &str, out: &mut Vec<Finding>) {
     let spec_replicas = ptr_i64(d, "/spec/replicas");
     let ready = ptr_i64(d, "/status/readyReplicas").unwrap_or(0);
     let updated = ptr_i64(d, "/status/updatedReplicas").unwrap_or(0);
-    let available = ptr_i64(d, "/status/availableReplicas").unwrap_or(0);
 
     // DaemonSets count differently — desired is scheduled onto matching nodes.
     let (desired, ds) = match ev.plural {
@@ -118,6 +117,15 @@ fn explain_workload(ev: &Evidence, name: &str, out: &mut Vec<Finding>) {
     };
     let ds_ready = ptr_i64(d, "/status/numberReady").unwrap_or(0);
     let ready = if ds { ds_ready } else { ready };
+    let available = ptr_i64(
+        d,
+        if ds {
+            "/status/numberAvailable"
+        } else {
+            "/status/availableReplicas"
+        },
+    )
+    .unwrap_or(0);
 
     let healthy = ready >= desired && desired > 0
         || (desired == 0 && ptr_i64(d, "/status/replicas").unwrap_or(0) == 0);
@@ -830,5 +838,22 @@ mod tests {
                 .iter()
                 .any(|f| f.level == Level::Warn && f.text.starts_with("MemoryPressure"))
         );
+    }
+    #[test]
+    fn daemonset_available_count_uses_its_status_field() {
+        for available in [Some(3), Some(1), Some(0), None] {
+            let mut daemonset = obj(json!({"apiVersion": "apps/v1", "kind": "DaemonSet",
+                "metadata": {"name": "agent"}, "status": {"desiredNumberScheduled": 3,
+                    "currentNumberScheduled": 3, "updatedNumberScheduled": 3, "numberReady": 3}}));
+            if let Some(n) = available {
+                daemonset.data["status"]["numberAvailable"] = json!(n);
+            }
+            let findings = explain(&ev("DaemonSet", "daemonsets", &daemonset, &[], &[]));
+            assert_eq!(findings[0].level, Level::Good);
+            assert!(
+                findings.iter().any(|f| f.text
+                    == format!("desired 3 · ready 3 · available {}", available.unwrap_or(0)))
+            );
+        }
     }
 }

@@ -15,6 +15,8 @@ are `True`. `NetworkUnavailable=True` is also a warning. These conditions do
 not produce warnings when they are `False`. `Unknown` remains a warning, and
 the `Ready` condition is assessed separately.
 
+The DaemonSet rollout summary reads available pods from `status.numberAvailable`.
+
 ## Timeline (`T`)
 
 A per-object timestamped log of every state change the watch saw this session:

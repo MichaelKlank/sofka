@@ -14425,3 +14425,28 @@ async fn explain_key_reports_node_pressure_without_warning_on_healthy_conditions
         assert_eq!(app.mode, Mode::Table);
     }
 }
+
+#[tokio::test]
+async fn explain_key_shows_reported_daemonset_availability() {
+    let (mut app, _rx) = test_app();
+    app.cluster
+        .register_kind("apps", "DaemonSet", "daemonsets", true);
+    app.switch_kind("daemonsets");
+    apply(
+        &mut app,
+        json!({"apiVersion": "apps/v1", "kind": "DaemonSet",
+        "metadata": {"name": "agent", "namespace": "default"},
+        "status": {"desiredNumberScheduled": 3, "currentNumberScheduled": 3,
+            "updatedNumberScheduled": 3, "numberReady": 3, "numberAvailable": 3}}),
+    );
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    explain_selected_with_pure_evidence(&mut app);
+    assert_eq!(app.explain_items[0].text, "DaemonSet/agent is healthy");
+    assert!(
+        app.explain_items
+            .iter()
+            .any(|f| f.text == "desired 3 · ready 3 · available 3")
+    );
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+}
