@@ -107,6 +107,7 @@ pub struct Cluster {
     /// unknown, supported, or unsupported. Shared by all view watches so one
     /// negotiation failure avoids retrying the extension on every switch.
     streaming_lists: Arc<AtomicU8>,
+    pub discovery_warnings: Vec<String>,
 }
 
 const STREAMING_UNKNOWN: u8 = 0;
@@ -183,6 +184,7 @@ impl Cluster {
             connected: true,
             allow_v1_client_cert,
             streaming_lists: Arc::new(AtomicU8::new(STREAMING_UNKNOWN)),
+            discovery_warnings: Vec::new(),
         };
         // Version is useful metadata, not a connectivity prerequisite. Fetch
         // it alongside discovery so it adds no serial startup latency, and
@@ -250,6 +252,7 @@ impl Cluster {
             connected: false,
             allow_v1_client_cert: false,
             streaming_lists: Arc::new(AtomicU8::new(STREAMING_UNKNOWN)),
+            discovery_warnings: Vec::new(),
         }
     }
 
@@ -283,8 +286,9 @@ impl Cluster {
     async fn discover(&mut self) -> Result<()> {
         // Aggregated discovery needs two requests and tolerates stale APIService
         // entries. Legacy discovery is used when negotiation fails.
-        let resources = discovery::discover(&self.client).await?;
-        self.register_resources(resources);
+        let discovered = discovery::discover(&self.client).await?;
+        self.discovery_warnings = discovered.warnings;
+        self.register_resources(discovered.resources);
         Ok(())
     }
 
@@ -621,6 +625,7 @@ impl Cluster {
             registry: HashMap::new(),
             catalog: Vec::new(),
             streaming_lists: Arc::new(AtomicU8::new(STREAMING_UNKNOWN)),
+            discovery_warnings: Vec::new(),
         };
         cluster.register_kind("", "Pod", "pods", true);
         cluster.register_kind("apps", "Deployment", "deployments", true);
@@ -961,7 +966,7 @@ pub(crate) mod tests {
         let addr = listener.local_addr().expect("local addr");
 
         fn route(path: &str, aggregated: bool, include_broken: bool) -> (&'static str, String) {
-            let broken_legacy = r#",{"name":"broken.example.com","versions":[{"groupVersion":"broken.example.com/v1beta1","version":"v1beta1"}],"preferredVersion":{"groupVersion":"broken.example.com/v1beta1","version":"v1beta1"}}"#;
+            let broken_legacy = r#",{"name":"broken.example.com","versions":[{"groupVersion":"broken.example.com/v1beta1","version":"v1beta1"}],"preferredVersion":{"groupVersion":"broken.example.com/v1beta1","version":"v1beta1"}},{"name":"odd.example.com","versions":[{"groupVersion":"odd.example.com/v1alpha3","version":"v1alpha3"}],"preferredVersion":{"groupVersion":"odd.example.com/v1alpha3","version":"v1alpha3"}}"#;
             let broken_v2 = r#",{"metadata":{"name":"broken.example.com"},"versions":[{"version":"v1beta1","resources":[],"freshness":"Stale"}]}"#;
             // A mixed-version group modeled on the netbird.io operator: the
             // preferred version (v1) serves `widgets`, while `gadgets` is
@@ -1017,6 +1022,10 @@ pub(crate) mod tests {
                 ("/apis/mixed.example.com/v1alpha1", _) => (
                     "200 OK",
                     r#"{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"mixed.example.com/v1alpha1","resources":[{"name":"gadgets","singularName":"gadget","shortNames":["gd","shared"],"namespaced":true,"kind":"Gadget","verbs":["get","list","watch"]}]}"#.into(),
+                ),
+                ("/apis/odd.example.com/v1alpha3", _) => (
+                    "200 OK",
+                    r#"{"kind":"APIResourceList","apiVersion":"v1alpha3","groupVersion":"odd.example.com/v1alpha3","resources":[{"name":"oddities","singularName":"oddity","namespaced":true,"kind":"Oddity","verbs":["get","list","watch"]}]}"#.into(),
                 ),
                 ("/apis/broken.example.com/v1beta1", _) => (
                     "503 Service Unavailable",
@@ -1133,6 +1142,7 @@ pub(crate) mod tests {
             .expect("connect with broken APIService");
         assert!(cluster.resolve("deployments").is_some());
         assert!(cluster.resolve("pods").is_some());
+        assert!(cluster.discovery_warnings.is_empty());
     }
 
     #[test]
@@ -1178,6 +1188,7 @@ pub(crate) mod tests {
             .expect("connect via legacy discovery walk");
         assert!(cluster.resolve("deployments").is_some());
         assert!(cluster.resolve("pods").is_some());
+        assert!(cluster.discovery_warnings.is_empty());
     }
 
     /// Asserts every kind of the mixed-version group resolved: `widgets` at
@@ -1216,13 +1227,27 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_walk_still_fails_on_broken_apiservice() {
-        // Documents the failure mode the aggregated path exists to avoid:
-        // the per-group walk hits the broken group's 503 and discovery fails
-        // (after ~4 minutes of client-side 503 retries with the default
-        // config). If kube-rs ever makes run() tolerant, this starts failing
-        // and the aggregated workaround can be simplified.
+    async fn legacy_walk_skips_unreadable_groups_with_warnings() {
         let url = mock_apiserver(false, true, true).await;
-        assert!(connect_mock(url).await.is_err());
+        let cluster = connect_mock(url)
+            .await
+            .expect("connect despite unreadable groups");
+        assert!(cluster.resolve("deployments").is_some());
+        assert!(cluster.resolve("pods").is_some());
+        assert!(cluster.resolve("oddities").is_none());
+        let warnings = &cluster.discovery_warnings;
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("API discovery could not read broken.example.com/v1beta1: ")),
+            "{warnings:?}"
+        );
+        let odd = warnings
+            .iter()
+            .find(|w| w.starts_with("API discovery could not read odd.example.com/v1alpha3: "))
+            .expect("v1alpha3 group is named");
+        assert!(odd.contains("expected v1"), "{odd}");
+        assert_eq!(odd.matches("expected v1").count(), 1, "{odd}");
     }
 }

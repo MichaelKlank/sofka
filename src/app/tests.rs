@@ -11352,6 +11352,53 @@ fn land_context(app: &mut App, name: &str) {
     });
 }
 
+#[tokio::test]
+async fn landing_a_context_flashes_skipped_discovery_groups() {
+    let (mut app, _rx) = test_app();
+    let mut cluster = Cluster::fake();
+    cluster.context = "dev".into();
+    cluster.discovery_warnings =
+        vec!["API discovery could not read odd.example.com/v1alpha3: expected v1".into()];
+    app.handle_msg(Msg::ContextSwitched {
+        generation: app.generation,
+        name: "dev".into(),
+        result: Ok(Box::new(cluster)),
+    });
+    assert_eq!(
+        app.flash,
+        "API discovery could not read 1 API group. Refer to :info for details."
+    );
+    assert!(app.flash_err);
+
+    land_context(&mut app, "prod");
+    assert_eq!(app.flash, "Viewing pods");
+    assert!(!app.flash_err);
+}
+
+#[tokio::test]
+async fn info_lists_skipped_discovery_groups() {
+    let (mut app, _rx) = test_app();
+    app.cluster.discovery_warnings = vec![
+        "API discovery could not read odd.example.com/v1alpha3: expected v1".into(),
+        "API discovery could not read broken.example.com/v1beta1: 503".into(),
+    ];
+    palette(&mut app, "info");
+    let lines: Vec<String> = app.detail.lines.iter().map(|l| l.to_string()).collect();
+    let discovery = lines
+        .iter()
+        .position(|l| l.starts_with("  discovery:"))
+        .expect("discovery line");
+    assert_eq!(
+        lines[discovery + 1],
+        "    • API discovery could not read odd.example.com/v1alpha3: expected v1"
+    );
+    assert_eq!(
+        lines[discovery + 2],
+        "    • API discovery could not read broken.example.com/v1beta1: 503"
+    );
+    assert!(app.config_warnings.is_empty());
+}
+
 /// Choose `name` in the context switcher, through the switcher's own keys.
 fn pick_context(app: &mut App, name: &str) {
     let mut list = vec![app.cluster.context.clone(), name.to_string()];

@@ -175,6 +175,12 @@ counts, and the state/snapshot/bundle directories. `sofka --info` prints the
 static subset without connecting to a cluster. Identifiers and counts only,
 never credentials, tokens, or Secret values.
 
+When a kind you expect is missing, check the discovery line first. An API group
+whose discovery document could not be read is skipped with a warning at
+startup (`warning: API discovery skipped <group>/<version>: <reason>`), and
+`:info` lists the same warnings under the cluster's discovery status.
+`sofka --check` prints them too and reports how many groups were skipped.
+
 ## X.509 v1 client certificates
 
 Some MicroK8s kubeconfigs contain an X.509 v1 client certificate. The standard

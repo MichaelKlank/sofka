@@ -928,6 +928,7 @@ impl App {
                 .unwrap_or_else(|| "pods".into());
             self.switch_kind(&kind);
         }
+        self.flash_discovery_warnings();
         // Saved forwards for the new context. Running ones from the previous
         // context are deliberately left alone (kubectl pinned their context
         // at spawn); autostart only adds what's missing here.
