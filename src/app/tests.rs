@@ -2395,7 +2395,7 @@ async fn cordoned_node_statuses_keep_readiness_colors() {
     );
     assert_eq!(
         cell_color(&terminal, status_start, status_end, ready_y),
-        theme::green()
+        theme::yellow()
     );
 
     assert_eq!(
