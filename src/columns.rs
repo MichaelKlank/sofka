@@ -1399,20 +1399,40 @@ pub(crate) fn humanize(secs: i64) -> String {
     }
 }
 
+/// The array at `ptr`, or empty when the object does not carry it.
+fn array<'a>(d: &'a Value, ptr: &str) -> &'a [Value] {
+    d.pointer(ptr).and_then(Value::as_array).map_or(&[], |a| a)
+}
+
+/// Restartable init containers — native sidecars — from a pod spec. They run
+/// alongside the app containers for the pod's whole life instead of finishing
+/// before it starts, so they count as containers everywhere kubectl counts.
+fn sidecars(d: &Value) -> impl Iterator<Item = &Value> {
+    array(d, "/spec/initContainers")
+        .iter()
+        .filter(|c| c.get("restartPolicy").and_then(Value::as_str) == Some("Always"))
+}
+
 /// (ready "n/m", status, restarts) for a pod, approximating kubectl logic.
 fn pod_summary(obj: &DynamicObject) -> (String, String, String) {
     let d = &obj.data;
-    let empty = vec![];
-    let statuses = d
-        .get("status")
-        .and_then(|s| s.get("containerStatuses"))
-        .and_then(|c| c.as_array())
-        .unwrap_or(&empty);
+    let statuses = array(d, "/status/containerStatuses");
 
-    let total = statuses.len();
+    // The denominator comes from the spec, like kubectl's. A kubelet is what
+    // publishes `containerStatuses`, so a pod that never reached one — never
+    // scheduled, or scheduled a moment ago — carries none and would read
+    // `0/0` where kubectl reads `0/1`. A spec always has containers, so an
+    // empty one means a truncated object, not a pod of nothing: there, fall
+    // back to whatever did report.
+    let total = (array(d, "/spec/containers").len() + sidecars(d).count()).max(statuses.len());
+
+    let sidecar_statuses = array(d, "/status/initContainerStatuses")
+        .iter()
+        .filter(|s| sidecars(d).any(|c| c.get("name") == s.get("name")));
+
     let mut ready = 0usize;
     let mut restarts = 0i64;
-    for c in statuses {
+    for c in statuses.iter().chain(sidecar_statuses) {
         if c.get("ready").and_then(Value::as_bool).unwrap_or(false) {
             ready += 1;
         }
@@ -1982,13 +2002,17 @@ mod tests {
         let p = obj(json!({
             "apiVersion": "v1", "kind": "Pod",
             "metadata": {"name": "web", "namespace": "default"},
-            "spec": {"nodeName": "node-1"},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "app"}, {"name": "worker"}]
+            },
             "status": {
                 "phase": "Running",
                 "podIP": "10.0.0.5",
                 "containerStatuses": [
-                    {"ready": true, "restartCount": 2, "state": {"running": {}}},
-                    {"ready": false, "restartCount": 0,
+                    {"name": "app", "ready": true, "restartCount": 2,
+                     "state": {"running": {}}},
+                    {"name": "worker", "ready": false, "restartCount": 0,
                      "state": {"waiting": {"reason": "CrashLoopBackOff"}}}
                 ]
             }
@@ -2001,6 +2025,80 @@ mod tests {
         assert_eq!(cells[4], "10.0.0.5");
         assert_eq!(cells[5], "node-1");
         assert_eq!(status_idx, Some(2));
+    }
+
+    #[test]
+    fn pod_ready_counts_containers_the_kubelet_has_not_reported() {
+        // Nothing scheduled the pod, so no kubelet has published a
+        // `containerStatuses` entry for either container. kubectl reads the
+        // spec and shows `0/2`; counting statuses would show `0/0` and read
+        // like a pod with nothing in it.
+        let p = obj(json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "default"},
+            "spec": {"containers": [{"name": "app"}, {"name": "worker"}]},
+            "status": {
+                "phase": "Pending",
+                "conditions": [{"type": "PodScheduled", "status": "False",
+                                "reason": "Unschedulable"}]
+            }
+        }));
+        let (c, _) = cells(&p, "pods", now_secs());
+        assert_eq!(c[1], "0/2");
+        assert_eq!(c[2], "Pending");
+        assert_eq!(c[3], "0");
+
+        // A truncated object with no spec still counts what did report,
+        // rather than claiming more ready containers than it has.
+        let p = obj(json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "default"},
+            "status": {"phase": "Running", "containerStatuses": [
+                {"name": "app", "ready": true, "restartCount": 0,
+                 "state": {"running": {}}}
+            ]}
+        }));
+        assert_eq!(cells(&p, "pods", now_secs()).0[1], "1/1");
+    }
+
+    #[test]
+    fn pod_ready_counts_native_sidecars_but_not_plain_init_containers() {
+        let pod = |proxy_ready: bool| {
+            obj(json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": "web", "namespace": "default"},
+                "spec": {
+                    "containers": [{"name": "app"}],
+                    "initContainers": [
+                        {"name": "migrate"},
+                        {"name": "proxy", "restartPolicy": "Always"}
+                    ]
+                },
+                "status": {
+                    "phase": "Running",
+                    "initContainerStatuses": [
+                        {"name": "migrate", "ready": false, "restartCount": 7,
+                         "state": {"terminated": {"reason": "Completed", "exitCode": 0}}},
+                        {"name": "proxy", "ready": proxy_ready, "restartCount": 3,
+                         "state": {"running": {}}}
+                    ],
+                    "containerStatuses": [
+                        {"name": "app", "ready": true, "restartCount": 1,
+                         "state": {"running": {}}}
+                    ]
+                }
+            }))
+        };
+
+        // The sidecar runs for the pod's whole life, so it is a container on
+        // both sides of the fraction. `migrate` has already exited and is on
+        // neither side, restarts included.
+        let (c, _) = cells(&pod(true), "pods", now_secs());
+        assert_eq!(c[1], "2/2");
+        assert_eq!(c[3], "4");
+
+        // A sidecar failing its readiness probe holds the pod short of ready.
+        assert_eq!(cells(&pod(false), "pods", now_secs()).0[1], "1/2");
     }
 
     fn deploy(spec_replicas: i64, status: serde_json::Value) -> DynamicObject {

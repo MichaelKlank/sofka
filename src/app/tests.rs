@@ -1230,6 +1230,73 @@ async fn table_cell_cache_invalidates_on_apply() {
 }
 
 #[tokio::test]
+async fn pods_view_reads_ready_from_the_spec() {
+    let (mut app, _rx) = test_app();
+    app.kind_plural = "pods".into();
+    app.refresh_view_spec();
+
+    // Pending and unscheduled: the kubelet has published no container
+    // statuses, and the READY cell still has to say how many containers the
+    // pod is waiting on.
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "queued", "namespace": "default"},
+            "spec": {"containers": [{"name": "app"}, {"name": "worker"}]},
+            "status": {"phase": "Pending"}
+        }),
+    );
+    // Serving, with a native sidecar next to the app container and an init
+    // container that has already exited.
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "app"}],
+                "initContainers": [
+                    {"name": "migrate"},
+                    {"name": "proxy", "restartPolicy": "Always"}
+                ]
+            },
+            "status": {
+                "phase": "Running",
+                "initContainerStatuses": [
+                    {"name": "migrate", "ready": false, "restartCount": 0,
+                     "state": {"terminated": {"reason": "Completed", "exitCode": 0}}},
+                    {"name": "proxy", "ready": true, "restartCount": 2,
+                     "state": {"running": {}}}
+                ],
+                "containerStatuses": [
+                    {"name": "app", "ready": true, "restartCount": 1,
+                     "state": {"running": {}}}
+                ]
+            }
+        }),
+    );
+
+    let headers = app.display_headers().to_vec();
+    let ready = headers.iter().position(|h| h == "READY").unwrap();
+    let restarts = headers.iter().position(|h| h == "RESTARTS").unwrap();
+    let rows = app.rows();
+    app.ensure_table_cell_cache(&rows);
+    let cache = app.table_cell_cache();
+    let cell = |name: &str, idx: usize| {
+        let obj = rows
+            .iter()
+            .find(|o| o.metadata.name.as_deref() == Some(name))
+            .unwrap();
+        cache.get(&row_key(obj)).unwrap().0[idx].to_string()
+    };
+
+    assert_eq!(cell("queued", ready), "0/2");
+    assert_eq!(cell("web", ready), "2/2");
+    assert_eq!(cell("web", restarts), "3");
+}
+
+#[tokio::test]
 async fn palette_merges_commands_with_resources() {
     let (mut app, _rx) = test_app();
 
