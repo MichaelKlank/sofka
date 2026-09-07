@@ -145,6 +145,9 @@ impl App {
                     }]
                 };
                 argv.extend(plugin.args.iter().map(|a| subst(a)));
+                if plugin.bundled && self.cluster.allow_v1_client_cert {
+                    argv.push("--allow-v1-client-cert".into());
+                }
                 let object = if (plugin.package_dir.is_some() || plugin.bundled)
                     && plugin.target.as_deref() != Some("context")
                 {

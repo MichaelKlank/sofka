@@ -111,6 +111,7 @@ impl App {
     }
 
     fn spawn_fleet_gathers(&mut self) {
+        let allow_v1_client_cert = self.cluster.allow_v1_client_cert;
         let sema = Arc::new(tokio::sync::Semaphore::new(FLEET_CONCURRENCY));
         for row in &self.fleet_rows {
             let ctx = row.context.clone();
@@ -122,7 +123,12 @@ impl App {
                 // Bound concurrency: hold a permit for the whole gather.
                 let _permit = sema.acquire().await;
                 let dur = Duration::from_secs(FLEET_TIMEOUT_SECS);
-                let row = match tokio::time::timeout(dur, gather_context(&ctx, readonly)).await {
+                let row = match tokio::time::timeout(
+                    dur,
+                    gather_context(&ctx, readonly, allow_v1_client_cert),
+                )
+                .await
+                {
                     Ok(row) => row,
                     Err(_) => {
                         let mut r = FleetRow::connecting(ctx.clone(), readonly);
@@ -186,9 +192,9 @@ impl App {
 /// Gather one context's summary: connect, then read version, node readiness,
 /// unhealthy pods, and Flux failures. Any connection/auth error becomes an
 /// `Error` row rather than propagating.
-async fn gather_context(ctx: &str, readonly: bool) -> FleetRow {
+async fn gather_context(ctx: &str, readonly: bool, allow_v1_client_cert: bool) -> FleetRow {
     let mut row = FleetRow::connecting(ctx.to_string(), readonly);
-    let cluster = match Cluster::connect_context(ctx).await {
+    let cluster = match Cluster::connect_context(ctx, allow_v1_client_cert).await {
         Ok(c) => c,
         Err(e) => {
             row.status = FleetStatus::Error(short_error(&format!("{e:#}")));

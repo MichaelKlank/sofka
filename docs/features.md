@@ -6,6 +6,8 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 
 - **Connect** to the current kubeconfig context, including exec credential
   plugins (GKE, EKS, and friends).
+- **Optional v1 client certificates** through `--allow-v1-client-cert`, disabled
+  by default. See [certificate compatibility](debugging.md#x509-v1-client-certificates).
 - **API discovery** of every resource type on the cluster, with k9s-style short
   aliases (`po`, `dp`, `svc`, `no`, `cm`, `sts`, `ds`, `ks`, `hr`, …) and correct
   precedence - core `pods` wins over `pods.metrics.k8s.io`.

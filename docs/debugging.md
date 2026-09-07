@@ -174,3 +174,43 @@ server and Kubernetes revision, discovery and Metrics API status, watch error
 counts, and the state/snapshot/bundle directories. `sofka --info` prints the
 static subset without connecting to a cluster. Identifiers and counts only,
 never credentials, tokens, or Secret values.
+
+## X.509 v1 client certificates
+
+Some MicroK8s kubeconfigs contain an X.509 v1 client certificate. The standard
+rustls client certificate loader rejects this format. Sofka identifies this
+failure as a client certificate error and rejects the connection by default.
+
+To allow this format for one run, pass the explicit flag:
+
+```sh
+sofka --allow-v1-client-cert
+sofka --allow-v1-client-cert --check
+sofka --allow-v1-client-cert --context microk8s
+```
+
+The flag applies to context switches, fleet connections, and bundled plugin
+adapters in that run. It is not saved to configuration and does not change
+kubeconfig. It supports static `client-certificate-data` / `client-key-data`
+and `client-certificate` / `client-key` files. It does not support v1
+certificates returned by exec credential plugins. Exec plugins with supported
+certificates continue to use the standard client path.
+
+Sofka checks that the v1 certificate matches its private key. The flag does not
+disable server certificate verification or change TLS versions and ciphers.
+Existing kubeconfig trust settings still apply. X.509 v1 is a certificate
+format, not TLS 1.0. V1 certificates cannot contain usage restrictions such as
+an extended key usage for client authentication. The API server still decides
+whether to accept the client certificate.
+
+To check an inline client certificate for the selected context:
+
+```sh
+kubectl config view --raw --minify -o jsonpath='{.users[0].user.client-certificate-data}' \
+  | openssl base64 -d -A | openssl x509 -noout -text
+```
+
+For a certificate file, use `openssl x509 -in client.crt -noout -text`.
+`Version: 1 (0x0)` identifies a v1 certificate. To remove the need for the
+flag, have the cluster administrator issue a v3 client certificate and update
+your kubeconfig. Keep the existing identity and required permissions.
