@@ -98,6 +98,8 @@ pub struct Config {
     /// behavior (text selection) everywhere. Document views release capture
     /// on their own regardless — see [`crate::app::App::wants_mouse_capture`].
     pub mouse: Option<bool>,
+    /// Save and restore sort choices per kind. Defaults to true.
+    pub remember_sort: Option<bool>,
     /// How `:notify` events are delivered — see [`NotifyConfig`].
     pub notify: NotifyConfig,
     /// Command-palette completion key rebinds — see [`KeysConfig`]. Compiled

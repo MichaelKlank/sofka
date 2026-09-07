@@ -11,7 +11,8 @@ lowercase kind. The most specific key wins.
 [views."cert-manager.io/v1/certificates"]
 sort = "EXPIRES:desc"     # initial sort column, ":asc" (default) or ":desc";
                           # a sort you pick in the TUI (S/I/header click) is
-                          # remembered per kind and wins over this
+                          # saved per kind by default and has priority
+                          # set remember_sort = false at the top level to disable
 # replace = true          # replace the curated columns instead of overlaying
 
 [[views."cert-manager.io/v1/certificates".columns]]
@@ -159,11 +160,30 @@ All-namespaces mode and cluster-scoped resources use only unqualified keys.
 A row filter does not change the namespace used for this lookup.
 
 The selected layout does not inherit columns, `replace`, or `sort` from
-another view key. Columns still overlay the built-in layout unless
+another resource key. If it has no `sort`, `[views."*"].sort` supplies the
+global default. The `"*"` key supports only the default sort; it does not
+supply columns or navigation settings. A table without the specified column
+ignores the global sort until that column is available. The default sort is
+checked again when CRD printer columns arrive or wide mode changes. A saved
+sort can replace a configured default when its column becomes available.
+An active user or bookmark sort keeps its priority. Columns still overlay the built-in layout unless
 `replace = true`. In this example, the `matlab` view adds TENANT and MODEL,
 but does not add OWNERKIND. Wide mode works as usual. An active sort stays
 on its column if that column is still present. A saved user sort has priority
-over the configured initial sort.
+over the configured initial sort when `remember_sort` is enabled (the default).
+Set `remember_sort = false` at the top level of the config to stop saving
+and restoring user sort choices. Sort changes still work in the active view.
+On a new view start, the configured sort applies again. Existing saved
+choices stay on disk while the option is disabled.
+
+The sort picker's no-sort entry clears sorting in the active view. Column
+updates, wide mode, config reload, and watch refresh keep that choice.
+Opening a resource view again applies its saved or configured sort as usual.
+
+A user or bookmark sort waits while its column is hidden or unavailable.
+The table uses its natural order during that time. When the column returns,
+the selected sort and direction return, even with `remember_sort = false`.
+Clearing the sort or selecting another column cancels the waiting choice.
 
 The `node` and `drill` settings use the same key order, but each setting
 falls back separately. A view that sets only columns does not hide a

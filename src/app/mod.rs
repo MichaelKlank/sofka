@@ -1573,6 +1573,14 @@ struct Frame {
     selected: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SortOrigin {
+    Unset,
+    Configured,
+    Selected { header: String, desc: bool },
+    Cleared,
+}
+
 pub struct App {
     pub cluster: Cluster,
     pub store: Store,
@@ -1623,6 +1631,7 @@ pub struct App {
     /// Column index (into the displayed headers) to sort the table by, or
     /// `None` for the natural namespace/name order.
     pub sort_column: Option<usize>,
+    sort_origin: SortOrigin,
     pub sort_desc: bool,
     /// Horizontal offset in terminal cells after NAMESPACE/NAME.
     /// The renderer clamps this when the viewport or columns change.
@@ -1770,6 +1779,7 @@ pub struct App {
     /// Remembered sort per kind (`S`/`I`/header click), restored on every
     /// view start. Persisted to `sort_memory_path` on every change.
     pub sort_memory: crate::sortmem::SortMemory,
+    pub remember_sort: bool,
     /// Where remembered sorts persist (`<state-dir>/sort.toml`, set at
     /// startup); `None` (tests) keeps them in memory only.
     pub sort_memory_path: Option<std::path::PathBuf>,
@@ -2028,6 +2038,7 @@ impl App {
             table_page_rows: 10,
             marked: HashSet::new(),
             sort_column: None,
+            sort_origin: SortOrigin::Unset,
             sort_desc: false,
             col_offset: 0,
             col_scroll_max: 0,
@@ -2102,6 +2113,7 @@ impl App {
             fleet_marks: crate::fleet::FleetMarks::default(),
             fleet_marks_path: None,
             sort_memory: crate::sortmem::SortMemory::default(),
+            remember_sort: true,
             sort_memory_path: None,
             namespace_memory: crate::nsmem::NamespaceMemory::default(),
             namespace_memory_path: None,
