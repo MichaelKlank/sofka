@@ -368,7 +368,7 @@ fn table(title: &str, columns: &[&str], rows: Vec<Vec<String>>) -> Value {
 /// The label and field selectors the view filter implies.
 ///
 /// `-l` and `-f` terms are already Kubernetes selectors, so they are sent with
-/// the list and narrow the scan exactly. The rest of the grammar — fuzzy text
+/// the list and narrow the scan exactly. The rest of the grammar — text terms
 /// and typed comparisons like `restarts>=5` — is evaluated against rendered
 /// table cells inside the app, and this adapter cannot reproduce it. Rather
 /// than silently sanitize a wider set than the table is showing, refuse: for a

@@ -10249,6 +10249,176 @@ async fn inverse_filter_hides_fuzzy_matches() {
     assert_eq!(row_names(&app), ["api-1"]);
 }
 
+/// The noise the fuzzy filter is prone to: a subsequence match means a short
+/// needle like `auth` also drags in every name with a scattered a…u…t…h.
+/// Quoting the term keeps only what a `grep` would find.
+#[tokio::test]
+async fn quoted_filter_matches_only_contiguous_text() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for n in ["auth-api-0", "api-gateway-runtime-hash"] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Pod",
+                   "metadata": {"name": n, "namespace": "default"}}),
+        );
+    }
+
+    // Unquoted, both match: a-u-t-h occurs in "api-gateway-runtime-hash" too.
+    type_filter(&mut app, "auth");
+    assert_eq!(row_names(&app), ["api-gateway-runtime-hash", "auth-api-0"]);
+
+    retype_filter(&mut app, "\"auth\"");
+    assert_eq!(row_names(&app), ["auth-api-0"]);
+
+    // Case-insensitive, like every other text term.
+    retype_filter(&mut app, "\"AUTH-API\"");
+    assert_eq!(row_names(&app), ["auth-api-0"]);
+}
+
+#[tokio::test]
+async fn regex_filter_terms_match_names_and_cells() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for n in ["auth-api-0", "auth-api-canary", "web-1"] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Pod",
+                   "metadata": {"name": n, "namespace": "default"}}),
+        );
+    }
+
+    type_filter(&mut app, "/auth-api-\\d/");
+    assert_eq!(row_names(&app), ["auth-api-0"]);
+
+    // Cells are matched one at a time, so `^` anchors to the NAME cell rather
+    // than to the "namespace name" haystack.
+    retype_filter(&mut app, "/^web/");
+    assert_eq!(row_names(&app), ["web-1"]);
+}
+
+#[tokio::test]
+async fn quoted_and_regex_terms_invert_and_combine() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for n in ["auth-api-0", "auth-api-canary", "web-1"] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Pod",
+                   "metadata": {"name": n, "namespace": "default"}}),
+        );
+    }
+
+    type_filter(&mut app, "!\"canary\"");
+    assert_eq!(row_names(&app), ["auth-api-0", "web-1"]);
+
+    // AND-ed with a positive literal term, and with an inverse regex.
+    retype_filter(&mut app, "\"auth\" !/canary/");
+    assert_eq!(row_names(&app), ["auth-api-0"]);
+}
+
+/// Literals see the rendered columns like fuzzy terms do — and, unlike fuzzy,
+/// an IP fragment can't match a cell that merely contains its digits in order.
+#[tokio::test]
+async fn quoted_filter_matches_column_cells_without_gaps() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    for (n, ip) in [("api", "10.96.13.5"), ("web", "10.9.61.35")] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Service",
+                   "metadata": {"name": n, "namespace": "default"},
+                   "spec": {"type": "ClusterIP", "clusterIP": ip,
+                            "ports": [{"port": 80, "protocol": "TCP"}]}}),
+        );
+    }
+
+    type_filter(&mut app, "10.96");
+    assert_eq!(row_names(&app), ["api", "web"]);
+
+    retype_filter(&mut app, "\"10.96\"");
+    assert_eq!(row_names(&app), ["api"]);
+}
+
+/// The row filter prefilters on a byte mask that folds with ASCII rules,
+/// while a literal folds with Unicode ones. A needle whose case mapping
+/// changes its bytes must still reach the matcher instead of being masked out.
+#[tokio::test]
+async fn unicode_literals_survive_the_mask_prefilter() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for n in ["kube-httpcache-0", "öresund-api", "web-1"] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Pod",
+                   "metadata": {"name": n, "namespace": "default"}}),
+        );
+    }
+
+    // U+212A KELVIN SIGN lowercases to a plain ASCII `k`.
+    type_filter(&mut app, "\"\u{212a}ube\"");
+    assert_eq!(row_names(&app), ["kube-httpcache-0"]);
+
+    // A needle whose folded form is itself non-ASCII.
+    retype_filter(&mut app, "\"Öresund\"");
+    assert_eq!(row_names(&app), ["öresund-api"]);
+}
+
+/// A term that cannot be compiled is skipped and reported, like every other
+/// malformed term — the rest of the filter still narrows the table.
+#[tokio::test]
+async fn malformed_regex_filter_reports_and_keeps_filtering() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for n in ["auth-api-0", "web-1"] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Pod",
+                   "metadata": {"name": n, "namespace": "default"}}),
+        );
+    }
+
+    type_filter(&mut app, "/[unclosed/ auth");
+    assert!(
+        app.filter_error().is_some_and(|e| e.contains("bad regex")),
+        "{:?}",
+        app.filter_error()
+    );
+    assert_eq!(row_names(&app), ["auth-api-0"]);
+    assert!(!app.filter_server_side());
+}
+
+/// The NAME highlight follows the term that matched: a literal or a regex
+/// marks the contiguous run it landed on, not fuzzy's scattered positions.
+#[tokio::test]
+async fn quoted_and_regex_filters_highlight_the_matched_run() {
+    let (mut app, _rx) = test_app();
+
+    retype_filter(&mut app, "khc");
+    let scattered = app.filter_match_indices("kube-httpcache-0").unwrap();
+    assert_eq!(scattered.len(), 3);
+
+    retype_filter(&mut app, "\"httpcache\"");
+    assert_eq!(
+        app.filter_match_indices("kube-httpcache-0")
+            .unwrap()
+            .to_vec(),
+        (5..14).collect::<Vec<usize>>()
+    );
+
+    retype_filter(&mut app, "/cache-\\d/");
+    assert_eq!(
+        app.filter_match_indices("kube-httpcache-0")
+            .unwrap()
+            .to_vec(),
+        (9..16).collect::<Vec<usize>>()
+    );
+
+    // A name the pattern doesn't occur in highlights nothing, even though the
+    // row may have matched on one of its other cells.
+    assert_eq!(app.filter_match_indices("web-1"), None);
+}
+
 #[tokio::test]
 async fn fuzzy_filter_matches_any_column_cell() {
     let (mut app, _rx) = test_app();

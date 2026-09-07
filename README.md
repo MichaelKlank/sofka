@@ -117,7 +117,7 @@ The essentials. `?` in the app shows everything, or see the
 | Key                  | Action                                                                                            |
 | -------------------- | ------------------------------------------------------------------------------------------------- |
 | `:`                  | command palette - fuzzy over kinds, commands, bookmarks, workspaces (`:deploy social` also works) |
-| `/`                  | filter: fuzzy · `!inverse` · `-l`/`-f` selectors · `status=X` `cpu>500m` `age<2h`                 |
+| `/`                  | filter: fuzzy · `"exact"` · `/regex/` · `!inverse` · `-l`/`-f` selectors · `status=X` `age<2h`    |
 | `enter` / `esc`      | drill down / go back                                                                              |
 | `j`/`k`, `g`/`G`     | navigate                                                                                          |
 | `ctrl-f` / `ctrl-b`  | page forward / back (also `PgDn` / `PgUp`)                                                        |
@@ -127,8 +127,8 @@ The essentials. `?` in the app shows everything, or see the
 | `l` / `L`            | logs / VictoriaLogs history                                                                       |
 | `X` / `T`            | explain why it's unhealthy / state-change timeline                                                |
 | `s` / `e` / `a`      | shell or scale / edit in `$EDITOR` / attach                                                       |
-| `f`                  | port-forward — port picker from manifest, `●` marks active forwards (`:pf` manages them)         |
-| `t`                  | Flux/ArgoCD menu · CronJob trigger · pod file transfer                                                   |
+| `f`                  | port-forward — port picker from manifest, `●` marks active forwards (`:pf` manages them)          |
+| `t`                  | Flux/ArgoCD menu · CronJob trigger · pod file transfer                                            |
 | `r` / `i`            | rollout restart / set container image                                                             |
 | `ctrl-d` / `ctrl-k`  | delete / force-delete (marked rows, or current)                                                   |
 | `S` / `w` / `ctrl-e` | sort picker / wide columns / compact mode                                                         |
