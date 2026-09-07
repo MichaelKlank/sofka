@@ -18,7 +18,9 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   a NAME/AGE fallback for everything else. STATUS columns use a fixed width of
   26 characters so status changes do not move adjacent columns. A configured
   column width takes priority. Column widths use the full filtered list so
-  vertical scrolling does not move the columns.
+  vertical scrolling does not move the columns. Node ROLES combines
+  `node-role.kubernetes.io/` labels with the legacy `kubernetes.io/role` value
+  and removes duplicate roles.
 - **Service endpoints** include ExternalName targets, configured external IPs,
   load balancer addresses, and NodePort values such as `80:30080/TCP`.
 - **Pod health** shows init progress and failure reasons, Pod reasons such as
