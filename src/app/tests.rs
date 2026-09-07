@@ -17671,3 +17671,36 @@ async fn describe_refresh_does_not_replace_plugin_output_or_yaml_fallback() {
     assert!(app.describe_source.is_none());
     assert_eq!(app.detail.lines[0], "fallback");
 }
+
+#[tokio::test]
+async fn describe_refresh_clamps_horizontal_scroll_when_content_shrinks() {
+    for viewport in [false, true] {
+        let (mut app, _rx) = describe_refresh_app();
+        if viewport {
+            app.detail.set_viewport(4, 2);
+        }
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        assert_eq!(app.detail.hscroll, 5);
+        app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        let generation = app.describe_refresh_generation;
+
+        app.handle_msg(Msg::DescribeRefresh {
+            generation,
+            result: Ok(vec!["another wide event".into()]),
+        });
+        assert_eq!(app.detail.hscroll, 5);
+
+        app.handle_msg(Msg::DescribeRefresh {
+            generation,
+            result: Ok(vec!["ok".into()]),
+        });
+        assert_eq!(app.detail.hscroll, 1);
+
+        app.handle_msg(Msg::DescribeRefresh {
+            generation,
+            result: Ok(vec![]),
+        });
+        assert_eq!(app.detail.hscroll, 0);
+        app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    }
+}

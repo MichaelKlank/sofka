@@ -897,6 +897,7 @@ impl Scrollable {
             .as_ref()
             .map(|viewport| (viewport.width, viewport.height));
         self.lines = lines;
+        self.scroll_h(0);
         self.revision = self.revision.wrapping_add(1);
         self.viewport = None;
         if let Some((width, height)) = dimensions {
