@@ -11,13 +11,15 @@ use futures_util::StreamExt;
 use kube::api::{Api, ListParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::core::{DynamicObject, GroupVersionResource};
-use kube::discovery::{ApiResource, Discovery, Scope};
+use kube::discovery::ApiResource;
 use kube::runtime::{WatchStreamExt, watcher};
 use kube::{Client, Config, ResourceExt};
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 
 use crate::store::{Msg, row_key};
+
+mod discovery;
 
 pub(crate) fn build_client(config: Config, allow_v1_client_cert: bool) -> Result<Client> {
     let builder = crate::legacy_tls::client_builder(config, allow_v1_client_cert)?;
@@ -277,56 +279,38 @@ impl Cluster {
         }
     }
 
-    /// Walk the discovery API and index every recommended resource by its
-    /// plural and kind. Built-in aliases are layered on top.
+    /// Index resource names and short names from API discovery.
     async fn discover(&mut self) -> Result<()> {
-        // Prefer the Aggregated Discovery API (K8s ≥1.26): two requests total,
-        // and the apiserver serves cached data for groups whose backing
-        // APIService is down. The per-group walk instead 503s on the first
-        // broken aggregated API (e.g. a dead metrics-server), which would make
-        // the whole cluster unconnectable. Servers without aggregated
-        // discovery answer the request with the legacy document, which
-        // deserializes as *empty* rather than failing — so fall back to the
-        // per-group walk on empty as well as on error.
-        let discovery = match Discovery::new(self.client.clone()).run_aggregated().await {
-            Ok(d) if d.groups().next().is_some() => d,
-            _ => Discovery::new(self.client.clone())
-                .run()
-                .await
-                .context("running API discovery")?,
-        };
+        // Aggregated discovery needs two requests and tolerates stale APIService
+        // entries. Legacy discovery is used when negotiation fails.
+        let resources = discovery::discover(&self.client).await?;
+        self.register_resources(resources);
+        Ok(())
+    }
 
-        // Collect everything first, then insert bare keys in priority order so
-        // that e.g. core `pods` wins over `pods.metrics.k8s.io`.
-        let mut entries: Vec<(Kind, String, String)> = Vec::new(); // (kind, plural, kind_lc)
+    fn register_resources(&mut self, mut resources: Vec<discovery::Resource>) {
+        // Higher priority groups claim short names first. Alphabetical group
+        // order makes collisions between equal-priority groups deterministic.
+        resources.sort_by(|a, b| {
+            group_priority(&b.kind.ar.group)
+                .cmp(&group_priority(&a.kind.ar.group))
+                .then_with(|| a.kind.ar.group.cmp(&b.kind.ar.group))
+                .then_with(|| a.kind.ar.plural.cmp(&b.kind.ar.plural))
+        });
+        let mut entries = Vec::new();
         let mut catalog = Vec::new();
-        for group in discovery.groups() {
-            // All served versions of the group, most stable version per kind.
-            // NOT `recommended_resources()`: that only returns resources at
-            // the group's *preferred* version, silently dropping kinds served
-            // solely at other versions — e.g. a CRD group whose preferred
-            // version is v1 while half its kinds only exist at v1alpha1
-            // (netbird.io does this; kube-rs docs call it the "ApiGroup
-            // Common Pitfall").
-            for (ar, caps) in group.resources_by_stability() {
-                let namespaced = matches!(caps.scope, Scope::Namespaced);
-                let kind = Kind {
-                    ar: ar.clone(),
-                    namespaced,
-                };
-                let plural = ar.plural.to_lowercase();
-                let kind_lc = ar.kind.to_lowercase();
-                catalog.push(plural.clone());
-                // Group-qualified keys are unambiguous; insert directly. They
-                // join the catalog too, so completion can surface a kind whose
-                // bare plural is shadowed (or find it by its group name).
-                if !ar.group.is_empty() {
-                    let qualified = format!("{}.{}", plural, ar.group);
-                    self.registry.insert(qualified.clone(), kind.clone());
-                    catalog.push(qualified);
-                }
-                entries.push((kind, plural, kind_lc));
+        for resource in &resources {
+            let kind = &resource.kind;
+            let ar = &kind.ar;
+            let plural = ar.plural.to_lowercase();
+            let kind_lc = ar.kind.to_lowercase();
+            catalog.push(plural.clone());
+            if !ar.group.is_empty() {
+                let qualified = format!("{}.{}", plural, ar.group);
+                self.registry.insert(qualified.clone(), kind.clone());
+                catalog.push(qualified);
             }
+            entries.push((kind.clone(), plural, kind_lc));
         }
         // Lowest priority first; later inserts overwrite, so the highest
         // priority group ends up owning each bare plural/kind key.
@@ -348,7 +332,15 @@ impl Cluster {
                 self.registry.entry((*alias).to_string()).or_insert(k);
             }
         }
-        Ok(())
+        for resource in resources {
+            for alias in resource.short_names {
+                if !alias.is_empty() {
+                    self.registry
+                        .entry(alias.to_lowercase())
+                        .or_insert_with(|| resource.kind.clone());
+                }
+            }
+        }
     }
 
     pub fn resolve(&self, input: &str) -> Option<Kind> {
@@ -731,7 +723,7 @@ impl Cluster {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[tokio::test]
@@ -944,13 +936,25 @@ mod tests {
     /// entry), and the core group (pods). When `supports_aggregated` is
     /// false it behaves like a pre-1.26 server and answers the aggregated
     /// request with the legacy document.
-    async fn mock_apiserver(
+    pub(crate) async fn mock_apiserver(
         supports_aggregated: bool,
         include_broken: bool,
         serve_version: bool,
     ) -> String {
+        mock_apiserver_with_requests(supports_aggregated, include_broken, serve_version)
+            .await
+            .0
+    }
+
+    async fn mock_apiserver_with_requests(
+        supports_aggregated: bool,
+        include_broken: bool,
+        serve_version: bool,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock apiserver");
@@ -963,8 +967,10 @@ mod tests {
             // preferred version (v1) serves `widgets`, while `gadgets` is
             // only served at v1alpha1 — a preferred-version-only walk never
             // sees gadgets.
-            let mixed_v2 = r#",{"metadata":{"name":"mixed.example.com"},"versions":[{"version":"v1","resources":[{"resource":"widgets","responseKind":{"group":"mixed.example.com","version":"v1","kind":"Widget"},"scope":"Namespaced","singularResource":"widget","verbs":["get","list","watch"]}],"freshness":"Current"},{"version":"v1alpha1","resources":[{"resource":"gadgets","responseKind":{"group":"mixed.example.com","version":"v1alpha1","kind":"Gadget"},"scope":"Namespaced","singularResource":"gadget","verbs":["get","list","watch"]}],"freshness":"Current"}]}"#;
+            let mixed_v2 = r#",{"metadata":{"name":"mixed.example.com"},"versions":[{"version":"v1","resources":[{"resource":"widgets","responseKind":{"group":"mixed.example.com","version":"v1","kind":"Widget"},"scope":"Namespaced","singularResource":"widget","shortNames":["zz","po","pods","shared","native","cross"],"verbs":["get","list","watch"]}],"freshness":"Current"},{"version":"v1alpha1","resources":[{"resource":"gadgets","responseKind":{"group":"mixed.example.com","version":"v1alpha1","kind":"Gadget"},"scope":"Namespaced","singularResource":"gadget","shortNames":["gd","shared"],"verbs":["get","list","watch"]},{"resource":"widgets","responseKind":{"kind":"Widget"},"scope":"Namespaced","shortNames":["oldwidget"],"verbs":["get","list","watch"]}],"freshness":"Current"}]}"#;
             let mixed_legacy = r#",{"name":"mixed.example.com","versions":[{"groupVersion":"mixed.example.com/v1","version":"v1"},{"groupVersion":"mixed.example.com/v1alpha1","version":"v1alpha1"}],"preferredVersion":{"groupVersion":"mixed.example.com/v1","version":"v1"}}"#;
+            let capi_legacy = r#",{"name":"cluster.x-k8s.io","versions":[{"groupVersion":"cluster.x-k8s.io/v1beta1","version":"v1beta1"}],"preferredVersion":{"groupVersion":"cluster.x-k8s.io/v1beta1","version":"v1beta1"}}"#;
+            let capi_v2 = r#",{"metadata":{"name":"cluster.x-k8s.io"},"versions":[{"version":"v1beta1","freshness":"Current","resources":[{"resource":"machinedeployments","responseKind":{"kind":"MachineDeployment"},"scope":"Namespaced","shortNames":["md","cross"],"verbs":["get","list","watch"]},{"resource":"machinedrainrules","responseKind":{"kind":"MachineDrainRule"},"scope":"Namespaced","verbs":["get","list","watch"]}]}]}"#;
             match (path, aggregated) {
                 ("/version", _) => (
                     "200 OK",
@@ -973,18 +979,18 @@ mod tests {
                 ("/apis", true) => (
                     "200 OK",
                     format!(
-                        r#"{{"kind":"APIGroupDiscoveryList","apiVersion":"apidiscovery.k8s.io/v2","metadata":{{}},"items":[{{"metadata":{{"name":"apps"}},"versions":[{{"version":"v1","resources":[{{"resource":"deployments","responseKind":{{"group":"apps","version":"v1","kind":"Deployment"}},"scope":"Namespaced","singularResource":"deployment","verbs":["get","list","watch"]}}],"freshness":"Current"}}]}}{mixed_v2}{}]}}"#,
+                        r#"{{"kind":"APIGroupDiscoveryList","apiVersion":"apidiscovery.k8s.io/v2","metadata":{{}},"items":[{{"metadata":{{"name":"apps"}},"versions":[{{"version":"v1","resources":[{{"resource":"deployments","responseKind":{{"group":"apps","version":"v1","kind":"Deployment"}},"scope":"Namespaced","singularResource":"deployment","verbs":["get","list","watch"]}}],"freshness":"Current"}}]}}{mixed_v2}{capi_v2}{}]}}"#,
                         if include_broken { broken_v2 } else { "" }
                     ),
                 ),
                 ("/api", true) => (
                     "200 OK",
-                    r#"{"kind":"APIGroupDiscoveryList","apiVersion":"apidiscovery.k8s.io/v2","metadata":{},"items":[{"metadata":{"name":""},"versions":[{"version":"v1","resources":[{"resource":"pods","responseKind":{"group":"","version":"v1","kind":"Pod"},"scope":"Namespaced","singularResource":"pod","verbs":["get","list","watch"]}],"freshness":"Current"}]}]}"#.into(),
+                    r#"{"kind":"APIGroupDiscoveryList","apiVersion":"apidiscovery.k8s.io/v2","metadata":{},"items":[{"metadata":{"name":""},"versions":[{"version":"v1","resources":[{"resource":"pods","responseKind":{"group":"","version":"v1","kind":"Pod"},"scope":"Namespaced","singularResource":"pod","shortNames":["native"],"verbs":["get","list","watch"]}],"freshness":"Current"}]}]}"#.into(),
                 ),
                 ("/apis", false) => (
                     "200 OK",
                     format!(
-                        r#"{{"kind":"APIGroupList","apiVersion":"v1","groups":[{{"name":"apps","versions":[{{"groupVersion":"apps/v1","version":"v1"}}],"preferredVersion":{{"groupVersion":"apps/v1","version":"v1"}}}}{mixed_legacy}{}]}}"#,
+                        r#"{{"kind":"APIGroupList","apiVersion":"v1","groups":[{{"name":"apps","versions":[{{"groupVersion":"apps/v1","version":"v1"}}],"preferredVersion":{{"groupVersion":"apps/v1","version":"v1"}}}}{mixed_legacy}{capi_legacy}{}]}}"#,
                         if include_broken { broken_legacy } else { "" }
                     ),
                 ),
@@ -992,21 +998,25 @@ mod tests {
                     "200 OK",
                     r#"{"kind":"APIVersions","versions":["v1"],"serverAddressByClientCIDRs":[]}"#.into(),
                 ),
+                ("/apis/cluster.x-k8s.io/v1beta1", _) => (
+                    "200 OK",
+                    r#"{"kind":"APIResourceList","groupVersion":"cluster.x-k8s.io/v1beta1","resources":[{"name":"machinedeployments","kind":"MachineDeployment","singularName":"machinedeployment","namespaced":true,"shortNames":["md","cross"],"verbs":["get","list","watch"]},{"name":"machinedrainrules","kind":"MachineDrainRule","singularName":"machinedrainrule","namespaced":true,"verbs":["get","list","watch"]}]}"#.into(),
+                ),
                 ("/apis/apps/v1", _) => (
                     "200 OK",
                     r#"{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"apps/v1","resources":[{"name":"deployments","singularName":"deployment","namespaced":true,"kind":"Deployment","verbs":["get","list","watch"]}]}"#.into(),
                 ),
                 ("/api/v1", _) => (
                     "200 OK",
-                    r#"{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"v1","resources":[{"name":"pods","singularName":"pod","namespaced":true,"kind":"Pod","verbs":["get","list","watch"]}]}"#.into(),
+                    r#"{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"v1","resources":[{"name":"pods","singularName":"pod","shortNames":["native"],"namespaced":true,"kind":"Pod","verbs":["get","list","watch"]}]}"#.into(),
                 ),
                 ("/apis/mixed.example.com/v1", _) => (
                     "200 OK",
-                    r#"{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"mixed.example.com/v1","resources":[{"name":"widgets","singularName":"widget","namespaced":true,"kind":"Widget","verbs":["get","list","watch"]}]}"#.into(),
+                    r#"{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"mixed.example.com/v1","resources":[{"name":"widgets","singularName":"widget","shortNames":["zz","po","pods","shared","native","cross"],"namespaced":true,"kind":"Widget","verbs":["get","list","watch"]}]}"#.into(),
                 ),
                 ("/apis/mixed.example.com/v1alpha1", _) => (
                     "200 OK",
-                    r#"{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"mixed.example.com/v1alpha1","resources":[{"name":"gadgets","singularName":"gadget","namespaced":true,"kind":"Gadget","verbs":["get","list","watch"]}]}"#.into(),
+                    r#"{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"mixed.example.com/v1alpha1","resources":[{"name":"gadgets","singularName":"gadget","shortNames":["gd","shared"],"namespaced":true,"kind":"Gadget","verbs":["get","list","watch"]}]}"#.into(),
                 ),
                 ("/apis/broken.example.com/v1beta1", _) => (
                     "503 Service Unavailable",
@@ -1021,6 +1031,7 @@ mod tests {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     break;
                 };
+                let recorded = Arc::clone(&recorded);
                 tokio::spawn(async move {
                     let (r, mut w) = sock.split();
                     let mut reader = BufReader::new(r);
@@ -1035,6 +1046,7 @@ mod tests {
                             .nth(1)
                             .unwrap_or("")
                             .to_string();
+                        recorded.lock().unwrap().push(path.clone());
                         let mut wants_aggregated = false;
                         loop {
                             let mut header = String::new();
@@ -1073,16 +1085,41 @@ mod tests {
                 });
             }
         });
-        format!("http://{addr}")
+        (format!("http://{addr}"), requests)
     }
 
-    async fn connect_mock(url: String) -> Result<Cluster> {
+    pub(crate) async fn connect_mock(url: String) -> Result<Cluster> {
         let mut config = Config::new(url.parse().expect("mock url"));
         // The client's default retry policy (15 attempts, exponential
         // backoff) turns the mock's deliberate 503 into a ~4-minute stall;
         // retrying is not what these tests exercise.
         config.default_retry = false;
         Cluster::from_config(config, "test".into(), None, false).await
+    }
+
+    #[tokio::test]
+    async fn short_names_do_not_need_extra_discovery_requests() {
+        for aggregated in [true, false] {
+            let (url, requests) = mock_apiserver_with_requests(aggregated, false, true).await;
+            let cluster = connect_mock(url).await.unwrap();
+            assert_eq!(cluster.resolve("md").unwrap().ar.kind, "MachineDeployment");
+            let mut requests = requests.lock().unwrap().clone();
+            requests.sort();
+            let mut expected = vec!["/api", "/apis", "/version"];
+            if !aggregated {
+                expected.extend([
+                    "/api",
+                    "/apis",
+                    "/api/v1",
+                    "/apis/apps/v1",
+                    "/apis/cluster.x-k8s.io/v1beta1",
+                    "/apis/mixed.example.com/v1",
+                    "/apis/mixed.example.com/v1alpha1",
+                ]);
+            }
+            expected.sort();
+            assert_eq!(requests, expected);
+        }
     }
 
     #[tokio::test]
@@ -1148,6 +1185,10 @@ mod tests {
     /// limited to each group's preferred version loses gadgets entirely
     /// (the netbird.io bug: `:sidecarprofiles.netbird.io` -> no match).
     fn assert_mixed_group(cluster: &Cluster) {
+        assert!(cluster.resolve("oldwidget").is_none());
+        assert!(cluster.resolve("statusalias").is_none());
+        assert_eq!(cluster.resolve("zz").unwrap().ar.version, "v1");
+        assert_eq!(cluster.resolve("gd").unwrap().ar.version, "v1alpha1");
         let widgets = cluster.resolve("widgets").expect("widgets resolves");
         assert_eq!(widgets.ar.version, "v1");
         let gadgets = cluster.resolve("gadgets").expect("gadgets resolves");
