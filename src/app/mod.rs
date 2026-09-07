@@ -18,8 +18,7 @@ use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use kube::Client;
 use kube::api::{
-    Api, DeleteParams, EvictParams, ListParams, LogParams, Patch, PatchParams, PostParams,
-    PropagationPolicy,
+    Api, DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams, PropagationPolicy,
 };
 use kube::core::{DynamicObject, TypeMeta};
 use kube::discovery::ApiResource;
