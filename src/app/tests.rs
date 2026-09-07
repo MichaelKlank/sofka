@@ -4152,7 +4152,7 @@ async fn explain_findings_clear_the_progress_flash() {
         findings: Vec::new(),
     });
 
-    assert_eq!(app.mode, Mode::Explain);
+    assert_eq!(app.mode, Mode::Table);
     assert!(app.flash.is_empty(), "{}", app.flash);
     assert!(!app.flash_err);
 }
@@ -4214,7 +4214,7 @@ async fn a_finished_report_only_clears_its_own_status_claim() {
         source: None,
         findings: Vec::new(),
     });
-    assert_eq!(app.mode, Mode::Explain);
+    assert_eq!(app.mode, Mode::Detail);
     assert!(app.flash_err);
     assert!(app.flash.contains("forbidden"), "{}", app.flash);
 }
@@ -14898,6 +14898,69 @@ async fn health_refresh_keys_preserve_the_newest_error_over_older_success() {
             &app.explain_source
         };
         assert_eq!(source.as_ref().unwrap().data["status"]["readyReplicas"], 2);
+    }
+}
+
+#[tokio::test]
+async fn report_navigation_keeps_its_destination_after_a_late_reply() {
+    for (gitops, key, destination) in [
+        (false, KeyCode::Enter, Mode::Table),
+        (false, KeyCode::Char('E'), Mode::Events),
+        (false, KeyCode::Char('l'), Mode::Logs),
+        (true, KeyCode::Enter, Mode::Table),
+        (false, KeyCode::Char(':'), Mode::Command),
+        (true, KeyCode::Char(':'), Mode::Command),
+    ] {
+        let root = expression_workload(true);
+        let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+        responses.lock().unwrap().insert(
+            "/apis/apps/v1/namespaces/default/deployments/web".into(),
+            (200, root),
+        );
+        open_health_report_key(&mut app, gitops);
+        let reply = take_health_report(&mut rx, gitops).await;
+        let finding = crate::explain::Finding {
+            indent: 0,
+            level: crate::explain::Level::Warn,
+            text: "inspect Pod".into(),
+            target: Some(crate::explain::Target {
+                plural: "pods".into(),
+                namespace: Some("default".into()),
+                name: "web".into(),
+            }),
+        };
+        if gitops {
+            app.gitops_items = vec![finding];
+            app.gitops_state.select(Some(0));
+        } else {
+            app.explain_items = vec![finding];
+            app.explain_state.select(Some(0));
+        }
+        let request = if gitops {
+            app.gitops_request
+        } else {
+            app.explain_request
+        };
+        app.handle_key(press(key)).unwrap();
+        assert_eq!(app.mode, destination);
+        if destination != Mode::Command {
+            let current = if gitops {
+                app.gitops_request
+            } else {
+                app.explain_request
+            };
+            assert_ne!(current, request, "navigation must cancel the report");
+        }
+        app.handle_msg(reply);
+        assert_eq!(
+            app.mode, destination,
+            "a reply must preserve the destination"
+        );
+        if gitops {
+            assert!(app.gitops_claim.is_none());
+        } else {
+            assert!(app.explain_claim.is_none());
+        }
     }
 }
 

@@ -183,7 +183,6 @@ impl App {
         let len = self.gitops_items.len();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.cancel_gitops_request();
                 self.mode = self.return_mode;
                 if self.return_mode == Mode::Table {
                     self.restore_selection();
@@ -207,6 +206,9 @@ impl App {
                 }
             }
             _ => {}
+        }
+        if self.mode != Mode::Gitops {
+            self.cancel_gitops_request();
         }
     }
 }

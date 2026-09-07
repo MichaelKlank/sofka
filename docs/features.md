@@ -132,7 +132,8 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   before gathering its evidence. A failed read or a changed UID produces a
   warning instead of findings from an old snapshot. Only the latest requested
   report can update the findings. Closing the view with `esc` or `q` cancels
-  pending results and clears the report progress message.
+  pending results and clears the report progress message. Navigation to
+  evidence or a target resource also cancels pending results.
 - **Session-local timeline** (`T` / `:timeline`) - a per-object timestamped log
   of every state change the watch saw: generation bumps, replica and readiness
   changes, pod phase, restarts, waiting reasons, condition flips. Computed from
@@ -170,7 +171,7 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   or replaced resource produces a warning. These reads require `get` access.
   Only the latest requested report can update the findings. Closing the view
   with `esc` or `q` cancels pending results and clears the report progress
-  message.
+  message. Navigation to a target resource also cancels pending results.
 - **Native Helm inspector** (`:helm` / `:hm`) - sofka decodes Helm's release
   storage Secrets directly (double base64 → gunzip → JSON, same as Helm) and
   lists one row per release at its latest revision, like `helm list`. `⏎` opens

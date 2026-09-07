@@ -1049,7 +1049,6 @@ impl App {
                     .unwrap_or(0);
                 self.explain_state
                     .select((!self.explain_items.is_empty()).then_some(first));
-                self.mode = Mode::Explain;
                 // As in the `Msg::Gitops` arm below: the "explaining X…"
                 // progress flash has done its job now the findings are up.
                 self.clear_claimed_status(claim);
@@ -1075,7 +1074,6 @@ impl App {
                     .unwrap_or(0);
                 self.gitops_state
                     .select((!self.gitops_items.is_empty()).then_some(first));
-                self.mode = Mode::Gitops;
                 self.clear_claimed_status(claim);
             }
             Msg::PluginOutput {

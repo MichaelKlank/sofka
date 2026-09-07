@@ -134,7 +134,6 @@ impl App {
         let len = self.explain_items.len();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.cancel_explain_request();
                 let destination = self.explain_return;
                 self.mode = destination;
                 self.explain_return = Mode::Table;
@@ -163,6 +162,9 @@ impl App {
             KeyCode::Char('E') => self.explain_events(),
             KeyCode::Char('l') => self.explain_logs(),
             _ => {}
+        }
+        if self.mode != Mode::Explain {
+            self.cancel_explain_request();
         }
     }
 
