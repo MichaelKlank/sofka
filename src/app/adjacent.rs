@@ -42,6 +42,12 @@ impl App {
             self.flash_warn("adjacent is not available for Helm releases");
             return;
         }
+        // A namespace's neighbourhood is everything in it — that's what
+        // `enter` re-scopes to, not a list of one-hop connections.
+        if self.kind_plural == "namespaces" {
+            self.flash_warn("adjacent is not available for namespaces — enter re-scopes to one");
+            return;
+        }
         let Some(obj) = self.selected() else {
             self.flash_warn("no selection");
             return;

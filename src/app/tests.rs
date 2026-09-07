@@ -3352,6 +3352,22 @@ async fn adjacent_opens_from_the_palette_and_refuses_helm_rows() {
         "{}",
         app.flash
     );
+
+    // A namespace's neighbourhood is everything in it: `enter` covers that.
+    app.switch_kind("namespaces");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "shop"}}),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('u'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash_err);
+    assert!(
+        app.flash.contains("not available for namespaces"),
+        "{}",
+        app.flash
+    );
 }
 
 #[tokio::test]

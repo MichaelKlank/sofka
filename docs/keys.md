@@ -126,6 +126,7 @@ what its spec names (a pod's node, claims, ConfigMaps, Secrets), and what names
 it (the pods mounting a claim, the claims using a class). `j` / `k` move, `⏎`
 opens the object in its own view - name-filtered, so every action there applies
 to it - `y` shows its YAML, `d` describes it, `r` gathers again, `esc` goes back.
+Not offered on namespaces (`enter` re-scopes to one) or Helm rows.
 See [Views](views.md#navigating-between-kinds) for adding CRD relations.
 
 ## Text inputs (palette, filters, prompts)
