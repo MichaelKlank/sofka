@@ -17704,3 +17704,295 @@ async fn describe_refresh_clamps_horizontal_scroll_when_content_shrinks() {
         app.handle_key(press(KeyCode::Char('q'))).unwrap();
     }
 }
+
+#[tokio::test]
+async fn configured_metric_columns_keep_order_values_and_live_filters() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/pods"]
+        replace = true
+        columns = [
+            { name = "NAME", builtin = "NAME" },
+            { name = "READY", builtin = "READY" },
+            { name = "CPU", metric = "cpu" },
+            { name = "CPU/R", metric = "cpu-request" },
+            { name = "LOAD", metric = "cpu-request-utilization" },
+            { name = "MEM/R", metric = "memory-request" },
+            { name = "LIMIT", metric = "memory-limit-utilization", wide = true },
+            { name = "AGE", builtin = "AGE" },
+        ]
+    "#,
+    );
+    palette(&mut app, "pods");
+    for name in ["api", "worker"] {
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": name, "namespace": "default"},
+                "spec": {
+                    "containers": [
+                        {"name": "app", "resources": {"requests": {"cpu": "4", "memory": "1Gi"}, "limits": {"memory": "2Gi"}}},
+                        {"name": "reloader", "resources": {"requests": {"cpu": "100m"}}}
+                    ],
+                    "initContainers": [
+                        {"name": "proxy", "restartPolicy": "Always", "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}}},
+                        {"name": "setup", "resources": {"requests": {"cpu": "20", "memory": "8Gi"}}}
+                    ]
+                },
+                "status": {"phase": "Running", "containerStatuses": [
+                    {"name": "app", "ready": true, "restartCount": 0},
+                    {"name": "reloader", "ready": true, "restartCount": 0}
+                ], "initContainerStatuses": [{"name": "proxy", "ready": true, "restartCount": 0}]}
+            }),
+        );
+    }
+    let metrics = |app: &mut App, api| {
+        app.handle_msg(Msg::Metrics {
+            generation: app.generation,
+            data: HashMap::from([
+                ("default/api".into(), (api, 0)),
+                ("default/worker".into(), (420, 0)),
+            ]),
+            containers: HashMap::new(),
+        });
+    };
+    metrics(&mut app, 4200);
+    let (headers, rows) = app.snapshot_table();
+    assert_eq!(
+        headers,
+        ["NAME", "READY", "CPU", "CPU/R", "LOAD", "MEM/R", "AGE"]
+    );
+    assert_eq!(
+        &rows[0][..6],
+        ["api", "3/3", "4200m", "4200m", "100%", "1.1Gi"]
+    );
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    let (headers, rows) = app.snapshot_table();
+    assert_eq!(headers[6], "LIMIT");
+    assert_eq!(rows[0][6], "-");
+    let fields = app.selected_row_fields();
+    assert!(fields.contains(&("LOAD".into(), "100%".into())));
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(180, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let mut found_red = false;
+    for y in 0..buffer.area.height {
+        let line: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect();
+        if line.contains("api")
+            && let Some(x) = line.find("100%")
+        {
+            // The table prefix can contain a multi-byte border or marker.
+            let x = line[..x].chars().count() as u16;
+            found_red = buffer[(x, y)].fg == crate::theme::red();
+        }
+    }
+    assert!(found_red);
+    type_filter(&mut app, "load>=75%");
+    assert_eq!(row_names(&app), ["api"]);
+    metrics(&mut app, 0);
+    assert!(row_names(&app).is_empty());
+    retype_filter(&mut app, "cpu/r>4 mem/r>=1Gi");
+    assert_eq!(row_names(&app), ["api", "worker"]);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    for c in "LOAD".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(row_names(&app), ["api", "worker"]);
+    metrics(&mut app, 4200);
+    assert_eq!(row_names(&app), ["worker", "api"]);
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::new(),
+        containers: HashMap::new(),
+    });
+    let (_, rows) = app.snapshot_table();
+    assert_eq!(rows[0][2], "-");
+    assert_eq!(rows[0][3], "4200m");
+    assert_eq!(rows[0][4], "-");
+}
+
+#[tokio::test]
+async fn configured_node_metrics_filter_and_refresh_by_source() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/nodes"]
+        replace = true
+        columns = [
+            { name = "NAME", builtin = "NAME" },
+            { name = "COUNT", metric = "node-pods" },
+            { name = "LOAD", metric = "node-cpu-utilization" },
+            { name = "USED", metric = "memory" },
+        ]
+    "#,
+    );
+    palette(&mut app, "nodes");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": "node"}, "status": {"allocatable": {"cpu": "2"}}}),
+    );
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::from([("node".into(), (1000, 1024 * 1024 * 1024))]),
+        containers: HashMap::new(),
+    });
+    type_filter(&mut app, "count>0 load>=50 used>=1Gi");
+    assert!(row_names(&app).is_empty());
+    app.handle_msg(Msg::NodePods {
+        generation: app.generation,
+        counts: HashMap::from([("node".into(), 3)]),
+    });
+    assert_eq!(row_names(&app), ["node"]);
+    let (headers, rows) = app.snapshot_table();
+    assert_eq!(headers, ["NAME", "COUNT", "LOAD", "USED"]);
+    assert_eq!(rows[0], ["node", "3", "50%", "1.0Gi"]);
+    app.handle_msg(Msg::NodePods {
+        generation: app.generation,
+        counts: HashMap::new(),
+    });
+    assert!(row_names(&app).is_empty());
+}
+
+#[tokio::test]
+async fn metric_layout_keeps_hidden_columns_hidden_and_avoids_duplicate_defaults() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/pods"]
+        replace = true
+        columns = [
+            { name = "NAME", builtin = "NAME" },
+            { name = "CPU", metric = "cpu", wide = true },
+        ]
+    "#,
+    );
+    palette(&mut app, "pods");
+    assert_eq!(app.display_headers().to_vec(), ["NAME"]);
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "CPU"]);
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/pods"]
+        columns = [{ name = "CPU", path = "/spec/containers/0/resources/requests/cpu", type = "quantity" }]
+    "#,
+    );
+    palette(&mut app, "nodes");
+    palette(&mut app, "pods");
+    assert_eq!(
+        app.display_headers()
+            .iter()
+            .filter(|h| h.as_str() == "CPU")
+            .count(),
+        1
+    );
+    assert!(app.display_headers().contains(&"MEM".into()));
+}
+
+#[tokio::test]
+async fn metric_overlay_retains_defaults_and_filters_percent_headers() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/pods"]
+        columns = [{ name = "%CPU/R", metric = "cpu-request-utilization" }]
+    "#,
+    );
+    palette(&mut app, "pods");
+    assert_eq!(
+        app.display_headers().to_vec(),
+        [
+            "NAME", "READY", "STATUS", "RESTARTS", "%CPU/R", "AGE", "CPU", "MEM"
+        ]
+    );
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "api", "namespace": "default"}, "spec": {"containers": [{"resources": {"requests": {"cpu": "1"}}}]}}),
+    );
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::from([("default/api".into(), (900, 0))]),
+        containers: HashMap::new(),
+    });
+    type_filter(&mut app, "%cpu/r>=90%");
+    assert_eq!(row_names(&app), ["api"]);
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::from([("default/api".into(), (800, 0))]),
+        containers: HashMap::new(),
+    });
+    assert!(row_names(&app).is_empty());
+}
+
+#[tokio::test]
+async fn unsupported_column_sources_warn_and_keep_a_usable_view() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/nodes"]
+        replace = true
+        columns = [
+            { name = "READY", builtin = "READY" },
+            { name = "CPU/R", metric = "cpu-request" },
+        ]
+    "#,
+    );
+    palette(&mut app, "nodes");
+    assert!(app.display_headers().contains(&"NAME".into()));
+    assert!(!app.display_headers().contains(&"CPU/R".into()));
+    assert_eq!(app.config_warnings.len(), 2);
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.config_warnings.len(), 2);
+}
+
+#[tokio::test]
+async fn builtin_aliases_keep_numeric_sort_and_elapsed_values() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/pods"]
+        replace = true
+        columns = [
+            { name = "NAME", builtin = "NAME" },
+            { name = "RETRY", builtin = "RESTARTS" },
+            { name = "CREATED", builtin = "AGE" },
+        ]
+    "#,
+    );
+    palette(&mut app, "pods");
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "RETRY", "CREATED"]);
+    for (name, restarts) in [("api", 10), ("worker", 2)] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": name, "namespace": "default", "creationTimestamp": "2025-01-01T00:00:00Z"}, "status": {"containerStatuses": [{"name": "app", "restartCount": restarts}]}}),
+        );
+    }
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    for c in "RETRY".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(row_names(&app), ["worker", "api"]);
+    let now = "2025-01-01T00:01:00Z"
+        .parse::<Timestamp>()
+        .unwrap()
+        .as_second();
+    assert_eq!(app.snapshot_table_at(now).1[0][2], "1m");
+    assert_eq!(app.snapshot_table_at(now + 60).1[0][2], "2m");
+}

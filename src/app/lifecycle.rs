@@ -994,14 +994,18 @@ impl App {
                         let headers = self.display_headers();
                         headers.get(i).cloned()
                     })
-                    .is_some_and(|h| matches!(h.as_str(), "CPU" | "MEM" | "%CPU" | "%MEM"));
+                    .is_some_and(|h| self.spec.metric(&h).is_some());
                 if !data.is_empty() || !containers.is_empty() {
                     self.metrics_seen = true;
                 }
                 self.metrics_error = None;
                 self.metrics = data;
                 self.container_metrics = containers;
-                if sort_uses_metrics || self.parsed_filter().uses_metrics() {
+                if sort_uses_metrics
+                    || self
+                        .parsed_filter()
+                        .uses_metrics(&|key| self.spec.metric(key).is_some())
+                {
                     self.invalidate_rows();
                 }
             }
@@ -1009,9 +1013,15 @@ impl App {
                 let sort_uses_pods = self
                     .sort_column
                     .and_then(|i| self.display_headers().get(i).cloned())
-                    .is_some_and(|h| h == "PODS");
+                    .is_some_and(|h| {
+                        self.spec.metric(&h) == Some(crate::columns::MetricColumn::NodePods)
+                    });
                 self.node_pods = Some(counts);
-                if sort_uses_pods {
+                if sort_uses_pods
+                    || self.parsed_filter().uses_metrics(&|key| {
+                        self.spec.metric(key) == Some(crate::columns::MetricColumn::NodePods)
+                    })
+                {
                     self.invalidate_rows();
                 }
             }

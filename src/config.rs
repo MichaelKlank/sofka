@@ -767,6 +767,10 @@ pub struct DrillConfig {
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct ViewColumnConfig {
+    /// Built-in metric source. Use exactly one of path, metric, or builtin.
+    pub metric: Option<String>,
+    /// Existing built-in column, such as READY or AGE.
+    pub builtin: Option<String>,
     /// Column header (displayed uppercased).
     pub name: String,
     /// JSON Pointer to the cell value, e.g. `/status/phase`.

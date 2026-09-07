@@ -67,14 +67,15 @@ pub enum Term {
 }
 
 impl Term {
-    pub fn metrics_sensitive(&self) -> bool {
+    pub fn metrics_sensitive(&self, is_metric: &impl Fn(&str) -> bool) -> bool {
         match self {
             Self::Cmp(Cmp {
                 value: CmpValue::Cpu(_) | CmpValue::Mem(_),
                 ..
             }) => true,
+            Self::Cmp(cmp) => is_metric(&cmp.key),
             Self::All(terms) | Self::Any(terms) | Self::Not(terms) => {
-                terms.iter().any(Self::metrics_sensitive)
+                terms.iter().any(|t| t.metrics_sensitive(is_metric))
             }
             _ => false,
         }
@@ -245,6 +246,8 @@ impl Op {
 pub enum CmpValue {
     /// Plain number (`restarts>=5`).
     Num(f64),
+    /// A quantity for metric columns, with text retained for other columns.
+    Quantity { value: f64, text: String },
     /// CPU quantity in millicores (`cpu>500m`).
     Cpu(i64),
     /// Memory quantity in bytes (`memory>1Gi`).
@@ -258,8 +261,8 @@ pub enum CmpValue {
 }
 
 impl ParsedFilter {
-    pub fn uses_metrics(&self) -> bool {
-        matches!(self, Self::Structured(s) if s.terms.iter().any(Term::metrics_sensitive))
+    pub fn uses_metrics(&self, is_metric: &impl Fn(&str) -> bool) -> bool {
+        matches!(self, Self::Structured(s) if s.terms.iter().any(|t| t.metrics_sensitive(is_metric)))
     }
 
     pub fn labels(&self) -> Option<&str> {
@@ -685,12 +688,12 @@ fn split_cmp(tok: &str) -> Option<(&str, Op, &str)> {
     if !tok
         .chars()
         .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '%'))
     {
         return None;
     }
-    let key_end =
-        tok.find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))?;
+    let key_end = tok
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '%' | '/')))?;
     let (key, rest) = tok.split_at(key_end);
     let (op, value) = if let Some(v) = rest.strip_prefix("!=") {
         (Op::Ne, v)
@@ -757,7 +760,12 @@ fn typed_value(key: &str, raw: &str) -> Result<CmpValue, String> {
             Err(_) if key.eq_ignore_ascii_case("restarts") => {
                 Err(format!("bad restart count '{raw}'"))
             }
-            Err(_) => Ok(CmpValue::Str(fold_lower(raw))),
+            Err(_) => Ok(crate::views::parse_quantity(raw)
+                .map(|value| CmpValue::Quantity {
+                    value,
+                    text: fold_lower(raw),
+                })
+                .unwrap_or_else(|| CmpValue::Str(fold_lower(raw)))),
         },
     }
 }

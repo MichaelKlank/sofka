@@ -47,6 +47,86 @@ the layout. By default columns overlay the curated ones: a matching header
 replaces it in place, new columns go before AGE. Invalid entries are skipped with
 a warning in the app - they never take down the TUI.
 
+### Built-in and metric columns
+
+Set exactly one source for each column: `path`, `builtin`, or `metric`.
+Use `builtin` to retain an existing computed column, such as `READY` or `AGE`.
+Its value comes from the selected resource's built-in view. Use `metric` for
+live usage, resource totals, or percentages. `name` sets the displayed header.
+`type` applies only to `path` columns. All sources support `wide`, `width`,
+and `align`.
+
+This example puts CPU usage and request utilization before memory usage and AGE:
+
+```toml
+[views."v1/pods"]
+replace = true
+columns = [
+  { name = "NAME", builtin = "NAME" },
+  { name = "READY", builtin = "READY" },
+  { name = "STATUS", builtin = "STATUS" },
+  { name = "RESTARTS", builtin = "RESTARTS" },
+  { name = "CPU", metric = "cpu" },
+  { name = "CPU/R", metric = "cpu-request" },
+  { name = "%CPU/R", metric = "cpu-request-utilization" },
+  { name = "%CPU/L", metric = "cpu-limit-utilization", wide = true },
+  { name = "MEM", metric = "memory" },
+  { name = "%MEM/R", metric = "memory-request-utilization" },
+  { name = "%MEM/L", metric = "memory-limit-utilization", wide = true },
+  { name = "AGE", builtin = "AGE" },
+]
+```
+
+With `replace = true` and at least one valid `builtin` or `metric` column,
+only the declared columns are used, in declaration order. A namespace column
+is still added in all-namespaces mode. Without `replace`, columns overlay
+the built-in view. Default metrics remain unless their source or header is
+already declared, including a declaration with `wide = true`.
+Existing configurations that use only `path` retain their default metric
+columns. A custom CPU or MEM header prevents a duplicate default header.
+
+Available metric sources:
+
+| Sources                                                 | Resources   | Value                                          |
+| ------------------------------------------------------- | ----------- | ---------------------------------------------- |
+| `cpu`, `memory`                                         | Pods, nodes | Live usage                                     |
+| `cpu-request`, `memory-request`                         | Pods        | Request totals                                 |
+| `cpu-limit`, `memory-limit`                             | Pods        | Limit totals                                   |
+| `cpu-request-utilization`, `memory-request-utilization` | Pods        | Usage as a percentage of the request           |
+| `cpu-limit-utilization`, `memory-limit-utilization`     | Pods        | Usage as a percentage of the limit             |
+| `node-pods`                                             | Nodes       | Pod count                                      |
+| `node-cpu-utilization`, `node-memory-utilization`       | Nodes       | Usage as a percentage of allocatable resources |
+
+Pod totals sum application containers and native sidecars
+(`initContainers` with `restartPolicy = "Always"`). A declaration in
+`spec.resources` takes priority for that resource and request or limit.
+Regular init containers and pod overhead are excluded. These are workload
+totals after startup, not the effective values used for scheduling.
+Pod percentages can hide a container that is near its own limit. Open the
+container picker to check individual containers.
+
+For requests, unset container values contribute zero. If all values are
+unset, the total is `-`. For limits, the total is `-` if any included
+container has no limit, unless a pod-level limit is set. A percentage is
+`-` when its request or limit is missing or zero, or usage is unavailable.
+A measured zero usage is `0m`, `0Mi`, or `0%`. Request and limit totals
+remain available without Metrics Server.
+
+Sorting uses numeric values. Missing values sort first in ascending order,
+as in the default CPU and MEM columns. Structured filters use the displayed
+header, without regard to letter case: `cpu/r>4`, `%cpu/r>=75`,
+`%mem/l>=90%`, or `mem/r>=1Gi`. CPU quantities without a suffix are cores.
+Memory quantities without a suffix are bytes. Percentage values are points
+from zero, with an optional `%` suffix. Metric filters and sorts update
+when a new sample arrives. Use structured filters to search metric values.
+The existing `cpu`, `mem`, and `memory` usage filters remain available when
+those default columns are hidden.
+
+CPU and memory values use the existing resource threshold bands.
+Percentages use `[thresholds].utilization`, including per-resource overrides.
+Duplicate headers, invalid source combinations, and sources that are not
+available for a resource produce configuration warnings.
+
 ### Namespace-specific views
 
 Add `@<namespace>` to a view key to select a layout for one namespace:

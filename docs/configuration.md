@@ -60,7 +60,7 @@ Each of these is documented where the feature itself is:
 
 | Section               | What it does                                | Docs                                                       |
 | --------------------- | ------------------------------------------- | ---------------------------------------------------------- |
-| `[views]`             | custom columns per resource and namespace   | [Views and thresholds](views.md)                           |
+| `[views]`             | path, built-in, and metric columns per view | [Views and thresholds](views.md)                           |
 | `[thresholds]`        | RESTARTS/CPU/MEM/utilization coloring bands | [Views and thresholds](views.md#thresholds)                |
 | `[[plugins]]`         | shell-out commands bound to key chords      | [Plugins](plugins.md)                                      |
 | `[[bookmarks]]`       | saved navigation commands                   | [Plugins](plugins.md#bookmarks)                            |
