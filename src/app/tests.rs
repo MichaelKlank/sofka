@@ -1389,6 +1389,7 @@ async fn navigation_views_share_palette_and_help_shortcuts() {
         Mode::Explain,
         Mode::Timeline,
         Mode::Gitops,
+        Mode::Adjacent,
         Mode::Diff,
         Mode::Events,
         Mode::FluxMenu,
@@ -3073,6 +3074,248 @@ async fn find_opens_picker_and_enter_navigates_to_the_object() {
     });
     assert!(app.flash_err);
     assert!(app.flash.contains("incomplete"), "{}", app.flash);
+}
+
+// ----- adjacent view ------------------------------------------------------
+
+fn adjacent_item(
+    relation: &str,
+    kind: &str,
+    plural: &str,
+    ns: Option<&str>,
+    name: &str,
+) -> crate::store::AdjacentItem {
+    let mut meta = json!({"name": name});
+    if let Some(ns) = ns {
+        meta["namespace"] = json!(ns);
+    }
+    crate::store::AdjacentItem {
+        relation: relation.into(),
+        kind: kind.into(),
+        plural: plural.into(),
+        namespace: ns.map(str::to_string),
+        name: name.into(),
+        object: Box::new(obj(
+            json!({"apiVersion": "v1", "kind": kind, "metadata": meta}),
+        )),
+    }
+}
+
+/// A pod with an owner, a node, and a claim, opened in the adjacent view.
+fn open_adjacent_on_a_pod(app: &mut App) {
+    app.cluster
+        .register_kind("", "PersistentVolumeClaim", "persistentvolumeclaims", true);
+    app.switch_kind("pods");
+    apply(
+        app,
+        json!({"apiVersion": "v1", "kind": "Pod",
+               "metadata": {"name": "db-0", "namespace": "db", "uid": "p-1",
+                            "ownerReferences": [{"apiVersion": "apps/v1", "kind": "StatefulSet",
+                                                 "name": "db", "uid": "s-1"}]},
+               "spec": {"nodeName": "ip-10-0-1-2",
+                        "volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": "data-db-0"}}]}}),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('u'))).unwrap();
+    assert_eq!(app.mode, Mode::Adjacent);
+}
+
+fn deliver_adjacent(app: &mut App, items: Vec<crate::store::AdjacentItem>, warn: Option<String>) {
+    app.handle_msg(Msg::Adjacent {
+        generation: app.generation,
+        request: app.adjacent_request,
+        claim: current_claim(app),
+        title: app.adjacent_title.clone(),
+        items,
+        warn,
+    });
+}
+
+fn pod_neighbours() -> Vec<crate::store::AdjacentItem> {
+    vec![
+        adjacent_item(
+            "↑ owned by",
+            "StatefulSet",
+            "statefulsets",
+            Some("db"),
+            "db",
+        ),
+        adjacent_item(
+            "→ mounts",
+            "PersistentVolumeClaim",
+            "persistentvolumeclaims",
+            Some("db"),
+            "data-db-0",
+        ),
+        adjacent_item("→ runs on", "Node", "nodes", None, "ip-10-0-1-2"),
+    ]
+}
+
+#[tokio::test]
+async fn u_opens_the_adjacent_view_and_enter_lands_on_the_object() {
+    let (mut app, _rx) = test_app();
+    open_adjacent_on_a_pod(&mut app);
+    assert_eq!(app.adjacent_title, "db-0 — adjacent");
+    assert!(app.adjacent_pending());
+    assert!(app.flash.contains("gathering"), "{}", app.flash);
+    assert!(app.adjacent_items.is_empty());
+
+    deliver_adjacent(&mut app, pod_neighbours(), None);
+    assert!(!app.adjacent_pending());
+    assert!(!app.flash_err);
+    assert_eq!(app.adjacent_items.len(), 3);
+    assert_eq!(app.adjacent_state.selected(), Some(0));
+
+    // Down to the claim, then ⏎: its own kind's view, name-filtered, so
+    // every action there applies to it.
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.kind_plural, "persistentvolumeclaims");
+    assert_eq!(app.namespace, "db");
+    assert_eq!(app.fields.as_deref(), Some("metadata.name=data-db-0"));
+    assert_eq!(app.stack.len(), 1);
+    assert!(
+        app.adjacent_claim.is_none(),
+        "navigating away cancels the gather"
+    );
+
+    // esc pops the frame back to the pods table.
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.kind_plural, "pods");
+    assert!(app.stack.is_empty());
+}
+
+#[tokio::test]
+async fn adjacent_cluster_scoped_row_opens_without_a_namespace() {
+    let (mut app, _rx) = test_app();
+    open_adjacent_on_a_pod(&mut app);
+    deliver_adjacent(&mut app, pod_neighbours(), None);
+    app.handle_key(press(KeyCode::Char('G'))).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.kind_plural, "nodes");
+    assert_eq!(app.namespace, "");
+    assert_eq!(app.fields.as_deref(), Some("metadata.name=ip-10-0-1-2"));
+}
+
+#[tokio::test]
+async fn adjacent_esc_returns_to_the_table_and_cancels_the_gather() {
+    let (mut app, _rx) = test_app();
+    open_adjacent_on_a_pod(&mut app);
+    let request = app.adjacent_request;
+    let claim = current_claim(&app);
+
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.table_state.selected(), Some(0));
+    assert_ne!(app.adjacent_request, request, "esc retires the request");
+    assert!(app.adjacent_claim.is_none());
+
+    // The late result is dropped, not shown over the table.
+    app.handle_msg(Msg::Adjacent {
+        generation: app.generation,
+        request,
+        claim,
+        title: "db-0 — adjacent".into(),
+        items: pod_neighbours(),
+        warn: None,
+    });
+    assert!(app.adjacent_items.is_empty());
+    assert_eq!(app.mode, Mode::Table);
+}
+
+#[tokio::test]
+async fn adjacent_y_shows_the_rows_yaml_and_esc_comes_back() {
+    let (mut app, _rx) = test_app();
+    open_adjacent_on_a_pod(&mut app);
+    deliver_adjacent(&mut app, pod_neighbours(), None);
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    assert_eq!(app.mode, Mode::Detail);
+    assert_eq!(app.detail.title, "data-db-0 — YAML");
+    assert!(
+        app.adjacent_claim.is_none(),
+        "the gather is done; nothing to keep alive"
+    );
+
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Adjacent);
+    assert_eq!(app.adjacent_items.len(), 3);
+    assert_eq!(app.adjacent_state.selected(), Some(1));
+}
+
+#[tokio::test]
+async fn adjacent_d_describes_the_row_and_returns_here() {
+    let (mut app, _rx) = test_app();
+    open_adjacent_on_a_pod(&mut app);
+    deliver_adjacent(&mut app, pod_neighbours(), None);
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+
+    app.handle_key(press(KeyCode::Char('d'))).unwrap();
+    assert_eq!(
+        app.mode,
+        Mode::Adjacent,
+        "describe runs off-thread; the view stays"
+    );
+    assert_eq!(app.return_mode, Mode::Adjacent);
+    assert!(app.flash.contains("describing data-db-0"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn adjacent_incomplete_gathers_say_so() {
+    let (mut app, _rx) = test_app();
+    open_adjacent_on_a_pod(&mut app);
+    deliver_adjacent(
+        &mut app,
+        Vec::new(),
+        Some("listing persistentvolumeclaims: forbidden".into()),
+    );
+    assert!(app.flash_err);
+    assert!(
+        app.flash.contains("adjacent is incomplete"),
+        "{}",
+        app.flash
+    );
+    assert_eq!(app.adjacent_state.selected(), None);
+}
+
+#[tokio::test]
+async fn adjacent_opens_from_the_palette_and_refuses_helm_rows() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Pod",
+               "metadata": {"name": "web", "namespace": "default"}}),
+    );
+    app.table_state.select(Some(0));
+    assert!(app.run_palette_command("adjacent"));
+    assert_eq!(app.mode, Mode::Adjacent);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+
+    app.kind_plural = "helm".into();
+    app.handle_key(press(KeyCode::Char('u'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash_err);
+    assert!(
+        app.flash.contains("not available for Helm"),
+        "{}",
+        app.flash
+    );
+}
+
+#[tokio::test]
+async fn adjacent_view_keys_resolve_to_their_group() {
+    let (app, _rx) = test_app();
+    assert!(app.resolve_view_key("pods").is_some());
+    assert!(app.resolve_view_key("v1/pods").is_some());
+    assert!(app.resolve_view_key("apps/deployments").is_some());
+    assert!(app.resolve_view_key("apps/v1/deployments").is_some());
+    // A key that names another group must not resolve to the core kind.
+    assert!(app.resolve_view_key("metrics.k8s.io/pods").is_none());
+    assert!(app.resolve_view_key("nope").is_none());
 }
 
 #[tokio::test]

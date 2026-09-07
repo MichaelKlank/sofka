@@ -148,6 +148,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Xray => draw_xray(frame, app, chunks[1]),
         Mode::Explain => draw_explain(frame, app, chunks[1]),
         Mode::Gitops => draw_gitops(frame, app, chunks[1]),
+        Mode::Adjacent => draw_adjacent(frame, app, chunks[1]),
         Mode::Timeline => draw_timeline(frame, app, chunks[1]),
         Mode::PortForwards => draw_port_forwards(frame, app, chunks[1]),
         Mode::Fleet => draw_fleet(frame, app, chunks[1]),
@@ -172,6 +173,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Mode::Xray => draw_xray(frame, app, chunks[1]),
             Mode::Explain => draw_explain(frame, app, chunks[1]),
             Mode::Gitops => draw_gitops(frame, app, chunks[1]),
+            Mode::Adjacent => draw_adjacent(frame, app, chunks[1]),
             Mode::Timeline => draw_timeline(frame, app, chunks[1]),
             Mode::PortForwards => draw_port_forwards(frame, app, chunks[1]),
             Mode::Fleet => draw_fleet(frame, app, chunks[1]),
@@ -460,6 +462,7 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
             | Mode::Explain
             | Mode::Timeline
             | Mode::Gitops
+            | Mode::Adjacent
             | Mode::PortForwards
     ) {
         return Vec::new();
@@ -2225,6 +2228,10 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             "session-local state-change history for the selection",
         ),
         bind(
+            "u · :adjacent",
+            "adjacent view: owners, children, and the objects the selection names or is named by (⏎ opens one)",
+        ),
+        bind(
             ":rightsize",
             "historical right-sizing: P50/P95/P99 usage → suggested requests + patch (needs [providers.metrics])",
         ),
@@ -2757,6 +2764,47 @@ fn draw_find(frame: &mut Frame, app: &mut App, area: Rect) {
         items,
         Span::styled(title, theme::title()),
         &mut app.find_state,
+    );
+}
+
+fn draw_adjacent(frame: &mut Frame, app: &mut App, area: Rect) {
+    let items: Vec<ListItem> = if app.adjacent_items.is_empty() {
+        let msg = if app.adjacent_pending() {
+            "gathering…"
+        } else {
+            "nothing connected to this object was found"
+        };
+        vec![ListItem::new(Span::styled(msg, theme::dim()))]
+    } else {
+        app.adjacent_items
+            .iter()
+            .map(|it| {
+                let location = match &it.namespace {
+                    Some(ns) if !ns.is_empty() => format!("{ns}/{}", it.name),
+                    _ => it.name.clone(),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{:<16} ", it.relation), theme::dim()),
+                    Span::styled(
+                        format!("{:<24} ", it.kind),
+                        Style::default().fg(theme::text()),
+                    ),
+                    Span::styled(location, Style::default().fg(theme::text())),
+                ]))
+            })
+            .collect()
+    };
+    let title = format!(
+        " {} [{}]  (⏎ open · y yaml · d describe · r refresh · esc back) ",
+        app.adjacent_title,
+        app.adjacent_items.len()
+    );
+    render_framed_list(
+        frame,
+        area,
+        items,
+        Span::styled(title, theme::title()),
+        &mut app.adjacent_state,
     );
 }
 
@@ -3822,6 +3870,10 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
         )),
         Mode::Gitops => Line::from(Span::styled(
             "  j/k: move   ⏎: jump to owner/source   r: refresh   esc: back",
+            theme::dim(),
+        )),
+        Mode::Adjacent => Line::from(Span::styled(
+            "  j/k: move   ⏎: open the object   y: yaml   d: describe   r: refresh   esc: back",
             theme::dim(),
         )),
         Mode::FluxMenu => Line::from(Span::styled(

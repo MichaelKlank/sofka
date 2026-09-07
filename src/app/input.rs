@@ -165,6 +165,7 @@ impl App {
             Mode::Explain => self.key_explain(key),
             Mode::Timeline => self.key_timeline(key),
             Mode::Gitops => self.key_gitops(key),
+            Mode::Adjacent => self.key_adjacent(key),
             Mode::FluxMenu => self.key_flux_menu(key),
             Mode::TransferMenu => self.key_transfer_menu(key),
             Mode::PortForwards => self.key_port_forwards(key),
@@ -192,6 +193,7 @@ impl App {
                 | Mode::Explain
                 | Mode::Timeline
                 | Mode::Gitops
+                | Mode::Adjacent
                 | Mode::Diff
                 | Mode::Events
                 | Mode::FluxMenu
@@ -288,6 +290,8 @@ impl App {
             KeyCode::Char('X') => self.open_explain(),
             // `T` — session-local state-change timeline for the selection.
             KeyCode::Char('T') => self.open_timeline(),
+            // `u` — the objects directly connected to the selection.
+            KeyCode::Char('u') => self.open_adjacent(),
             KeyCode::Char('C') => self.request_cordon(true),
             KeyCode::Char('U') => self.request_cordon(false),
             KeyCode::Char('D') => self.request_drain(),
@@ -521,6 +525,7 @@ impl App {
             PaletteAction::Explain => self.open_explain(),
             PaletteAction::Timeline => self.open_timeline(),
             PaletteAction::Gitops => self.open_gitops(),
+            PaletteAction::Adjacent => self.open_adjacent(),
             PaletteAction::CanI => self.open_can_i(),
             PaletteAction::Journal => self.open_journal(),
             PaletteAction::Debug => self.request_debug(None),

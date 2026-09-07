@@ -8,6 +8,7 @@
 //! binary is the product; the library exists so the benchmarks and any future
 //! integration tests can reach the same code the TUI runs.
 
+pub mod adjacent;
 pub mod altscroll;
 pub mod app;
 pub mod atomicfile;

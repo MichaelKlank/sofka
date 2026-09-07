@@ -1058,6 +1058,28 @@ impl App {
                 // progress flash has done its job now the findings are up.
                 self.clear_claimed_status(claim);
             }
+            Msg::Adjacent {
+                generation,
+                request,
+                claim,
+                title,
+                items,
+                warn,
+            } if generation == self.generation && request == self.adjacent_request => {
+                self.adjacent_claim = None;
+                let count = items.len();
+                self.adjacent_items = items;
+                self.adjacent_title = title;
+                self.adjacent_state.select((count > 0).then_some(0));
+                match warn {
+                    Some(w) => self.set_claimed_status(
+                        claim,
+                        format!("adjacent is incomplete — {w}"),
+                        true,
+                    ),
+                    None => self.clear_claimed_status(claim),
+                }
+            }
             Msg::Gitops {
                 generation,
                 request,

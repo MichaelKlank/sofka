@@ -83,6 +83,12 @@ pub struct View {
     pub node: Option<String>,
     /// Where `enter` drills to — see [`drill_for`].
     pub drill: Option<Drill>,
+    /// References to other objects, for the adjacent view — see
+    /// [`crate::adjacent::rules_for`].
+    pub refs: Vec<crate::adjacent::RefRule>,
+    /// Kinds whose objects this kind owns, scanned for children by the
+    /// adjacent view.
+    pub children: Vec<String>,
 }
 
 /// A configured drill-down: `enter` on a row opens `kind`, scoped by the
@@ -145,7 +151,7 @@ pub const BUILTIN_DRILLS: &[&str] = &[
 /// The plural a view key names: the last segment of `apiVersion/plural`,
 /// `group/plural`, or a bare plural. A key that is a lowercased kind (`pod`)
 /// isn't a plural and won't match anything here.
-fn key_plural(key: &str) -> &str {
+pub(crate) fn key_plural(key: &str) -> &str {
     key.rsplit('/').next().unwrap_or(key)
 }
 
@@ -350,6 +356,64 @@ pub fn compile(
                 fields: fields.map(str::to_string),
             })
         });
+        let mut refs = Vec::new();
+        for r in &cfg.refs {
+            let path = r.path.trim();
+            let kind = r.kind.trim();
+            let mut problem = None;
+            if !path.starts_with('/') {
+                problem = Some(format!(
+                    "path '{path}' is not a JSON Pointer (must start with '/')"
+                ));
+            } else if kind.is_empty() {
+                problem = Some("kind is empty".to_string());
+            } else if let Some(p) = r.namespace_path.as_deref().map(str::trim)
+                && !p.starts_with('/')
+            {
+                problem = Some(format!("namespace_path '{p}' is not a JSON Pointer"));
+            }
+            let reverse = match r.reverse.as_deref().map(str::trim) {
+                None | Some("") => Some(crate::adjacent::Reverse::Namespace),
+                Some(s) => crate::adjacent::Reverse::parse(s),
+            };
+            if reverse.is_none() {
+                problem = Some(format!(
+                    "reverse '{}' must be namespace, cluster, or none",
+                    r.reverse.as_deref().unwrap_or_default()
+                ));
+            }
+            if let Some(why) = problem {
+                warnings.push(format!(
+                    "views.\"{key}\": ref {}: {why}; skipped",
+                    refs.len() + 1
+                ));
+                continue;
+            }
+            refs.push(crate::adjacent::RefRule {
+                from: key.to_lowercase(),
+                path: path.to_string(),
+                namespace_path: r
+                    .namespace_path
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_string),
+                kind: kind.to_string(),
+                relation: r
+                    .relation
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("references")
+                    .to_string(),
+                reverse: reverse.unwrap_or_default(),
+            });
+        }
+        let children = cfg
+            .children
+            .iter()
+            .map(|c| c.trim().to_lowercase())
+            .filter(|c| !c.is_empty())
+            .collect();
         views.insert(
             key.to_lowercase(),
             View {
@@ -358,6 +422,8 @@ pub fn compile(
                 replace,
                 node,
                 drill,
+                refs,
+                children,
             },
         );
     }
@@ -390,7 +456,7 @@ fn parse_sort(key: &str, s: &str, warnings: &mut Vec<String>) -> Option<(String,
 
 /// The keys a resource's view can be configured under, most specific first:
 /// `apiVersion/plural`, `group/plural`, plural, then lowercased kind.
-fn lookup_keys(ar: &ApiResource) -> Vec<String> {
+pub(crate) fn lookup_keys(ar: &ApiResource) -> Vec<String> {
     let plural = ar.plural.to_lowercase();
     let mut keys = vec![format!("{}/{plural}", ar.api_version.to_lowercase())];
     if !ar.group.is_empty() {
@@ -794,6 +860,8 @@ pub fn printer_columns_view(crd: &Value, version: &str) -> Option<View> {
             replace: false,
             node: None,
             drill: None,
+            refs: Vec::new(),
+            children: Vec::new(),
         })
     }
 }
@@ -1262,6 +1330,49 @@ mod tests {
                 .any(|w| w.contains("`enter` on deployments")),
             "{warnings:?}"
         );
+    }
+
+    #[test]
+    fn refs_validate_and_default() {
+        let (views, warnings) = compile_toml(
+            r#"
+            [views.widgets]
+            children = ["Gadgets", ""]
+
+            [[views.widgets.refs]]
+            path = "/spec/owner"
+            kind = "teams"
+
+            [[views.widgets.refs]]
+            path = "spec/owner"
+            kind = "teams"
+
+            [[views.widgets.refs]]
+            path = "/spec/owner"
+            kind = ""
+
+            [[views.widgets.refs]]
+            path = "/spec/owner"
+            kind = "teams"
+            reverse = "everywhere"
+            "#,
+        );
+        let view = &views["widgets"];
+        assert_eq!(view.children, ["gadgets"]);
+        assert_eq!(view.refs.len(), 1, "{:?}", view.refs);
+        let r = &view.refs[0];
+        assert_eq!(
+            (r.from.as_str(), r.relation.as_str()),
+            ("widgets", "references")
+        );
+        assert_eq!(r.reverse, crate::adjacent::Reverse::Namespace);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings[0].contains("ref 2") && warnings[0].contains("JSON Pointer"),
+            "{warnings:?}"
+        );
+        assert!(warnings[1].contains("kind is empty"), "{warnings:?}");
+        assert!(warnings[2].contains("reverse 'everywhere'"), "{warnings:?}");
     }
 
     #[test]

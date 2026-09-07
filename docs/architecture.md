@@ -22,6 +22,9 @@ thresholds.rs Configurable RESTARTS/CPU/MEM/utilization coloring bands
              (global + per-resource), compiled from config, with unit tests.
 explain.rs   Deterministic "why is this unhealthy?" analysis — pure, turns
              an object + its pods + events into ranked findings, unit-tested.
+adjacent.rs  Which objects connect to which: built-in and configured reference
+             rules, child kinds, JSON-Pointer fan-out — pure, unit-tested.
+             `app/adjacent.rs` gathers the objects and drives the view.
 timeline.rs  Session-local per-object state-change history diffed from the
              watch stream (pure transition logic, unit-tested).
 pvcexplore.rs PVC browsing: which pod already mounts a claim, the helper pod

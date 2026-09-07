@@ -174,6 +174,8 @@ pub enum Mode {
     Timeline,
     /// Flux GitOps ownership + reconciliation chain for the selection.
     Gitops,
+    /// The objects directly connected to the selection (`u`).
+    Adjacent,
     Diff,
     Events,
     FluxMenu,
@@ -568,6 +570,7 @@ enum PaletteAction {
     Explain,
     Timeline,
     Gitops,
+    Adjacent,
     CanI,
     Journal,
     Debug,
@@ -617,6 +620,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         action: PaletteAction::Timeline,
         names: &["timeline", "tl", "history"],
+    },
+    PaletteCommand {
+        action: PaletteAction::Adjacent,
+        names: &["adjacent", "adj", "related"],
     },
     PaletteCommand {
         action: PaletteAction::Gitops,
@@ -1902,6 +1909,14 @@ pub struct App {
     /// Parent of the explain view. Kept separately because an evidence view
     /// (logs/events) temporarily uses `return_mode` to return to Explain.
     explain_return: Mode,
+    /// Adjacent view: the connected objects, cursor, title, and the object
+    /// they were gathered for (kept so `r` can re-gather).
+    pub adjacent_items: Vec<crate::store::AdjacentItem>,
+    pub adjacent_state: ListState,
+    pub adjacent_title: String,
+    pub adjacent_source: Option<DynamicObject>,
+    adjacent_request: u64,
+    adjacent_claim: Option<StatusClaim>,
     /// GitOps view: the reconciliation-chain findings, cursor, title, and the
     /// object being investigated (kept so `r` can re-gather).
     pub gitops_items: Vec<crate::explain::Finding>,
@@ -2147,6 +2162,12 @@ impl App {
             explain_request: 0,
             explain_claim: None,
             explain_return: Mode::Table,
+            adjacent_items: Vec::new(),
+            adjacent_state: ListState::default(),
+            adjacent_title: String::new(),
+            adjacent_source: None,
+            adjacent_request: 0,
+            adjacent_claim: None,
             gitops_items: Vec::new(),
             gitops_state: ListState::default(),
             gitops_title: String::new(),
@@ -2244,6 +2265,7 @@ impl App {
 }
 
 mod actions;
+mod adjacent;
 mod authz;
 mod bookmarks;
 mod bundle;
