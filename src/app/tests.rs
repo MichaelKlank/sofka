@@ -780,6 +780,49 @@ fn helm_release_secret_deployed_at(
 }
 
 #[tokio::test]
+async fn discovered_short_names_select_resources_in_the_palette() {
+    for aggregated in [true, false] {
+        let url = crate::k8s::tests::mock_apiserver(aggregated, aggregated, true).await;
+        let cluster = crate::k8s::tests::connect_mock(url).await.unwrap();
+        let (tx, _rx) = mpsc::channel(1024);
+        let mut app = App::new(cluster, tx);
+        for (alias, plural) in [
+            ("md", "machinedeployments"),
+            ("zz", "widgets"),
+            ("gd", "gadgets"),
+            ("po", "pods"),
+            ("pods", "pods"),
+            ("shared", "gadgets"),
+            ("cross", "machinedeployments"),
+            ("native", "pods"),
+            ("MD", "machinedeployments"),
+        ] {
+            for ch in format!(":{alias}").chars() {
+                app.handle_key(press(KeyCode::Char(ch))).unwrap();
+            }
+            assert_eq!(
+                app.cluster
+                    .resolve(&app.cmd_suggestions[0].label)
+                    .unwrap()
+                    .ar
+                    .plural,
+                plural,
+                "alias {alias}, aggregated={aggregated}"
+            );
+            app.handle_key(press(KeyCode::Enter)).unwrap();
+            assert_eq!(app.kind_plural, plural);
+        }
+        app.cluster
+            .add_aliases(&HashMap::from([("md".into(), "widgets".into())]));
+        for ch in ":md".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.kind_plural, "widgets");
+    }
+}
+
+#[tokio::test]
 async fn exact_alias_outranks_fuzzy_suggestions() {
     let (mut app, _rx) = test_app();
     // `hr` fuzzy-matches horizontalpodautoscalers too; the alias target

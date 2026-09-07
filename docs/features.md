@@ -14,6 +14,11 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 - **API discovery** of every resource type on the cluster, with k9s-style short
   aliases (`po`, `dp`, `svc`, `no`, `cm`, `sts`, `ds`, `ks`, `hr`, …) and correct
   precedence - core `pods` wins over `pods.metrics.k8s.io`.
+  Discovered short names also work for custom resources, such as `:md` for
+  MachineDeployments. Exact aliases appear before fuzzy resource matches.
+  Resource names and built-in aliases take priority over discovered short names.
+  Shared short names use group priority, then alphabetical group and resource
+  order. User aliases override discovered aliases.
 - **Live watch** of any kind through `kube::runtime::watcher`, streamed into an
   in-memory store. Watch requests use uncompressed responses to avoid gzip
   stream errors. List requests retain gzip compression.

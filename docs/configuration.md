@@ -25,6 +25,14 @@ favorite_namespaces = ["kube-system", "monitoring"]
 dep = "deployments"
 ```
 
+CRD short names are discovered automatically. To override a short name, add it
+under `[aliases]`. Use a group-qualified target when resource names overlap:
+
+```toml
+[aliases]
+md = "machinedeployments.cluster.x-k8s.io"
+```
+
 ## Skins
 
 ```toml
