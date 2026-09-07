@@ -1573,11 +1573,11 @@ struct Frame {
     selected: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SortOrigin {
     Unset,
     Configured,
-    Selected,
+    Selected { header: String, desc: bool },
     Cleared,
 }
 

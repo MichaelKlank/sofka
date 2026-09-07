@@ -816,13 +816,19 @@ impl App {
 
     /// Rebuild the active column layout from the current kind, user views,
     /// printer-column fallback, and wide mode. An active sort stays pinned to
-    /// its column *header* — indices shift when columns appear/disappear (wide
-    /// toggle, printer columns arriving) — and resets if the column is gone.
+    /// its column header as indices change. A selected sort waits while its
+    /// column is hidden and returns when that column is available again.
     /// Cached cells are laid out for the old spec, so they're always dropped.
     pub(super) fn refresh_view_spec(&mut self) {
-        let sort_header = self
-            .sort_column
-            .and_then(|i| self.display_headers().get(i).cloned());
+        let sort = match &self.sort_origin {
+            SortOrigin::Selected { header, desc } => Some((header.clone(), *desc)),
+            _ => self.sort_column.and_then(|i| {
+                self.display_headers()
+                    .get(i)
+                    .cloned()
+                    .map(|h| (h, self.sort_desc))
+            }),
+        };
         let resource = self.kind.as_ref().map(Kind::resource_key);
         let warnings = crate::columns::view_warnings(
             self.kind.as_ref().map_or("", |kind| kind.ar.group.as_str()),
@@ -846,11 +852,9 @@ impl App {
         );
         self.spec = spec;
         self.spec_rev = self.spec_rev.wrapping_add(1);
-        if let Some(h) = sort_header {
+        if let Some((h, desc)) = sort {
             self.sort_column = self.display_headers().iter().position(|x| *x == h);
-            if self.sort_column.is_none() {
-                self.sort_desc = false;
-            }
+            self.sort_desc = self.sort_column.is_some() && desc;
         }
         self.clear_rows_cache();
         self.col_offset = 0;
@@ -876,7 +880,12 @@ impl App {
     /// Apply a view's configured initial sort, unless a sort is already
     /// active (a refresh must not clobber the user's choice).
     pub(super) fn apply_view_sort(&mut self) {
-        if self.sort_column.is_some() || self.sort_origin == SortOrigin::Cleared {
+        if self.sort_column.is_some()
+            || matches!(
+                self.sort_origin,
+                SortOrigin::Selected { .. } | SortOrigin::Cleared
+            )
+        {
             return;
         }
         let specific_sort = self.active_user_view().and_then(|v| v.sort.clone());
@@ -1060,19 +1069,21 @@ impl App {
     /// kind's entry is forgotten instead. View switches call `reset_sort`
     /// directly and must NOT land here — a switch isn't a sort choice.
     pub(super) fn remember_sort(&mut self) {
-        self.sort_origin = if self.sort_column.is_some() {
-            SortOrigin::Selected
-        } else {
-            SortOrigin::Cleared
+        let header = self
+            .sort_column
+            .and_then(|i| self.display_headers().get(i).cloned());
+        self.sort_origin = match &header {
+            Some(header) => SortOrigin::Selected {
+                header: header.clone(),
+                desc: self.sort_desc,
+            },
+            None => SortOrigin::Cleared,
         };
         if !self.remember_sort || self.kind_plural.is_empty() {
             return;
         }
         let kind = self.kind_plural.clone();
-        match self
-            .sort_column
-            .and_then(|i| self.display_headers().get(i).cloned())
-        {
+        match header {
             Some(h) => self.sort_memory.set(&kind, &h, self.sort_desc),
             None if self.sort_memory.clear(&kind) => {}
             None => return, // nothing was remembered; skip the disk write
@@ -1096,7 +1107,10 @@ impl App {
     /// a wide-only column simply stays dormant until `w`.
     pub(super) fn apply_remembered_sort(&mut self) {
         if !self.remember_sort
-            || self.sort_origin == SortOrigin::Cleared
+            || matches!(
+                self.sort_origin,
+                SortOrigin::Selected { .. } | SortOrigin::Cleared
+            )
             || (self.sort_column.is_some() && self.sort_origin != SortOrigin::Configured)
         {
             return;
@@ -1107,7 +1121,7 @@ impl App {
         if let Some(i) = self.display_headers().iter().position(|h| *h == header) {
             self.sort_column = Some(i);
             self.sort_desc = desc;
-            self.sort_origin = SortOrigin::Selected;
+            self.sort_origin = SortOrigin::Selected { header, desc };
             self.invalidate_rows();
         }
     }

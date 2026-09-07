@@ -6393,8 +6393,156 @@ async fn wildcard_sort_applies_when_wide_columns_appear() {
         app.handle_key(press(KeyCode::Char('w'))).unwrap();
         assert_eq!(app.sort_column, None);
         app.handle_key(press(KeyCode::Char('w'))).unwrap();
-        assert_eq!(app.sort_desc, !remember);
+        assert!(!app.sort_desc);
     }
+}
+
+#[tokio::test]
+async fn temporary_wide_sort_keeps_its_column_and_direction_until_cleared_or_navigation() {
+    for remember in [true, false] {
+        for desc in [true, false] {
+            let (mut app, _rx) = test_app();
+            app.remember_sort = remember;
+            app.sort_memory.set("pods", "NAME", false);
+            install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+            palette(&mut app, "pods");
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            select_sort_with_keys(&mut app, "IP");
+            if desc {
+                app.handle_key(press(KeyCode::Char('I'))).unwrap();
+            }
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            assert_eq!(app.sort_column, None);
+            assert!(!app.sort_desc);
+            assert_eq!(
+                app.sort_origin,
+                SortOrigin::Selected {
+                    header: "IP".into(),
+                    desc
+                }
+            );
+            app.handle_key(ctrl(KeyCode::Char('r'))).unwrap();
+            assert_eq!(app.sort_column, None);
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            assert_eq!(
+                app.sort_column,
+                app.display_headers().iter().position(|h| h == "IP")
+            );
+            assert_eq!(app.sort_desc, desc);
+            assert_eq!(
+                app.sort_memory.get("pods"),
+                Some(if remember {
+                    ("IP".into(), desc)
+                } else {
+                    ("NAME".into(), false)
+                })
+            );
+
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            clear_sort_with_keys(&mut app);
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            assert_eq!(app.sort_column, None);
+            assert_eq!(app.sort_origin, SortOrigin::Cleared);
+            palette(&mut app, "services");
+            palette(&mut app, "pods");
+            assert_eq!(
+                app.sort_column,
+                app.display_headers().iter().position(|h| h == "AGE")
+            );
+            assert!(app.sort_desc);
+        }
+    }
+}
+
+fn select_sort_with_keys(app: &mut App, header: &str) {
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    for c in header.chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == header)
+    );
+    assert!(app.sort_column.is_some());
+}
+
+#[tokio::test]
+async fn new_sort_selection_replaces_a_hidden_temporary_sort() {
+    let (mut app, _rx) = test_app();
+    app.remember_sort = false;
+    install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+    palette(&mut app, "pods");
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    select_sort_with_keys(&mut app, "IP");
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.sort_column, None);
+    select_sort_with_keys(&mut app, "NAME");
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.sort_column, Some(0));
+    assert!(!app.sort_desc);
+    assert_eq!(app.sort_memory.get("pods"), None);
+}
+
+#[tokio::test]
+async fn bookmark_sort_waits_for_a_hidden_column_without_using_sort_memory() {
+    for remember in [true, false] {
+        let (mut app, _rx) = test_app();
+        app.remember_sort = remember;
+        app.sort_memory.set("pods", "NAME", false);
+        install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+        app.bookmarks = vec![crate::config::Bookmark {
+            key: Some("ctrl-y".into()),
+            name: "pods by IP".into(),
+            resource: "pods".into(),
+            sort: Some("IP:desc".into()),
+            ..Default::default()
+        }];
+        app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+        assert_eq!(app.sort_column, None);
+        app.handle_key(ctrl(KeyCode::Char('r'))).unwrap();
+        assert_eq!(app.sort_column, None);
+        for _ in 0..2 {
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            assert_eq!(
+                app.sort_column,
+                app.display_headers().iter().position(|h| h == "IP")
+            );
+            assert!(app.sort_column.is_some());
+            assert!(app.sort_desc);
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            assert_eq!(app.sort_column, None);
+        }
+        assert_eq!(app.sort_memory.get("pods"), Some(("NAME".into(), false)));
+    }
+}
+
+#[tokio::test]
+async fn temporary_printer_sort_waits_when_its_column_is_removed_then_restored() {
+    let (mut app, _rx) = test_app();
+    app.remember_sort = false;
+    app.sort_memory.set("certificates", "NAME", false);
+    install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
+    palette(&mut app, "certificates");
+    deliver_ready_printer_column(&mut app);
+    select_sort_with_keys(&mut app, "READY");
+    app.handle_key(press(KeyCode::Char('I'))).unwrap();
+    app.handle_msg(Msg::PrinterColumns {
+        generation: app.generation,
+        resource: app.cluster.resolve("certificates").unwrap().resource_key(),
+        view: Box::new(None),
+    });
+    assert_eq!(app.sort_column, None);
+    deliver_ready_printer_column(&mut app);
+    assert_eq!(
+        app.sort_column,
+        app.display_headers().iter().position(|h| h == "READY")
+    );
+    assert!(app.sort_desc);
+    assert_eq!(
+        app.sort_memory.get("certificates"),
+        Some(("NAME".into(), false))
+    );
 }
 
 #[tokio::test]
@@ -6445,7 +6593,7 @@ async fn saved_printer_sort_replaces_config_default_but_not_a_new_user_choice() 
         assert_eq!(app.sort_origin, SortOrigin::Configured);
         if invert {
             app.handle_key(press(KeyCode::Char('I'))).unwrap();
-            assert_eq!(app.sort_origin, SortOrigin::Selected);
+            assert!(matches!(app.sort_origin, SortOrigin::Selected { .. }));
         }
         let crd = json!({"spec": {"versions": [{
             "name": "v1", "served": true, "storage": true,
@@ -6481,7 +6629,7 @@ async fn saved_wide_sort_replaces_config_default_when_its_column_appears() {
         app.display_headers().iter().position(|h| h == "IP")
     );
     assert!(app.sort_column.is_some());
-    assert_eq!(app.sort_origin, SortOrigin::Selected);
+    assert!(matches!(app.sort_origin, SortOrigin::Selected { .. }));
     assert!(!app.sort_desc);
 }
 
@@ -6602,7 +6750,7 @@ async fn bookmark_sort_keeps_priority_over_delayed_saved_and_configured_sorts() 
         app.handle_key(press(KeyCode::Char('w'))).unwrap();
         assert_eq!(app.sort_column, Some(0));
         assert!(app.sort_desc);
-        assert_eq!(app.sort_origin, SortOrigin::Selected);
+        assert!(matches!(app.sort_origin, SortOrigin::Selected { .. }));
         assert_eq!(
             app.sort_memory.get("certificates"),
             Some(("READY".into(), false))
@@ -6646,7 +6794,7 @@ async fn sort_can_be_selected_again_after_clearing_with_memory_disabled() {
         deliver_ready_printer_column(&mut app);
         assert_eq!(app.sort_column, Some(0));
         assert!(app.sort_desc);
-        assert_eq!(app.sort_origin, SortOrigin::Selected);
+        assert!(matches!(app.sort_origin, SortOrigin::Selected { .. }));
         assert_eq!(
             app.sort_memory.get("certificates"),
             Some(("READY".into(), false))

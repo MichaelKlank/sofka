@@ -94,14 +94,12 @@ impl App {
             _ => (spec.trim(), false),
         };
         let header = name.to_uppercase();
-        match self.display_headers().iter().position(|h| *h == header) {
-            Some(i) => {
-                self.sort_column = Some(i);
-                self.sort_desc = desc;
-                self.sort_origin = SortOrigin::Selected;
-                self.invalidate_rows();
-            }
-            None => self.flash_warn(&format!("bookmark sort column '{header}' not found")),
+        self.sort_column = self.display_headers().iter().position(|h| *h == header);
+        self.sort_desc = self.sort_column.is_some() && desc;
+        if self.sort_column.is_none() {
+            self.flash_warn(&format!("bookmark sort column '{header}' not found"));
         }
+        self.sort_origin = SortOrigin::Selected { header, desc };
+        self.invalidate_rows();
     }
 }

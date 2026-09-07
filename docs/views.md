@@ -180,6 +180,11 @@ The sort picker's no-sort entry clears sorting in the active view. Column
 updates, wide mode, config reload, and watch refresh keep that choice.
 Opening a resource view again applies its saved or configured sort as usual.
 
+A user or bookmark sort waits while its column is hidden or unavailable.
+The table uses its natural order during that time. When the column returns,
+the selected sort and direction return, even with `remember_sort = false`.
+Clearing the sort or selecting another column cancels the waiting choice.
+
 The `node` and `drill` settings use the same key order, but each setting
 falls back separately. A view that sets only columns does not hide a
 `node` or `drill` setting on a less specific key. Built-in navigation rules
