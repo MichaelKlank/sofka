@@ -22,6 +22,9 @@ on the same chord.
 
 For the minus key, use `"-"` alone or `"ctrl--"`, `"alt--"`, or `"ctrl-alt--"`
 with modifiers. The final two hyphens are the separator and the minus key.
+`"shift--"` is not supported. Bind the character that your keyboard produces
+instead. For example, use `"_"` if Shift+minus produces an underscore, or
+`"ctrl-_"` to add Ctrl.
 
 ```toml
 [[plugins]]
