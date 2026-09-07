@@ -15175,6 +15175,38 @@ async fn workload_table_reports_rollout_generation_and_desired_readiness() {
 }
 
 #[tokio::test]
+async fn workload_tables_default_omitted_replicas_to_one() {
+    for (plural, kind, header, expected) in [
+        ("replicasets", "ReplicaSet", "DESIRED", "1"),
+        ("statefulsets", "StatefulSet", "READY", "1/1"),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.cluster.register_kind("apps", kind, plural, true);
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for ch in plural.chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "apps/v1",
+                "kind": kind,
+                "metadata": {"name": "web", "namespace": "default"},
+                "spec": {},
+                "status": {"replicas": 1, "readyReplicas": 1, "updatedReplicas": 1},
+            }),
+        );
+        let (headers, rows) = app.snapshot_table();
+        assert_eq!(
+            rows[0][headers.iter().position(|h| h == header).unwrap()],
+            expected,
+            "{kind} {header}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn workload_table_keeps_active_rollouts_progressing_when_unavailable() {
     for (current, ready, updated, stalled, expected) in [
         (3, 1, 1, false, "Progressing"),

@@ -842,7 +842,11 @@ fn col_deploy_available<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
 }
 
 fn col_rs_desired<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
-    Cow::Owned(iget(ctx.data, &["spec", "replicas"]).to_string())
+    Cow::Owned(
+        iopt(ctx.data, &["spec", "replicas"])
+            .unwrap_or(1)
+            .to_string(),
+    )
 }
 
 fn col_rs_current<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
@@ -857,7 +861,7 @@ fn col_sts_ready<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     Cow::Owned(format!(
         "{}/{}",
         iget(ctx.data, &["status", "readyReplicas"]),
-        iget(ctx.data, &["spec", "replicas"])
+        iopt(ctx.data, &["spec", "replicas"]).unwrap_or(1)
     ))
 }
 
