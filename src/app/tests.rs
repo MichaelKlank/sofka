@@ -14366,3 +14366,62 @@ async fn sidecar_failures_remain_visible_after_initialization() {
         assert_eq!(health_row_color(&mut app, "a-sidecar", "a-sidecar"), color);
     }
 }
+
+fn explain_selected_with_pure_evidence(app: &mut App) {
+    app.handle_key(press(KeyCode::Char('X'))).unwrap();
+    assert_eq!(app.mode, Mode::Explain);
+    let source = app.explain_source.as_ref().unwrap();
+    let findings = crate::explain::explain(&crate::explain::Evidence {
+        kind: &app.kind.as_ref().unwrap().ar.kind,
+        plural: &app.kind_plural,
+        obj: source,
+        pods: &[],
+        events: &[],
+        events_v1: false,
+    });
+    app.handle_msg(Msg::Explain {
+        generation: app.generation,
+        claim: current_claim(app),
+        title: app.explain_title.clone(),
+        findings,
+    });
+}
+
+#[tokio::test]
+async fn explain_key_reports_node_pressure_without_warning_on_healthy_conditions() {
+    for state in ["False", "True", "Unknown"] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("nodes");
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "worker"}, "status": {"conditions": [
+                {"type": "Ready", "status": "True"},
+                {"type": "MemoryPressure", "status": state, "reason": "MemoryCondition"},
+                {"type": "DiskPressure", "status": state},
+                {"type": "PIDPressure", "status": state},
+                {"type": "NetworkUnavailable", "status": state}]}}),
+        );
+        app.handle_key(press(KeyCode::Home)).unwrap();
+        explain_selected_with_pure_evidence(&mut app);
+        assert_eq!(app.explain_items[0].text, "Node/worker is Ready");
+        for condition in [
+            "MemoryPressure",
+            "DiskPressure",
+            "PIDPressure",
+            "NetworkUnavailable",
+        ] {
+            let finding = app
+                .explain_items
+                .iter()
+                .find(|f| f.text.starts_with(condition));
+            if state == "False" {
+                assert!(finding.is_none(), "{condition}");
+            } else {
+                assert_eq!(finding.unwrap().level, crate::explain::Level::Warn);
+            }
+        }
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        assert_eq!(app.mode, Mode::Table);
+    }
+}

@@ -300,14 +300,20 @@ fn explain_generic(ev: &Evidence, name: &str, out: &mut Vec<Finding>) {
         }
     }
 
-    // Any other False/Unknown conditions add detail.
+    // Node pressure conditions report a problem when True; Ready and generic
+    // conditions report a problem when False. Unknown remains a warning.
     for cond in conditions(ev.obj) {
-        if cstr(cond, "type") == "Ready" {
+        let ty = cstr(cond, "type");
+        if ty == "Ready" {
             continue;
         }
         let status = cstr(cond, "status");
-        if status == "False" || status == "Unknown" {
-            let ty = cstr(cond, "type");
+        let pressure = ev.plural == "nodes"
+            && matches!(
+                ty,
+                "MemoryPressure" | "DiskPressure" | "PIDPressure" | "NetworkUnavailable"
+            );
+        if status == "Unknown" || status == if pressure { "True" } else { "False" } {
             let detail = join_reason(cstr(cond, "reason"), cstr(cond, "message"));
             out.push(Finding::new(1, Level::Warn, format!("{ty}: {detail}")));
         }
@@ -779,5 +785,50 @@ mod tests {
         assert_eq!(ev_lines.len(), 2, "only Warnings, Normal dropped");
         assert!(ev_lines[0].text.contains("Failed: newer"), "newest first");
         assert!(ev_lines[1].text.contains("BackOff: older"));
+    }
+    #[test]
+    fn node_pressure_polarity_is_separate_from_readiness() {
+        for condition in [
+            "MemoryPressure",
+            "DiskPressure",
+            "PIDPressure",
+            "NetworkUnavailable",
+        ] {
+            for state in ["True", "False", "Unknown"] {
+                let node = obj(
+                    json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": "worker"},
+                    "status": {"conditions": [{"type": "Ready", "status": "True"},
+                        {"type": condition, "status": state, "reason": "ConditionReason"}]}}),
+                );
+                let findings = explain(&ev("Node", "nodes", &node, &[], &[]));
+                assert_eq!(findings[0].level, Level::Good);
+                let pressure = findings.iter().find(|f| f.text.starts_with(condition));
+                if state == "False" {
+                    assert!(pressure.is_none(), "{condition}={state}");
+                } else {
+                    assert_eq!(pressure.unwrap().level, Level::Warn, "{condition}={state}");
+                    assert!(pressure.unwrap().text.contains("ConditionReason"));
+                }
+            }
+        }
+        for (state, level) in [("False", Level::Critical), ("Unknown", Level::Warn)] {
+            let node = obj(
+                json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": "worker"},
+                "status": {"conditions": [{"type": "Ready", "status": state}]}}),
+            );
+            assert_eq!(
+                explain(&ev("Node", "nodes", &node, &[], &[]))[0].level,
+                level
+            );
+        }
+        let custom = obj(
+            json!({"metadata": {"name": "custom"}, "status": {"conditions": [
+            {"type": "MemoryPressure", "status": "False"}]}}),
+        );
+        assert!(
+            explain(&ev("Custom", "customs", &custom, &[], &[]))
+                .iter()
+                .any(|f| f.level == Level::Warn && f.text.starts_with("MemoryPressure"))
+        );
     }
 }

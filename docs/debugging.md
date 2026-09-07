@@ -10,6 +10,11 @@ failed probes), and recent Warning events. No AI, no external service.
 `j`/`k` move, `⏎` goes to the resource behind a finding, `E` its events, `l` its
 logs, `r` gathers again. A finding you can drill into has a trailing `→`.
 
+For Nodes, memory, disk, and PID pressure are warnings when their conditions
+are `True`. `NetworkUnavailable=True` is also a warning. These conditions do
+not produce warnings when they are `False`. `Unknown` remains a warning, and
+the `Ready` condition is assessed separately.
+
 ## Timeline (`T`)
 
 A per-object timestamped log of every state change the watch saw this session:
