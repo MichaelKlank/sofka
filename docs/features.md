@@ -198,7 +198,9 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   the full revision history (`helm history`); on a revision, `⏎` shows
   user-supplied values, `y` the rendered manifest, `d` the NOTES.txt. `r` rolls
   back and `ctrl-d` uninstalls - those two shell out to the real `helm` binary,
-  all the inspection is native.
+  all the inspection is native. UPDATED advances with the clock in both the
+  release list and revision history. The table keeps the deployment timestamp
+  in its row cache, so clock updates do not decode the release again.
 - **Managed-resource mutation warnings** - before you edit, delete, scale, or
   otherwise change an object Flux (or another controller) owns, sofka tells you
   the next reconcile will revert it or recreate it. Fix the source instead of

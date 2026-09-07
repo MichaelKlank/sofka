@@ -482,6 +482,16 @@ impl ViewSpec {
     /// Cells for one object, aligned with [`Self::headers`], plus the index
     /// of the status column (if any).
     pub fn cells(&self, obj: &DynamicObject, now: i64) -> (Vec<String>, Option<usize>) {
+        let (cells, status_idx, _) = self.cells_with_helm_time(obj, now);
+        (cells, status_idx)
+    }
+
+    /// Keep the deployment timestamp from the same decode used by the row.
+    pub(crate) fn cells_with_helm_time(
+        &self,
+        obj: &DynamicObject,
+        now: i64,
+    ) -> (Vec<String>, Option<usize>, Option<i64>) {
         let ctx = CellContext::new(obj, now);
         let values = self
             .columns
@@ -491,7 +501,12 @@ impl ViewSpec {
                 SpecSource::User(uc) => crate::views::render_cell(obj, uc, now),
             })
             .collect();
-        (values, self.status_idx)
+        let helm_time = ctx
+            .helm
+            .get()
+            .and_then(Option::as_ref)
+            .and_then(|r| r.last_deployed_secs);
+        (values, self.status_idx, helm_time)
     }
 
     /// See [`volatile_cell`]. User `time` columns re-render every frame too:
@@ -510,6 +525,26 @@ impl ViewSpec {
             }
             SpecSource::User(_) => None,
             SpecSource::Curated(_) => volatile_cell(obj, plural, &col.header, now),
+        }
+    }
+
+    /// Refresh elapsed time from cached release metadata without another decode.
+    pub(crate) fn volatile_cached(
+        &self,
+        obj: &DynamicObject,
+        plural: &str,
+        idx: usize,
+        now: i64,
+        helm_time: Option<i64>,
+    ) -> Option<String> {
+        let col = self.columns.get(idx)?;
+        if matches!(plural, "helm" | "helmhistory")
+            && col.header == "UPDATED"
+            && matches!(col.source, SpecSource::Curated(_))
+        {
+            Some(helm_updated(helm_time, now))
+        } else {
+            self.volatile(obj, plural, idx, now)
         }
     }
 
@@ -628,6 +663,10 @@ pub(crate) fn parse_leading_num(s: &str) -> f64 {
 pub fn volatile_cell(obj: &DynamicObject, plural: &str, header: &str, now: i64) -> Option<String> {
     match (plural, header) {
         (_, "AGE") => Some(age(obj, now)),
+        ("helm" | "helmhistory", "UPDATED") => Some(helm_updated(
+            crate::helm::decode_summary(obj).and_then(|r| r.last_deployed_secs),
+            now,
+        )),
         ("jobs", "DURATION") if sget(&obj.data, &["status", "completionTime"]).is_none() => {
             Some(job_duration(&obj.data, now))
         }
@@ -1198,10 +1237,17 @@ fn col_helm_description<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
 }
 
 fn col_helm_updated<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
-    Cow::Owned(match ctx.helm().and_then(|r| r.last_deployed_secs) {
-        Some(secs) => humanize((Timestamp::now().as_second() - secs).max(0)),
+    Cow::Owned(helm_updated(
+        ctx.helm().and_then(|r| r.last_deployed_secs),
+        ctx.now,
+    ))
+}
+
+fn helm_updated(deployed: Option<i64>, now: i64) -> String {
+    match deployed {
+        Some(secs) => humanize(now.saturating_sub(secs).max(0)),
         None => "<unknown>".into(),
-    })
+    }
 }
 
 // ----- helpers ------------------------------------------------------------

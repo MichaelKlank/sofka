@@ -1,5 +1,6 @@
 use super::*;
 use crate::store::row_key;
+use k8s_openapi::jiff::Timestamp;
 use serde_json::json;
 use std::time::Instant;
 use tokio::sync::mpsc::{self, Receiver};
@@ -15645,4 +15646,130 @@ async fn node_roles_include_legacy_labels_without_duplicates() {
             expected
         );
     }
+}
+
+fn open_helm_clock_view(app: &mut App) {
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "helm".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.kind_plural, "helm");
+}
+
+fn helm_updated_snapshot(app: &App, now: i64) -> String {
+    let (headers, rows) = app.snapshot_table_at(now);
+    rows[0][headers.iter().position(|h| h == "UPDATED").unwrap()].clone()
+}
+
+#[tokio::test]
+async fn helm_updated_advances_without_decoding_cached_releases() {
+    let deployed = "2026-09-07T00:00:00Z";
+    let base = deployed.parse::<Timestamp>().unwrap().as_second();
+    for history in [false, true] {
+        let (mut app, _rx) = test_app();
+        open_helm_clock_view(&mut app);
+        let mut secret =
+            helm_release_secret_deployed_at("clock", "default", 1, "deployed", deployed);
+        secret["metadata"]["resourceVersion"] = json!("1");
+        apply(&mut app, secret.clone());
+        if history {
+            app.handle_key(press(KeyCode::Enter)).unwrap();
+            assert_eq!(app.kind_plural, "helmhistory");
+            apply(&mut app, secret);
+        }
+        let before = crate::helm::release_decode_count();
+        assert_eq!(helm_updated_snapshot(&app, base + 59), "59s");
+        assert_eq!(crate::helm::release_decode_count(), before + 1);
+        assert_eq!(helm_updated_snapshot(&app, base + 60), "1m");
+        assert_eq!(helm_updated_snapshot(&app, base + 3600), "1h");
+        app.table_column_widths();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        assert_eq!(crate::helm::release_decode_count(), before + 1);
+        let mut fresh = helm_release_secret_deployed_at(
+            "clock",
+            "default",
+            1,
+            "deployed",
+            "2026-09-07T00:01:00Z",
+        );
+        fresh["metadata"]["resourceVersion"] = json!("2");
+        apply(&mut app, fresh);
+        assert_eq!(helm_updated_snapshot(&app, base + 120), "1m");
+        assert_eq!(crate::helm::release_decode_count(), before + 2);
+    }
+}
+
+#[tokio::test]
+async fn helm_unknown_updated_stays_cached_and_future_times_clamp_to_zero() {
+    let base = "2026-09-07T00:00:00Z"
+        .parse::<Timestamp>()
+        .unwrap()
+        .as_second();
+    for deployed in ["", "invalid", "2026-09-07T01:00:00Z"] {
+        let (mut app, _rx) = test_app();
+        open_helm_clock_view(&mut app);
+        apply(
+            &mut app,
+            helm_release_secret_deployed_at("clock", "default", 1, "deployed", deployed),
+        );
+        let before = crate::helm::release_decode_count();
+        let expected = if deployed.starts_with("2026") {
+            "0s"
+        } else {
+            "<unknown>"
+        };
+        assert_eq!(helm_updated_snapshot(&app, base), expected);
+        assert_eq!(helm_updated_snapshot(&app, base + 60), expected);
+        assert_eq!(crate::helm::release_decode_count(), before + 1);
+    }
+}
+
+#[test]
+fn helm_updated_custom_columns_keep_their_own_type_and_clock() {
+    let cfg: crate::config::Config = toml::from_str(
+        r#"
+        [views.helm]
+        replace = true
+        [[views.helm.columns]]
+        name = "UPDATED"
+        path = "/metadata/creationTimestamp"
+        type = "time"
+    "#,
+    )
+    .unwrap();
+    let (views, warnings) = crate::views::compile(&cfg.views);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let view = views.get("helm").unwrap();
+    let mut secret = obj(helm_release_secret("clock", "default", 1, "deployed"));
+    let base = "2026-09-07T00:00:00Z"
+        .parse::<Timestamp>()
+        .unwrap()
+        .as_second();
+    secret.metadata.creation_timestamp = Some(
+        k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Timestamp::from_second(base).unwrap()),
+    );
+    let spec = crate::columns::build_spec("helm", Some(view), None, false);
+    let before = crate::helm::release_decode_count();
+    let (_, _, cached) = spec.cells_with_helm_time(&secret, base + 59);
+    assert_eq!(
+        spec.volatile_cached(&secret, "helm", 0, base + 60, cached)
+            .as_deref(),
+        Some("1m")
+    );
+    assert_eq!(crate::helm::release_decode_count(), before);
+    let mut text = view.clone();
+    text.columns[0].kind = crate::views::ColumnKind::Text;
+    let spec = crate::columns::build_spec("helm", Some(&text), None, false);
+    assert!(
+        spec.volatile_cached(&secret, "helm", 0, base + 60, Some(base))
+            .is_none()
+    );
 }

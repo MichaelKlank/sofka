@@ -146,6 +146,8 @@ pub fn parse_release_json(json: &[u8]) -> bool {
 /// The release payload as JSON: `data.release` is base64 twice over, then
 /// gzipped. Shared by [`decode`] and [`decode_summary`].
 fn release_json(secret: &DynamicObject) -> Option<Vec<u8>> {
+    #[cfg(test)]
+    RELEASE_DECODES.with(|count| count.set(count.get() + 1));
     let wire = secret.data.pointer("/data/release")?.as_str()?;
     let helm_encoded = BASE64.decode(wire).ok()?;
     let gzipped = BASE64.decode(helm_encoded).ok()?;
@@ -153,6 +155,16 @@ fn release_json(secret: &DynamicObject) -> Option<Vec<u8>> {
     let mut json = Vec::with_capacity(inflated_hint(&gzipped));
     gz.read_to_end(&mut json).ok()?;
     Some(json)
+}
+
+#[cfg(test)]
+thread_local! {
+    static RELEASE_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn release_decode_count() -> usize {
+    RELEASE_DECODES.with(std::cell::Cell::get)
 }
 
 /// Capacity to give the gunzip buffer, from gzip's ISIZE trailer — the

@@ -1433,6 +1433,7 @@ struct CellCacheEntry {
     resource_version: Option<String>,
     cells: Vec<String>,
     status_idx: Option<usize>,
+    helm_updated: Option<i64>,
     /// Per-cell character-presence masks, and their union across the row.
     /// See [`subseq_mask`]: a cheap necessary condition for a fuzzy
     /// subsequence match, used to skip cells (and whole rows) without paying
@@ -1474,6 +1475,13 @@ impl TableCellCache<'_> {
             .cells
             .get(key)
             .map(|entry| (entry.cells.as_slice(), entry.status_idx))
+    }
+
+    pub(crate) fn helm_updated(&self, key: &str) -> Option<i64> {
+        self.cache
+            .cells
+            .get(key)
+            .and_then(|entry| entry.helm_updated)
     }
 }
 

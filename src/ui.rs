@@ -720,14 +720,14 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let col_offset = app.col_offset;
 
     let visible_objects = app.rows_window(offset, visible_rows);
-    app.ensure_table_cell_cache(&visible_objects);
-    let cell_cache = app.table_cell_cache();
     let spec = app.view_spec();
     let thresholds = app.resolved_thresholds();
     // One clock reading for the whole frame. Every visible AGE/DURATION cell
     // used to call `Timestamp::now()` for itself, so a full table took one
     // reading per volatile cell and could show two rows a second apart.
     let now = crate::columns::now_secs();
+    app.ensure_table_cell_cache_at(&visible_objects, now);
+    let cell_cache = app.table_cell_cache();
 
     let rows: Vec<Vec<Cell>> = visible_objects
         .iter()
@@ -740,6 +740,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
             let (base_cells, status_idx) = cell_cache
                 .get(&row_key)
                 .expect("visible rows are warmed in the table cell cache");
+            let helm_updated = cell_cache.helm_updated(&row_key);
             let mut style_idx = status_idx;
             let mut cells = Vec::with_capacity(headers.len());
             if show_ns {
@@ -749,7 +750,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                 style_idx = status_idx.map(|i| i + 1);
             }
             for (i, cell) in base_cells.iter().enumerate() {
-                if let Some(value) = spec.volatile(obj, &app.kind_plural, i, now) {
+                if let Some(value) =
+                    spec.volatile_cached(obj, &app.kind_plural, i, now, helm_updated)
+                {
                     cells.push(TableCellText::Owned(value));
                 } else {
                     cells.push(TableCellText::Borrowed(cell.as_str()));
