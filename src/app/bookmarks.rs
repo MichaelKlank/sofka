@@ -37,8 +37,10 @@ impl App {
         if let Some(ctx) = bm.context.clone()
             && ctx != self.cluster.context
         {
-            self.pending_bookmark = Some(bm);
             self.switch_context(ctx);
+            self.pending_resource_query = None;
+            self.pending_workspace = None;
+            self.pending_bookmark = Some(bm);
             return;
         }
         self.apply_bookmark_local(bm);
@@ -51,22 +53,20 @@ impl App {
             self.flash_warn("bookmark has no resource");
             return;
         }
-        // Namespace + kind in one move (also starts the watch and builds the
-        // view spec, so headers are ready for the sort below).
-        let ns = bm.namespace.as_deref();
-        self.switch_kind_ns(bm.resource.trim(), ns);
-        // If the kind didn't resolve, switch_kind_ns already flashed an error
-        // and left the view unchanged — don't layer a filter/sort on top.
-        if self.kind.is_none() {
+        if self.cluster.resolve(bm.resource.trim()).is_none() {
+            self.flash_warn(&format!("No resource matches '{}'", bm.resource));
             return;
         }
-
-        if let Some(filter) = &bm.filter {
-            self.filter = filter.clone();
-            self.sync_filter_selectors();
-            self.invalidate_rows();
-            self.table_state.select(Some(0));
+        if let Some(error) = crate::filter::parse(bm.filter.as_deref().unwrap_or("")).error() {
+            self.flash_warn(&format!("filter: {error}"));
+            return;
         }
+        self.apply_resource_query(crate::filter::ResourceQuery {
+            resource: bm.resource.clone(),
+            namespace: bm.namespace.clone(),
+            context: None,
+            filter: bm.filter.clone().unwrap_or_default(),
+        });
         if let Some(sort) = &bm.sort {
             self.apply_sort_spec(sort);
         }

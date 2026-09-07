@@ -71,16 +71,17 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   `reload`, `config`, `info`). `:` and `?` open the palette and help from every
   navigation screen, then close back to the screen where they were opened.
 - **Filtering** (`/`) with matched-character highlighting: fuzzy text, `"text"`
-  exact match, `/re/` regular expression (both case-insensitive), `!text`
-  inverse match (`!"text"` and `!/re/` too), `-l`/`-f` label and field selectors
-  (evaluated server-side on ⏎), and typed column comparisons
-  (`status=CrashLoopBackOff`, `cpu>500m`, `memory>1Gi`, `restarts>=5`,
-  `age<2h`). Space-separated terms AND together. Quoted terms and `/re/` terms keep
-  their spaces. Quotes inside `/re/` are part of the regular expression.
-  Quoted text matches Unicode lowercase equivalents in column cells.
-  Fuzzy matching is deliberately loose — `khc` finds `kube-httpcache-0` — so a
-  short needle like `auth` also matches names that merely contain
-  `a`…`u`…`t`…`h`. Quote it (`"auth"`) to match only a contiguous run.
+  contiguous match, `/re/` regular expression (both case-insensitive), `!text`
+  inverse match (also `!"text"` and `!/re/`), `-l`/`-f` label and field selectors (evaluated server-side on
+  ⏎), and typed column comparisons (`status=CrashLoopBackOff`, `cpu>500m`,
+  `memory>1Gi`, `restarts>=5`, `age<2h`). Structured terms AND together with
+  spaces or `&&`; `||` combines alternatives, parentheses group expressions,
+  and `!(...)` negates a group. Quote values containing spaces. Selectors
+  survive refresh, namespace changes, drill-down, and view history. The title
+  shows local, server-side, mixed, or pending evaluation; `/` edits and Esc
+  clears. Palette queries combine scope and filtering:
+  `:pods -n prod --context west /-l app=api status=Running`.
+  See [filter grammar and selectors](filtering.md).
 - **Toggle faults** (`Ctrl+Z`, pods only) shows pending, failed, unknown,
   terminating, and running pods that are not ready. Completed pods are hidden.
   The table title shows `[faults]` while the filter is on. It works with the

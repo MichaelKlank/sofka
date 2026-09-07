@@ -89,17 +89,45 @@ impl App {
         cells: &mut crate::store::FastMap<RowKey, CellCacheEntry>,
         now: i64,
     ) -> bool {
-        use crate::filter::{ParsedFilter, Term};
+        use crate::filter::ParsedFilter;
         match parsed {
             ParsedFilter::Fuzzy(pat) => {
                 pat.text().is_empty() || self.pattern_match_row(o, pat, key, cells, now)
             }
-            ParsedFilter::Structured(s) => s.terms.iter().all(|t| match t {
-                Term::Text { negate, pat } => {
-                    negate ^ self.pattern_match_row(o, pat, key, cells, now)
+            ParsedFilter::Structured(s) => s
+                .terms
+                .iter()
+                .all(|t| self.eval_term(o, key, t, cells, now) == Some(true)),
+        }
+    }
+
+    fn eval_term(
+        &self,
+        o: &DynamicObject,
+        key: &RowKey,
+        term: &crate::filter::Term,
+        cells: &mut crate::store::FastMap<RowKey, CellCacheEntry>,
+        now: i64,
+    ) -> Option<bool> {
+        use crate::filter::Term;
+        match term {
+            Term::Text { negate, pat } => {
+                Some(negate ^ self.pattern_match_row(o, pat, key, cells, now))
+            }
+            Term::Cmp(cmp) => self.eval_cmp(o, key, cmp, cells, now),
+            Term::All(terms) | Term::Not(terms) | Term::Any(terms) => {
+                let any = matches!(term, Term::Any(_));
+                let inverse = matches!(term, Term::Not(_));
+                let mut result = Some(!any);
+                for t in terms {
+                    match self.eval_term(o, key, t, cells, now) {
+                        Some(value) if value == any => return Some(value ^ inverse),
+                        None => result = None,
+                        _ => {}
+                    }
                 }
-                Term::Cmp(cmp) => self.eval_cmp(o, cmp, now),
-            }),
+                result.map(|v| v ^ inverse)
+            }
         }
     }
 
@@ -162,6 +190,12 @@ impl App {
     }
 
     /// The cached cells for `key`, rendering them if absent or stale.
+    ///
+    /// Every object of every rebuild reaches this, so the hit path does no
+    /// work beyond one lookup: the revision is compared borrowed rather than
+    /// cloned, and `entry` hashes the key once instead of probing before and
+    /// after the staleness check. Cloning the `Rc<str>` key to hold that
+    /// entry is a refcount bump, not a copy of the key text.
     fn cell_entry<'c>(
         &self,
         key: &RowKey,
@@ -169,28 +203,34 @@ impl App {
         cells: &'c mut crate::store::FastMap<RowKey, CellCacheEntry>,
         now: i64,
     ) -> &'c CellCacheEntry {
-        let resource_version = o.metadata.resource_version.clone();
-        let stale = cells
-            .get(key)
-            .is_none_or(|e| e.plural != self.kind_plural || e.resource_version != resource_version);
-        if stale {
-            let (rendered, status_idx, helm_updated) = self.spec.cells_with_helm_time(o, now);
-            let cell_masks: Vec<u64> = rendered.iter().map(|c| subseq_mask(c)).collect();
-            let row_mask = cell_masks.iter().fold(0u64, |a, m| a | m);
-            cells.insert(
-                key.clone(),
-                CellCacheEntry {
-                    plural: self.kind_plural.clone(),
-                    resource_version,
-                    cells: rendered,
-                    status_idx,
-                    helm_updated,
-                    cell_masks,
-                    row_mask,
-                },
-            );
+        use std::collections::hash_map::Entry;
+        let rv = o.metadata.resource_version.as_deref();
+        let fresh = |e: &CellCacheEntry| {
+            e.plural == self.kind_plural && e.resource_version.as_deref() == rv
+        };
+        let slot = match cells.entry(key.clone()) {
+            Entry::Occupied(e) if fresh(e.get()) => return e.into_mut(),
+            slot => slot,
+        };
+        let (rendered, status_idx, helm_updated) = self.spec.cells_with_helm_time(o, now);
+        let cell_masks: Vec<u64> = rendered.iter().map(|c| subseq_mask(c)).collect();
+        let row_mask = cell_masks.iter().fold(0u64, |a, m| a | m);
+        let built = CellCacheEntry {
+            plural: self.kind_plural.clone(),
+            resource_version: o.metadata.resource_version.clone(),
+            cells: rendered,
+            status_idx,
+            helm_updated,
+            cell_masks,
+            row_mask,
+        };
+        match slot {
+            Entry::Occupied(mut e) => {
+                e.insert(built);
+                e.into_mut()
+            }
+            Entry::Vacant(e) => e.insert(built),
         }
-        cells.get(key).expect("just inserted")
     }
 
     /// What fuzzy terms match against: "namespace name". Helm rows are backed
@@ -213,49 +253,99 @@ impl App {
     /// read the live metrics snapshot, `age` the creation timestamp; any
     /// other key names a displayed column (numeric values compare by the
     /// cell's leading number, text case-insensitively).
-    fn eval_cmp(&self, o: &DynamicObject, cmp: &crate::filter::Cmp, now: i64) -> bool {
+    fn eval_cmp(
+        &self,
+        o: &DynamicObject,
+        key: &RowKey,
+        cmp: &crate::filter::Cmp,
+        cells: &mut crate::store::FastMap<RowKey, CellCacheEntry>,
+        now: i64,
+    ) -> Option<bool> {
         use crate::filter::CmpValue;
-        match &cmp.value {
-            CmpValue::Cpu(want) => self
-                .metrics_for(o)
-                .is_some_and(|(cpu, _)| cmp.op.eval(cpu.cmp(want))),
-            CmpValue::Mem(want) => self
-                .metrics_for(o)
-                .is_some_and(|(_, mem)| cmp.op.eval(mem.cmp(want))),
-            CmpValue::Duration(want) => match crate::columns::age_secs(o, now) {
-                Some(age) => cmp.op.eval(age.cmp(want)),
-                None => false,
-            },
-            CmpValue::Num(want) => match self.column_cell(o, &cmp.key, now) {
-                Some(cell) => cmp
-                    .op
-                    .eval(crate::columns::parse_leading_num(&cell).total_cmp(want)),
-                None => false,
-            },
+        let ordering = match &cmp.value {
+            CmpValue::Cpu(want) => self.row_metrics(o, key)?.0.cmp(want),
+            CmpValue::Mem(want) => self.row_metrics(o, key)?.1.cmp(want),
+            CmpValue::Duration(want) => crate::columns::age_secs(o, now)?.cmp(want),
+            CmpValue::Num(want) => {
+                let cell = self.column_cell(o, key, &cmp.key, cells, now)?;
+                crate::filter::cell_number(&cell)?.total_cmp(want)
+            }
             // `want` was folded once at parse time. ASCII cells compare through
             // an allocation-free byte iterator; non-ASCII cells use
             // whole-string lowercasing for context-sensitive Unicode mappings.
-            CmpValue::Str(want) => match self.column_cell(o, &cmp.key, now) {
-                Some(cell) => cmp.op.eval(crate::filter::cmp_folded_lower(&cell, want)),
-                None => false,
-            },
-        }
+            CmpValue::Str(want) => {
+                let cell = self.column_cell(o, key, &cmp.key, cells, now)?;
+                crate::filter::cmp_folded_lower(&cell, want)
+            }
+        };
+        Some(cmp.op.eval(ordering))
+    }
+
+    fn row_metrics(&self, o: &DynamicObject, key: &RowKey) -> Option<(i64, i64)> {
+        let metric_key = match self.kind_plural.as_str() {
+            "pods" => key.as_ref(),
+            "nodes" => o.metadata.name.as_deref()?,
+            _ => return None,
+        };
+        self.metrics.get(metric_key).copied()
     }
 
     /// The displayed cell a comparison key names (case-insensitive column
     /// header), plus NAMESPACE and a `/status/phase` fallback for kinds
-    /// without a STATUS column. Extracts only the named column — this runs
-    /// per object per rebuild when a structured filter is active.
-    fn column_cell<'o>(&self, o: &'o DynamicObject, key: &str, now: i64) -> Option<Cow<'o, str>> {
-        if key.eq_ignore_ascii_case("namespace") || key.eq_ignore_ascii_case("ns") {
-            // Borrowed: the namespace is already a `String` on the object, and
-            // this runs per object per rebuild.
-            return Some(o.metadata.namespace.as_deref().unwrap_or("").into());
+    /// without a STATUS column. Runs per object per rebuild whenever a
+    /// structured filter is active, so the object-borrowing keys are matched
+    /// before anything renders and the rest read through the row cache.
+    fn column_cell<'c>(
+        &self,
+        o: &'c DynamicObject,
+        row: &RowKey,
+        key: &str,
+        cells: &'c mut crate::store::FastMap<RowKey, CellCacheEntry>,
+        now: i64,
+    ) -> Option<Cow<'c, str>> {
+        // One match, not a chain of comparisons: these keys borrow straight
+        // from the object and never render a cell, and this runs per object
+        // per rebuild.
+        match key {
+            "namespace" | "ns" | "metadata.namespace" => {
+                return Some(o.metadata.namespace.as_deref().unwrap_or("").into());
+            }
+            "metadata.name" => return o.metadata.name.as_deref().map(Cow::Borrowed),
+            "spec.nodename" => {
+                return o
+                    .data
+                    .pointer("/spec/nodeName")
+                    .and_then(|v| v.as_str())
+                    .map(Cow::Borrowed);
+            }
+            "status.phase" => {
+                return o
+                    .data
+                    .pointer("/status/phase")
+                    .and_then(|v| v.as_str())
+                    .map(Cow::Borrowed);
+            }
+            _ => {}
         }
         if let Some(i) = self.spec.header_index(key) {
-            return self.spec.cell_at(o, i, now);
+            // Time-derived cells (AGE, a running Job's DURATION, a CronJob's
+            // LAST-SCHEDULE, user `time` columns) drift without a new
+            // resourceVersion, so the row cache cannot answer for them.
+            if let Some(cell) = self.spec.volatile(o, &self.kind_plural, i, now) {
+                return Some(Cow::Owned(cell));
+            }
+            // Through the cell cache, not `cell_at`: one curated cell can cost
+            // a full `containerStatuses` walk and three `String`s (READY,
+            // STATUS and RESTARTS share one summary), and `cell_at` pays that
+            // again for every object on every keystroke. The cached row is
+            // keyed by resourceVersion, so the rows the watch did not touch
+            // are already rendered — and rendering the whole row on a miss
+            // costs one summary, the same walk the single cell needed.
+            return Some(Cow::Borrowed(
+                self.cell_entry(row, o, cells, now).cells.get(i)?.as_str(),
+            ));
         }
-        if key.eq_ignore_ascii_case("status") {
+        if key == "status" {
             let phase = phase(o);
             return (!phase.is_empty()).then_some(Cow::Owned(phase));
         }
@@ -266,6 +356,19 @@ impl App {
     /// filter — i.e. the active filter is (partly) server-side.
     pub fn filter_server_side(&self) -> bool {
         self.applied_filter_labels.is_some() || self.applied_filter_fields.is_some()
+    }
+
+    pub fn filter_location(&self) -> &'static str {
+        if self.filter_selectors_pending() {
+            return " ·pending ⏎";
+        }
+        if !self.filter_server_side() {
+            return " ·local";
+        }
+        match &*self.parsed_filter() {
+            crate::filter::ParsedFilter::Structured(s) if !s.terms.is_empty() => " ·server+local",
+            _ => " ·server",
+        }
     }
 
     /// Parse error of the current filter input, if any.
@@ -334,9 +437,18 @@ impl App {
 
     pub(super) fn ensure_rows_cache(&self) {
         let mut cache = self.rows_cache.borrow_mut();
-        if !cache.dirty {
+        let now = crate::columns::now_secs();
+        if !cache.dirty && (!cache.time_sensitive || cache.filter_second == now) {
             return;
         }
+        let parsed = self.parsed_filter();
+        cache.time_sensitive = match &*parsed {
+            crate::filter::ParsedFilter::Structured(s) => {
+                s.terms.iter().any(crate::filter::Term::time_sensitive)
+            }
+            _ => false,
+        };
+        cache.filter_second = now;
         cache.column_widths = None;
 
         let headers = self.display_headers();
@@ -366,12 +478,10 @@ impl App {
         }
         // Parsed once, not once per object: the filter check used to re-borrow
         // the filter cache and re-compare the raw filter string for every row.
-        let parsed = self.parsed_filter();
         // One clock reading for the whole rebuild. Every AGE cell, DURATION
         // cell and `age >` comparison in this pass is measured against the
         // same instant, so a rebuild that crosses a second boundary cannot
         // sort two rows against two different "now"s.
-        let now = crate::columns::now_secs();
         // Disjoint field borrows so the filter can warm the cell cache while
         // the sort-key cache is also held.
         let RowsCache {

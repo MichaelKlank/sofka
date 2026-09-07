@@ -522,6 +522,7 @@ impl App {
     }
 
     pub(super) fn set_namespace(&mut self, sel: String) {
+        self.save_history_filter();
         self.namespace = normalize_ns(&sel);
         self.drop_owner_scope();
         self.note_recent_namespace(&sel);
@@ -768,6 +769,25 @@ impl App {
         if name == self.cluster.context && self.cluster.connected {
             return;
         }
+        // Re-selecting the target of the live connection is also a no-op. A
+        // bookmark, workspace, or query may be waiting for it to land, and a
+        // replacement connection would otherwise invalidate that destination.
+        if self
+            .context_switch_target
+            .as_ref()
+            .is_some_and(|(generation, target)| *generation == self.generation && target == &name)
+        {
+            return;
+        }
+        // One deferred navigation at a time. Whatever asked for this switch
+        // owns what lands when it completes, so anything armed by an earlier
+        // switch is dropped here rather than left to fire on a later one.
+        // Below both no-op returns, deliberately: a re-select that starts no
+        // switch must not disarm one already in flight. Callers that arm a new
+        // deferred action clear its competing slots after this returns.
+        self.pending_resource_query = None;
+        self.pending_bookmark = None;
+        self.pending_workspace = None;
         // Stop the current context's watches and clear stale rows while we
         // reconnect; the new watch starts when the connection lands. The rows
         // are stashed first — if the switch fails we stay on this context,
@@ -778,6 +798,7 @@ impl App {
         // being left: nothing in the new one can serve it.
         self.leave_pvc_explore();
         self.bump_generation();
+        self.context_switch_target = Some((self.generation, name.clone()));
         self.set_flash(format!("switching to {name}…"));
         self.stash_view_snapshot();
         self.store.clear();
@@ -892,7 +913,10 @@ impl App {
         self.config_warnings.extend(threshold_warnings);
         // A bookmark/workspace that requested this context lands on its own
         // view(s); a plain switch lands on the context's default resource.
-        if self.pending_workspace.is_some() {
+        if let Some(mut query) = self.pending_resource_query.take() {
+            query.context = None;
+            self.apply_resource_query(query);
+        } else if self.pending_workspace.is_some() {
             self.apply_pending_workspace();
         } else if self.pending_bookmark.is_some() {
             self.apply_pending_bookmark();
