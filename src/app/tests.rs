@@ -11376,8 +11376,41 @@ async fn landing_a_context_flashes_skipped_discovery_groups() {
 }
 
 #[tokio::test]
+async fn discovery_flash_yields_to_a_config_warning_on_context_switch() {
+    let dir = std::env::temp_dir().join(format!(
+        "sofka-discovery-flash-yields-{}",
+        std::process::id()
+    ));
+    let cluster_dir = dir.join("clusters").join("test-cluster");
+    std::fs::create_dir_all(&cluster_dir).unwrap();
+    std::fs::write(cluster_dir.join("config.toml"), "readonly = \n").unwrap();
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+
+    let mut cluster = Cluster::fake();
+    cluster.context = "dev".into();
+    cluster.discovery_warnings =
+        vec!["API discovery could not read odd.example.com/v1alpha3: expected v1".into()];
+    app.handle_msg(Msg::ContextSwitched {
+        generation: app.generation,
+        name: "dev".into(),
+        result: Ok(Box::new(cluster)),
+    });
+    assert!(app.flash_err);
+    assert!(
+        app.flash.starts_with("ignoring invalid "),
+        "config warning must stay visible, got: {}",
+        app.flash
+    );
+    assert_eq!(app.config_warnings.len(), 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
 async fn info_lists_skipped_discovery_groups() {
     let (mut app, _rx) = test_app();
+    app.cluster.discovery_fallback =
+        Some("Aggregated API discovery failed: boom. Sofka read each API group separately.".into());
     app.cluster.discovery_warnings = vec![
         "API discovery could not read odd.example.com/v1alpha3: expected v1".into(),
         "API discovery could not read broken.example.com/v1beta1: 503".into(),
@@ -11390,10 +11423,14 @@ async fn info_lists_skipped_discovery_groups() {
         .expect("discovery line");
     assert_eq!(
         lines[discovery + 1],
-        "    • API discovery could not read odd.example.com/v1alpha3: expected v1"
+        "    • Aggregated API discovery failed: boom. Sofka read each API group separately."
     );
     assert_eq!(
         lines[discovery + 2],
+        "    • API discovery could not read odd.example.com/v1alpha3: expected v1"
+    );
+    assert_eq!(
+        lines[discovery + 3],
         "    • API discovery could not read broken.example.com/v1beta1: 503"
     );
     assert!(app.config_warnings.is_empty());

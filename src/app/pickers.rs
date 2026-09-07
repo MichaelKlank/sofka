@@ -898,16 +898,14 @@ impl App {
         self.apply_context_skin(resolved.skin_override);
         self.flash = format!("context: {name}");
         self.flash_err = false;
-        if let Some(w) = resolved
+        let first_warning = resolved
             .warnings
             .first()
             .or(view_warnings.first())
             .or(plugin_warnings.first())
             .or(threshold_warnings.first())
             .or(provider_warnings.first())
-        {
-            self.flash_warn(w);
-        }
+            .cloned();
         // Keep `:config` in sync with the layers just resolved for this context.
         self.config_warnings = resolved.warnings;
         self.config_warnings.extend(plugin_warnings);
@@ -927,6 +925,9 @@ impl App {
                 .default_resource
                 .unwrap_or_else(|| "pods".into());
             self.switch_kind(&kind);
+        }
+        if let Some(w) = &first_warning {
+            self.flash_warn(w);
         }
         self.flash_discovery_warnings();
         // Saved forwards for the new context. Running ones from the previous

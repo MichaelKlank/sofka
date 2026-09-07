@@ -43,6 +43,9 @@ impl App {
             "  discovery:   {} resource kinds",
             self.cluster.catalog.len()
         ));
+        if let Some(note) = &self.cluster.discovery_fallback {
+            lines.push(format!("    • {note}"));
+        }
         for w in &self.cluster.discovery_warnings {
             lines.push(format!("    • {w}"));
         }
@@ -149,7 +152,7 @@ impl App {
 
     pub fn flash_discovery_warnings(&mut self) {
         let n = self.cluster.discovery_warnings.len();
-        if n == 0 {
+        if n == 0 || self.flash_err {
             return;
         }
         let noun = if n == 1 { "group" } else { "groups" };

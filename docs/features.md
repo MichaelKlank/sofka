@@ -19,10 +19,10 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   Resource names and built-in aliases take priority over discovered short names.
   Shared short names use group priority, then alphabetical group and resource
   order. User aliases override discovered aliases.
-  An API group whose discovery document cannot be read (an extension API
-  server that is down, or one that answers with a non-`v1` `apiVersion`) is
-  skipped instead of blocking the connection. Startup warns about it, the
-  first screen flashes it, and `:info` names the group and the reason.
+  Sofka can connect when it cannot read one API group. Examples: the
+  extension API server is down, or it sends an `apiVersion` that is not `v1`.
+  Sofka does not load that group. It shows a warning at startup and a flash
+  on the first screen. `:info` shows the group and the reason.
 - **Live watch** of any kind through `kube::runtime::watcher`, streamed into an
   in-memory store. Watch requests use uncompressed responses to avoid gzip
   stream errors. List requests retain gzip compression.
@@ -411,8 +411,8 @@ pod is rejected; browse through a pod that already mounts the claim instead.
   [Snapshots](debugging.md#snapshots).
 - **Runtime diagnostics** (`:info`, or `sofka --info`) - version and build,
   config sources, live context/cluster/API server and Kubernetes revision,
-  discovery status (including any API group skipped as unreadable) and Metrics
-  API status, watch error counts, and the state/snapshot/bundle directories.
+  discovery status with the API groups that sofka could not read, Metrics API
+  status, watch error counts, and the state/snapshot/bundle directories.
   The connected Kubernetes revision also
   stays visible in the main header.
   Identifiers and counts only, never credentials, tokens, or Secret values.

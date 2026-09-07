@@ -15,20 +15,22 @@ pub(super) struct Resource {
 
 pub(super) struct Discovered {
     pub resources: Vec<Resource>,
-    pub warnings: Vec<String>,
+    pub skipped: Vec<String>,
+    pub fallback: Option<String>,
 }
 
 // Keep short names from the wire documents. kube's Discovery conversion drops them.
 pub(super) async fn discover(client: &Client) -> Result<Discovered> {
-    let mut warnings = Vec::new();
+    let mut skipped = Vec::new();
+    let mut fallback = None;
     let mut resources = match aggregated(client).await {
         Ok(Some(resources)) => resources,
-        Ok(None) => legacy(client, &mut warnings).await?,
+        Ok(None) => legacy(client, &mut skipped).await?,
         Err(e) => {
-            warnings.push(format!(
+            fallback = Some(format!(
                 "Aggregated API discovery failed: {e}. Sofka read each API group separately."
             ));
-            legacy(client, &mut warnings).await?
+            legacy(client, &mut skipped).await?
         }
     };
     // Select the most stable served version of each kind, including kinds absent
@@ -44,7 +46,8 @@ pub(super) async fn discover(client: &Client) -> Result<Discovered> {
         .dedup_by(|a, b| a.kind.ar.group == b.kind.ar.group && a.kind.ar.kind == b.kind.ar.kind);
     Ok(Discovered {
         resources,
-        warnings,
+        skipped,
+        fallback,
     })
 }
 
@@ -94,7 +97,7 @@ fn append_aggregated(out: &mut Vec<Resource>, list: APIGroupDiscoveryList) -> Re
     Ok(())
 }
 
-async fn legacy(client: &Client, warnings: &mut Vec<String>) -> Result<Vec<Resource>> {
+async fn legacy(client: &Client, skipped: &mut Vec<String>) -> Result<Vec<Resource>> {
     let mut resources = Vec::new();
     for group in client
         .list_api_groups()
@@ -103,7 +106,7 @@ async fn legacy(client: &Client, warnings: &mut Vec<String>) -> Result<Vec<Resou
         .groups
     {
         if group.versions.is_empty() {
-            warnings.push(format!(
+            skipped.push(format!(
                 "API discovery could not read {}: the group has no versions",
                 group.name
             ));
@@ -116,7 +119,7 @@ async fn legacy(client: &Client, warnings: &mut Vec<String>) -> Result<Vec<Resou
                 Err(e) => Err(e.into()),
             };
             if let Err(e) = result {
-                warnings.push(format!("API discovery could not read {gv}: {e}"));
+                skipped.push(format!("API discovery could not read {gv}: {e}"));
             }
         }
     }
@@ -126,18 +129,13 @@ async fn legacy(client: &Client, warnings: &mut Vec<String>) -> Result<Vec<Resou
         .context("running API discovery")?;
     ensure!(!core.versions.is_empty(), "empty core API group");
     for version in core.versions {
-        let result = match client.list_core_api_resources(&version).await {
-            Ok(list) => append_legacy(&mut resources, list),
-            Err(e) => Err(e.into()),
-        };
-        if let Err(e) = result {
-            warnings.push(format!("API discovery could not read {version}: {e}"));
-        }
+        let list = client
+            .list_core_api_resources(&version)
+            .await
+            .with_context(|| format!("running API discovery: reading core API group {version}"))?;
+        append_legacy(&mut resources, list)
+            .with_context(|| format!("running API discovery: reading core API group {version}"))?;
     }
-    ensure!(
-        !resources.is_empty(),
-        "running API discovery: sofka could not read any API group"
-    );
     Ok(resources)
 }
 
