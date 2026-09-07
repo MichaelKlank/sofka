@@ -128,6 +128,15 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   and recent Warning events. No AI, no external service. `⏎`, `E`, or `l` jumps
   from a finding to the pod, its events, or its logs. After opening evidence,
   `esc` returns to Explain before another `esc` returns to the table.
+  Opening the view or pressing `r` reads the selected resource from the API
+  before gathering its evidence. A failed read or a changed UID produces a
+  warning instead of findings from an old snapshot. Only the latest requested
+  report can update the findings. Closing the view with `esc` or `q` cancels
+  pending results and clears the report progress message. Navigation to
+  a target resource or a palette destination also cancels pending results.
+  Temporary Events and Logs views keep the parent report active. New findings
+  update that report without changing the evidence view. Refresh keeps the
+  previous findings until new results arrive.
 - **Session-local timeline** (`T` / `:timeline`) - a per-object timestamped log
   of every state change the watch saw: generation bumps, replica and readiness
   changes, pod phase, restarts, waiting reasons, condition flips. Computed from
@@ -160,7 +169,13 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   chain for the selection: the owning Kustomization/HelmRelease, its source
   (GitRepository/OCIRepository/HelmRepository) with applied and latest revision,
   the `dependsOn` edges, and ready status. Each item is a finding you can `⏎`
-  into.
+  into. Opening the view or pressing `r` reads the original resource again,
+  then follows its current owner labels, source, and dependencies. A missing
+  or replaced resource produces a warning. These reads require `get` access.
+  Only the latest requested report can update the findings. Closing the view
+  with `esc` or `q` cancels pending results and clears the report progress
+  message. Navigation to a target resource or a palette destination also
+  cancels pending results.
 - **Native Helm inspector** (`:helm` / `:hm`) - sofka decodes Helm's release
   storage Secrets directly (double base64 → gunzip → JSON, same as Helm) and
   lists one row per release at its latest revision, like `helm list`. `⏎` opens

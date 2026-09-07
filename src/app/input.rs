@@ -422,6 +422,8 @@ impl App {
             Mode::Events => self.stop_event_stream(),
             _ => {}
         }
+        self.cancel_explain_request();
+        self.cancel_gitops_request();
         self.help_return = Mode::Table;
         self.palette_return = Mode::Table;
         // `:kind namespace` switches both at once (`:deploy social`,

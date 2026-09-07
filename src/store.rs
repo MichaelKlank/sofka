@@ -80,15 +80,19 @@ pub enum Msg {
     /// Findings for the explain-unhealthy view, gathered off-thread.
     Explain {
         generation: u64,
+        request: u64,
         claim: StatusClaim,
         title: String,
+        source: Option<Box<DynamicObject>>,
         findings: Vec<crate::explain::Finding>,
     },
     /// Reconciliation-chain findings for the GitOps view, gathered off-thread.
     Gitops {
         generation: u64,
+        request: u64,
         claim: StatusClaim,
         title: String,
+        source: Option<Box<DynamicObject>>,
         findings: Vec<crate::explain::Finding>,
     },
     /// Captured output of an `output = "popup"` plugin run.

@@ -1885,6 +1885,9 @@ pub struct App {
     pub explain_title: String,
     /// The object the explain view is investigating, kept so `r` can re-gather.
     pub explain_source: Option<DynamicObject>,
+    /// Latest Explain request, independent of the table watch generation.
+    explain_request: u64,
+    explain_claim: Option<StatusClaim>,
     /// Parent of the explain view. Kept separately because an evidence view
     /// (logs/events) temporarily uses `return_mode` to return to Explain.
     explain_return: Mode,
@@ -1894,6 +1897,9 @@ pub struct App {
     pub gitops_state: ListState,
     pub gitops_title: String,
     pub gitops_source: Option<DynamicObject>,
+    /// Latest GitOps request, independent of the table watch generation.
+    gitops_request: u64,
+    gitops_claim: Option<StatusClaim>,
     /// Session-local per-object state-change history, fed by the table watch.
     pub timeline: crate::timeline::Timeline,
     /// Table geometry from the last frame, for mouse hit-testing. A RefCell
@@ -2127,11 +2133,15 @@ impl App {
             explain_state: ListState::default(),
             explain_title: String::new(),
             explain_source: None,
+            explain_request: 0,
+            explain_claim: None,
             explain_return: Mode::Table,
             gitops_items: Vec::new(),
             gitops_state: ListState::default(),
             gitops_title: String::new(),
             gitops_source: None,
+            gitops_request: 0,
+            gitops_claim: None,
             timeline: crate::timeline::Timeline::default(),
             table_hit: RefCell::new(None),
             notify_tasks: HashMap::new(),
