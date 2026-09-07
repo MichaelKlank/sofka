@@ -315,6 +315,9 @@ reverse = "cluster"                  # usages listed: namespace (default) | clus
 namespace the table shows, for a cluster-scoped row); with `cluster`, across the
 cluster; `none` skips it. A `namespace_path` names where the target's namespace
 lives when it isn't the row's own, as a PersistentVolume's `claimRef.namespace`.
+A cluster-scoped kind naming a namespaced one must set it - there is no row
+namespace to fall back on - or the view reports the rule as unfollowable
+instead of quietly finding nothing.
 
 Both settings are resolved key by key across the view keys for a kind
 (`apiVersion/plural`, `group/plural`, plural, kind), not off the single most

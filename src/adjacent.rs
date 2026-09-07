@@ -573,6 +573,10 @@ pub fn plan(
         let Some(target) = kinds.by_name(&rule.kind) else {
             continue;
         };
+        if let Some(why) = unreachable_namespace(&rule, source.namespaced, target.namespaced) {
+            plan.warn.get_or_insert(why);
+            continue;
+        }
         let refs: Vec<(String, String)> =
             pointer_pairs(&value, &rule.path, rule.namespace_path.as_deref())
                 .into_iter()
@@ -595,6 +599,10 @@ pub fn plan(
         let Some(from) = resolve_view_key(kinds, &rule.from) else {
             continue;
         };
+        if let Some(why) = unreachable_namespace(&rule, from.namespaced, source.namespaced) {
+            plan.warn.get_or_insert(why);
+            continue;
+        }
         // A rule declared under `kind@namespace` describes that namespace's
         // objects only, so that's where its usages are looked for.
         let scope = match (key_namespace(&rule.from), rule.reverse) {
@@ -605,6 +613,22 @@ pub fn plan(
         plan.backward.push(Backward { rule, from, scope });
     }
     plan
+}
+
+/// Why a rule can't be followed: a cluster-scoped object naming a namespaced
+/// one says nothing about which namespace, unless `namespace_path` does.
+/// Better one warning than a GET in no namespace that quietly finds nothing.
+fn unreachable_namespace(
+    rule: &RefRule,
+    from_namespaced: bool,
+    to_namespaced: bool,
+) -> Option<String> {
+    (!from_namespaced && to_namespaced && rule.namespace_path.is_none()).then(|| {
+        format!(
+            "ref {} → {}: a namespaced kind named from a cluster-scoped one needs namespace_path",
+            rule.from, rule.kind
+        )
+    })
 }
 
 // ----- matching the gathered objects ------------------------------------
@@ -941,6 +965,68 @@ mod tests {
             .find(|b| b.from.plural == "pods")
             .unwrap();
         assert_eq!(pods_rule.scope, "prod");
+    }
+
+    #[test]
+    fn a_cluster_scoped_source_needs_a_namespace_path_for_namespaced_targets() {
+        let (views, warnings) = crate::views::compile(
+            &toml::from_str::<crate::config::Config>(
+                r#"
+                # Nothing says which namespace the ConfigMap is in.
+                [[views.nodes.refs]]
+                path = "/metadata/annotations/example.com~1config"
+                kind = "configmaps"
+
+                # This one does.
+                [[views.nodes.refs]]
+                path = "/metadata/annotations/example.com~1secret"
+                kind = "secrets"
+                namespace_path = "/metadata/annotations/example.com~1secret-namespace"
+                "#,
+            )
+            .unwrap()
+            .views,
+        );
+        assert!(
+            warnings.is_empty(),
+            "compile can't know scopes: {warnings:?}"
+        );
+        let kinds = cluster();
+        let node = obj(json!({"apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "n1", "annotations": {
+                "example.com/config": "tuning", "example.com/secret": "tls", "example.com/secret-namespace": "edge"}}}));
+        let plan = self::plan(&views, &kinds, &kind("", "Node", "nodes", false), &node, "");
+        // The rule with a namespace path is followed into that namespace…
+        let secret = plan
+            .forward
+            .iter()
+            .find(|f| f.target.plural == "secrets")
+            .unwrap();
+        assert_eq!(secret.refs, [("tls".to_string(), "edge".to_string())]);
+        // …the one without is skipped, and the view says why instead of
+        // quietly reading in no namespace and finding nothing.
+        assert!(plan.forward.iter().all(|f| f.target.plural != "configmaps"));
+        assert!(
+            plan.warn.as_deref().unwrap().contains("nodes → configmaps")
+                && plan.warn.as_deref().unwrap().contains("namespace_path"),
+            "{:?}",
+            plan.warn
+        );
+        // Read backwards from a ConfigMap, the same rule is skipped for the
+        // same reason; the pods-mount-configmaps rule still runs.
+        let cm = obj(
+            json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "tuning", "namespace": "kube-system"}}),
+        );
+        let plan = self::plan(
+            &views,
+            &kinds,
+            &kind("", "ConfigMap", "configmaps", true),
+            &cm,
+            "kube-system",
+        );
+        assert!(plan.backward.iter().all(|b| b.from.plural != "nodes"));
+        assert!(plan.backward.iter().any(|b| b.from.plural == "pods"));
+        assert!(plan.warn.as_deref().unwrap().contains("namespace_path"));
     }
 
     #[test]
