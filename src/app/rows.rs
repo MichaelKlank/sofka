@@ -158,7 +158,7 @@ impl App {
             .get(key)
             .is_none_or(|e| e.plural != self.kind_plural || e.resource_version != resource_version);
         if stale {
-            let (rendered, status_idx) = self.spec.cells(o, now);
+            let (rendered, status_idx, helm_updated) = self.spec.cells_with_helm_time(o, now);
             let cell_masks: Vec<u64> = rendered.iter().map(|c| subseq_mask(c)).collect();
             let row_mask = cell_masks.iter().fold(0u64, |a, m| a | m);
             cells.insert(
@@ -168,6 +168,7 @@ impl App {
                     resource_version,
                     cells: rendered,
                     status_idx,
+                    helm_updated,
                     cell_masks,
                     row_mask,
                 },
@@ -545,13 +546,15 @@ impl App {
             }
             let entry = self.cell_entry(key, obj, cells, now);
             for (i, cell) in entry.cells.iter().enumerate() {
-                let cell_width =
-                    if let Some(value) = self.spec.volatile(obj, &self.kind_plural, i, now) {
-                        // Reserve space for elapsed times as the clock advances.
-                        width(&value).max(7)
-                    } else {
-                        width(cell)
-                    };
+                let cell_width = if let Some(value) =
+                    self.spec
+                        .volatile_cached(obj, &self.kind_plural, i, now, entry.helm_updated)
+                {
+                    // Reserve space for elapsed times as the clock advances.
+                    width(&value).max(7)
+                } else {
+                    width(cell)
+                };
                 needed[i + ns_off] = needed[i + ns_off].max(cell_width);
             }
         }
@@ -562,9 +565,14 @@ impl App {
         needed
     }
 
+    #[cfg(test)]
     pub(crate) fn ensure_table_cell_cache(&self, rows: &[&DynamicObject]) {
-        let mut cache = self.rows_cache.borrow_mut();
         let now = crate::columns::now_secs();
+        self.ensure_table_cell_cache_at(rows, now);
+    }
+
+    pub(crate) fn ensure_table_cell_cache_at(&self, rows: &[&DynamicObject], now: i64) {
+        let mut cache = self.rows_cache.borrow_mut();
         for obj in rows {
             // Shares `cell_entry` with the filter pass, so a row rendered for
             // filtering is already warm for the renderer (and vice versa) and
@@ -973,11 +981,11 @@ impl App {
             values.push(obj.metadata.namespace.clone().unwrap_or_default());
         }
         let now = crate::columns::now_secs();
-        let (cells, _) = self.spec.cells(obj, now);
+        let (cells, _, helm_updated) = self.spec.cells_with_helm_time(obj, now);
         for (i, cell) in cells.into_iter().enumerate() {
             values.push(
                 self.spec
-                    .volatile(obj, &self.kind_plural, i, now)
+                    .volatile_cached(obj, &self.kind_plural, i, now, helm_updated)
                     .unwrap_or(cell),
             );
         }
