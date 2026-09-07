@@ -43,6 +43,10 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 - **Drill-down navigation** with a breadcrumb stack: workload/service → pods,
   cronjob → its jobs, node → its pods, pod → containers, namespace → re-scope,
   CRD → its custom resources. `esc` goes back.
+  Workload pod selection includes both `matchLabels` and `matchExpressions`.
+  Drill-down, logs, Explain, and diagnostic bundles apply all requirements,
+  including `In`, `NotIn`, `Exists`, and `DoesNotExist`. Services use their
+  plain label map.
 - **Resource cycling** (`Tab` / `Shift-Tab`) - browse pods → services →
   deployments → statefulsets → daemonsets → secrets → configmaps → ingresses →
   PVCs, wrapping in either direction without configuration. Keeps the current

@@ -14450,3 +14450,88 @@ async fn explain_key_shows_reported_daemonset_availability() {
     app.handle_key(press(KeyCode::Esc)).unwrap();
     assert_eq!(app.mode, Mode::Table);
 }
+
+fn expression_workload(include_labels: bool) -> serde_json::Value {
+    let mut workload = json!({"apiVersion":"apps/v1","kind":"Deployment",
+        "metadata":{"name":"web","namespace":"default","uid":"workload-uid"},
+        "spec":{"replicas":1,"selector":{"matchExpressions":[
+            {"key":"tier","operator":"In","values":["frontend","api"]},
+            {"key":"environment","operator":"NotIn","values":["test"]},
+            {"key":"enabled","operator":"Exists"},
+            {"key":"disabled","operator":"DoesNotExist"}
+        ]}}, "status":{"replicas":1,"readyReplicas":1,"updatedReplicas":1}});
+    if include_labels {
+        workload["spec"]["selector"]["matchLabels"] = json!({"app":"web"});
+    }
+    workload
+}
+
+#[tokio::test]
+async fn workload_enter_preserves_all_selector_requirements() {
+    for include_labels in [false, true] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("deployments");
+        apply(&mut app, expression_workload(include_labels));
+        app.table_state.select(Some(0));
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.kind_plural, "pods");
+        let expected = if include_labels {
+            "app=web,tier in (api,frontend),environment notin (test),enabled,!disabled"
+        } else {
+            "tier in (api,frontend),environment notin (test),enabled,!disabled"
+        };
+        assert_eq!(app.labels.as_deref(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn workload_explain_requests_complete_expression_selector() {
+    let (mut app, mut rx) = test_app();
+    app.switch_kind("deployments");
+    let workload = expression_workload(true);
+    apply(&mut app, workload.clone());
+    app.table_state.select(Some(0));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            seen.lock().unwrap().push(request.uri().to_string());
+            let response = if request.uri().path().ends_with("/pods") {
+                json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":[]})
+            } else if request.uri().path().ends_with("/web") {
+                workload.clone()
+            } else {
+                json!({"apiVersion":"v1","kind":"EventList","metadata":{},"items":[]})
+            };
+            async move {
+                Ok::<_, std::convert::Infallible>(http::Response::new(http_body_util::Full::new(
+                    hyper::body::Bytes::from(response.to_string()),
+                )))
+            }
+        }),
+        "default",
+    );
+    app.handle_key(press(KeyCode::Char('X'))).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if matches!(rx.recv().await, Some(Msg::Explain { .. })) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let requests = requests.lock().unwrap();
+    let pods = requests
+        .iter()
+        .find(|uri| uri.contains("/pods?"))
+        .expect("owned pods requested");
+    let params: std::collections::HashMap<_, _> =
+        form_urlencoded::parse(pods.split_once('?').unwrap().1.as_bytes())
+            .into_owned()
+            .collect();
+    assert_eq!(
+        params.get("labelSelector").map(String::as_str),
+        Some("app=web,tier in (api,frontend),environment notin (test),enabled,!disabled")
+    );
+}
