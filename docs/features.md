@@ -73,7 +73,9 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   inverse match (`!"text"` and `!/re/` too), `-l`/`-f` label and field selectors
   (evaluated server-side on ⏎), and typed column comparisons
   (`status=CrashLoopBackOff`, `cpu>500m`, `memory>1Gi`, `restarts>=5`,
-  `age<2h`). Space-separated terms AND together; a quoted term keeps its spaces.
+  `age<2h`). Space-separated terms AND together. Quoted terms and `/re/` terms keep
+  their spaces. Quotes inside `/re/` are part of the regular expression.
+  Quoted text matches Unicode lowercase equivalents in column cells.
   Fuzzy matching is deliberately loose — `khc` finds `kube-httpcache-0` — so a
   short needle like `auth` also matches names that merely contain
   `a`…`u`…`t`…`h`. Quote it (`"auth"`) to match only a contiguous run.

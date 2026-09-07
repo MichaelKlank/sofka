@@ -124,19 +124,10 @@ impl App {
         cells: &mut crate::store::FastMap<RowKey, CellCacheEntry>,
         now: i64,
     ) -> bool {
-        // Fuzzy and literal matches both need every pattern character present
-        // in the haystack, so the mask prefilter applies to both — but only
-        // while the literal is ASCII. [`subseq_mask`] folds raw bytes with
-        // ASCII rules, and a literal folds with Unicode ones (`K` U+212A
-        // lowercases to `k`, `Ö` to `ö`), so a non-ASCII needle would be
-        // masked on bytes the matcher never compares and real matches would
-        // vanish. A regex can match text that shares no character with its
-        // source (`/a|b/`, `\d`) and never prefilters.
+        // Only fuzzy patterns use the byte mask. Unicode lowercase conversion
+        // can change the bytes of a literal or its cell text.
         let pat_mask = match pat {
             crate::filter::Pattern::Fuzzy(_) => subseq_mask(pat.text()),
-            crate::filter::Pattern::Literal(lit) if lit.text().is_ascii() => {
-                subseq_mask(lit.text())
-            }
             _ => 0,
         };
         {

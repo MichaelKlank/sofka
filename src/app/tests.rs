@@ -16297,3 +16297,49 @@ async fn service_columns_and_cached_rows_follow_the_api_group() {
     assert!(app.display_headers().contains(&"REVISION".to_string()));
     assert!(!app.display_headers().contains(&"TYPE".to_string()));
 }
+
+#[tokio::test]
+async fn regex_filter_preserves_spaces() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Pod", "metadata":{"name":"auth-api-0","namespace":"default"}}),
+    );
+    type_filter(&mut app, r"/default\sauth/");
+    assert_eq!(row_names(&app), ["auth-api-0"]);
+    retype_filter(&mut app, r"/default auth/");
+    assert_eq!(row_names(&app), ["auth-api-0"]);
+}
+
+#[tokio::test]
+async fn regex_filter_preserves_quotes_and_following_terms() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Pod", "metadata":{"name":"auth-api-0","namespace":"default"}}),
+    );
+    type_filter(&mut app, r#"/auth|"/ !canary"#);
+    assert_eq!(row_names(&app), ["auth-api-0"]);
+}
+
+#[tokio::test]
+async fn quoted_filter_folds_unicode_column_text() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("events");
+    for (name, message) in [("event-1", "Kube started"), ("event-2", "other message")] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Event",
+            "metadata": {"name": name, "namespace": "default"},
+            "message": message}),
+        );
+    }
+    type_filter(&mut app, "\"kube\"");
+    assert_eq!(row_names(&app), ["event-1"]);
+    retype_filter(&mut app, "\"KUBE\"");
+    assert_eq!(row_names(&app), ["event-1"]);
+    retype_filter(&mut app, "!\"kube\"");
+    assert_eq!(row_names(&app), ["event-2"]);
+}

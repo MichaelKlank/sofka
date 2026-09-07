@@ -137,7 +137,11 @@ impl Literal {
     }
 
     pub fn matches(&self, haystack: &str) -> bool {
-        self.substring.matches(haystack)
+        if haystack.is_ascii() {
+            self.substring.matches(haystack)
+        } else {
+            self.substring.matches(&haystack.to_lowercase())
+        }
     }
 
     /// Char positions of the first occurrence in `haystack`, for highlighting
@@ -362,24 +366,60 @@ fn is_structured(input: &str) -> bool {
 /// narrowing the table while it is still being typed.
 fn tokenize(input: &str) -> Vec<&str> {
     let mut tokens = Vec::new();
-    let mut start: Option<usize> = None;
-    let mut quoted = false;
-    for (i, c) in input.char_indices() {
-        if c == '"' {
-            quoted = !quoted;
+    let mut rest = input.trim_start();
+    while !rest.is_empty() {
+        let regex_start = if rest.starts_with("!/") { 2 } else { 1 };
+        if (rest.starts_with('/') || rest.starts_with("!/"))
+            && let Some(end) = regex_end(rest, regex_start)
+        {
+            tokens.push(&rest[..end]);
+            rest = rest[end..].trim_start();
+            continue;
         }
-        if c.is_whitespace() && !quoted {
-            if let Some(s) = start.take() {
-                tokens.push(&input[s..i]);
-            }
-        } else if start.is_none() {
-            start = Some(i);
-        }
-    }
-    if let Some(s) = start {
-        tokens.push(&input[s..]);
+        let mut quoted = false;
+        let end = rest
+            .char_indices()
+            .find_map(|(i, c)| {
+                if c == '"' {
+                    quoted = !quoted;
+                }
+                (c.is_whitespace() && !quoted).then_some(i)
+            })
+            .unwrap_or(rest.len());
+        tokens.push(&rest[..end]);
+        rest = rest[end..].trim_start();
     }
     tokens
+}
+
+// Find a closing slash at a term boundary. Keep escapes and character classes
+// inside the regex. Keep an invalid class available for the compiler to report.
+fn regex_end(input: &str, start: usize) -> Option<usize> {
+    let mut escaped = false;
+    let mut classes = 0usize;
+    let mut fallback = None;
+    for (offset, c) in input[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '[' => classes += 1,
+            ']' => classes = classes.saturating_sub(1),
+            '/' => {
+                let end = start + offset + 1;
+                if input[end..].chars().next().is_none_or(char::is_whitespace) {
+                    if classes == 0 {
+                        return Some(end);
+                    }
+                    fallback.get_or_insert(end);
+                }
+            }
+            _ => {}
+        }
+    }
+    fallback
 }
 
 /// Classify one text term: `"quoted"` is a literal, `/re/` a regex, anything
@@ -736,18 +776,35 @@ mod tests {
         assert!(tokenize("   ").is_empty());
     }
 
-    /// Where case folding stops: the substring matcher folds the *needle*
-    /// with full Unicode rules and then reads the haystack's raw bytes. So a
-    /// needle that folds onto ASCII finds ASCII text, but an ASCII needle
-    /// does not find a haystack character that merely folds to it. Folding
-    /// every cell of every row to close that gap is the cost the log filter
-    /// and the document search — the same matcher — already decided against,
-    /// and a Kubernetes name cannot hold such a character anyway.
     #[test]
-    fn literals_fold_the_needle_not_the_haystack() {
-        // U+212A KELVIN SIGN folds to a plain `k`.
+    fn tokenizer_keeps_regex_contents_in_one_term() {
+        for input in [
+            r#"/a b/ !canary"#,
+            r#"/a"b/ !canary"#,
+            r"/a\/ b/ !canary",
+            r"/[a/ ]/ !canary",
+            r"!/a b/ !canary",
+        ] {
+            let tokens = tokenize(input);
+            assert_eq!(tokens.len(), 2, "{input}");
+            assert_eq!(tokens[1], "!canary");
+            let parsed = structured(input);
+            assert_eq!(parsed.error, None, "{input}");
+            assert!(matches!(
+                &parsed.terms[0],
+                Term::Text {
+                    pat: Pattern::Regex(_),
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn literals_fold_both_the_needle_and_the_haystack() {
         assert!(Literal::new("\u{212a}ube").matches("kube-httpcache-0"));
-        assert!(!Literal::new("kube").matches("\u{212a}ube-httpcache-0"));
+        assert!(Literal::new("kube").matches("\u{212a}ube-httpcache-0"));
+        assert!(Literal::new("KUBE").matches("\u{212a}ube-httpcache-0"));
     }
 
     /// Highlight positions are char indices into the name, so a multibyte
