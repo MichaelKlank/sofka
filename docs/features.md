@@ -271,3 +271,6 @@ Workload STATUS shows `Progressing` until the controller observes the current
 specification and an active rolling update reaches its target. StatefulSet
 partitions and `OnDelete` strategies retain their update semantics. Deployment
 READY compares ready replicas with the desired count from the specification.
+An active rollout with some ready replicas shows `Progressing` even when
+`Available=False`. A workload with no ready replicas shows `Unavailable`. A
+failed rollout shows `Stalled`.

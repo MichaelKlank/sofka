@@ -12056,3 +12056,52 @@ async fn workload_table_reports_rollout_generation_and_desired_readiness() {
         );
     }
 }
+
+#[tokio::test]
+async fn workload_table_keeps_active_rollouts_progressing_when_unavailable() {
+    for (current, ready, updated, stalled, expected) in [
+        (3, 1, 1, false, "Progressing"),
+        (4, 2, 3, false, "Progressing"),
+        (2, 1, 2, false, "Progressing"),
+        (3, 0, 1, false, "Unavailable"),
+        (3, 2, 3, false, "Unavailable"),
+        (3, 3, 3, false, "Unavailable"),
+        (3, 1, 1, true, "Stalled"),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.cluster
+            .register_kind("apps", "Deployment", "deployments", true);
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for ch in "deployments".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        let mut conditions = vec![json!({"type": "Available", "status": "False"})];
+        if stalled {
+            conditions.push(json!({"type": "Progressing", "status": "False", "reason": "ProgressDeadlineExceeded"}));
+        }
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "apps/v1", "kind": "Deployment",
+                "metadata": {"name": "web", "namespace": "default", "generation": 2},
+                "spec": {"replicas": 3},
+                "status": {
+                    "observedGeneration": 2, "replicas": current,
+                    "readyReplicas": ready, "updatedReplicas": updated,
+                    "conditions": conditions,
+                },
+            }),
+        );
+        let headers = app.display_headers().to_vec();
+        let rows = app.rows();
+        app.ensure_table_cell_cache(&rows);
+        let cache = app.table_cell_cache();
+        let (cells, _) = cache.get(&row_key(rows[0])).unwrap();
+        assert_eq!(
+            cells[headers.iter().position(|h| h == "STATUS").unwrap()],
+            expected,
+            "current={current}, ready={ready}, updated={updated}, stalled={stalled}"
+        );
+    }
+}

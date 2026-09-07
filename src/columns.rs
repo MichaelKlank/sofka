@@ -852,11 +852,14 @@ fn workload_status(obj: &DynamicObject, c: WorkloadCounts) -> String {
     {
         return "Stalled".into();
     }
-    if c.ready == 0 || condition_is(d, "Available", "False") {
+    if c.ready == 0 {
         return "Unavailable".into();
     }
     if c.updated < c.desired || c.current != c.desired {
         return "Progressing".into();
+    }
+    if condition_is(d, "Available", "False") {
+        return "Unavailable".into();
     }
     if c.ready >= c.desired {
         return "Ready".into();
