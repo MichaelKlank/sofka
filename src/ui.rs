@@ -217,6 +217,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::TransferMenu => draw_transfer_menu(frame, app, chunks[1]),
         Mode::Skins => draw_skins(frame, app, chunks[1]),
         Mode::Snapshots => draw_snapshots(frame, app, chunks[1]),
+        Mode::PortForwardPicker => draw_port_forward_picker(frame, app, chunks[1]),
         _ => {}
     }
 
@@ -626,6 +627,13 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     if let Some(i) = sort_col {
         needed[i] = needed[i].max(cell_width(&headers[i]).saturating_add(2));
     }
+    // Reserve space for the "● " port-forward marker on the NAME column when
+    // any live forward matches the current context+cluster.
+    if !app.port_forwards.is_empty()
+        && let Some(n) = needed.get_mut(name_col)
+    {
+        *n = n.saturating_add(2);
+    }
     // Compute widths from all columns before applying the viewport offset.
     let col_rules: Vec<(ColWidth, u16)> = headers
         .iter()
@@ -713,6 +721,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|obj| {
             let row_key = crate::store::row_key(obj);
             let marked_row = !app.marked.is_empty() && app.marked.contains(&row_key);
+            let pf_ns = obj.metadata.namespace.as_deref().unwrap_or_default();
+            let pf_name = obj.metadata.name.as_deref().unwrap_or_default();
+            let forwarded = app.has_port_forward(pf_ns, pf_name, &app.kind_plural);
             let (base_cells, status_idx) = cell_cache
                 .get(&row_key)
                 .expect("visible rows are warmed in the table cell cache");
@@ -791,18 +802,24 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                 .map(|(i, c)| {
                     let align = align_of(i);
                     if marked_row {
-                        // Marked rows override everything so a bulk selection
-                        // stands out.
-                        c.into_cell_aligned(align).style(
-                            Style::default()
-                                .fg(theme::mark())
-                                .add_modifier(Modifier::BOLD),
-                        )
+                        if i == name_col {
+                            render_name_cell(app, c.as_str(), theme::mark(), forwarded).style(
+                                Style::default()
+                                    .fg(theme::mark())
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                        } else {
+                            c.into_cell_aligned(align).style(
+                                Style::default()
+                                    .fg(theme::mark())
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                        }
                     } else if Some(i) == style_idx {
                         c.into_cell_aligned(align)
                             .style(Style::default().fg(status_badge))
                     } else if i == name_col {
-                        render_name_cell(app, c.as_str(), row_color)
+                        render_name_cell(app, c.as_str(), row_color, forwarded)
                     } else if Some(i) == age_idx {
                         c.into_cell_aligned(align).style(theme::dim())
                     } else if Some(i) == restarts_idx {
@@ -1162,9 +1179,17 @@ fn all_ready(ready: &str) -> bool {
 /// fuzzy row filter (bold yellow) so a scan across many filtered results is
 /// faster — every visible row already matched, this just shows *where*.
 /// Falls back to a flat `base`-colored cell when there's no active filter.
-fn render_name_cell(app: &App, name: &str, base: Color) -> Cell<'static> {
+fn render_name_cell(app: &App, name: &str, base: Color, forwarded: bool) -> Cell<'static> {
+    // A teal ● prepended when a port-forward is active for this row.
+    let marker = if forwarded {
+        vec![Span::styled("● ", Style::default().fg(theme::teal()))]
+    } else {
+        Vec::new()
+    };
     let Some(matched) = app.filter_match_indices(name).filter(|idx| !idx.is_empty()) else {
-        return Cell::from(name.to_string()).style(Style::default().fg(base));
+        let mut spans = marker;
+        spans.push(Span::styled(name.to_string(), Style::default().fg(base)));
+        return Cell::from(Line::from(spans));
     };
     let matched: std::collections::HashSet<usize> = matched.iter().copied().collect();
     let plain = Style::default().fg(base);
@@ -1172,7 +1197,7 @@ fn render_name_cell(app: &App, name: &str, base: Color) -> Cell<'static> {
         .fg(theme::yellow())
         .add_modifier(Modifier::BOLD);
 
-    let mut spans = Vec::new();
+    let mut spans = marker;
     let mut run = String::new();
     let mut run_matched = false;
     for (i, ch) in name.chars().enumerate() {
@@ -2541,6 +2566,37 @@ fn draw_flux_menu(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+/// Port-forward picker (`f` on a pod/service): lists the object's declared
+/// ports for single-select, plus a "Custom…" entry for manual input.
+fn draw_port_forward_picker(frame: &mut Frame, app: &mut App, area: Rect) {
+    let target = app
+        .pf_picker_target
+        .as_ref()
+        .map(|(_, name)| name.clone())
+        .unwrap_or_default();
+    let items: Vec<ListItem> = app
+        .pf_picker_items
+        .iter()
+        .map(|label| {
+            let color = if *label == "Custom…" {
+                theme::overlay1()
+            } else {
+                theme::green()
+            };
+            ListItem::new(Span::styled(label.as_str(), Style::default().fg(color)))
+        })
+        .collect();
+    render_popup_list(
+        frame,
+        area,
+        40,
+        24,
+        items,
+        Span::styled(format!(" Port-forward {target} "), theme::title()),
+        &mut app.pf_picker_state,
+    );
+}
+
 /// Pod file-transfer menu (`t` on a pod): download from or upload to the pod
 /// via `kubectl cp`, then two prompts for the source and destination paths.
 fn draw_transfer_menu(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -3528,6 +3584,10 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
         )),
         Mode::FluxMenu => Line::from(Span::styled(
             "  j/k: move   enter: confirm   esc: cancel",
+            theme::dim(),
+        )),
+        Mode::PortForwardPicker => Line::from(Span::styled(
+            "  j/k: move   ⏎: forward this port   esc: cancel",
             theme::dim(),
         )),
         Mode::PortForwards => Line::from(Span::styled(

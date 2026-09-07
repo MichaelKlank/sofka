@@ -345,35 +345,55 @@ impl App {
                     }
                 };
 
+                let blocked: Vec<String> = pod_list
+                    .items
+                    .iter()
+                    .filter(|pod| drainable_pod(pod))
+                    .filter_map(|pod| {
+                        drain_blocker(pod).map(|reason| {
+                            format!(
+                                "{}/{}: {reason}",
+                                pod.metadata.namespace.as_deref().unwrap_or("default"),
+                                pod.metadata.name.as_deref().unwrap_or("<unknown>"),
+                            )
+                        })
+                    })
+                    .collect();
+                if !blocked.is_empty() {
+                    failed = true;
+                    let _ = tx.send(Msg::Flash {
+                        generation: genr,
+                        claim,
+                        message: format!("drain {node} blocked: {}. Node remains cordoned; no pods were evicted from this node", blocked.join("; ")),
+                        err: true,
+                    }).await;
+                    continue;
+                }
+
                 for pod in pod_list.items.iter().filter(|pod| drainable_pod(pod)) {
                     let Some(name) = pod.metadata.name.as_deref() else {
                         continue;
                     };
                     let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
                     let pod_api: Api<Pod> = Api::namespaced(client.clone(), ns);
-                    let evict = EvictParams {
-                        delete_options: Some(DeleteParams::default()),
-                        ..Default::default()
-                    };
-                    match pod_api.evict(name, &evict).await {
+                    // kube 4.2 serializes EvictParams as delete_options. The API
+                    // requires deleteOptions to enforce the UID precondition.
+                    let eviction = serde_json::json!({
+                        "apiVersion": "policy/v1",
+                        "kind": "Eviction",
+                        "metadata": { "name": name, "namespace": ns },
+                        "deleteOptions": { "preconditions": { "uid": pod.metadata.uid } },
+                    });
+                    let result: Result<kube::core::Status, kube::Error> = pod_api
+                        .create_subresource("eviction", name, &PostParams::default(), &eviction)
+                        .await;
+                    match result {
                         Ok(_) => {}
-                        Err(e) if eviction_unsupported(&e) => {
-                            if let Err(delete_err) =
-                                pod_api.delete(name, &DeleteParams::default()).await
-                            {
-                                failed = true;
-                                let _ = tx
-                                    .send(Msg::Flash {
-                                        generation: genr,
-                                        claim,
-                                        message: format!(
-                                            "drain {node}: delete {ns}/{name} failed after eviction fallback: {delete_err}"
-                                        ),
-                                        err: true,
-                                    })
-                                    .await;
-                            }
-                        }
+                        Err(kube::Error::Api(e))
+                            if e.code == 404
+                                && e.details.as_ref().is_some_and(|details| {
+                                    details.kind == "pods" && details.name == name
+                                }) => {}
                         Err(e) => {
                             failed = true;
                             let _ = tx
@@ -1169,26 +1189,18 @@ impl App {
         }
         let name = obj.metadata.name.clone().unwrap_or_default();
         let ns = obj.metadata.namespace.clone().unwrap_or_default();
-        // Pre-fill `p:p` from the first exposed port (service `spec.ports`,
-        // pod container ports) so the common case is Enter-only; still
-        // editable, and empty when the object declares no ports.
-        let port = match self.kind_plural.as_str() {
-            "services" => obj
-                .data
-                .pointer("/spec/ports/0/port")
-                .and_then(Value::as_i64),
-            _ => obj
-                .data
-                .pointer("/spec/containers")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .find_map(|c| c.pointer("/ports/0/containerPort").and_then(Value::as_i64)),
+
+        let mut items = match self.kind_plural.as_str() {
+            "services" => service_port_labels(&obj.data),
+            _ => pod_port_labels(&obj.data),
         };
-        self.prompt_label = format!("Port-forward {name} (LOCAL:REMOTE, e.g. 8080:80):");
-        self.prompt_input = port.map(|p| format!("{p}:{p}")).unwrap_or_default();
-        self.prompt_kind = Some(PromptKind::PortForward { ns, name });
-        self.mode = Mode::Prompt;
+        items.dedup();
+        items.push("Custom…".into());
+
+        self.pf_picker_items = items;
+        self.pf_picker_state.select(Some(0));
+        self.pf_picker_target = Some((ns, name));
+        self.mode = Mode::PortForwardPicker;
     }
 
     /// Start `kubectl port-forward` in the background (not a foreground
@@ -1210,14 +1222,11 @@ impl App {
         }
         argv.push(target.clone());
         argv.push(ports.clone());
-        let mut cmd = tokio::process::Command::new(&argv[0]);
-        cmd.args(&argv[1..])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        match cmd.spawn() {
+        match (self.pf_spawner)(&argv) {
             Ok(child) => {
                 let pf = PortForward {
+                    context: self.cluster.context.clone(),
+                    cluster_url: self.cluster.cluster_url.clone(),
                     ns,
                     target,
                     ports,
@@ -1241,6 +1250,22 @@ impl App {
         self.port_forwards
             .iter()
             .any(|pf| pf.config_name.as_deref() == Some(name))
+    }
+
+    /// Whether any live port-forward targets the given `(namespace, name)` on
+    /// the current cluster and resource kind. Used by the table renderer to
+    /// mark forwarded rows. Matched by both context name and cluster URL so
+    /// neither a context name remap nor same-server-different-credentials
+    /// causes a false marker. The `kind_plural` distinguishes `svc/web` from
+    /// `pod/web` so a forward on a service doesn't mark a pod with the same
+    /// name and vice-versa.
+    pub fn has_port_forward(&self, ns: &str, name: &str, kind_plural: &str) -> bool {
+        let ctx = &self.cluster.context;
+        let url = &self.cluster.cluster_url;
+        let target = forward_target(kind_plural, name);
+        self.port_forwards.iter().any(|pf| {
+            pf.context == *ctx && pf.cluster_url == *url && pf.ns == ns && pf.target == target
+        })
     }
 
     /// Start one saved forward by its config index.
@@ -2612,6 +2637,116 @@ impl App {
     }
 }
 
+/// Build the `kubectl port-forward` target string for a resource kind.
+/// Uses kubectl's documented short-name syntax: `pod/name`, `svc/name`,
+/// `deploy/name`, etc. Saved forwards use the same spelling.
+pub(super) fn forward_target(kind_plural: &str, name: &str) -> String {
+    let prefix = match kind_plural {
+        "pods" => "pod",
+        "services" => "svc",
+        other => other.trim_end_matches('s'),
+    };
+    format!("{prefix}/{name}")
+}
+
+/// Collect declared ports from a Service manifest as `"port:port  (name)"` labels.
+/// Only TCP ports are included — `kubectl port-forward` doesn't support UDP/SCTP.
+fn service_port_labels(data: &Value) -> Vec<String> {
+    let Some(ports) = data.pointer("/spec/ports").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    ports
+        .iter()
+        .filter(|p| is_tcp(p, "protocol"))
+        .filter_map(|p| {
+            let port = p.get("port")?.as_i64()?;
+            let name = p.get("name").and_then(Value::as_str).unwrap_or("");
+            Some(port_label(port, &[("", name)]))
+        })
+        .collect()
+}
+
+/// Collect declared container ports from a Pod manifest as
+/// `"port:port  (container/portname)"` labels. Scans regular, init, and
+/// ephemeral containers. Init and ephemeral containers that have already
+/// terminated are skipped — their ports are no longer listening. Only TCP
+/// ports are included — `kubectl port-forward` doesn't support UDP/SCTP.
+fn pod_port_labels(data: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for (path, status_path) in [
+        ("/spec/containers", None),
+        (
+            "/spec/initContainers",
+            Some("/status/initContainerStatuses"),
+        ),
+        (
+            "/spec/ephemeralContainers",
+            Some("/status/ephemeralContainerStatuses"),
+        ),
+    ] {
+        let Some(containers) = data.pointer(path).and_then(Value::as_array) else {
+            continue;
+        };
+        for c in containers {
+            let cname = c.get("name").and_then(Value::as_str).unwrap_or("");
+            if let Some(sp) = status_path
+                && container_terminated(data, sp, cname)
+            {
+                continue;
+            }
+            let Some(ports) = c.pointer("/ports").and_then(Value::as_array) else {
+                continue;
+            };
+            for p in ports {
+                if !is_tcp(p, "protocol") {
+                    continue;
+                }
+                let Some(port) = p.get("containerPort").and_then(Value::as_i64) else {
+                    continue;
+                };
+                let pname = p.get("name").and_then(Value::as_str).unwrap_or("");
+                out.push(port_label(port, &[(cname, pname)]));
+            }
+        }
+    }
+    out
+}
+
+/// Whether a port entry is TCP. Absent protocol defaults to TCP (the API
+/// default), so only explicit non-TCP values are excluded.
+fn is_tcp(port: &Value, key: &str) -> bool {
+    match port.get(key).and_then(Value::as_str) {
+        Some(proto) => proto == "TCP",
+        None => true,
+    }
+}
+
+/// Whether the named container in `status_path` has a `terminated` state.
+fn container_terminated(data: &Value, status_path: &str, name: &str) -> bool {
+    let Some(statuses) = data.pointer(status_path).and_then(Value::as_array) else {
+        return false;
+    };
+    statuses.iter().any(|s| {
+        s.get("name").and_then(Value::as_str) == Some(name)
+            && s.pointer("/state/terminated").is_some()
+    })
+}
+
+/// Build a `"port:port"` label, appending `"  (qualifiers)"` joined by `/`
+/// when any qualifier is non-empty.
+fn port_label(port: i64, qualifiers: &[(&str, &str)]) -> String {
+    let mut s = format!("{port}:{port}");
+    let parts: Vec<&str> = qualifiers
+        .iter()
+        .flat_map(|&(k, v)| [k, v].into_iter().filter(|s| !s.is_empty()))
+        .collect();
+    if !parts.is_empty() {
+        s.push_str("  (");
+        s.push_str(&parts.join("/"));
+        s.push(')');
+    }
+    s
+}
 /// Run a `helm` subprocess to completion, following the same
 /// missing-binary/non-zero-exit handling as `describe()`'s `kubectl` shell-out.
 async fn run_helm(argv: &[String]) -> std::result::Result<(), String> {
