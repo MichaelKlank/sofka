@@ -7830,7 +7830,7 @@ async fn helm_list_shows_only_latest_revision_per_release() {
         .expect("myapp row present");
     assert_eq!(crate::helm::revision(myapp_row), Some(2));
 
-    let (cells, _) = crate::columns::cells(myapp_row, "helm", crate::columns::now_secs());
+    let (cells, _) = crate::columns::cells(myapp_row, "", "helm", crate::columns::now_secs());
     assert_eq!(
         cells[0], "myapp",
         "NAME cell shows the release, not the secret"
@@ -9712,7 +9712,7 @@ async fn printer_columns_msg_upgrades_name_age_fallback() {
     let view = crate::views::printer_columns_view(&crd, "v1");
     app.handle_msg(Msg::PrinterColumns {
         generation: app.generation,
-        plural: "certificates".into(),
+        resource: app.cluster.resolve("certificates").unwrap().resource_key(),
         view: Box::new(view),
     });
     // Narrow mode hides the priority>0 column; wide shows it.
@@ -9727,10 +9727,14 @@ async fn printer_columns_msg_upgrades_name_age_fallback() {
     app.switch_kind("pods");
     app.handle_msg(Msg::PrinterColumns {
         generation: app.generation - 1,
-        plural: "widgets".into(),
+        resource: GroupVersionResource::gvr("example.com", "v1", "widgets"),
         view: Box::new(None),
     });
-    assert!(!app.crd_views.contains_key("widgets"));
+    assert!(!app.crd_views.contains_key(&GroupVersionResource::gvr(
+        "example.com",
+        "v1",
+        "widgets"
+    )));
 }
 
 #[tokio::test]
@@ -9747,7 +9751,7 @@ async fn user_view_wins_over_printer_columns() {
     app.switch_kind("certificates");
     app.handle_msg(Msg::PrinterColumns {
         generation: app.generation,
-        plural: "certificates".into(),
+        resource: app.cluster.resolve("certificates").unwrap().resource_key(),
         view: Box::new(Some(crate::views::View {
             columns: vec![crate::views::UserColumn {
                 header: "THEIRS".into(),
@@ -11653,7 +11657,7 @@ async fn filtering_matches_a_naive_fuzzy_pass() {
 
         // Naive expectation: name haystack, else any rendered cell.
         let matcher = crate::fuzzy::Fuzzy::new();
-        let spec = crate::columns::build_spec("pods", None, None, false);
+        let spec = crate::columns::build_spec("", "pods", None, None, false);
         let mut want: Vec<String> = Vec::new();
         for (k, o) in app.store.iter() {
             let hay = format!(
@@ -15756,7 +15760,7 @@ fn helm_updated_custom_columns_keep_their_own_type_and_clock() {
     secret.metadata.creation_timestamp = Some(
         k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Timestamp::from_second(base).unwrap()),
     );
-    let spec = crate::columns::build_spec("helm", Some(view), None, false);
+    let spec = crate::columns::build_spec("", "helm", Some(view), None, false);
     let before = crate::helm::release_decode_count();
     let (_, _, cached) = spec.cells_with_helm_time(&secret, base + 59);
     assert_eq!(
@@ -15767,7 +15771,7 @@ fn helm_updated_custom_columns_keep_their_own_type_and_clock() {
     assert_eq!(crate::helm::release_decode_count(), before);
     let mut text = view.clone();
     text.columns[0].kind = crate::views::ColumnKind::Text;
-    let spec = crate::columns::build_spec("helm", Some(&text), None, false);
+    let spec = crate::columns::build_spec("", "helm", Some(&text), None, false);
     assert!(
         spec.volatile_cached(&secret, "helm", 0, base + 60, Some(base))
             .is_none()
@@ -15839,4 +15843,167 @@ async fn event_last_seen_sorts_recent_occurrences_and_advances_with_time() {
         app.handle_key(press(KeyCode::Enter)).unwrap();
         assert_eq!(row_names(&app), ["repeat", "single"]);
     }
+}
+
+#[tokio::test]
+async fn service_columns_and_cached_rows_follow_the_api_group() {
+    let (mut app, mut rx) = test_app();
+    for group in ["serving.knative.dev", "other.example.com"] {
+        app.cluster
+            .register_kind(group, "Service", "services", true);
+    }
+    app.cluster.register_kind("", "Service", "services", true);
+    app.cluster.register_kind(
+        "apiextensions.k8s.io",
+        "CustomResourceDefinition",
+        "customresourcedefinitions",
+        false,
+    );
+    let fetched = Arc::new(AtomicU64::new(0));
+    let requests = fetched.clone();
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let path = request.uri().path();
+            let is_crd = path
+                .starts_with("/apis/apiextensions.k8s.io/v1/customresourcedefinitions/services.");
+            let (status, body) = if is_crd {
+                requests.fetch_add(1, Ordering::SeqCst);
+                let columns = if path.ends_with("serving.knative.dev") {
+                    json!([
+                        {"name": "Ready", "type": "string", "jsonPath": ".status.ready"},
+                        {"name": "URL", "type": "string", "jsonPath": ".status.url"}
+                    ])
+                } else {
+                    json!([{"name": "State", "type": "string", "jsonPath": ".status.state"}])
+                };
+                (
+                    200,
+                    json!({
+                        "apiVersion": "apiextensions.k8s.io/v1",
+                        "kind": "CustomResourceDefinition",
+                        "metadata": {"name": path.rsplit('/').next().unwrap()},
+                        "spec": {"versions": [{"name": "v1", "served": true, "storage": true,
+                            "additionalPrinterColumns": columns}]}
+                    }),
+                )
+            } else {
+                (
+                    403,
+                    json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                    "reason": "Forbidden", "message": "unused test request", "code": 403}),
+                )
+            };
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                            body.to_string(),
+                        )))
+                        .unwrap(),
+                )
+            }
+        }),
+        "default",
+    );
+    let command = |app: &mut App, name: &str| {
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for c in name.chars() {
+            app.handle_key(press(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+    };
+    command(&mut app, "services");
+    assert_eq!(app.kind.as_ref().unwrap().ar.group, "");
+    let core_headers = app.display_headers().to_vec();
+    assert!(core_headers.contains(&"CLUSTER-IP".into()));
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "shared", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"clusterIP": "10.0.0.1"}
+        }),
+    );
+    app.handle_msg(Msg::Synced {
+        generation: app.generation,
+    });
+    command(&mut app, "services.serving.knative.dev");
+    assert!(
+        app.rows().is_empty(),
+        "core rows must not enter the Knative view"
+    );
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "AGE"]);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(message @ Msg::PrinterColumns { .. }) = rx.recv().await {
+                app.handle_msg(message);
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        app.display_headers().to_vec(),
+        ["NAME", "READY", "URL", "AGE"]
+    );
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "serving.knative.dev/v1", "kind": "Service",
+            "metadata": {"name": "shared", "namespace": "default", "resourceVersion": "1"},
+            "status": {"ready": "True", "url": "https://app.example.com"}
+        }),
+    );
+    assert_eq!(app.snapshot_table().1[0][2], "https://app.example.com");
+
+    app.handle_msg(Msg::Synced {
+        generation: app.generation,
+    });
+    command(&mut app, "services.other.example.com");
+    assert!(app.rows().is_empty());
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "AGE"]);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(message @ Msg::PrinterColumns { .. }) = rx.recv().await {
+                app.handle_msg(message);
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "STATE", "AGE"]);
+    command(&mut app, "services");
+    assert_eq!(app.display_headers().to_vec(), core_headers);
+    assert_eq!(app.rows()[0].data["spec"]["clusterIP"], "10.0.0.1");
+    command(&mut app, "services.serving.knative.dev");
+    assert_eq!(
+        app.display_headers().to_vec(),
+        ["NAME", "READY", "URL", "AGE"]
+    );
+    assert_eq!(
+        app.rows()[0].data["status"]["url"],
+        "https://app.example.com"
+    );
+    assert_eq!(fetched.load(Ordering::SeqCst), 2);
+
+    install_views(
+        &mut app,
+        r#"
+        [views."serving.knative.dev/services"]
+        replace = true
+        [[views."serving.knative.dev/services".columns]]
+        name = "CUSTOM"
+        path = "/metadata/name"
+    "#,
+    );
+    command(&mut app, "services.serving.knative.dev");
+    assert_eq!(app.display_headers().to_vec(), ["CUSTOM"]);
+    command(&mut app, "services");
+    assert_eq!(app.display_headers().to_vec(), core_headers);
+    command(&mut app, "helm");
+    assert!(app.display_headers().contains(&"REVISION".to_string()));
+    assert!(!app.display_headers().contains(&"TYPE".to_string()));
 }

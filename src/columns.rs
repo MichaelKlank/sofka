@@ -316,43 +316,44 @@ const HELM_HISTORY_COLUMNS: &[Column] = &[
     column("UPDATED", col_helm_updated),
 ];
 
-fn columns_for(plural: &str) -> &'static [Column] {
-    match plural {
-        "pods" => POD_COLUMNS,
-        "deployments" => DEPLOYMENT_COLUMNS,
-        "replicasets" => REPLICASET_COLUMNS,
-        "statefulsets" => STATEFULSET_COLUMNS,
-        "daemonsets" => DAEMONSET_COLUMNS,
-        "services" => SERVICE_COLUMNS,
-        "nodes" => NODE_COLUMNS,
-        "namespaces" => NAMESPACE_COLUMNS,
-        "configmaps" => CONFIGMAP_COLUMNS,
-        "secrets" => SECRET_COLUMNS,
-        "jobs" => JOB_COLUMNS,
-        "cronjobs" => CRONJOB_COLUMNS,
-        "events" => EVENT_COLUMNS,
-        "horizontalpodautoscalers" => HPA_COLUMNS,
-        "persistentvolumeclaims" => PVC_COLUMNS,
-        "persistentvolumes" => PV_COLUMNS,
-        "ingresses" => INGRESS_COLUMNS,
-        "httproutes" => HTTPROUTE_COLUMNS,
-        "endpoints" => ENDPOINT_COLUMNS,
-        "customresourcedefinitions" => CRD_COLUMNS,
-        "kustomizations" | "helmreleases" => FLUX_OBJECT_COLUMNS,
-        "gitrepositories" | "helmrepositories" | "ocirepositories" | "buckets" => {
-            FLUX_SOURCE_COLUMNS
-        }
-        "helm" => HELM_COLUMNS,
-        "helmhistory" => HELM_HISTORY_COLUMNS,
+fn columns_for(group: &str, plural: &str) -> &'static [Column] {
+    match (group, plural) {
+        ("", "pods") => POD_COLUMNS,
+        ("apps" | "extensions", "deployments") => DEPLOYMENT_COLUMNS,
+        ("apps" | "extensions", "replicasets") => REPLICASET_COLUMNS,
+        ("apps", "statefulsets") => STATEFULSET_COLUMNS,
+        ("apps" | "extensions", "daemonsets") => DAEMONSET_COLUMNS,
+        ("", "services") => SERVICE_COLUMNS,
+        ("", "nodes") => NODE_COLUMNS,
+        ("", "namespaces") => NAMESPACE_COLUMNS,
+        ("", "configmaps") => CONFIGMAP_COLUMNS,
+        ("", "secrets") => SECRET_COLUMNS,
+        ("batch", "jobs") => JOB_COLUMNS,
+        ("batch", "cronjobs") => CRONJOB_COLUMNS,
+        ("" | "events.k8s.io", "events") => EVENT_COLUMNS,
+        ("autoscaling", "horizontalpodautoscalers") => HPA_COLUMNS,
+        ("", "persistentvolumeclaims") => PVC_COLUMNS,
+        ("", "persistentvolumes") => PV_COLUMNS,
+        ("networking.k8s.io" | "extensions", "ingresses") => INGRESS_COLUMNS,
+        ("gateway.networking.k8s.io", "httproutes") => HTTPROUTE_COLUMNS,
+        ("", "endpoints") => ENDPOINT_COLUMNS,
+        ("apiextensions.k8s.io", "customresourcedefinitions") => CRD_COLUMNS,
+        ("kustomize.toolkit.fluxcd.io", "kustomizations")
+        | ("helm.toolkit.fluxcd.io", "helmreleases") => FLUX_OBJECT_COLUMNS,
+        (
+            "source.toolkit.fluxcd.io",
+            "gitrepositories" | "helmrepositories" | "ocirepositories" | "buckets",
+        ) => FLUX_SOURCE_COLUMNS,
+        ("", "helm") => HELM_COLUMNS,
+        ("", "helmhistory") => HELM_HISTORY_COLUMNS,
         _ => DEFAULT_COLUMNS,
     }
 }
 
-/// Whether `plural` has curated columns (anything beyond the NAME/AGE
-/// fallback). Kinds without them are candidates for the CRD printer-column
-/// fallback.
-pub fn has_curated(plural: &str) -> bool {
-    columns_for(plural).as_ptr() != DEFAULT_COLUMNS.as_ptr()
+/// Whether the API group and plural have curated columns beyond NAME/AGE.
+/// Other kinds can use the CRD printer-column fallback.
+pub fn has_curated(group: &str, plural: &str) -> bool {
+    columns_for(group, plural).as_ptr() != DEFAULT_COLUMNS.as_ptr()
 }
 
 /// The full curated headers for a kind (wide columns included), excluding the
@@ -360,16 +361,24 @@ pub fn has_curated(plural: &str) -> bool {
 /// namespaces). Live views go through [`ViewSpec`] instead, which folds in
 /// user views, printer columns, and wide-mode filtering.
 #[cfg(test)]
-pub fn headers(plural: &str) -> Vec<&'static str> {
-    columns_for(plural).iter().map(|c| c.header).collect()
+pub fn headers(group: &str, plural: &str) -> Vec<&'static str> {
+    columns_for(group, plural)
+        .iter()
+        .map(|c| c.header)
+        .collect()
 }
 
 /// Cells for one object, aligned with [`headers`]. The 2nd return value is the
 /// index of the column that should be colorized as a status (or None).
 #[cfg(test)]
-pub fn cells(obj: &DynamicObject, plural: &str, now: i64) -> (Vec<String>, Option<usize>) {
+pub fn cells(
+    obj: &DynamicObject,
+    group: &str,
+    plural: &str,
+    now: i64,
+) -> (Vec<String>, Option<usize>) {
     let ctx = CellContext::new(obj, now);
-    let columns = columns_for(plural);
+    let columns = columns_for(group, plural);
     let values = columns
         .iter()
         .map(|c| (c.extract)(&ctx).into_owned())
@@ -383,6 +392,7 @@ pub fn cells(obj: &DynamicObject, plural: &str, now: i64) -> (Vec<String>, Optio
 /// columns when the kind is unknown — then filtered by wide mode. Built once
 /// per view change, never per row.
 pub struct ViewSpec {
+    group: String,
     plural: String,
     columns: Vec<SpecColumn>,
     status_idx: Option<usize>,
@@ -423,21 +433,25 @@ fn spec_user(uc: &crate::views::UserColumn) -> SpecColumn {
 
 /// Resolve the columns for a view. `user` is the explicit view configured for
 /// the kind; `crd` is the printer-column fallback, consulted only when the
-/// user view defines no columns and `plural` has no curated ones.
+/// user view defines no columns and this API resource has no curated ones.
 pub fn build_spec(
+    group: &str,
     plural: &str,
     user: Option<&crate::views::View>,
     crd: Option<&crate::views::View>,
     wide: bool,
 ) -> ViewSpec {
-    let mut cols: Vec<SpecColumn> = columns_for(plural).iter().map(spec_curated).collect();
+    let mut cols: Vec<SpecColumn> = columns_for(group, plural)
+        .iter()
+        .map(spec_curated)
+        .collect();
     // A user view only counts as explicit column config when it has columns —
     // a sort-only view (or one whose columns all failed validation) still
     // benefits from the printer-column fallback.
     let view = match user {
         Some(v) if !v.columns.is_empty() => Some(v),
         _ => {
-            if has_curated(plural) {
+            if has_curated(group, plural) {
                 None
             } else {
                 crd
@@ -469,6 +483,7 @@ pub fn build_spec(
     cols.retain(|c| wide || !c.wide);
     let status_idx = cols.iter().position(|c| c.is_status);
     ViewSpec {
+        group: group.to_string(),
         plural: plural.to_string(),
         columns: cols,
         status_idx,
@@ -599,7 +614,7 @@ impl ViewSpec {
             SpecSource::Curated(extract) => {
                 let ctx = CellContext::new(obj, now);
                 let v = extract(&ctx);
-                if is_numeric_header(&self.plural, header) {
+                if is_numeric_header(&self.group, &self.plural, header) {
                     crate::views::SortValue::Num(parse_leading_num(&v))
                 } else {
                     crate::views::SortValue::Text(v.to_lowercase().to_string())
@@ -627,11 +642,11 @@ impl ViewSpec {
 }
 
 /// Columns whose curated cell is a count/number and should sort numerically.
-fn is_numeric_header(plural: &str, header: &str) -> bool {
+fn is_numeric_header(group: &str, plural: &str, header: &str) -> bool {
     // READY is a count ("1/2") for workloads, but flux kinds render it as
     // True/False/Unknown, which must sort as text.
     if header == "READY" {
-        let cols = columns_for(plural);
+        let cols = columns_for(group, plural);
         return cols.as_ptr() != FLUX_OBJECT_COLUMNS.as_ptr()
             && cols.as_ptr() != FLUX_SOURCE_COLUMNS.as_ptr();
     }
@@ -2275,7 +2290,7 @@ mod tests {
                 ]
             }
         }));
-        let (cells, status_idx) = cells(&p, "pods", now_secs());
+        let (cells, status_idx) = cells(&p, "", "pods", now_secs());
         assert_eq!(cells[0], "web");
         assert_eq!(cells[1], "1/2"); // ready
         assert_eq!(cells[2], "CrashLoopBackOff"); // waiting reason overrides phase
@@ -2301,7 +2316,7 @@ mod tests {
                                 "reason": "Unschedulable"}]
             }
         }));
-        let (c, _) = cells(&p, "pods", now_secs());
+        let (c, _) = cells(&p, "", "pods", now_secs());
         assert_eq!(c[1], "0/2");
         assert_eq!(c[2], "Pending");
         assert_eq!(c[3], "0");
@@ -2316,7 +2331,7 @@ mod tests {
                  "state": {"running": {}}}
             ]}
         }));
-        assert_eq!(cells(&p, "pods", now_secs()).0[1], "1/1");
+        assert_eq!(cells(&p, "", "pods", now_secs()).0[1], "1/1");
     }
 
     #[test]
@@ -2351,12 +2366,12 @@ mod tests {
         // The sidecar runs for the pod's whole life, so it is a container on
         // both sides of the fraction. `migrate` has already exited and is on
         // neither side, restarts included.
-        let (c, _) = cells(&pod(true), "pods", now_secs());
+        let (c, _) = cells(&pod(true), "", "pods", now_secs());
         assert_eq!(c[1], "2/2");
         assert_eq!(c[3], "4");
 
         // A sidecar failing its readiness probe holds the pod short of ready.
-        assert_eq!(cells(&pod(false), "pods", now_secs()).0[1], "1/2");
+        assert_eq!(cells(&pod(false), "", "pods", now_secs()).0[1], "1/2");
     }
 
     fn deploy(spec_replicas: i64, status: serde_json::Value) -> DynamicObject {
@@ -2375,7 +2390,7 @@ mod tests {
             3,
             json!({"replicas": 3, "readyReplicas": 3, "updatedReplicas": 3}),
         );
-        let (c, status_idx) = cells(&d, "deployments", now_secs());
+        let (c, status_idx) = cells(&d, "apps", "deployments", now_secs());
         assert_eq!(c[1], "3/3");
         assert_eq!(c[2], "Ready");
         assert_eq!(status_idx, Some(2));
@@ -2385,14 +2400,20 @@ mod tests {
             3,
             json!({"replicas": 3, "readyReplicas": 0, "updatedReplicas": 3}),
         );
-        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Unavailable");
+        assert_eq!(
+            cells(&d, "apps", "deployments", now_secs()).0[2],
+            "Unavailable"
+        );
 
         // Rollout replacing pods (updated < desired) → progressing.
         let d = deploy(
             3,
             json!({"replicas": 4, "readyReplicas": 2, "updatedReplicas": 1}),
         );
-        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Progressing");
+        assert_eq!(
+            cells(&d, "apps", "deployments", now_secs()).0[2],
+            "Progressing"
+        );
 
         // Fully rolled out but pods unready (crash loops, failed probes) →
         // degraded, not "progressing" — nothing is coming to fix it.
@@ -2400,14 +2421,23 @@ mod tests {
             3,
             json!({"replicas": 3, "readyReplicas": 2, "updatedReplicas": 3}),
         );
-        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Degraded");
+        assert_eq!(
+            cells(&d, "apps", "deployments", now_secs()).0[2],
+            "Degraded"
+        );
 
         // Scaled to zero reads faded, not broken.
         let d = deploy(0, json!({}));
-        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "ScaledDown");
+        assert_eq!(
+            cells(&d, "apps", "deployments", now_secs()).0[2],
+            "ScaledDown"
+        );
         // ... and still tearing down reads transitional.
         let d = deploy(0, json!({"replicas": 2, "readyReplicas": 2}));
-        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Progressing");
+        assert_eq!(
+            cells(&d, "apps", "deployments", now_secs()).0[2],
+            "Progressing"
+        );
     }
 
     #[test]
@@ -2421,7 +2451,7 @@ mod tests {
                                 "reason": "ProgressDeadlineExceeded"}]
             }),
         );
-        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Stalled");
+        assert_eq!(cells(&d, "apps", "deployments", now_secs()).0[2], "Stalled");
 
         // Available=False overrides a numerically-satisfied ready count.
         let d = deploy(
@@ -2431,7 +2461,10 @@ mod tests {
                 "conditions": [{"type": "Available", "status": "False"}]
             }),
         );
-        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Unavailable");
+        assert_eq!(
+            cells(&d, "apps", "deployments", now_secs()).0[2],
+            "Unavailable"
+        );
     }
 
     #[test]
@@ -2443,7 +2476,10 @@ mod tests {
             "status": {"replicas": 3, "readyReplicas": 2, "updatedReplicas": 2}
         }));
         // Rolling update in flight (updated < desired) → progressing.
-        assert_eq!(cells(&sts, "statefulsets", now_secs()).0[2], "Progressing");
+        assert_eq!(
+            cells(&sts, "apps", "statefulsets", now_secs()).0[2],
+            "Progressing"
+        );
 
         let ds = obj(json!({
             "apiVersion": "apps/v1", "kind": "DaemonSet",
@@ -2452,7 +2488,10 @@ mod tests {
                        "numberReady": 3, "updatedNumberScheduled": 5}
         }));
         // Fully rolled out, nodes unready → degraded. STATUS follows AVAILABLE.
-        assert_eq!(cells(&ds, "daemonsets", now_secs()).0[5], "Degraded");
+        assert_eq!(
+            cells(&ds, "apps", "daemonsets", now_secs()).0[5],
+            "Degraded"
+        );
 
         // An old, scaled-down ReplicaSet must read faded, not broken.
         let rs = obj(json!({
@@ -2461,7 +2500,10 @@ mod tests {
             "spec": {"replicas": 0},
             "status": {"replicas": 0}
         }));
-        assert_eq!(cells(&rs, "replicasets", now_secs()).0[4], "ScaledDown");
+        assert_eq!(
+            cells(&rs, "apps", "replicasets", now_secs()).0[4],
+            "ScaledDown"
+        );
 
         // spec.replicas unset defaults to 1 — a bare RS with one ready pod
         // is healthy, not degraded.
@@ -2470,7 +2512,7 @@ mod tests {
             "metadata": {"name": "web-abc", "namespace": "default"},
             "status": {"replicas": 1, "readyReplicas": 1}
         }));
-        assert_eq!(cells(&rs, "replicasets", now_secs()).0[4], "Ready");
+        assert_eq!(cells(&rs, "apps", "replicasets", now_secs()).0[4], "Ready");
     }
 
     #[test]
@@ -2482,7 +2524,10 @@ mod tests {
             "spec": {"replicas": 3},
             "status": {"replicas": 3, "readyReplicas": 3, "updatedReplicas": 3}
         }));
-        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Terminating");
+        assert_eq!(
+            cells(&d, "apps", "deployments", now_secs()).0[2],
+            "Terminating"
+        );
     }
 
     #[test]
@@ -2498,7 +2543,7 @@ mod tests {
             "status": {"conditions": [{"type": "Ready", "status": "True"}],
                        "nodeInfo": {"kubeletVersion": "v1.31.0"}}
         }));
-        let (node_cells, status_idx) = cells(&n, "nodes", now_secs());
+        let (node_cells, status_idx) = cells(&n, "", "nodes", now_secs());
         assert_eq!(node_cells[0], "cp-1");
         assert_eq!(node_cells[1], "Ready");
         assert_eq!(node_cells[2], "control-plane");
@@ -2507,7 +2552,7 @@ mod tests {
         assert_eq!(status_idx, Some(1));
 
         let bare = obj(json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": "w-1"}}));
-        let (bare_cells, _) = cells(&bare, "nodes", now_secs());
+        let (bare_cells, _) = cells(&bare, "", "nodes", now_secs());
         assert_eq!(bare_cells[3], "0");
     }
 
@@ -2520,7 +2565,7 @@ mod tests {
                      "ports": [{"port": 80, "protocol": "TCP"}]},
             "status": {"loadBalancer": {}}
         }));
-        let (cells, _) = cells(&s, "services", now_secs());
+        let (cells, _) = cells(&s, "", "services", now_secs());
         assert_eq!(cells[1], "LoadBalancer");
         assert_eq!(cells[3], "<pending>");
         assert_eq!(cells[4], "80/TCP");
@@ -2543,10 +2588,15 @@ mod tests {
             }
         }));
         assert_eq!(
-            headers("customresourcedefinitions"),
+            headers("apiextensions.k8s.io", "customresourcedefinitions"),
             vec!["NAME", "GROUP", "KIND", "VERSIONS", "SCOPE", "AGE"]
         );
-        let (cells, _) = cells(&crd, "customresourcedefinitions", now_secs());
+        let (cells, _) = cells(
+            &crd,
+            "apiextensions.k8s.io",
+            "customresourcedefinitions",
+            now_secs(),
+        );
         assert_eq!(cells[0], "widgets.example.com");
         assert_eq!(cells[1], "example.com");
         assert_eq!(cells[2], "Widget");
@@ -2570,7 +2620,12 @@ mod tests {
                 ]
             }
         }));
-        let (cells, status_idx) = cells(&ks, "kustomizations", now_secs());
+        let (cells, status_idx) = cells(
+            &ks,
+            "kustomize.toolkit.fluxcd.io",
+            "kustomizations",
+            now_secs(),
+        );
         assert_eq!(cells[0], "apps");
         assert_eq!(cells[1], "True");
         assert_eq!(cells[2], "Applied revision: main@sha1:abc123");
@@ -2594,7 +2649,7 @@ mod tests {
                 ]
             }
         }));
-        let (cells, status_idx) = cells(&hr, "helmreleases", now_secs());
+        let (cells, status_idx) = cells(&hr, "helm.toolkit.fluxcd.io", "helmreleases", now_secs());
         assert_eq!(cells[1], "False");
         assert_eq!(cells[2], "install retries exhausted");
         assert_eq!(cells[3], "6.5.4");
@@ -2616,9 +2671,14 @@ mod tests {
                 ]
             }
         }));
-        let (cells, status_idx) = cells(&git, "gitrepositories", now_secs());
+        let (cells, status_idx) = cells(
+            &git,
+            "source.toolkit.fluxcd.io",
+            "gitrepositories",
+            now_secs(),
+        );
         assert_eq!(
-            headers("gitrepositories"),
+            headers("source.toolkit.fluxcd.io", "gitrepositories"),
             vec![
                 "NAME",
                 "READY",
@@ -2650,7 +2710,7 @@ mod tests {
                 "conditions": [{"type": "Ready", "status": "False", "message": "denied"}]
             }
         }));
-        let (cells, status_idx) = cells(&bucket, "buckets", now_secs());
+        let (cells, status_idx) = cells(&bucket, "source.toolkit.fluxcd.io", "buckets", now_secs());
         assert_eq!(cells[1], "False");
         assert_eq!(cells[2], "denied");
         assert_eq!(cells[3], "sha256:abc123");
@@ -2672,9 +2732,9 @@ mod tests {
                 "completionTime": "2024-01-01T01:05:00Z"
             }
         }));
-        let (cells, _) = cells(&job, "jobs", now_secs());
+        let (cells, _) = cells(&job, "batch", "jobs", now_secs());
         assert_eq!(
-            headers("jobs"),
+            headers("batch", "jobs"),
             vec!["NAME", "STATUS", "COMPLETIONS", "DURATION", "AGE"]
         );
         assert_eq!(cells[2], "2/3");
@@ -2690,9 +2750,9 @@ mod tests {
             "spec": {"schedule": "*/15 * * * *", "suspend": false},
             "status": {"active": [{"name": "backup-1"}]}
         }));
-        let (cells, _) = cells(&cron, "cronjobs", now_secs());
+        let (cells, _) = cells(&cron, "batch", "cronjobs", now_secs());
         assert_eq!(
-            headers("cronjobs"),
+            headers("batch", "cronjobs"),
             vec![
                 "NAME",
                 "SCHEDULE",
@@ -2720,9 +2780,9 @@ mod tests {
             "note": "Back-off restarting\nfailed container",
             "series": {"count": 7}
         }));
-        let (cells, status_idx) = cells(&event, "events", now_secs());
+        let (cells, status_idx) = cells(&event, "", "events", now_secs());
         assert_eq!(
-            headers("events"),
+            headers("", "events"),
             vec![
                 "NAME",
                 "LAST-SEEN",
@@ -2771,9 +2831,9 @@ mod tests {
                 }]
             }
         }));
-        let (cells, _) = cells(&hpa, "horizontalpodautoscalers", now_secs());
+        let (cells, _) = cells(&hpa, "autoscaling", "horizontalpodautoscalers", now_secs());
         assert_eq!(
-            headers("horizontalpodautoscalers"),
+            headers("autoscaling", "horizontalpodautoscalers"),
             vec![
                 "NAME",
                 "REFERENCE",
@@ -2798,7 +2858,12 @@ mod tests {
             "kind": "Kustomization",
             "metadata": {"name": "new"}
         }));
-        let (cells, _) = cells(&ks, "kustomizations", now_secs());
+        let (cells, _) = cells(
+            &ks,
+            "kustomize.toolkit.fluxcd.io",
+            "kustomizations",
+            now_secs(),
+        );
         assert_eq!(cells[1], "Unknown");
         assert_eq!(cells[2], "");
         assert_eq!(cells[3], "");
@@ -2816,9 +2881,9 @@ mod tests {
             },
             "status": {"loadBalancer": {"ingress": [{"ip": "203.0.113.10"}]}}
         }));
-        let (cells, _) = cells(&ing, "ingresses", now_secs());
+        let (cells, _) = cells(&ing, "networking.k8s.io", "ingresses", now_secs());
         assert_eq!(
-            headers("ingresses"),
+            headers("networking.k8s.io", "ingresses"),
             ["NAME", "CLASS", "HOSTS", "ADDRESS", "AGE"]
         );
         assert_eq!(cells[1], "nginx");
@@ -2834,7 +2899,7 @@ mod tests {
             "status": {"loadBalancer": {"ingress": [{"hostname": "abc.elb.amazonaws.com"}]}}
         }));
         assert_eq!(
-            cells(&hostname, "ingresses", now_secs()).0[3],
+            cells(&hostname, "networking.k8s.io", "ingresses", now_secs()).0[3],
             "abc.elb.amazonaws.com"
         );
 
@@ -2842,7 +2907,10 @@ mod tests {
             "apiVersion": "networking.k8s.io/v1", "kind": "Ingress",
             "metadata": {"name": "pending"}
         }));
-        assert_eq!(cells(&pending, "ingresses", now_secs()).0[3], "<none>");
+        assert_eq!(
+            cells(&pending, "networking.k8s.io", "ingresses", now_secs()).0[3],
+            "<none>"
+        );
     }
 
     #[test]
@@ -2853,8 +2921,16 @@ mod tests {
             "metadata": {"name": "web"},
             "spec": {"hostnames": ["app.example.com", "www.example.com"]}
         }));
-        let (row, idx) = cells(&route, "httproutes", now_secs());
-        assert_eq!(headers("httproutes"), ["NAME", "HOSTNAMES", "AGE"]);
+        let (row, idx) = cells(
+            &route,
+            "gateway.networking.k8s.io",
+            "httproutes",
+            now_secs(),
+        );
+        assert_eq!(
+            headers("gateway.networking.k8s.io", "httproutes"),
+            ["NAME", "HOSTNAMES", "AGE"]
+        );
         assert_eq!(row[1], "app.example.com,www.example.com");
         assert_eq!(idx, None);
 
@@ -2862,7 +2938,16 @@ mod tests {
             "apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
             "metadata": {"name": "any"}
         }));
-        assert_eq!(cells(&wildcard, "httproutes", now_secs()).0[1], "*");
+        assert_eq!(
+            cells(
+                &wildcard,
+                "gateway.networking.k8s.io",
+                "httproutes",
+                now_secs()
+            )
+            .0[1],
+            "*"
+        );
     }
 
     #[test]
@@ -2871,7 +2956,7 @@ mod tests {
             "apiVersion": "example.com/v1", "kind": "Widget",
             "metadata": {"name": "thingy"}
         }));
-        let (cells, idx) = cells(&o, "widgets", now_secs());
+        let (cells, idx) = cells(&o, "example.com", "widgets", now_secs());
         assert_eq!(cells[0], "thingy");
         assert_eq!(cells.len(), 2);
         assert_eq!(idx, None);
@@ -2885,38 +2970,38 @@ mod tests {
             "metadata": {"name": "sample"}
         }));
         let kinds = [
-            "pods",
-            "deployments",
-            "replicasets",
-            "statefulsets",
-            "daemonsets",
-            "services",
-            "nodes",
-            "namespaces",
-            "configmaps",
-            "secrets",
-            "jobs",
-            "cronjobs",
-            "events",
-            "horizontalpodautoscalers",
-            "persistentvolumeclaims",
-            "persistentvolumes",
-            "ingresses",
-            "httproutes",
-            "endpoints",
-            "customresourcedefinitions",
-            "kustomizations",
-            "helmreleases",
-            "gitrepositories",
-            "helmrepositories",
-            "ocirepositories",
-            "buckets",
-            "widgets",
+            ("", "pods"),
+            ("apps", "deployments"),
+            ("apps", "replicasets"),
+            ("apps", "statefulsets"),
+            ("apps", "daemonsets"),
+            ("", "services"),
+            ("", "nodes"),
+            ("", "namespaces"),
+            ("", "configmaps"),
+            ("", "secrets"),
+            ("batch", "jobs"),
+            ("batch", "cronjobs"),
+            ("", "events"),
+            ("autoscaling", "horizontalpodautoscalers"),
+            ("", "persistentvolumeclaims"),
+            ("", "persistentvolumes"),
+            ("networking.k8s.io", "ingresses"),
+            ("gateway.networking.k8s.io", "httproutes"),
+            ("", "endpoints"),
+            ("apiextensions.k8s.io", "customresourcedefinitions"),
+            ("kustomize.toolkit.fluxcd.io", "kustomizations"),
+            ("helm.toolkit.fluxcd.io", "helmreleases"),
+            ("source.toolkit.fluxcd.io", "gitrepositories"),
+            ("source.toolkit.fluxcd.io", "helmrepositories"),
+            ("source.toolkit.fluxcd.io", "ocirepositories"),
+            ("source.toolkit.fluxcd.io", "buckets"),
+            ("example.com", "widgets"),
         ];
 
-        for kind in kinds {
-            let headers = headers(kind);
-            let (cells, status_idx) = cells(&o, kind, now_secs());
+        for (group, kind) in kinds {
+            let headers = headers(group, kind);
+            let (cells, status_idx) = cells(&o, group, kind, now_secs());
             assert_eq!(headers.len(), cells.len(), "{kind} column count");
             if let Some(idx) = status_idx {
                 assert!(idx < cells.len(), "{kind} status index");
@@ -2962,7 +3047,7 @@ mod tests {
             ],
             false,
         );
-        let spec = build_spec("pods", Some(&v), None, false);
+        let spec = build_spec("", "pods", Some(&v), None, false);
         assert_eq!(
             spec.headers(),
             vec!["NAME", "READY", "STATUS", "RESTARTS", "NODE-IP", "AGE"]
@@ -2988,18 +3073,18 @@ mod tests {
             ],
             true,
         );
-        let spec = build_spec("pods", Some(&v), None, true);
+        let spec = build_spec("", "pods", Some(&v), None, true);
         assert_eq!(spec.headers(), vec!["NAME", "PHASE"]);
     }
 
     #[test]
     fn spec_wide_mode_gates_wide_only_columns() {
-        let narrow = build_spec("pods", None, None, false);
+        let narrow = build_spec("", "pods", None, None, false);
         assert_eq!(
             narrow.headers(),
             vec!["NAME", "READY", "STATUS", "RESTARTS", "AGE"]
         );
-        let wide = build_spec("pods", None, None, true);
+        let wide = build_spec("", "pods", None, None, true);
         assert_eq!(
             wide.headers(),
             vec!["NAME", "READY", "STATUS", "RESTARTS", "IP", "NODE", "AGE"]
@@ -3014,10 +3099,10 @@ mod tests {
             false,
         );
         // Unknown kind: printer columns upgrade the NAME/AGE fallback.
-        let spec = build_spec("widgets", None, Some(&crd), false);
+        let spec = build_spec("example.com", "widgets", None, Some(&crd), false);
         assert_eq!(spec.headers(), vec!["NAME", "PHASE", "AGE"]);
         // Curated kind: printer columns never apply.
-        let spec = build_spec("pods", None, Some(&crd), false);
+        let spec = build_spec("", "pods", None, Some(&crd), false);
         assert_eq!(
             spec.headers(),
             vec!["NAME", "READY", "STATUS", "RESTARTS", "AGE"]
@@ -3027,14 +3112,20 @@ mod tests {
             vec![user_col("MINE", "/status/mine", ColumnKind::Text)],
             false,
         );
-        let spec = build_spec("widgets", Some(&user), Some(&crd), false);
+        let spec = build_spec("example.com", "widgets", Some(&user), Some(&crd), false);
         assert_eq!(spec.headers(), vec!["NAME", "MINE", "AGE"]);
         // A sort-only user view (no columns) still gets printer columns.
         let sort_only = crate::views::View {
             sort: Some(("PHASE".into(), false)),
             ..Default::default()
         };
-        let spec = build_spec("widgets", Some(&sort_only), Some(&crd), false);
+        let spec = build_spec(
+            "example.com",
+            "widgets",
+            Some(&sort_only),
+            Some(&crd),
+            false,
+        );
         assert_eq!(spec.headers(), vec!["NAME", "PHASE", "AGE"]);
     }
 
@@ -3045,7 +3136,7 @@ mod tests {
             vec![user_col("CPU", "/spec/cpu", ColumnKind::Quantity)],
             false,
         );
-        let spec = build_spec("widgets", Some(&v), None, false);
+        let spec = build_spec("example.com", "widgets", Some(&v), None, false);
         let o = obj(json!({
             "apiVersion": "example.com/v1", "kind": "Widget",
             "metadata": {"name": "w"},
@@ -3070,7 +3161,7 @@ mod tests {
                 "containerStatuses": []
             }
         }));
-        let spec = build_spec("pods", None, None, true);
+        let spec = build_spec("", "pods", None, None, true);
 
         assert!(matches!(
             spec.cell_at(&pod, 0, now_secs()),
@@ -3097,7 +3188,13 @@ mod tests {
                 "status": {"conditions": [{"type": "Ready", "status": status}]}
             }))
         };
-        let spec = build_spec("kustomizations", None, None, false);
+        let spec = build_spec(
+            "kustomize.toolkit.fluxcd.io",
+            "kustomizations",
+            None,
+            None,
+            false,
+        );
         let ready =
             |status: &str| match spec.sort_value(&flux(status), "READY", now_secs()).unwrap() {
                 SortValue::Text(t) => t,
@@ -3114,7 +3211,7 @@ mod tests {
                 {"ready": false, "restartCount": 0, "state": {"running": {}}}
             ]}
         }));
-        let spec = build_spec("pods", None, None, false);
+        let spec = build_spec("", "pods", None, None, false);
         match spec.sort_value(&pod, "READY", now_secs()).unwrap() {
             SortValue::Num(n) => assert_eq!(n, 1.0),
             SortValue::Text(t) => panic!("pod READY must sort numerically, got '{t}'"),

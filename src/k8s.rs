@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use kube::api::{Api, ListParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
-use kube::core::DynamicObject;
+use kube::core::{DynamicObject, GroupVersionResource};
 use kube::discovery::{ApiResource, Discovery, Scope};
 use kube::runtime::{WatchStreamExt, watcher};
 use kube::{Client, Config, ResourceExt};
@@ -48,6 +48,10 @@ pub struct Kind {
 }
 
 impl Kind {
+    pub fn resource_key(&self) -> GroupVersionResource {
+        GroupVersionResource::gvr(&self.ar.group, &self.ar.version, &self.ar.plural)
+    }
+
     pub fn title(&self) -> String {
         if self.ar.group.is_empty() {
             self.ar.plural.clone()
