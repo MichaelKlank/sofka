@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use kube::api::{Api, ListParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
-use kube::core::DynamicObject;
+use kube::core::{DynamicObject, GroupVersionResource};
 use kube::discovery::{ApiResource, Discovery, Scope};
 use kube::runtime::{WatchStreamExt, watcher};
 use kube::{Client, Config, ResourceExt};
@@ -48,6 +48,10 @@ pub struct Kind {
 }
 
 impl Kind {
+    pub fn resource_key(&self) -> GroupVersionResource {
+        GroupVersionResource::gvr(&self.ar.group, &self.ar.version, &self.ar.plural)
+    }
+
     pub fn title(&self) -> String {
         if self.ar.group.is_empty() {
             self.ar.plural.clone()
@@ -718,6 +722,14 @@ impl Cluster {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn client_accepts_socks5_proxy() {
+        let mut config = Config::new("https://127.0.0.1:6443".parse().unwrap());
+        config.proxy_url = Some("socks5://127.0.0.1:9090".parse().unwrap());
+
+        Client::try_from(config).expect("build client with a SOCKS5 proxy");
+    }
 
     #[test]
     fn expired_watch_errors_are_benign() {

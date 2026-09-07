@@ -92,7 +92,7 @@ impl App {
         use crate::filter::ParsedFilter;
         match parsed {
             ParsedFilter::Fuzzy(pat) => {
-                pat.is_empty() || self.fuzzy_match_row(o, pat, key, cells, now)
+                pat.text().is_empty() || self.pattern_match_row(o, pat, key, cells, now)
             }
             ParsedFilter::Structured(s) => s
                 .terms
@@ -111,8 +111,9 @@ impl App {
     ) -> Option<bool> {
         use crate::filter::Term;
         match term {
-            Term::Fuzzy(pat) => Some(self.fuzzy_match_row(o, pat, key, cells, now)),
-            Term::NotFuzzy(pat) => Some(!self.fuzzy_match_row(o, pat, key, cells, now)),
+            Term::Text { negate, pat } => {
+                Some(negate ^ self.pattern_match_row(o, pat, key, cells, now))
+            }
             Term::Cmp(cmp) => self.eval_cmp(o, key, cmp, cells, now),
             Term::All(terms) | Term::Not(terms) | Term::Any(terms) => {
                 let any = matches!(term, Term::Any(_));
@@ -130,7 +131,7 @@ impl App {
         }
     }
 
-    /// Does one fuzzy pattern match this row? "namespace name" first (the
+    /// Does one text pattern match this row? "namespace name" first (the
     /// original haystack — cheap, and by far the most common hit), then each
     /// rendered column cell individually, so `/10.96` finds a Service by its
     /// CLUSTER-IP. Cells are matched one at a time rather than joined so a
@@ -143,21 +144,26 @@ impl App {
     /// a helm view that meant five gunzip+JSON-parse rounds per row per
     /// keypress. Cached by `resourceVersion`, a row is now rendered once per
     /// change instead of once per keystroke.
-    fn fuzzy_match_row(
+    fn pattern_match_row(
         &self,
         o: &DynamicObject,
-        pat: &str,
+        pat: &crate::filter::Pattern,
         key: &RowKey,
         cells: &mut crate::store::FastMap<RowKey, CellCacheEntry>,
         now: i64,
     ) -> bool {
-        let pat_mask = subseq_mask(pat);
+        // Only fuzzy patterns use the byte mask. Unicode lowercase conversion
+        // can change the bytes of a literal or its cell text.
+        let pat_mask = match pat {
+            crate::filter::Pattern::Fuzzy(_) => subseq_mask(pat.text()),
+            _ => 0,
+        };
         {
             // Built into a reused buffer: this used to `format!` a fresh
             // `String` for every object on every keystroke.
             let mut hay = self.hay_buf.borrow_mut();
             self.write_fuzzy_hay(o, &mut hay);
-            if subseq_mask(&hay) & pat_mask == pat_mask && self.matcher.score(&hay, pat).is_some() {
+            if subseq_mask(&hay) & pat_mask == pat_mask && self.pattern_matches(pat, &hay) {
                 return true;
             }
         }
@@ -170,7 +176,17 @@ impl App {
             .cells
             .iter()
             .zip(&entry.cell_masks)
-            .any(|(c, &m)| m & pat_mask == pat_mask && self.matcher.score(c, pat).is_some())
+            .any(|(c, &m)| m & pat_mask == pat_mask && self.pattern_matches(pat, c))
+    }
+
+    /// One pattern against one string, with no prefiltering.
+    fn pattern_matches(&self, pat: &crate::filter::Pattern, text: &str) -> bool {
+        use crate::filter::Pattern;
+        match pat {
+            Pattern::Fuzzy(needle) => self.matcher.score(text, needle).is_some(),
+            Pattern::Literal(lit) => lit.matches(text),
+            Pattern::Regex(re) => re.is_match(text),
+        }
     }
 
     /// The cached cells for `key`, rendering them if absent or stale.
@@ -196,7 +212,7 @@ impl App {
             Entry::Occupied(e) if fresh(e.get()) => return e.into_mut(),
             slot => slot,
         };
-        let (rendered, status_idx) = self.spec.cells(o, now);
+        let (rendered, status_idx, helm_updated) = self.spec.cells_with_helm_time(o, now);
         let cell_masks: Vec<u64> = rendered.iter().map(|c| subseq_mask(c)).collect();
         let row_mask = cell_masks.iter().fold(0u64, |a, m| a | m);
         let built = CellCacheEntry {
@@ -204,6 +220,7 @@ impl App {
             resource_version: o.metadata.resource_version.clone(),
             cells: rendered,
             status_idx,
+            helm_updated,
             cell_masks,
             row_mask,
         };
@@ -367,27 +384,27 @@ impl App {
             || parsed.fields() != self.applied_filter_fields.as_deref()
     }
 
-    /// Char indices in `name` that matched the active row filter's fuzzy
+    /// Char indices in `name` that matched the active row filter's text
     /// pattern, for highlighting them in the table. `None` when there's no
-    /// active filter or no fuzzy term (every visible row already passed
-    /// the filter pass, so this is purely a rendering aid, not a second
-    /// filter decision).
+    /// active filter or no positive text term (every visible row already
+    /// passed the filter pass, so this is purely a rendering aid, not a
+    /// second filter decision).
     ///
-    /// Memoized per name for the current needle: the renderer asks this for
-    /// every visible row on every redraw, and re-running the fuzzy matcher to
-    /// get an answer that cannot have changed is the single most expensive
-    /// thing a filtered frame used to do.
+    /// Memoized per name for the current filter: the renderer asks this for
+    /// every visible row on every redraw, and re-running the matcher to get
+    /// an answer that cannot have changed is the single most expensive thing
+    /// a filtered frame used to do.
     pub fn filter_match_indices(&self, name: &str) -> Option<Rc<[usize]>> {
         if self.filter.is_empty() {
             return None;
         }
         let parsed = self.parsed_filter();
-        let needle = parsed.fuzzy_needle()?;
+        let pat = parsed.highlight_pattern()?;
 
         let mut cache = self.highlight_cache.borrow_mut();
-        if cache.needle != needle {
-            cache.needle.clear();
-            cache.needle.push_str(needle);
+        if cache.filter != self.filter {
+            cache.filter.clear();
+            cache.filter.push_str(&self.filter);
             cache.rows.clear();
         }
         if let Some(hit) = cache.rows.get(name) {
@@ -396,12 +413,26 @@ impl App {
         if cache.rows.len() >= HIGHLIGHT_CACHE_LIMIT {
             cache.rows.clear();
         }
-        let idx = self
-            .matcher
-            .indices(name, needle)
-            .map(|idx| Rc::from(idx.as_slice()));
+        let idx = self.match_positions(pat, name).map(Rc::from);
         cache.rows.insert(Box::from(name), idx.clone());
         idx
+    }
+
+    /// Where `pat` matched in `name`, as char positions. A literal or a regex
+    /// matches one contiguous run, so both report the span they landed on;
+    /// only fuzzy scatters its positions.
+    fn match_positions(&self, pat: &crate::filter::Pattern, name: &str) -> Option<Vec<usize>> {
+        use crate::filter::Pattern;
+        match pat {
+            Pattern::Fuzzy(needle) => self.matcher.indices(name, needle),
+            Pattern::Literal(lit) => lit.match_span(name).map(Iterator::collect),
+            Pattern::Regex(re) => re.find(name).map(|m| {
+                // Byte offsets from the regex, char positions for the cell
+                // renderer, which walks `name.chars()`.
+                let start = name[..m.start()].chars().count();
+                (start..start + m.as_str().chars().count()).collect()
+            }),
+        }
     }
 
     pub(super) fn ensure_rows_cache(&self) {
@@ -655,13 +686,15 @@ impl App {
             }
             let entry = self.cell_entry(key, obj, cells, now);
             for (i, cell) in entry.cells.iter().enumerate() {
-                let cell_width =
-                    if let Some(value) = self.spec.volatile(obj, &self.kind_plural, i, now) {
-                        // Reserve space for elapsed times as the clock advances.
-                        width(&value).max(7)
-                    } else {
-                        width(cell)
-                    };
+                let cell_width = if let Some(value) =
+                    self.spec
+                        .volatile_cached(obj, &self.kind_plural, i, now, entry.helm_updated)
+                {
+                    // Reserve space for elapsed times as the clock advances.
+                    width(&value).max(7)
+                } else {
+                    width(cell)
+                };
                 needed[i + ns_off] = needed[i + ns_off].max(cell_width);
             }
         }
@@ -672,9 +705,14 @@ impl App {
         needed
     }
 
+    #[cfg(test)]
     pub(crate) fn ensure_table_cell_cache(&self, rows: &[&DynamicObject]) {
-        let mut cache = self.rows_cache.borrow_mut();
         let now = crate::columns::now_secs();
+        self.ensure_table_cell_cache_at(rows, now);
+    }
+
+    pub(crate) fn ensure_table_cell_cache_at(&self, rows: &[&DynamicObject], now: i64) {
+        let mut cache = self.rows_cache.borrow_mut();
         for obj in rows {
             // Shares `cell_entry` with the filter pass, so a row rendered for
             // filtering is already warm for the renderer (and vice versa) and
@@ -746,6 +784,10 @@ impl App {
     /// is opened for.
     pub fn node_capacity_columns(&self) -> bool {
         self.kind_plural == "nodes"
+            && self
+                .kind
+                .as_ref()
+                .is_some_and(|kind| kind.ar.group.is_empty())
     }
 
     pub(crate) fn view_spec(&self) -> &crate::columns::ViewSpec {
@@ -772,11 +814,14 @@ impl App {
         let sort_header = self
             .sort_column
             .and_then(|i| self.display_headers().get(i).cloned());
+        let resource = self.kind.as_ref().map(Kind::resource_key);
         let spec = crate::columns::build_spec(
+            self.kind.as_ref().map_or("", |kind| kind.ar.group.as_str()),
             &self.kind_plural,
             self.active_user_view(),
-            self.crd_views
-                .get(&self.kind_plural)
+            resource
+                .as_ref()
+                .and_then(|resource| self.crd_views.get(resource))
                 .and_then(Option::as_ref),
             self.wide,
         );
@@ -851,17 +896,41 @@ impl App {
 
     pub fn metrics_columns(&self) -> bool {
         matches!(self.kind_plural.as_str(), "pods" | "nodes")
+            && self
+                .kind
+                .as_ref()
+                .is_some_and(|kind| kind.ar.group.is_empty())
     }
 
     /// Latest (cpu_millicores, mem_bytes) for an object from the metrics map.
-    pub(super) fn metrics_for(&self, o: &DynamicObject) -> (i64, i64) {
+    pub(crate) fn metrics_for(&self, o: &DynamicObject) -> Option<(i64, i64)> {
         let name = o.metadata.name.clone().unwrap_or_default();
         let key = if self.kind_plural == "pods" {
             format!("{}/{}", o.metadata.namespace.as_deref().unwrap_or(""), name)
         } else {
             name
         };
-        self.metrics.get(&key).copied().unwrap_or((0, 0))
+        self.metrics.get(&key).copied()
+    }
+
+    pub(super) fn metric_cells(&self, obj: &DynamicObject) -> Vec<String> {
+        let metrics = self.metrics_for(obj);
+        let cpu = metrics.map(|(cpu, _)| cpu);
+        let mem = metrics.map(|(_, mem)| mem);
+        let mut cells = vec![
+            crate::columns::fmt_cpu_sample(cpu),
+            crate::columns::fmt_mem_sample(mem),
+        ];
+        if self.node_capacity_columns() {
+            let (alloc_cpu, alloc_mem) = crate::columns::node_allocatable(obj);
+            cells.push(crate::columns::fmt_pct(
+                cpu.and_then(|cpu| crate::columns::usage_pct(cpu, alloc_cpu)),
+            ));
+            cells.push(crate::columns::fmt_pct(
+                mem.and_then(|mem| crate::columns::usage_pct(mem, alloc_mem)),
+            ));
+        }
+        cells
     }
 
     /// Latest pod count for a node from the pods poll; `None` before the
@@ -903,32 +972,45 @@ impl App {
             ),
             // Unknown timestamps sort last (oldest-unknown) in ascending order.
             "AGE" => SortKey::Num(crate::columns::age_secs(o, now).unwrap_or(i64::MAX) as f64),
-            "CPU" => SortKey::Num(self.metrics_for(o).0 as f64),
-            "MEM" => SortKey::Num(self.metrics_for(o).1 as f64),
+            "CPU" => SortKey::Num(
+                self.metrics_for(o)
+                    .map(|(cpu, _)| cpu as f64)
+                    .unwrap_or(-1.0),
+            ),
+            "MEM" => SortKey::Num(
+                self.metrics_for(o)
+                    .map(|(_, mem)| mem as f64)
+                    .unwrap_or(-1.0),
+            ),
             // Unknown counts (poll hasn't landed) sort below every real count.
             "PODS" if self.node_capacity_columns() => {
                 SortKey::Num(self.node_pods_for(o).map(|c| c as f64).unwrap_or(-1.0))
             }
             // Unknown allocatable sorts below every real percentage.
             "%CPU" if self.node_capacity_columns() => SortKey::Num(
-                crate::columns::usage_pct(
-                    self.metrics_for(o).0,
-                    crate::columns::node_allocatable(o).0,
-                )
-                .map(|p| p as f64)
-                .unwrap_or(-1.0),
+                self.metrics_for(o)
+                    .and_then(|(cpu, _)| {
+                        crate::columns::usage_pct(cpu, crate::columns::node_allocatable(o).0)
+                    })
+                    .map(|p| p as f64)
+                    .unwrap_or(-1.0),
             ),
             "%MEM" if self.node_capacity_columns() => SortKey::Num(
-                crate::columns::usage_pct(
-                    self.metrics_for(o).1,
-                    crate::columns::node_allocatable(o).1,
-                )
-                .map(|p| p as f64)
-                .unwrap_or(-1.0),
+                self.metrics_for(o)
+                    .and_then(|(_, mem)| {
+                        crate::columns::usage_pct(mem, crate::columns::node_allocatable(o).1)
+                    })
+                    .map(|p| p as f64)
+                    .unwrap_or(-1.0),
             ),
             // Humanized time cells ("5d23h") must sort by the underlying
             // timestamp, never the rendered string. Negated epoch seconds so
             // ascending = most recent first, matching AGE; unknowns last.
+            "LAST-SEEN" if self.kind_plural == "events" => SortKey::Num(
+                crate::columns::event_last_seen_secs(o)
+                    .map(|s| -(s as f64))
+                    .unwrap_or(f64::INFINITY),
+            ),
             "UPDATED" => SortKey::Num(
                 crate::helm::decode_summary(o)
                     .and_then(|r| r.last_deployed_secs)
@@ -1055,11 +1137,11 @@ impl App {
             values.push(obj.metadata.namespace.clone().unwrap_or_default());
         }
         let now = crate::columns::now_secs();
-        let (cells, _) = self.spec.cells(obj, now);
+        let (cells, _, helm_updated) = self.spec.cells_with_helm_time(obj, now);
         for (i, cell) in cells.into_iter().enumerate() {
             values.push(
                 self.spec
-                    .volatile(obj, &self.kind_plural, i, now)
+                    .volatile_cached(obj, &self.kind_plural, i, now, helm_updated)
                     .unwrap_or(cell),
             );
         }
@@ -1067,18 +1149,7 @@ impl App {
             values.push(self.node_pods_cell(obj));
         }
         if self.metrics_columns() {
-            let (cpu, mem) = self.metrics_for(obj);
-            values.push(crate::columns::fmt_cpu(cpu));
-            values.push(crate::columns::fmt_mem(mem));
-            if self.node_capacity_columns() {
-                let (alloc_cpu, alloc_mem) = crate::columns::node_allocatable(obj);
-                values.push(crate::columns::fmt_pct(crate::columns::usage_pct(
-                    cpu, alloc_cpu,
-                )));
-                values.push(crate::columns::fmt_pct(crate::columns::usage_pct(
-                    mem, alloc_mem,
-                )));
-            }
+            values.extend(self.metric_cells(obj));
         }
         self.display_headers()
             .iter()

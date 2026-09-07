@@ -4,11 +4,16 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use kube::core::DynamicObject;
+use kube::core::{DynamicObject, GroupVersionResource};
 
 /// Identity of an asynchronous operation's claim on the shared status bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StatusClaim(pub(crate) u64);
+
+/// One remote directory read, or why there isn't one. Named because the
+/// tuple inside the `Result` would otherwise need a type-complexity waiver
+/// every time it is written out.
+pub type PvcListingResult = Result<(crate::pvcexplore::Listing, Option<String>), String>;
 
 /// Messages flowing from watch tasks to the UI loop. Tagged with a
 /// `generation` so messages from a superseded watch can be discarded.
@@ -46,11 +51,11 @@ pub enum Msg {
         generation: u64,
         counts: HashMap<String, usize>,
     },
-    /// CRD `additionalPrinterColumns` fallback for a custom-resource plural,
+    /// CRD `additionalPrinterColumns` fallback for an API resource,
     /// fetched off-thread (`None` = CRD had nothing usable for the version).
     PrinterColumns {
         generation: u64,
-        plural: String,
+        resource: GroupVersionResource,
         view: Box<Option<crate::views::View>>,
     },
     PulseData {
@@ -75,15 +80,19 @@ pub enum Msg {
     /// Findings for the explain-unhealthy view, gathered off-thread.
     Explain {
         generation: u64,
+        request: u64,
         claim: StatusClaim,
         title: String,
+        source: Option<Box<DynamicObject>>,
         findings: Vec<crate::explain::Finding>,
     },
     /// Reconciliation-chain findings for the GitOps view, gathered off-thread.
     Gitops {
         generation: u64,
+        request: u64,
         claim: StatusClaim,
         title: String,
+        source: Option<Box<DynamicObject>>,
         findings: Vec<crate::explain::Finding>,
     },
     /// Captured output of an `output = "popup"` plugin run.
@@ -189,6 +198,39 @@ pub enum Msg {
         claim: StatusClaim,
         deleted: usize,
         failed: Vec<String>,
+    },
+    /// Result of a `:pvc-clean` sweep for leftover PVC-explore helper pods.
+    PvcHelpersCleaned {
+        generation: u64,
+        claim: StatusClaim,
+        deleted: usize,
+        failed: Vec<String>,
+    },
+    /// The pod a PVC can be browsed through, resolved off-thread. `Ok(None)`
+    /// means nothing running mounts the claim — the cue to offer a helper pod.
+    PvcTarget {
+        generation: u64,
+        /// Matched against the browser's own counter so a resolve for a claim
+        /// the user has already navigated away from is dropped.
+        run: u64,
+        /// Namespace the resolve ran in, so a helper pod that arrives after
+        /// the browser moved on can still be deleted rather than leaked.
+        namespace: String,
+        /// Context it ran against. A `:ctx` switch bumps the generation *and*
+        /// swaps the client, so a late helper is only safe to delete when this
+        /// still names the cluster it was created in.
+        context: String,
+        claim: StatusClaim,
+        result: Result<Option<crate::pvcexplore::Mount>, String>,
+    },
+    /// One directory listing for the remote pane of the PVC browser.
+    PvcListing {
+        generation: u64,
+        run: u64,
+        path: String,
+        /// The listing, plus a warning when `ls` produced it but could not
+        /// stat every entry in it.
+        result: PvcListingResult,
     },
     /// An assembled diagnostic bundle (`:bundle`), ready to preview and save.
     Bundle {

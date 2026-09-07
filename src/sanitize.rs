@@ -60,12 +60,49 @@ fn wanted(states: &str) -> Option<Vec<&'static str>> {
 /// They are infrastructure for the workload rather than the workload, and
 /// counting them would make an identical crash-looping pod exempt from
 /// `states = stuck` purely because something injected a proxy into it. The
-/// STATUS column ignores them for the same reason, so the two agree.
+/// cleanup rules keep this distinction even when table status becomes more detailed.
 fn running(pod: &DynamicObject) -> bool {
     pod.data
         .pointer("/status/containerStatuses")
         .and_then(Value::as_array)
         .is_some_and(|cs| cs.iter().any(|c| c.pointer("/state/running").is_some()))
+}
+
+/// Cleanup uses application state and pod phase, not display-only reason labels.
+/// Init failures and numeric exit labels must not widen the deletion categories.
+fn matches_states(pod: &DynamicObject, wanted: &[&str]) -> bool {
+    if pod.metadata.deletion_timestamp.is_some() || running(pod) {
+        return false;
+    }
+    let mut waiting = None;
+    let mut terminated = None;
+    if let Some(statuses) = pod
+        .data
+        .pointer("/status/containerStatuses")
+        .and_then(Value::as_array)
+    {
+        for status in statuses {
+            if let Some(reason) = status
+                .pointer("/state/waiting/reason")
+                .and_then(Value::as_str)
+                && (reason != "ContainerCreating" || waiting.is_none())
+            {
+                waiting = Some(reason);
+            }
+            if let Some(reason) = status
+                .pointer("/state/terminated/reason")
+                .and_then(Value::as_str)
+                && reason != "Completed"
+            {
+                terminated = Some(reason);
+            }
+        }
+    }
+    let category = waiting
+        .or(terminated)
+        .or_else(|| pod.data.pointer("/status/phase").and_then(Value::as_str))
+        .unwrap_or("Unknown");
+    wanted.contains(&category)
 }
 
 struct Target {
@@ -153,7 +190,7 @@ async fn sanitize(
         let next = page.metadata.continue_.clone();
         for pod in page {
             let status = crate::columns::pod_status(&pod);
-            if !wanted.contains(&status.as_str()) || running(&pod) {
+            if !matches_states(&pod, &wanted) {
                 continue;
             }
             targets.push(Target {
@@ -226,8 +263,7 @@ async fn sanitize(
                 }
             };
             let still_selected = fresh.metadata.uid.as_deref() == Some(target.uid.as_str())
-                && wanted.contains(&crate::columns::pod_status(&fresh).as_str())
-                && !running(&fresh);
+                && matches_states(&fresh, &wanted);
             if !still_selected {
                 changed += 1;
                 continue;
@@ -332,7 +368,7 @@ fn table(title: &str, columns: &[&str], rows: Vec<Vec<String>>) -> Value {
 /// The label and field selectors the view filter implies.
 ///
 /// `-l` and `-f` terms are already Kubernetes selectors, so they are sent with
-/// the list and narrow the scan exactly. The rest of the grammar — fuzzy text
+/// the list and narrow the scan exactly. The rest of the grammar — text terms
 /// and typed comparisons like `restarts>=5` — is evaluated against rendered
 /// table cells inside the app, and this adapter cannot reproduce it. Rather
 /// than silently sanitize a wider set than the table is showing, refuse: for a
@@ -976,8 +1012,8 @@ mod tests {
             "metadata": {"name": "gone", "namespace": "default"},
             "status": {"phase": "Failed", "reason": "Evicted"}
         }));
-        assert_eq!(crate::columns::pod_status(&evicted), "Failed");
-        assert!(wanted("terminal").unwrap().contains(&"Failed"));
+        assert_eq!(crate::columns::pod_status(&evicted), "Evicted");
+        assert!(matches_states(&evicted, &wanted("terminal").unwrap()));
     }
 
     #[test]
@@ -1093,5 +1129,38 @@ mod tests {
                 .unwrap()
                 .starts_with("20 more rows")
         );
+    }
+
+    #[test]
+    fn display_reason_changes_do_not_expand_cleanup_categories() {
+        let mut p = pod(json!({"metadata": {"name": "p", "namespace": "default"},
+            "status": {"phase": "Failed", "reason": "Evicted"}}));
+        assert!(matches_states(&p, &wanted("terminal").unwrap()));
+        p.data["status"]["reason"] = json!("DeadlineExceeded");
+        assert!(matches_states(&p, &wanted("terminal").unwrap()));
+        p.data["status"] = json!({"phase": "Pending", "conditions": [
+            {"type": "PodScheduled", "status": "False", "reason": "SchedulingGated"}]});
+        assert!(!matches_states(&p, &wanted("terminal").unwrap()));
+        assert!(!matches_states(&p, &wanted("stuck").unwrap()));
+        assert!(matches_states(&p, &wanted("all").unwrap()));
+        p.data["spec"] = json!({"initContainers": [{"name": "init"}]});
+        p.data["status"] = json!({"phase": "Pending", "initContainerStatuses": [
+            {"name": "init", "state": {"waiting": {"reason": "CrashLoopBackOff"}}}],
+            "containerStatuses": [{"state": {"waiting": {"reason": "PodInitializing"}}}]});
+        assert_eq!(crate::columns::pod_status(&p), "Init:CrashLoopBackOff");
+        assert!(!matches_states(&p, &wanted("all").unwrap()));
+        p.data["spec"] = json!({});
+        p.data["status"] = json!({"phase": "Running", "containerStatuses": [
+            {"state": {"terminated": {"exitCode": 42}}}]});
+        assert_eq!(crate::columns::pod_status(&p), "ExitCode:42");
+        assert!(!matches_states(&p, &wanted("all").unwrap()));
+        p.data["status"] = json!({"phase": "Failed", "reason": "Evicted", "containerStatuses": [
+            {"ready": false, "state": {"running": {}}}]});
+        assert!(!matches_states(&p, &wanted("all").unwrap()));
+        p.data["status"]["containerStatuses"] = json!([]);
+        p.metadata.deletion_timestamp = Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            "2026-09-07T00:00:00Z".parse().unwrap(),
+        ));
+        assert!(!matches_states(&p, &wanted("all").unwrap()));
     }
 }

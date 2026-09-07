@@ -10,6 +10,8 @@ name, or an individual displayed column. Structured markers enable these terms:
 
 | Expression                         | Meaning                                            |
 | ---------------------------------- | -------------------------------------------------- |
+| `"auth"`                           | Contiguous text match, case-insensitive            |
+| `/^api/`                           | Regular expression, case-insensitive               |
 | `!canary`                          | Exclude fuzzy matches                              |
 | `-l app=api,env=prod`              | Kubernetes label selector                          |
 | `-l app in (api, worker)`          | Kubernetes set selector                            |
@@ -38,6 +40,7 @@ for grouping. AND binds more tightly than OR. `!text` excludes a fuzzy match;
 ```text
 (status=Pending || restarts>=5) && !canary
 !(status=Running && age<2h)
+("auth" || /^web/) && !/canary/
 -l app=api (status=Pending || restarts>=5)
 ```
 

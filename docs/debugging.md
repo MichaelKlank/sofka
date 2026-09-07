@@ -10,12 +10,24 @@ failed probes), and recent Warning events. No AI, no external service.
 `j`/`k` move, `⏎` goes to the resource behind a finding, `E` its events, `l` its
 logs, `r` gathers again. A finding you can drill into has a trailing `→`.
 
+For Nodes, memory, disk, and PID pressure are warnings when their conditions
+are `True`. `NetworkUnavailable=True` is also a warning. These conditions do
+not produce warnings when they are `False`. `Unknown` remains a warning, and
+the `Ready` condition is assessed separately.
+
+The DaemonSet rollout summary reads available pods from `status.numberAvailable`.
+
 ## Timeline (`T`)
 
 A per-object timestamped log of every state change the watch saw this session:
 generation bumps, replica and readiness changes, pod phase, restarts, waiting
 reasons, condition flips. Diffed from the watch stream, bounded in size, never
 written to disk.
+
+Restart history includes normal init containers and native sidecars. It keeps
+completed init restart counts in its total, so the end of initialization does
+not reset the count. The pod table excludes normal init restarts after
+initialization is complete.
 
 ## Diff (`:diff`)
 
@@ -68,9 +80,15 @@ the buffer size, and an optional `since` lookback:
 [logs]
 tail = 300         # initial lines fetched per stream (kubectl --tail)
 buffer = 5000      # max lines kept while following (oldest dropped)
-since = "1h"       # optional: only logs newer than this — replaces tail
+since = "1h"       # optional: only logs newer than this, within the tail limit
 fullscreen = false # open log views fullscreen (F toggles per session)
 ```
+
+The `since` window and the `1`–`5` time anchors keep the initial line limit.
+A pod stream requests at most `tail` initial lines per container. Workload and
+Service streams request at most `min(tail, 100)` initial lines per container.
+The time window can reduce this number. Live following continues after these
+initial lines. Previous-container logs keep their full history.
 
 In the view, `/` filters with a case-insensitive substring, a `/regex/`, or a
 leading `!` to invert (keep lines that don't match). A malformed regex is flagged

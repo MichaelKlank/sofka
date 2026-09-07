@@ -322,8 +322,27 @@ pub(super) fn drainable_pod(pod: &Pod) -> bool {
     )
 }
 
-pub(super) fn eviction_unsupported(err: &kube::Error) -> bool {
-    matches!(err, kube::Error::Api(api_err) if matches!(api_err.code, 404 | 405))
+pub(super) fn drain_blocker(pod: &Pod) -> Option<&'static str> {
+    if !pod
+        .metadata
+        .owner_references
+        .as_ref()
+        .is_some_and(|owners| owners.iter().any(|owner| owner.controller == Some(true)))
+    {
+        return Some("pod has no controller and will not be replaced");
+    }
+    if pod
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.volumes.as_ref())
+        .is_some_and(|volumes| volumes.iter().any(|volume| volume.empty_dir.is_some()))
+    {
+        return Some("pod has emptyDir data that eviction would delete");
+    }
+    if pod.metadata.uid.as_deref().is_none_or(str::is_empty) {
+        return Some("pod UID is missing; cannot verify the eviction target");
+    }
+    None
 }
 
 /// Pick a version name to query a CRD's custom resources: the storage version
@@ -342,28 +361,22 @@ pub(super) fn crd_served_version(d: &Value) -> Option<String> {
     pick.get("name").and_then(Value::as_str).map(String::from)
 }
 
-/// Build a `k=v,k2=v2` selector string from `spec/<field>` (matchLabels for
-/// workloads, selector map for services).
+/// Build a complete workload selector or a Service's equality selector.
 pub(super) fn label_selector(obj: &DynamicObject, field: &str) -> Option<String> {
-    let path = if field == "matchLabels" {
-        vec!["spec", "selector", "matchLabels"]
-    } else {
-        vec!["spec", "selector"]
-    };
-    let mut cur = &obj.data;
-    for p in path {
-        cur = cur.get(p)?;
+    let value = obj.data.pointer("/spec/selector")?;
+    if field == "matchLabels" {
+        let selector: k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector =
+            serde_json::from_value(value.clone()).ok()?;
+        let selector = kube::core::Selector::try_from(selector).ok()?.to_string();
+        return (!selector.is_empty()).then_some(selector);
     }
-    let map = cur.as_object()?;
-    if map.is_empty() {
-        return None;
-    }
+    let map = value.as_object()?;
     let mut parts: Vec<String> = map
         .iter()
-        .filter_map(|(k, v)| v.as_str().map(|vs| format!("{k}={vs}")))
-        .collect();
+        .map(|(key, value)| value.as_str().map(|value| format!("{key}={value}")))
+        .collect::<Option<_>>()?;
     parts.sort();
-    Some(parts.join(","))
+    (!parts.is_empty()).then(|| parts.join(","))
 }
 
 pub(super) fn container_names(obj: &DynamicObject) -> Vec<String> {
@@ -896,6 +909,54 @@ pub(super) async fn list_or_warn(
         Err(e) => {
             warn.get_or_insert(e);
             Vec::new()
+        }
+    }
+}
+
+/// Read the same resource instance before a health report gathers its evidence.
+pub(super) async fn report_source(
+    client: &Client,
+    ar: &ApiResource,
+    namespaced: bool,
+    source: &DynamicObject,
+) -> Result<DynamicObject, String> {
+    let name = source
+        .metadata
+        .name
+        .as_deref()
+        .ok_or("resource name is missing")?;
+    let api: Api<DynamicObject> = if namespaced {
+        let ns = source
+            .metadata
+            .namespace
+            .as_deref()
+            .ok_or("resource namespace is missing")?;
+        Api::namespaced_with(client.clone(), ns, ar)
+    } else {
+        Api::all_with(client.clone(), ar)
+    };
+    let fresh = api
+        .get(name)
+        .await
+        .map_err(|error| format!("reading {}/{name}: {error}", ar.plural))?;
+    if source.metadata.uid.is_some() && source.metadata.uid != fresh.metadata.uid {
+        return Err(format!(
+            "{}/{name} was replaced; return to the table and select the new resource",
+            ar.plural
+        ));
+    }
+    Ok(fresh)
+}
+
+pub(super) fn report_result(
+    result: Result<(DynamicObject, Vec<crate::explain::Finding>), String>,
+) -> (Option<Box<DynamicObject>>, Vec<crate::explain::Finding>) {
+    match result {
+        Ok((source, findings)) => (Some(Box::new(source)), findings),
+        Err(error) => {
+            let mut findings = Vec::new();
+            prepend_warn_finding(&mut findings, Some(error));
+            (None, findings)
         }
     }
 }

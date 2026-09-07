@@ -329,6 +329,7 @@ impl App {
         let watch_labels = join_selectors(&self.labels, &self.applied_filter_labels);
         let watch_fields = join_selectors(&self.fields, &self.applied_filter_fields);
         let key = ViewKey {
+            resource: kind.resource_key(),
             kind_plural: self.kind_plural.clone(),
             namespace: self.namespace.clone(),
             labels: watch_labels.clone(),
@@ -363,10 +364,10 @@ impl App {
         );
         self.tasks.push(handle);
 
-        if matches!(self.kind_plural.as_str(), "pods" | "nodes") {
+        if self.metrics_columns() {
             self.spawn_metrics_poll();
         }
-        if self.kind_plural == "nodes" {
+        if self.node_capacity_columns() {
             self.spawn_node_pods_poll();
         }
 
@@ -431,15 +432,15 @@ impl App {
     /// For a custom resource with neither curated columns nor a user view,
     /// fetch its CRD off-thread and read `additionalPrinterColumns` for the
     /// watched version — a better automatic fallback than NAME/AGE. Results
-    /// (including "nothing usable") are cached per plural for the session.
+    /// (including "nothing usable") are cached per API resource for the session.
     fn maybe_fetch_printer_columns(&mut self, kind: &Kind) {
         let user_has_columns = self
             .active_user_view()
             .is_some_and(|v| !v.columns.is_empty());
-        if crate::columns::has_curated(&self.kind_plural)
+        if crate::columns::has_curated(&kind.ar.group, &self.kind_plural)
             || kind.ar.group.is_empty()
             || kind.ar.plural.to_lowercase() != self.kind_plural
-            || self.crd_views.contains_key(&self.kind_plural)
+            || self.crd_views.contains_key(&kind.resource_key())
             || user_has_columns
         {
             return;
@@ -450,7 +451,7 @@ impl App {
         let client = self.cluster.client.clone();
         let name = format!("{}.{}", self.kind_plural, kind.ar.group);
         let version = kind.ar.version.clone();
-        let plural = self.kind_plural.clone();
+        let resource = kind.resource_key();
         let tx = self.tx.clone();
         let genr = self.generation;
         let handle = tokio::spawn(async move {
@@ -463,7 +464,7 @@ impl App {
             let _ = tx
                 .send(Msg::PrinterColumns {
                     generation: genr,
-                    plural,
+                    resource,
                     view: Box::new(view),
                 })
                 .await;
@@ -841,7 +842,28 @@ impl App {
         }
     }
 
+    /// Fold one background message into the app, then tidy up after any view
+    /// it displaced. The key path has the same sweep in `handle_key`; a
+    /// message that opens a document view (a finished describe, a plugin
+    /// report, a bundle) can displace the PVC browser without a keystroke
+    /// being involved at all.
     pub fn handle_msg(&mut self, msg: Msg) {
+        self.handle_msg_inner(msg);
+        let overlay = matches!(
+            self.mode,
+            Mode::PvcExplore
+                | Mode::Command
+                | Mode::Help
+                | Mode::Filter
+                | Mode::Confirm
+                | Mode::Prompt
+        );
+        if self.pvc.active && !overlay {
+            self.leave_pvc_explore();
+        }
+    }
+
+    fn handle_msg_inner(&mut self, msg: Msg) {
         let preserve_selection = self.faults_filter_active()
             && matches!(
                 &msg,
@@ -964,19 +986,13 @@ impl App {
                         headers.get(i).cloned()
                     })
                     .is_some_and(|h| matches!(h.as_str(), "CPU" | "MEM" | "%CPU" | "%MEM"));
-                let filter_uses_metrics = match &*self.parsed_filter() {
-                    crate::filter::ParsedFilter::Structured(s) => {
-                        s.terms.iter().any(crate::filter::Term::metrics_sensitive)
-                    }
-                    _ => false,
-                };
                 if !data.is_empty() || !containers.is_empty() {
                     self.metrics_seen = true;
                 }
                 self.metrics_error = None;
                 self.metrics = data;
                 self.container_metrics = containers;
-                if sort_uses_metrics || filter_uses_metrics {
+                if sort_uses_metrics || self.parsed_filter().uses_metrics() {
                     self.invalidate_rows();
                 }
             }
@@ -995,11 +1011,15 @@ impl App {
             }
             Msg::PrinterColumns {
                 generation,
-                plural,
+                resource,
                 view,
             } if generation == self.generation => {
-                let for_current = plural == self.kind_plural;
-                self.crd_views.insert(plural, *view);
+                let for_current = self
+                    .kind
+                    .as_ref()
+                    .is_some_and(|kind| kind.resource_key() == resource)
+                    && resource.resource == self.kind_plural;
+                self.crd_views.insert(resource, *view);
                 if for_current {
                     self.refresh_view_spec();
                     // A remembered sort on a printer column only becomes
@@ -1063,10 +1083,16 @@ impl App {
             }
             Msg::Explain {
                 generation,
+                request,
                 claim,
                 title,
+                source,
                 findings,
-            } if generation == self.generation => {
+            } if generation == self.generation && request == self.explain_request => {
+                self.explain_claim = None;
+                if let Some(source) = source {
+                    self.explain_source = Some(*source);
+                }
                 self.explain_items = findings;
                 self.explain_title = title;
                 // Land the cursor on the first navigable finding, else the top.
@@ -1077,17 +1103,22 @@ impl App {
                     .unwrap_or(0);
                 self.explain_state
                     .select((!self.explain_items.is_empty()).then_some(first));
-                self.mode = Mode::Explain;
                 // As in the `Msg::Gitops` arm below: the "explaining X…"
                 // progress flash has done its job now the findings are up.
                 self.clear_claimed_status(claim);
             }
             Msg::Gitops {
                 generation,
+                request,
                 claim,
                 title,
+                source,
                 findings,
-            } if generation == self.generation => {
+            } if generation == self.generation && request == self.gitops_request => {
+                self.gitops_claim = None;
+                if let Some(source) = source {
+                    self.gitops_source = Some(*source);
+                }
                 self.gitops_items = findings;
                 self.gitops_title = title;
                 let first = self
@@ -1097,7 +1128,6 @@ impl App {
                     .unwrap_or(0);
                 self.gitops_state
                     .select((!self.gitops_items.is_empty()).then_some(first));
-                self.mode = Mode::Gitops;
                 self.clear_claimed_status(claim);
             }
             Msg::PluginOutput {
@@ -1260,9 +1290,72 @@ impl App {
                 claim,
                 result,
             } if generation == self.generation => match result {
-                Ok(summary) => self.set_claimed_status(claim, summary, false),
+                Ok(summary) => {
+                    self.set_claimed_status(claim, summary, false);
+                    // A copy made in the PVC browser changed one of the two
+                    // panes; show the file where it landed.
+                    self.refresh_pvc_panes();
+                }
                 Err(e) => self.set_claimed_status(claim, format!("cp failed: {e}"), true),
             },
+            // Deliberately not generation-guarded: a helper pod may already
+            // exist by the time this lands, and the stale branch is the only
+            // thing that can clean it up.
+            Msg::PvcTarget {
+                generation,
+                run,
+                namespace,
+                context,
+                claim,
+                result,
+            } => {
+                if generation == self.generation {
+                    self.handle_pvc_target(run, namespace, claim, result);
+                } else {
+                    self.discard_pvc_target(namespace, context, result);
+                }
+            }
+            Msg::PvcListing {
+                generation,
+                run,
+                path,
+                result,
+            } => {
+                if generation == self.generation {
+                    self.handle_pvc_listing(run, path, result);
+                } else if run == self.pvc.run {
+                    // A watch restart under an in-flight listing. The result
+                    // belongs to a generation that is over, but the pane is
+                    // still waiting on it — without this it says "loading…"
+                    // until the user presses `r`.
+                    self.pvc.loading = false;
+                }
+            }
+            Msg::PvcHelpersCleaned {
+                generation,
+                claim,
+                deleted,
+                failed,
+            } if generation == self.generation => {
+                if failed.is_empty() {
+                    self.set_claimed_status(
+                        claim,
+                        format!("removed {deleted} PVC helper pod(s)"),
+                        false,
+                    );
+                } else {
+                    let shown: Vec<&str> = failed.iter().take(3).map(String::as_str).collect();
+                    self.set_claimed_status(
+                        claim,
+                        format!(
+                            "pvc-clean: removed {deleted}, {} failed — {}",
+                            failed.len(),
+                            shown.join("; ")
+                        ),
+                        true,
+                    );
+                }
+            }
             Msg::LogsSaved {
                 generation,
                 claim,
