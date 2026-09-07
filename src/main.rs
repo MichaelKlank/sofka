@@ -178,6 +178,13 @@ async fn run_main(args: Args) -> Result<()> {
         }
     };
     cluster.allow_v1_client_cert = args.allow_v1_client_cert;
+    for w in cluster
+        .discovery_fallback
+        .iter()
+        .chain(&cluster.discovery_warnings)
+    {
+        eprintln!("\x1b[33mwarning:\x1b[0m {w}");
+    }
     // Per-cluster/per-context override files merge over the base config.
     let resolved = loader.resolve(&cluster.context, &cluster.cluster_name);
     for w in &resolved.warnings {
@@ -205,6 +212,11 @@ async fn run_main(args: Args) -> Result<()> {
             "  kinds:      {} resource types discovered",
             cluster.catalog.len()
         );
+        let not_read = cluster.discovery_warnings.len();
+        if not_read > 0 {
+            let noun = if not_read == 1 { "group" } else { "groups" };
+            println!("  not read:   {not_read} API {noun}. Refer to the warnings above.");
+        }
         for alias in ["pods", "po", "dp", "svc", "no", "ns", "cm"] {
             match cluster.resolve(alias) {
                 Some(k) => println!(
@@ -377,6 +389,7 @@ async fn run_main(args: Args) -> Result<()> {
         app.flash = w.clone();
         app.flash_err = true;
     }
+    app.flash_discovery_warnings();
 
     if args.snapshot {
         return snapshot(&mut app, &mut rx).await;

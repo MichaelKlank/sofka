@@ -43,6 +43,12 @@ impl App {
             "  discovery:   {} resource kinds",
             self.cluster.catalog.len()
         ));
+        if let Some(note) = &self.cluster.discovery_fallback {
+            lines.push(format!("    • {note}"));
+        }
+        for w in &self.cluster.discovery_warnings {
+            lines.push(format!("    • {w}"));
+        }
         lines.push(format!(
             "  metrics API: {}",
             if self.metrics_seen {
@@ -142,6 +148,17 @@ impl App {
             ..Default::default()
         };
         self.mode = Mode::Detail;
+    }
+
+    pub fn flash_discovery_warnings(&mut self) {
+        let n = self.cluster.discovery_warnings.len();
+        if n == 0 || self.flash_err {
+            return;
+        }
+        let noun = if n == 1 { "group" } else { "groups" };
+        self.flash_warn(&format!(
+            "API discovery could not read {n} API {noun}. Refer to :info for details."
+        ));
     }
 }
 

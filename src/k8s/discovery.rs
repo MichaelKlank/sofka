@@ -13,11 +13,25 @@ pub(super) struct Resource {
     pub short_names: Vec<String>,
 }
 
+pub(super) struct Discovered {
+    pub resources: Vec<Resource>,
+    pub skipped: Vec<String>,
+    pub fallback: Option<String>,
+}
+
 // Keep short names from the wire documents. kube's Discovery conversion drops them.
-pub(super) async fn discover(client: &Client) -> Result<Vec<Resource>> {
+pub(super) async fn discover(client: &Client) -> Result<Discovered> {
+    let mut skipped = Vec::new();
+    let mut fallback = None;
     let mut resources = match aggregated(client).await {
-        Ok(resources) => resources,
-        Err(_) => legacy(client).await.context("running API discovery")?,
+        Ok(Some(resources)) => resources,
+        Ok(None) => legacy(client, &mut skipped).await?,
+        Err(e) => {
+            fallback = Some(format!(
+                "Aggregated API discovery failed: {e}. Sofka read each API group separately."
+            ));
+            legacy(client, &mut skipped).await?
+        }
     };
     // Select the most stable served version of each kind, including kinds absent
     // from the group's preferred version.
@@ -30,21 +44,24 @@ pub(super) async fn discover(client: &Client) -> Result<Vec<Resource>> {
     });
     resources
         .dedup_by(|a, b| a.kind.ar.group == b.kind.ar.group && a.kind.ar.kind == b.kind.ar.kind);
-    Ok(resources)
+    Ok(Discovered {
+        resources,
+        skipped,
+        fallback,
+    })
 }
 
-async fn aggregated(client: &Client) -> Result<Vec<Resource>> {
+async fn aggregated(client: &Client) -> Result<Option<Vec<Resource>>> {
     let groups = client.list_api_groups_aggregated().await?;
     let core = client.list_core_api_versions_aggregated().await?;
     // Legacy responses deserialize as empty lists when negotiation is unsupported.
-    ensure!(
-        !groups.items.is_empty() || !core.items.is_empty(),
-        "aggregated discovery is unavailable"
-    );
+    if groups.items.is_empty() && core.items.is_empty() {
+        return Ok(None);
+    }
     let mut resources = Vec::new();
     append_aggregated(&mut resources, groups)?;
     append_aggregated(&mut resources, core)?;
-    Ok(resources)
+    Ok(Some(resources))
 }
 
 fn append_aggregated(out: &mut Vec<Resource>, list: APIGroupDiscoveryList) -> Result<()> {
@@ -80,28 +97,44 @@ fn append_aggregated(out: &mut Vec<Resource>, list: APIGroupDiscoveryList) -> Re
     Ok(())
 }
 
-async fn legacy(client: &Client) -> Result<Vec<Resource>> {
+async fn legacy(client: &Client, skipped: &mut Vec<String>) -> Result<Vec<Resource>> {
     let mut resources = Vec::new();
-    for group in client.list_api_groups().await?.groups {
-        ensure!(
-            !group.versions.is_empty(),
-            "empty API group: {}",
-            group.name
-        );
+    for group in client
+        .list_api_groups()
+        .await
+        .context("running API discovery")?
+        .groups
+    {
+        if group.versions.is_empty() {
+            skipped.push(format!(
+                "API discovery could not read {}: the group has no versions",
+                group.name
+            ));
+            continue;
+        }
         for version in group.versions {
-            let list = client
-                .list_api_group_resources(&version.group_version)
-                .await?;
-            append_legacy(&mut resources, list)?;
+            let gv = version.group_version;
+            let result = match client.list_api_group_resources(&gv).await {
+                Ok(list) => append_legacy(&mut resources, list),
+                Err(e) => Err(e.into()),
+            };
+            if let Err(e) = result {
+                skipped.push(format!("API discovery could not read {gv}: {e}"));
+            }
         }
     }
-    let core = client.list_core_api_versions().await?;
+    let core = client
+        .list_core_api_versions()
+        .await
+        .context("running API discovery")?;
     ensure!(!core.versions.is_empty(), "empty core API group");
     for version in core.versions {
-        append_legacy(
-            &mut resources,
-            client.list_core_api_resources(&version).await?,
-        )?;
+        let list = client
+            .list_core_api_resources(&version)
+            .await
+            .with_context(|| format!("running API discovery: reading core API group {version}"))?;
+        append_legacy(&mut resources, list)
+            .with_context(|| format!("running API discovery: reading core API group {version}"))?;
     }
     Ok(resources)
 }

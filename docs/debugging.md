@@ -175,6 +175,15 @@ counts, and the state/snapshot/bundle directories. `sofka --info` prints the
 static subset without connecting to a cluster. Identifiers and counts only,
 never credentials, tokens, or Secret values.
 
+If a kind is missing, check the discovery line first. When sofka cannot read an
+API group, it shows a warning at startup:
+`warning: API discovery could not read <group>/<version>: <reason>`. `:info`
+shows the same warnings under the cluster discovery status. `sofka --check`
+also prints the warnings and the number of API groups that sofka did not read.
+Sofka cannot skip the core API group. If it cannot read `v1`, the connection
+fails with the reason. If aggregated discovery fails, sofka shows the reason
+and reads each API group separately.
+
 ## X.509 v1 client certificates
 
 Some MicroK8s kubeconfigs contain an X.509 v1 client certificate. The standard

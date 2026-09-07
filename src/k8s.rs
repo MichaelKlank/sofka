@@ -107,6 +107,8 @@ pub struct Cluster {
     /// unknown, supported, or unsupported. Shared by all view watches so one
     /// negotiation failure avoids retrying the extension on every switch.
     streaming_lists: Arc<AtomicU8>,
+    pub discovery_warnings: Vec<String>,
+    pub discovery_fallback: Option<String>,
 }
 
 const STREAMING_UNKNOWN: u8 = 0;
@@ -183,6 +185,8 @@ impl Cluster {
             connected: true,
             allow_v1_client_cert,
             streaming_lists: Arc::new(AtomicU8::new(STREAMING_UNKNOWN)),
+            discovery_warnings: Vec::new(),
+            discovery_fallback: None,
         };
         // Version is useful metadata, not a connectivity prerequisite. Fetch
         // it alongside discovery so it adds no serial startup latency, and
@@ -250,6 +254,8 @@ impl Cluster {
             connected: false,
             allow_v1_client_cert: false,
             streaming_lists: Arc::new(AtomicU8::new(STREAMING_UNKNOWN)),
+            discovery_warnings: Vec::new(),
+            discovery_fallback: None,
         }
     }
 
@@ -283,8 +289,10 @@ impl Cluster {
     async fn discover(&mut self) -> Result<()> {
         // Aggregated discovery needs two requests and tolerates stale APIService
         // entries. Legacy discovery is used when negotiation fails.
-        let resources = discovery::discover(&self.client).await?;
-        self.register_resources(resources);
+        let discovered = discovery::discover(&self.client).await?;
+        self.discovery_warnings = discovered.skipped;
+        self.discovery_fallback = discovered.fallback;
+        self.register_resources(discovered.resources);
         Ok(())
     }
 
@@ -621,6 +629,8 @@ impl Cluster {
             registry: HashMap::new(),
             catalog: Vec::new(),
             streaming_lists: Arc::new(AtomicU8::new(STREAMING_UNKNOWN)),
+            discovery_warnings: Vec::new(),
+            discovery_fallback: None,
         };
         cluster.register_kind("", "Pod", "pods", true);
         cluster.register_kind("apps", "Deployment", "deployments", true);
@@ -941,16 +951,37 @@ pub(crate) mod tests {
         include_broken: bool,
         serve_version: bool,
     ) -> String {
-        mock_apiserver_with_requests(supports_aggregated, include_broken, serve_version)
-            .await
-            .0
+        mock_apiserver_with_requests(MockOptions {
+            supports_aggregated,
+            include_broken,
+            serve_version,
+            ..MockOptions::default()
+        })
+        .await
+        .0
+    }
+
+    #[derive(Clone, Copy, Default)]
+    pub(crate) struct MockOptions {
+        pub supports_aggregated: bool,
+        pub include_broken: bool,
+        pub serve_version: bool,
+        pub core_unreadable: bool,
+        pub aggregated_unreadable: bool,
+    }
+
+    pub(crate) async fn mock_apiserver_opts(opts: MockOptions) -> String {
+        mock_apiserver_with_requests(opts).await.0
     }
 
     async fn mock_apiserver_with_requests(
-        supports_aggregated: bool,
-        include_broken: bool,
-        serve_version: bool,
+        opts: MockOptions,
     ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let MockOptions {
+            supports_aggregated,
+            serve_version,
+            ..
+        } = opts;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -960,8 +991,9 @@ pub(crate) mod tests {
             .expect("bind mock apiserver");
         let addr = listener.local_addr().expect("local addr");
 
-        fn route(path: &str, aggregated: bool, include_broken: bool) -> (&'static str, String) {
-            let broken_legacy = r#",{"name":"broken.example.com","versions":[{"groupVersion":"broken.example.com/v1beta1","version":"v1beta1"}],"preferredVersion":{"groupVersion":"broken.example.com/v1beta1","version":"v1beta1"}}"#;
+        fn route(path: &str, aggregated: bool, opts: MockOptions) -> (&'static str, String) {
+            let include_broken = opts.include_broken;
+            let broken_legacy = r#",{"name":"broken.example.com","versions":[{"groupVersion":"broken.example.com/v1beta1","version":"v1beta1"}],"preferredVersion":{"groupVersion":"broken.example.com/v1beta1","version":"v1beta1"}},{"name":"odd.example.com","versions":[{"groupVersion":"odd.example.com/v1alpha3","version":"v1alpha3"}],"preferredVersion":{"groupVersion":"odd.example.com/v1alpha3","version":"v1alpha3"}}"#;
             let broken_v2 = r#",{"metadata":{"name":"broken.example.com"},"versions":[{"version":"v1beta1","resources":[],"freshness":"Stale"}]}"#;
             // A mixed-version group modeled on the netbird.io operator: the
             // preferred version (v1) serves `widgets`, while `gadgets` is
@@ -972,6 +1004,14 @@ pub(crate) mod tests {
             let capi_legacy = r#",{"name":"cluster.x-k8s.io","versions":[{"groupVersion":"cluster.x-k8s.io/v1beta1","version":"v1beta1"}],"preferredVersion":{"groupVersion":"cluster.x-k8s.io/v1beta1","version":"v1beta1"}}"#;
             let capi_v2 = r#",{"metadata":{"name":"cluster.x-k8s.io"},"versions":[{"version":"v1beta1","freshness":"Current","resources":[{"resource":"machinedeployments","responseKind":{"kind":"MachineDeployment"},"scope":"Namespaced","shortNames":["md","cross"],"verbs":["get","list","watch"]},{"resource":"machinedrainrules","responseKind":{"kind":"MachineDrainRule"},"scope":"Namespaced","verbs":["get","list","watch"]}]}]}"#;
             match (path, aggregated) {
+                ("/apis", true) if opts.aggregated_unreadable => (
+                    "200 OK",
+                    r#"{"kind":"APIGroupDiscoveryList","apiVersion":"apidiscovery.k8s.io/v2","metadata":{},"items":[{"metadata":{"name":"apps"},"versions":"not-a-list"}]}"#.into(),
+                ),
+                ("/api/v1", _) if opts.core_unreadable => (
+                    "200 OK",
+                    r#"{"kind":"APIResourceList","apiVersion":"v1alpha3","groupVersion":"v1","resources":[]}"#.into(),
+                ),
                 ("/version", _) => (
                     "200 OK",
                     r#"{"major":"1","minor":"36","gitVersion":"v1.36.2-eks-bca9cf6","gitCommit":"abc123","gitTreeState":"clean","buildDate":"2026-08-20T00:00:00Z","goVersion":"go1.25.0","compiler":"gc","platform":"linux/amd64"}"#.into(),
@@ -1017,6 +1057,10 @@ pub(crate) mod tests {
                 ("/apis/mixed.example.com/v1alpha1", _) => (
                     "200 OK",
                     r#"{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"mixed.example.com/v1alpha1","resources":[{"name":"gadgets","singularName":"gadget","shortNames":["gd","shared"],"namespaced":true,"kind":"Gadget","verbs":["get","list","watch"]}]}"#.into(),
+                ),
+                ("/apis/odd.example.com/v1alpha3", _) => (
+                    "200 OK",
+                    r#"{"kind":"APIResourceList","apiVersion":"v1alpha3","groupVersion":"odd.example.com/v1alpha3","resources":[{"name":"oddities","singularName":"oddity","namespaced":true,"kind":"Oddity","verbs":["get","list","watch"]}]}"#.into(),
                 ),
                 ("/apis/broken.example.com/v1beta1", _) => (
                     "503 Service Unavailable",
@@ -1069,11 +1113,8 @@ pub(crate) mod tests {
                         if path == "/version" && !serve_version {
                             continue;
                         }
-                        let (status, body) = route(
-                            &path,
-                            wants_aggregated && supports_aggregated,
-                            include_broken,
-                        );
+                        let (status, body) =
+                            route(&path, wants_aggregated && supports_aggregated, opts);
                         let response = format!(
                             "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
                             body.len()
@@ -1100,7 +1141,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn short_names_do_not_need_extra_discovery_requests() {
         for aggregated in [true, false] {
-            let (url, requests) = mock_apiserver_with_requests(aggregated, false, true).await;
+            let (url, requests) = mock_apiserver_with_requests(MockOptions {
+                supports_aggregated: aggregated,
+                serve_version: true,
+                ..MockOptions::default()
+            })
+            .await;
             let cluster = connect_mock(url).await.unwrap();
             assert_eq!(cluster.resolve("md").unwrap().ar.kind, "MachineDeployment");
             let mut requests = requests.lock().unwrap().clone();
@@ -1133,6 +1179,8 @@ pub(crate) mod tests {
             .expect("connect with broken APIService");
         assert!(cluster.resolve("deployments").is_some());
         assert!(cluster.resolve("pods").is_some());
+        assert!(cluster.discovery_warnings.is_empty());
+        assert!(cluster.discovery_fallback.is_none());
     }
 
     #[test]
@@ -1178,6 +1226,8 @@ pub(crate) mod tests {
             .expect("connect via legacy discovery walk");
         assert!(cluster.resolve("deployments").is_some());
         assert!(cluster.resolve("pods").is_some());
+        assert!(cluster.discovery_warnings.is_empty());
+        assert!(cluster.discovery_fallback.is_none());
     }
 
     /// Asserts every kind of the mixed-version group resolved: `widgets` at
@@ -1216,13 +1266,73 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_walk_still_fails_on_broken_apiservice() {
-        // Documents the failure mode the aggregated path exists to avoid:
-        // the per-group walk hits the broken group's 503 and discovery fails
-        // (after ~4 minutes of client-side 503 retries with the default
-        // config). If kube-rs ever makes run() tolerant, this starts failing
-        // and the aggregated workaround can be simplified.
+    async fn legacy_walk_skips_unreadable_groups_with_warnings() {
         let url = mock_apiserver(false, true, true).await;
-        assert!(connect_mock(url).await.is_err());
+        let cluster = connect_mock(url)
+            .await
+            .expect("connect despite unreadable groups");
+        assert!(cluster.resolve("deployments").is_some());
+        assert!(cluster.resolve("pods").is_some());
+        assert!(cluster.resolve("oddities").is_none());
+        let warnings = &cluster.discovery_warnings;
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("API discovery could not read broken.example.com/v1beta1: ")),
+            "{warnings:?}"
+        );
+        let odd = warnings
+            .iter()
+            .find(|w| w.starts_with("API discovery could not read odd.example.com/v1alpha3: "))
+            .expect("v1alpha3 group is named");
+        assert!(odd.contains("expected v1"), "{odd}");
+        assert_eq!(odd.matches("expected v1").count(), 1, "{odd}");
+        assert!(cluster.discovery_fallback.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_walk_fails_when_the_core_group_is_unreadable() {
+        let url = mock_apiserver_opts(MockOptions {
+            supports_aggregated: false,
+            serve_version: true,
+            core_unreadable: true,
+            ..MockOptions::default()
+        })
+        .await;
+        let err = connect_mock(url)
+            .await
+            .err()
+            .expect("a cluster without a readable core group is unusable");
+        let text = format!("{err:#}");
+        assert!(text.contains("reading core API group v1"), "{text}");
+        assert!(text.contains("expected v1"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn failed_aggregated_discovery_is_reported_but_not_counted_as_skipped() {
+        let url = mock_apiserver_opts(MockOptions {
+            supports_aggregated: true,
+            serve_version: true,
+            aggregated_unreadable: true,
+            ..MockOptions::default()
+        })
+        .await;
+        let cluster = connect_mock(url).await.expect("legacy walk still connects");
+        assert!(cluster.resolve("deployments").is_some());
+        assert!(cluster.resolve("pods").is_some());
+        assert!(cluster.discovery_warnings.is_empty());
+        let note = cluster
+            .discovery_fallback
+            .as_deref()
+            .expect("the fallback reason is kept");
+        assert!(
+            note.starts_with("Aggregated API discovery failed: "),
+            "{note}"
+        );
+        assert!(
+            note.ends_with("Sofka read each API group separately."),
+            "{note}"
+        );
     }
 }
