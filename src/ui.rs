@@ -495,10 +495,6 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
             hint_line(&[("y", "yaml"), ("d", "describe"), ("e", "edit")]),
             hint_line(&[("Y", "copy cell"), ("^d", "delete")]),
         ],
-        "machinedeployments" => vec![
-            hint_line(&[("⏎", "machines"), ("y", "yaml"), ("d", "describe")]),
-            hint_line(&[("e", "edit"), ("^d", "delete")]),
-        ],
         "nodes" => vec![
             hint_line(&[("⏎", "pods"), ("y", "yaml"), ("d", "describe")]),
             hint_line(&[("C", "cordon"), ("U", "uncordon"), ("D", "drain")]),
@@ -537,6 +533,17 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
             hint_line(&[("^d", "delete")]),
         ],
     };
+    if app.kind_plural == "machinedeployments"
+        && app
+            .kind
+            .as_ref()
+            .is_some_and(|k| k.ar.group == "cluster.x-k8s.io")
+    {
+        lines = vec![
+            hint_line(&[("⏎", "machines"), ("y", "yaml"), ("d", "describe")]),
+            hint_line(&[("e", "edit"), ("^d", "delete")]),
+        ];
+    }
     if app.flux_suspendable() {
         lines.push(hint_line(&[("t", "flux menu")]));
     }

@@ -3358,6 +3358,36 @@ async fn machinedeployment_drill_resolves_qualified_machine_group() {
 }
 
 #[tokio::test]
+async fn non_capi_machinedeployments_falls_through_to_yaml() {
+    let (mut app, _rx) = test_app();
+    app.cluster.register_kind(
+        "other.example.com",
+        "MachineDeployment",
+        "machinedeployments",
+        true,
+    );
+    app.switch_kind("machinedeployments");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "other.example.com/v1", "kind": "MachineDeployment",
+            "metadata": {"name": "md-1", "namespace": "default"},
+            "spec": {"selector": {"matchLabels": {"app": "web"}}}
+        }),
+    );
+    app.table_state.select(Some(0));
+
+    // Enter on a non-CAPI machinedeployments opens YAML, not Cluster API
+    // Machines — the group guard prevents the CAPI drill from firing.
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Detail, "opens YAML, not machines");
+    assert_eq!(
+        app.kind_plural, "machinedeployments",
+        "stays on machinedeployments"
+    );
+}
+
+#[tokio::test]
 async fn o_on_pod_scopes_to_its_host_node() {
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");

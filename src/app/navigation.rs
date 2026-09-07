@@ -34,19 +34,6 @@ impl App {
                 Some(sel) => self.drill_to_pods(ns, Some(sel), None, format!("svc/{name}")),
                 None => self.flash_warn("service has no selector"),
             },
-            // Cluster API: MachineDeployment → Machines, same selector
-            // pattern as workload → pods. Use the qualified name so a
-            // bare `machines` registered by an unrelated CRD can't hijack it.
-            "machinedeployments" => match label_selector(&obj, "matchLabels") {
-                Some(sel) => self.drill_to(
-                    "machines.cluster.x-k8s.io",
-                    ns,
-                    Some(sel),
-                    None,
-                    format!("machinedeployment/{name}"),
-                ),
-                None => self.flash_warn("no machine selector on this object"),
-            },
             "pods" => self.open_containers(&obj),
             "cronjobs" => self.drill_into_cronjob_jobs(&obj),
             // enter on a CRD lists its custom resources, not its YAML.
@@ -62,7 +49,28 @@ impl App {
             // names a node (`[views."…"].node`) drills into it. Pods name one
             // too, but they drill into containers above.
             _ => {
-                if let Some(drill) = self.configured_drill() {
+                // Cluster API: MachineDeployment → Machines, same selector
+                // pattern as workload → pods. Guarded by the API group so a
+                // non-CAPI kind that happens to share the plural
+                // `machinedeployments` falls through to its configured drill
+                // or YAML instead of trying to open Cluster API Machines.
+                if self.kind_plural == "machinedeployments"
+                    && self
+                        .kind
+                        .as_ref()
+                        .is_some_and(|k| k.ar.group == "cluster.x-k8s.io")
+                {
+                    match label_selector(&obj, "matchLabels") {
+                        Some(sel) => self.drill_to(
+                            "machines.cluster.x-k8s.io",
+                            ns,
+                            Some(sel),
+                            None,
+                            format!("machinedeployment/{name}"),
+                        ),
+                        None => self.flash_warn("no machine selector on this object"),
+                    }
+                } else if let Some(drill) = self.configured_drill() {
                     self.drill_configured(&obj, &drill);
                 } else if let Some(pointer) = self.node_pointer() {
                     self.show_node_at(&pointer);
