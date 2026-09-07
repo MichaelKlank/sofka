@@ -20,6 +20,9 @@ character (`"g"`), a modifier combination (`"ctrl-g"`, `"alt-x"`, `"shift-b"`), 
 a function or named key (`"f5"`, `"ctrl-f2"`). A built-in key wins over a plugin
 on the same chord.
 
+For the minus key, use `"-"` alone or `"ctrl--"`, `"alt--"`, or `"ctrl-alt--"`
+with modifiers. The final two hyphens are the separator and the minus key.
+
 ```toml
 [[plugins]]
 key = "shift-y"
