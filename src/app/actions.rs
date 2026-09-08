@@ -1452,6 +1452,7 @@ impl App {
         self.namespace_favorites = resolved.config.favorite_namespaces;
         self.remember_sort = resolved.config.remember_sort.unwrap_or(true);
         self.hide_header = resolved.config.hide_header;
+        self.terminal_title = resolved.config.terminal_title.unwrap_or(true);
         self.plugins = resolved.config.plugins;
         self.bookmarks = resolved.config.bookmarks;
         self.workspaces = resolved.config.workspaces;

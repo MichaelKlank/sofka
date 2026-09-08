@@ -20968,3 +20968,58 @@ async fn timeline_key_keeps_recently_changed_history_at_capacity() {
         3
     );
 }
+
+#[tokio::test]
+async fn terminal_title_tracks_namespace_and_context() {
+    let (mut app, _rx) = test_app();
+    assert_eq!(app.terminal_title(), Some("sofka: test/default".into()));
+    palette(&mut app, "pods kube-system");
+    assert_eq!(app.terminal_title(), Some("sofka: test/kube-system".into()));
+    palette(&mut app, "pods all");
+    assert_eq!(app.terminal_title(), Some("sofka: test/all".into()));
+    palette(&mut app, "ctx prod");
+    land_context(&mut app, "prod");
+    assert_eq!(
+        app.terminal_title(),
+        Some(format!(
+            "sofka: prod/{}",
+            if app.namespace.is_empty() {
+                "all"
+            } else {
+                &app.namespace
+            }
+        ))
+    );
+}
+
+#[tokio::test]
+async fn terminal_title_setting_reloads_and_follows_context_overrides() {
+    let dir = std::env::temp_dir().join(format!("sofka-terminal-title-{}", std::process::id()));
+    write_config(&dir, "terminal_title = false\n");
+    write_config(
+        &dir.join("clusters/test-cluster/dev"),
+        "terminal_title = true\n",
+    );
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    palette(&mut app, "reload");
+    assert_eq!(app.terminal_title(), None);
+    palette(&mut app, "ctx dev");
+    land_context(&mut app, "dev");
+    assert!(app.terminal_title().unwrap().starts_with("sofka: dev/"));
+    palette(&mut app, "ctx prod");
+    land_context(&mut app, "prod");
+    assert_eq!(app.terminal_title(), None);
+    write_config(&dir, "");
+    palette(&mut app, "reload");
+    assert!(app.terminal_title().unwrap().starts_with("sofka: prod/"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn terminal_title_removes_control_characters() {
+    let (mut app, _rx) = test_app();
+    app.cluster.context = "dev\x1b\x07\n\u{009c}".into();
+    palette(&mut app, "pods kube-system");
+    assert_eq!(app.terminal_title(), Some("sofka: dev/kube-system".into()));
+}

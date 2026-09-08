@@ -17,6 +17,7 @@ readonly          = false  # true disables every mutating action (delete, edit,
 hide_header = false # true hides the header and logo
 mouse             = true   # false keeps the terminal's native mouse behavior
                            # (text selection) instead of scroll/click/sort
+terminal_title = true # false disables terminal title changes
 remember_sort     = true   # save and restore sort choices per resource kind
                            # false makes sort changes temporary
 
@@ -27,6 +28,14 @@ favorite_namespaces = ["kube-system", "monitoring"]
 [aliases]
 dep = "deployments"
 ```
+
+`terminal_title` is enabled by default. The title is `sofka: <context>/<namespace>`;
+`all` means all namespaces. It follows context and namespace changes, context
+overrides, and `:reload`. Sofka sets the title again after an external command
+returns. It clears the title when the setting is disabled, on normal exit, and
+on a fatal main-thread panic. It does not restore the title from before startup.
+Set `terminal_title = false` to keep your shell or terminal in control of the
+title. Headless modes do not change the title.
 
 Set `hide_header = true` to remove the header and logo and give more space to
 the active view. The default is `false`. This option supports cluster and

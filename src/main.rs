@@ -18,6 +18,8 @@ use sofka::{
     theme, thresholds, ui, views,
 };
 
+mod terminal_title;
+
 const EVENT_CHANNEL_CAP: usize = 4096;
 
 /// sofka: navigate, observe, and inspect your Kubernetes clusters.
@@ -304,6 +306,7 @@ async fn run_main(args: Args) -> Result<()> {
     app.sort_memory_path = Some(sort_memory_path);
     app.remember_sort = cfg.remember_sort.unwrap_or(true);
     app.hide_header = cfg.hide_header;
+    app.terminal_title = cfg.terminal_title.unwrap_or(true);
     // The last namespace picked per context persists too, so a relaunch (or
     // a `:ctx` switch back) lands where you left off.
     let namespace_memory_path = nsmem::NamespaceMemory::default_path();
@@ -440,6 +443,7 @@ async fn run_main(args: Args) -> Result<()> {
     // Disable before leaving the alternate screen so the shell never sees
     // mouse-report sequences (harmless if capture was never enabled).
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    terminal_title::clear();
     ratatui::restore();
     // `restore()` leaves the alternate screen but never re-shows the cursor
     // that `draw` hid, so without this the user's shell prompt has no cursor.
@@ -466,6 +470,7 @@ fn install_panic_hook(tx: mpsc::Sender<store::Msg>) {
             // alternate screen, and stray mouse reports would land in the
             // shell after a crash.
             let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+            terminal_title::clear();
             prev(info);
             let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
         } else {
@@ -942,6 +947,7 @@ fn take_suspend(terminal: &mut ratatui::DefaultTerminal, app: &mut App, captured
         app.flash = format!("ran: {}", argv.join(" "));
         app.flash_err = false;
         app.after_suspend();
+        terminal_title::set(app.terminal_title().as_deref());
     }
 }
 
@@ -968,11 +974,14 @@ async fn run(
     // while capture is released, which is the only time they can arrive.
     let mut repair = altscroll::Repair::default();
 
+    let mut title = terminal_title::Title::default();
     terminal.draw(|f| ui::draw(f, app))?;
     loop {
         if app.should_quit {
             return Ok(());
         }
+
+        title.update(app.terminal_title());
 
         if mouse && app.wants_mouse_capture() != captured {
             captured = !captured;
