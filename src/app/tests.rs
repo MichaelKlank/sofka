@@ -21595,6 +21595,48 @@ async fn every_builtin_action_has_the_same_effect_after_rebinding() {
 }
 
 #[tokio::test]
+async fn help_keeps_long_key_lists_separate_from_descriptions() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for width in [60, 100, 180] {
+        let (mut app, _rx) = test_app();
+        app.handle_key(press(KeyCode::Char('?'))).unwrap();
+        app.handle_key(press(KeyCode::Char('/'))).unwrap();
+        for c in "page down".chars() {
+            app.handle_key(press(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let descriptions: Vec<_> = rows
+            .iter()
+            .filter(|row| row.contains("page down"))
+            .filter(|row| row.contains("pagedown"))
+            .collect();
+        assert!(!descriptions.is_empty(), "{rows:#?}");
+        let column = descriptions[0].find("page down").unwrap();
+        for row in descriptions {
+            assert_eq!(row.find("page down"), Some(column), "{row}");
+            assert_eq!(&row[column - 2..column], "  ", "{row}");
+        }
+        assert!(
+            rows.iter().any(|row| row.contains("shift-pagedown")),
+            "{rows:#?}"
+        );
+        app.handle_key(press(KeyCode::End)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.help_scroll, app.help_max_scroll);
+    }
+}
+
+#[tokio::test]
 async fn custom_keys_are_visible_in_help_header_and_footer() {
     use ratatui::{Terminal, backend::TestBackend};
     let (mut app, _rx) = test_app();

@@ -2398,10 +2398,29 @@ fn value_style(value: &str) -> Style {
     Style::default().fg(theme::text())
 }
 
+fn wrap_help_span(span: Span<'static>, width: usize) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    let mut text = String::new();
+    for word in span.content.split_whitespace() {
+        if !text.is_empty() && text.width() + 1 + word.width() > width {
+            rows.extend(wrap_line(
+                Line::from(Span::styled(std::mem::take(&mut text), span.style)),
+                width,
+            ));
+        }
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(word);
+    }
+    rows.extend(wrap_line(Line::from(Span::styled(text, span.style)), width));
+    rows
+}
+
 fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
     let bind = |k: &str, d: &str| {
         Line::from(vec![
-            Span::styled(format!("  {k:<14}"), Style::default().fg(theme::yellow())),
+            Span::styled(k.to_string(), Style::default().fg(theme::yellow())),
             Span::styled(d.to_string(), theme::dim()),
         ])
     };
@@ -2568,6 +2587,15 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         app.keymap.label("help", Action::Close),
         "close help and return to the previous screen",
     ));
+    let width = usize::from(area.width.saturating_sub(2)).max(1);
+    let key_width = lines
+        .iter()
+        .filter(|line| line.spans.len() == 2)
+        .map(|line| line.spans[0].width())
+        .max()
+        .unwrap_or(14)
+        .min(width.saturating_sub(4) / 2)
+        .max(1);
     // `/` search: keep only matching binding lines (section headers and
     // spacers match like any other text), highlighting the matched runs.
     let needle = app.help_filter.to_lowercase();
@@ -2577,11 +2605,39 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         let shown: Vec<Line> = lines
             .into_iter()
             .filter(|l| line_text(l).to_lowercase().contains(&needle))
-            .map(|l| highlight_matches(l, &app.help_filter))
             .collect();
         let title = format!(" Help · /{} [{}] ", app.help_filter, shown.len());
         (shown, title)
     };
+    let lines: Vec<Line> = lines
+        .into_iter()
+        .flat_map(|line| {
+            if line.spans.len() != 2 {
+                return wrap_line(line, width);
+            }
+            let mut spans = line.spans.into_iter();
+            let keys = wrap_help_span(spans.next().unwrap(), key_width);
+            let descriptions = wrap_help_span(
+                spans.next().unwrap(),
+                width.saturating_sub(key_width + 4).max(1),
+            );
+            (0..keys.len().max(descriptions.len()))
+                .map(|i| {
+                    let mut row = vec![Span::raw("  ")];
+                    let used = keys.get(i).map_or(0, Line::width);
+                    if let Some(key) = keys.get(i) {
+                        row.extend(key.spans.clone());
+                    }
+                    row.push(Span::raw(" ".repeat(key_width.saturating_sub(used) + 2)));
+                    if let Some(description) = descriptions.get(i) {
+                        row.extend(description.spans.clone());
+                    }
+                    Line::from(row)
+                })
+                .collect()
+        })
+        .map(|line| highlight_matches(line, &app.help_filter))
+        .collect();
     // Record the content height for paging and clamp the offset after layout changes.
     let inner_h = area.height.saturating_sub(2);
     app.help_viewport_h = inner_h;
