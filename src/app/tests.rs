@@ -1226,6 +1226,32 @@ async fn filter_match_indices_highlight_matched_chars() {
 }
 
 #[tokio::test]
+async fn fuzzy_filter_highlights_complete_graphemes_at_char_positions() {
+    let (mut app, _rx) = test_app();
+    let cases = [
+        ("test-e\u{0301}lastic-role", "lastic", "lastic"),
+        ("test-e\u{0301}lastic-role", "elastic", "e\u{0301}lastic"),
+        ("a\u{0301}b\u{0308}c-role", "ac", "a\u{0301}c"),
+        ("test-👩‍💻-role", "role", "role"),
+        ("test-👩‍💻-role", "👩", "👩‍💻"),
+        ("test-élastic-role", "lastic", "lastic"),
+        ("test-elastic-role", "lastic", "lastic"),
+    ];
+    for (name, filter, expected) in cases {
+        retype_filter(&mut app, filter);
+        let indices = app.filter_match_indices(name).unwrap();
+        let highlighted: String = name
+            .chars()
+            .enumerate()
+            .filter(|(i, _)| indices.contains(i))
+            .map(|(_, ch)| ch)
+            .collect();
+        assert_eq!(highlighted, expected, "name={name:?}, filter={filter:?}");
+        assert!(indices.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+}
+
+#[tokio::test]
 async fn table_cell_cache_invalidates_on_apply() {
     let (mut app, _rx) = test_app();
     app.kind_plural = "pods".into();
@@ -20897,5 +20923,48 @@ async fn adjacent_c_incomplete_empty_results_remain_visible_without_a_flash() {
     assert!(
         !screen.contains("nothing connected to this object was found"),
         "{screen}"
+    );
+}
+
+#[tokio::test]
+async fn timeline_key_keeps_recently_changed_history_at_capacity() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let pod = |name: &str, generation: i64| {
+        json!({"apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": name, "namespace": "default",
+                "generation": generation, "resourceVersion": generation.to_string(),
+                "creationTimestamp": "2999-01-01T00:00:00Z"}})
+    };
+    apply(&mut app, pod("a-active", 1));
+    for i in 0..1999 {
+        apply(&mut app, pod(&format!("idle-{i:04}"), 1));
+    }
+    for generation in 2..=3 {
+        apply(&mut app, pod("a-active", generation));
+    }
+    apply(&mut app, pod("z-new", 1));
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::Char('T'))).unwrap();
+    assert_eq!(app.mode, Mode::Timeline);
+    let (plural, key) = app.timeline_target.as_ref().unwrap();
+    assert_eq!(key, "default/a-active");
+    let entries = app.timeline.entries(plural, key).unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].text, "Pod created");
+    assert_eq!(entries[2].text, "spec changed: generation 2 → 3");
+    assert!(app.timeline.entries("pods", "default/idle-0000").is_none());
+    assert!(app.timeline.entries("pods", "default/idle-0001").is_some());
+    assert!(app.timeline.entries("pods", "default/z-new").is_some());
+
+    apply(&mut app, pod("idle-0000", 2));
+    assert!(app.timeline.entries("pods", "default/idle-0000").is_some());
+    assert!(app.timeline.entries("pods", "default/idle-0001").is_none());
+    assert_eq!(
+        app.timeline
+            .entries("pods", "default/a-active")
+            .unwrap()
+            .len(),
+        3
     );
 }

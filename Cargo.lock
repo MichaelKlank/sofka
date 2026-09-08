@@ -3023,6 +3023,7 @@ dependencies = [
  "toml",
  "tower",
  "tower-http 0.7.1",
+ "unicode-segmentation",
  "unicode-width",
  "x509-parser",
 ]

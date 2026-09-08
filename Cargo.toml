@@ -41,6 +41,7 @@ tokio = { version = "1.52.3", features = ["full"] }
 toml = "1.1.2"
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.0", features = ["decompression-gzip", "trace", "util", "map-response-body"] }
+unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 x509-parser = { version = "0.18", default-features = false }
 
