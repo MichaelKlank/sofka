@@ -11194,6 +11194,62 @@ async fn help_search_uses_own_buffer() {
 }
 
 #[tokio::test]
+async fn help_search_keeps_section_headings_with_matching_bindings() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for filter in ["enter", "Keys: detail", "no-such-help-entry"] {
+        let (mut app, _rx) = test_app();
+        app.handle_key(press(KeyCode::Char('?'))).unwrap();
+        app.handle_key(press(KeyCode::Char('/'))).unwrap();
+        for c in filter.chars() {
+            app.handle_key(press(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 120)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(120)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let text = rows.join("\n");
+        if filter == "enter" {
+            let mut matches = 1; // The command section heading also matches.
+            for (scope, action, _) in app.keymap.entries() {
+                let label = app.keymap.label(scope, action);
+                if !label.contains("enter") {
+                    continue;
+                }
+                matches += 1;
+                let heading = format!("Keys: {scope}");
+                let positions: Vec<_> = rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| row.contains(&heading))
+                    .map(|(i, _)| i)
+                    .collect();
+                assert_eq!(positions.len(), 1, "{heading}: {text}");
+                let binding = &rows[positions[0] + 1];
+                assert!(binding.contains(label), "{heading}: {binding}");
+                assert!(binding.contains(action.description()), "{binding}");
+            }
+            assert!(text.contains(&format!("/enter [{matches}]")), "{text}");
+            assert!(!text.contains("Keys: detail"), "{text}");
+            assert!(!text.contains("decode secret"), "{text}");
+        } else if filter == "Keys: detail" {
+            assert!(text.contains("/Keys: detail [1]"), "{text}");
+            assert!(rows.iter().any(|row| row.contains("  Keys: detail")));
+            assert!(!text.contains("decode secret"), "{text}");
+        } else {
+            assert!(text.contains("/no-such-help-entry [0]"), "{text}");
+            assert!(!text.contains("Keys:"), "{text}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn help_pages_use_the_rendered_height() {
     use ratatui::{Terminal, backend::TestBackend};
 

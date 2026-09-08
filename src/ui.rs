@@ -2612,17 +2612,40 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         .unwrap_or(14)
         .min(width.saturating_sub(4) / 2)
         .max(1);
-    // `/` search: keep only matching binding lines (section headers and
-    // spacers match like any other text), highlighting the matched runs.
+    // Keep section headings with matching entries so each binding has context.
     let needle = app.help_filter.to_lowercase();
     let (lines, title) = if needle.is_empty() {
         (lines, " Help ".to_string())
     } else {
-        let shown: Vec<Line> = lines
-            .into_iter()
-            .filter(|l| line_text(l).to_lowercase().contains(&needle))
-            .collect();
-        let title = format!(" Help · /{} [{}] ", app.help_filter, shown.len());
+        let mut shown = Vec::new();
+        let mut heading = None;
+        let mut matches = 0;
+        for line in lines {
+            let text = line_text(&line);
+            if text.is_empty() {
+                continue;
+            }
+            let matched = text.to_lowercase().contains(&needle);
+            let binding = if line.spans.len() != 2 {
+                heading = Some(line);
+                None
+            } else {
+                Some(line)
+            };
+            if matched {
+                matches += 1;
+                if let Some(heading) = heading.take() {
+                    if !shown.is_empty() {
+                        shown.push(Line::default());
+                    }
+                    shown.push(heading);
+                }
+                if let Some(binding) = binding {
+                    shown.push(binding);
+                }
+            }
+        }
+        let title = format!(" Help · /{} [{}] ", app.help_filter, matches);
         (shown, title)
     };
     let lines: Vec<Line> = lines
