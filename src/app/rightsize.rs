@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::columns::{fmt_cpu, fmt_mem, parse_cpu_milli, parse_mem_bytes};
-use crate::rightsize::{ContainerRec, Quantiles, patch_preview, suggest};
+use crate::rightsize::{ContainerRec, PatchTarget, Quantiles, patch_preview, suggest};
 
 /// One container's spec pulled off the selected object before the gather.
 struct ContainerSpec {
@@ -21,20 +21,20 @@ impl App {
         };
         let name = obj.metadata.name.clone().unwrap_or_default();
         let ns = obj.metadata.namespace.clone().unwrap_or_default();
-        // Container list + a PromQL `pod` matcher: a bare pod matches exactly;
-        // a workload matches its replica pods by name prefix.
-        let (path, pod_matcher) = match self.kind_plural.as_str() {
-            "pods" => ("/spec/containers", format!("^{}$", regex_escape(&name))),
-            "deployments" | "statefulsets" | "daemonsets" | "replicasets" => (
-                "/spec/template/spec/containers",
-                format!("^{}-.*", regex_escape(&name)),
-            ),
+        // Match the controller's generated suffix, including past rollouts.
+        // A prefix alone also includes workloads such as api-worker under api.
+        let (target, suffix) = match self.kind_plural.as_str() {
+            "pods" => (PatchTarget::Pod, ""),
+            "deployments" => (PatchTarget::Workload, "-[a-z0-9]{1,10}-[a-z0-9]{5}"),
+            "statefulsets" => (PatchTarget::Workload, "-[0-9]+"),
+            "daemonsets" | "replicasets" => (PatchTarget::Workload, "-[a-z0-9]{5}"),
             _ => {
                 self.flash_warn("right-size applies to workloads (deploy/sts/ds/rs) and pods");
                 return;
             }
         };
-        let containers = container_specs(obj, path);
+        let pod_matcher = format!("^{}{suffix}$", regex::escape(&name));
+        let containers = container_specs(obj, target.containers_path());
         if containers.is_empty() {
             self.flash_warn("no containers found to right-size");
             return;
@@ -92,7 +92,14 @@ impl App {
                 errors.extend(errs);
             }
 
-            let lines = render_report(&provider.location(), &window, headroom, &recs, &errors);
+            let lines = render_report(
+                &provider.location(),
+                &window,
+                headroom,
+                &recs,
+                &errors,
+                target,
+            );
             let warn =
                 (!errors.is_empty()).then(|| format!("{} metrics queries failed", errors.len()));
             let _ = tx
@@ -121,8 +128,10 @@ async fn gather_container(
     headroom: u32,
 ) -> (ContainerRec, Vec<String>) {
     let sel = format!(
-        "namespace=\"{ns}\",pod=~\"{pod_matcher}\",container=\"{}\"",
-        spec.name
+        "namespace={},pod=~{},container={}",
+        json!(ns),
+        json!(pod_matcher),
+        json!(spec.name),
     );
     let cpu_q = |q: &str| {
         format!(
@@ -193,6 +202,7 @@ fn render_report(
     headroom: u32,
     recs: &[ContainerRec],
     errors: &[String],
+    target: PatchTarget,
 ) -> Vec<String> {
     let opt_cpu = |v: Option<f64>| v.map(|n| fmt_cpu(n as i64)).unwrap_or_else(|| "—".into());
     let opt_mem = |v: Option<f64>| v.map(|n| fmt_mem(n as i64)).unwrap_or_else(|| "—".into());
@@ -241,10 +251,10 @@ fn render_report(
         lines.push(String::new());
     }
 
-    match patch_preview(recs) {
+    match patch_preview(recs, target) {
         Some(patch) => {
             lines.push(
-                "suggested patch (preview only — copy with c, apply with kubectl patch):".into(),
+                "suggested patch (preview only; copy with c, apply with kubectl patch):".into(),
             );
             lines.push(String::new());
             lines.extend(patch.lines().map(String::from));
@@ -284,10 +294,4 @@ fn container_specs(obj: &DynamicObject, path: &str) -> Vec<ContainerSpec> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Escape the regex metacharacters that can appear in a Kubernetes object name
-/// (really just `.`), so the PromQL `pod=~` matcher is anchored to the literal.
-fn regex_escape(name: &str) -> String {
-    name.replace('.', "\\.")
 }
