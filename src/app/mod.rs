@@ -402,10 +402,19 @@ pub enum PluginMode {
     Background,
 }
 
+#[derive(Clone, Debug)]
+struct PodLogTarget {
+    ns: String,
+    name: String,
+    containers: Vec<String>,
+}
+
 /// What the logs view is currently streaming, so it can be re-streamed when
 /// toggling timestamps (k9s `t`).
 #[derive(Clone, Debug)]
 enum LogSource {
+    /// The marked pods captured when the log view opens.
+    Pods(Vec<PodLogTarget>),
     /// Every container of one pod.
     Pod {
         ns: String,

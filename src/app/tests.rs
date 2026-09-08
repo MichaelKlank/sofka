@@ -8415,6 +8415,225 @@ async fn narrow_window_keeps_full_external_ip_visible() {
     );
 }
 
+fn marked_logs_app() -> (App, Receiver<Msg>) {
+    let (mut app, rx) = test_app();
+    app.switch_kind("pods");
+    for ns in ["alpha", "beta", "gamma"] {
+        let mut pod = json!({"apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "web", "namespace": ns},
+            "spec": {"containers": [{"name": "app"}]}});
+        if ns == "alpha" {
+            pod["spec"]["containers"] = json!([{"name": "app"}, {"name": "sidecar"}]);
+            pod["spec"]["initContainers"] = json!([{"name": "setup"}]);
+            pod["spec"]["ephemeralContainers"] = json!([{"name": "debug"}]);
+        }
+        apply(&mut app, pod);
+    }
+    for ns in ["alpha", "beta"] {
+        select_log_pod(&mut app, ns);
+        app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    }
+    select_log_pod(&mut app, "gamma");
+    (app, rx)
+}
+
+fn select_log_pod(app: &mut App, ns: &str) {
+    let index = app
+        .rows()
+        .iter()
+        .position(|obj| obj.metadata.namespace.as_deref() == Some(ns))
+        .unwrap();
+    app.table_state.select(Some(index));
+}
+
+#[tokio::test]
+async fn marked_pod_logs_stream_all_containers_and_identify_errors() {
+    let (mut app, mut rx) = marked_logs_app();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let uri = request.uri().clone();
+            seen.lock().unwrap().push(uri.clone());
+            let (status, body) = if uri.query().unwrap_or_default().contains("container=setup") {
+                (
+                    403,
+                    json!({"kind": "Status", "apiVersion": "v1",
+                    "status": "Failure", "message": "access denied",
+                    "reason": "Forbidden", "code": 403})
+                    .to_string(),
+                )
+            } else {
+                (200, "ready\n".to_owned())
+            };
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .body(http_body_util::Full::new(hyper::body::Bytes::from(body)))
+                        .unwrap(),
+                )
+            }
+        }),
+        "default",
+    );
+    app.handle_key(press(KeyCode::Char('l'))).unwrap();
+    assert_eq!(app.mode, Mode::Logs);
+    assert_eq!(app.logs.view.title, "marked pods (2) - logs");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while app.logs.view.lines.len() < 5 {
+            app.handle_msg(rx.recv().await.unwrap());
+        }
+    })
+    .await
+    .expect("all marked container streams must report");
+    for source in [
+        "alpha/web:app",
+        "alpha/web:sidecar",
+        "alpha/web:debug",
+        "beta/web:app",
+    ] {
+        assert!(app.logs.view.lines.contains(&format!("[{source}] ready")));
+    }
+    assert!(app.logs.view.lines.iter().any(|line| {
+        line.starts_with("[alpha/web:setup] [error]") && line.contains("access denied")
+    }));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    for uri in requests.iter() {
+        assert!(!uri.path().contains("gamma"));
+        let query = uri.query().unwrap();
+        assert!(query.contains("follow=true"));
+        assert!(query.contains(&format!("tailLines={}", app.logs_cfg.tail)));
+    }
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert!(app.log_tasks.is_empty());
+    assert_eq!(app.marked.len(), 2);
+}
+
+#[tokio::test]
+async fn marked_pod_logs_keep_the_snapshot_and_existing_controls() {
+    let (mut app, _rx) = marked_logs_app();
+    app.handle_key(press(KeyCode::Char('l'))).unwrap();
+    let snapshot = format!("{:?}", app.logs.source);
+    app.handle_msg(Msg::Deleted {
+        generation: app.generation,
+        key: "beta/web".into(),
+    });
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": "new", "namespace": "alpha"},
+        "spec": {"containers": [{"name": "app"}]}}),
+    );
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "ready".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    assert!(!app.logs.follow);
+    for key in ['t', '2'] {
+        let generation = app.log_gen;
+        app.handle_key(press(KeyCode::Char(key))).unwrap();
+        assert!(app.log_gen > generation);
+        assert_eq!(format!("{:?}", app.logs.source), snapshot);
+        assert_eq!(app.log_tasks.len(), 5);
+        assert_eq!(app.logs.filter, "ready");
+        assert!(!app.logs.follow);
+    }
+    assert_eq!(app.logs.since_anchor, Some(300));
+    let generation = app.log_gen;
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    assert!(app.logs.stopped);
+    assert!(app.log_tasks.is_empty());
+    app.handle_msg(Msg::LogLines {
+        generation,
+        lines: vec!["stale".into()],
+    });
+    assert!(app.logs.view.lines.is_empty());
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    assert!(!app.logs.stopped);
+    assert_eq!(format!("{:?}", app.logs.source), snapshot);
+    assert_eq!(app.log_tasks.len(), 5);
+    app.logs_cfg.buffer = 2;
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    app.handle_msg(Msg::LogLines {
+        generation: app.log_gen,
+        lines: vec![
+            "old".into(),
+            "[alpha/web:app] ready".into(),
+            "[beta/web:app] ready".into(),
+        ],
+    });
+    assert_eq!(app.logs.view.lines.len(), 2);
+    assert!(!app.logs.view.lines.contains(&"old".to_owned()));
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+}
+
+#[tokio::test]
+async fn marked_pod_logs_use_one_mark_and_fall_back_only_without_marks() {
+    let (mut app, _rx) = marked_logs_app();
+    select_log_pod(&mut app, "alpha");
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    select_log_pod(&mut app, "gamma");
+    app.handle_key(press(KeyCode::Char('l'))).unwrap();
+    let Some(LogSource::Pods(pods)) = &app.logs.source else {
+        panic!("expected marked pods")
+    };
+    assert_eq!(pods.len(), 1);
+    assert_eq!(pods[0].ns, "beta");
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    select_log_pod(&mut app, "beta");
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    select_log_pod(&mut app, "gamma");
+    app.handle_key(press(KeyCode::Char('l'))).unwrap();
+    assert!(
+        matches!(&app.logs.source, Some(LogSource::Pod { ns, name, .. }) if ns == "gamma" && name == "web")
+    );
+}
+
+#[tokio::test]
+async fn marked_pod_logs_skip_stale_and_hidden_marks() {
+    let (mut app, _rx) = marked_logs_app();
+    app.handle_msg(Msg::Deleted {
+        generation: app.generation,
+        key: "beta/web".into(),
+    });
+    app.handle_key(press(KeyCode::Char('l'))).unwrap();
+    let Some(LogSource::Pods(pods)) = &app.logs.source else {
+        panic!("expected marked pods")
+    };
+    assert_eq!(pods.len(), 1);
+    assert_eq!(pods[0].ns, "alpha");
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "gamma".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.rows().len(), 1);
+    app.handle_key(press(KeyCode::Char('l'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.flash, "no marked pods in the current view");
+}
+
+#[tokio::test]
+async fn marked_pod_logs_do_not_change_previous_or_provider_selection() {
+    let (mut app, _rx) = marked_logs_app();
+    app.handle_key(press(KeyCode::Char('p'))).unwrap();
+    assert!(
+        matches!(&app.logs.source, Some(LogSource::Single { ns, pod, previous: true, .. }) if ns == "gamma" && pod == "web")
+    );
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    install_provider(&mut app);
+    app.handle_key(press(KeyCode::Char('L'))).unwrap();
+    assert!(matches!(&app.logs.source, Some(LogSource::Provider {
+        request: crate::providers::LogRequest::Pod { ns, pod, .. }
+    }) if ns == "gamma" && pod == "web"));
+}
+
 #[tokio::test]
 async fn logs_wait_for_container_start() {
     for reason in ["ContainerCreating", "PodInitializing", "ImagePullBackOff"] {

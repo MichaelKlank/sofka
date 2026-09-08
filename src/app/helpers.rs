@@ -591,7 +591,7 @@ pub(super) async fn forward_log_stream(
                 let _ = tx
                     .send(Msg::LogLines {
                         generation,
-                        lines: vec![format!("[error] {e}")],
+                        lines: vec![format!("{prefix}[error] {e}")],
                     })
                     .await;
                 return;
@@ -622,7 +622,7 @@ pub(super) async fn forward_log_stream(
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        batch.push(format!("[error] {e}"));
+                        batch.push(format!("{prefix}[error] {e}"));
                         break;
                     }
                 }
