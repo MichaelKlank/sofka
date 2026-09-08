@@ -144,10 +144,15 @@ fn format_rules(
     };
     let mut lines = Vec::new();
     if status.incomplete {
-        lines.push(
-            "⚠ incomplete — this cluster delegates authorization (e.g. to a cloud IAM),".into(),
-        );
-        lines.push("  so the rule list below may be partial.".into());
+        lines.push("⚠ incomplete: the rule list below may be partial.".into());
+    }
+    if let Some(error) = status
+        .evaluation_error
+        .filter(|error| !error.trim().is_empty())
+    {
+        lines.push(format!("⚠ evaluation error: {error}"));
+    }
+    if !lines.is_empty() {
         lines.push(String::new());
     }
 
