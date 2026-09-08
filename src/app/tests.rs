@@ -11782,6 +11782,66 @@ async fn printer_columns_msg_upgrades_name_age_fallback() {
 }
 
 #[tokio::test]
+async fn status_printer_columns_render_and_filter_through_keys() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("certificates");
+    let crd = json!({"spec": {"versions": [{"name": "v1", "additionalPrinterColumns": [
+        {"name": "State", "type": "string", "jsonPath": ".status.conditions[?(@.status=='True')].type"},
+        {"name": "Reason", "type": "string", "jsonPath": ".status.conditions[?(@.status=='True')].reason"},
+        {"name": "Message", "type": "string", "priority": 1, "jsonPath": ".status.conditions[?(@.status=='True')].message"},
+        {"name": "Ready", "type": "string", "jsonPath": ".status.conditions[?(@.type=='Ready')].status"}
+    ]}]}});
+    app.handle_msg(Msg::PrinterColumns {
+        generation: app.generation,
+        resource: app.cluster.resolve("certificates").unwrap().resource_key(),
+        view: Box::new(crate::views::printer_columns_view(&crd, "v1")),
+    });
+    for (name, reason) in [("one", "Issued"), ("two", "Renewed")] {
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "cert-manager.io/v1", "kind": "Certificate",
+                "metadata": {"name": name, "namespace": "default"},
+                "status": {"conditions": [
+                    {"type": "Ready", "status": "False"},
+                    {"type": "Available", "status": "True", "reason": reason, "message": "Certificate exists"},
+                    {"type": "Other", "status": "True", "reason": "Wrong"}
+                ]}
+            }),
+        );
+    }
+    assert_eq!(
+        app.display_headers().to_vec(),
+        ["NAME", "STATE", "REASON", "READY", "AGE"]
+    );
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(
+        app.display_headers().to_vec(),
+        ["NAME", "STATE", "REASON", "MESSAGE", "READY", "AGE"]
+    );
+    {
+        let rows = app.rows();
+        assert_eq!(rows.len(), 2);
+        app.ensure_table_cell_cache(&rows);
+        let cache = app.table_cell_cache();
+        for row in rows {
+            let (cells, status_idx) = cache.get(&row_key(row)).unwrap();
+            assert_eq!(cells[1], "Available");
+            assert_eq!(cells[3], "Certificate exists");
+            assert_eq!(cells[4], "False");
+            assert_eq!(status_idx, Some(4));
+        }
+    }
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "Renewed".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.rows().len(), 1);
+    assert_eq!(app.rows()[0].metadata.name.as_deref(), Some("two"));
+}
+
+#[tokio::test]
 async fn user_view_wins_over_printer_columns() {
     let (mut app, _rx) = test_app();
     install_views(
@@ -11804,6 +11864,7 @@ async fn user_view_wins_over_printer_columns() {
                 wide: false,
                 width: None,
                 align: None,
+                condition_match: crate::views::ConditionMatch::Type,
                 condition_field: None,
             }],
             ..Default::default()
