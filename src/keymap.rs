@@ -161,7 +161,7 @@ struct KeyLabels {
     all: String,
 }
 
-const LEGACY: &[(&str, Action)] = &[
+pub(crate) const LEGACY_PALETTE_KEYS: &[(&str, Action)] = &[
     ("palette_next", Action::Down),
     ("palette_prev", Action::Up),
     ("palette_accept", Action::Accept),
@@ -590,7 +590,11 @@ impl Keymap {
         let mut errors = Vec::new();
         let mut overrides = BTreeMap::new();
         for (scope, value) in settings {
-            if LEGACY.iter().any(|(name, _)| scope == name) {
+            if let Some((_, action)) = LEGACY_PALETTE_KEYS.iter().find(|(name, _)| scope == name) {
+                map.warnings.push(format!(
+                    "keys.{scope}: legacy setting ignored; move its value to [keys.command] {}",
+                    action.name()
+                ));
                 continue;
             }
             if !matches!(scope.as_str(), "global" | "navigation" | "input")
@@ -630,56 +634,14 @@ impl Keymap {
         let command_settings = settings.get("command").and_then(toml::Value::as_table);
         let scoped =
             |action: Action| command_settings.is_some_and(|c| c.contains_key(action.name()));
-        let legacy = |action: Action| {
-            LEGACY
-                .iter()
-                .any(|&(name, a)| a == action && settings.contains_key(name))
-        };
-        let defaults = Self::default();
-        for &(name, action) in LEGACY {
-            let Some(spec) = settings.get(name) else {
-                continue;
-            };
-            if scoped(action) {
-                errors.push(format!(
-                    "keys.{name}: also set as keys.command.{}",
-                    action.name()
-                ));
-            }
-            let path = format!("keys.{name}");
-            let mut chords = parse_chords(spec, &path, &mut map.warnings);
-            chords.retain(|c| {
-                let reserved = (c.ctrl && matches!(c.code, KeyCode::Char('c' | 'e')))
-                    || GLOBAL.iter().any(|&(global, _)| {
-                        map.chords("command", global).iter().any(|g| overlaps(c, g))
-                    });
-                if reserved {
-                    map.warnings.push(format!(
-                        "{path}: {} is reserved by a built-in; ignored",
-                        c.label()
-                    ));
-                }
-                !reserved
-            });
-            if chords.is_empty() {
-                map.warnings
-                    .push(format!("{path}: no usable chord; using default"));
-                chords = defaults.chords("command", action).to_vec();
-            }
-            map.bindings
-                .get_mut("command")
-                .unwrap()
-                .insert(action, chords);
-        }
-        // Both configuration forms give explicit completion keys priority over
-        // text editing and cancellation, as the original palette handler did.
-        for &(_, action) in LEGACY {
-            if !legacy(action) && !scoped(action) {
+        // Explicit completion keys take priority over text editing and cancellation.
+        for &(_, action) in LEGACY_PALETTE_KEYS {
+            if !scoped(action) {
                 continue;
             }
             let chords = map.chords("command", action).to_vec();
             for &(edit, _) in INPUT {
-                if LEGACY.iter().any(|&(_, a)| a == edit) {
+                if LEGACY_PALETTE_KEYS.iter().any(|&(_, a)| a == edit) {
                     continue;
                 }
                 map.bindings
@@ -688,33 +650,6 @@ impl Keymap {
                     .get_mut(&edit)
                     .unwrap()
                     .retain(|c| !chords.iter().any(|other| overlaps(c, other)));
-            }
-        }
-        // Legacy completion fields used ordered dispatch: next, previous, accept.
-        // Preserve that order when legacy fields overlap each other or defaults.
-        for (i, &(higher_name, higher)) in LEGACY.iter().enumerate() {
-            for &(lower_name, lower) in &LEGACY[i + 1..] {
-                if scoped(higher) || scoped(lower) || !(legacy(higher) || legacy(lower)) {
-                    continue;
-                }
-                let chords = map.chords("command", higher).to_vec();
-                let lower_chords = map
-                    .bindings
-                    .get_mut("command")
-                    .unwrap()
-                    .get_mut(&lower)
-                    .unwrap();
-                lower_chords.retain(|c| {
-                    if chords.iter().any(|other| overlaps(c, other)) {
-                        map.warnings.push(format!(
-                            "keys.{lower_name}: {} is handled by {higher_name}; ignored",
-                            c.label()
-                        ));
-                        false
-                    } else {
-                        true
-                    }
-                });
             }
         }
         map.cancel_any = !settings
@@ -848,7 +783,11 @@ impl Keymap {
     }
 }
 
-fn parse_chords(spec: &toml::Value, path: &str, errors: &mut Vec<String>) -> Vec<KeyChord> {
+pub(crate) fn parse_chords(
+    spec: &toml::Value,
+    path: &str,
+    errors: &mut Vec<String>,
+) -> Vec<KeyChord> {
     let values = match spec {
         toml::Value::String(_) => std::slice::from_ref(spec),
         toml::Value::Array(values) => values,
@@ -1001,22 +940,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_palette_fields_remain_valid_and_take_priority_over_editing() {
-        let map = compile(
-            r#"
-            [keys]
-            palette_next = "ctrl-w"
-            palette_prev = "ctrl-p"
-            palette_accept = ["ctrl-y", "enter"]
-        "#,
-        )
-        .unwrap();
-        assert_eq!(map.label("command", Action::Down), "ctrl-w");
-        assert_eq!(map.label("command", Action::Accept), "ctrl-y / enter");
-        assert!(!map.label("command", Action::DeleteWord).contains("ctrl-w"));
-        assert!(
-            compile("[keys]\npalette_next = 'ctrl-n'\n[keys.command]\ndown = 'ctrl-n'").is_err()
-        );
+    fn unmigrated_palette_fields_warn_and_keep_scoped_settings() {
+        let map = compile("[keys]\npalette_next = 'ctrl-n'\n[keys.command]\ndown = 'f8'").unwrap();
+        assert_eq!(map.label("command", Action::Down), "f8");
+        assert!(map.warnings()[0].contains("[keys.command] down"));
     }
 
     #[test]

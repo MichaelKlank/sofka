@@ -4,6 +4,11 @@ sofka reads `$XDG_CONFIG_HOME/sofka/config.toml` (or
 `~/.config/sofka/config.toml`). `:reload` re-reads it live, `:config` shows the
 sources and any warnings.
 
+Legacy palette keys are automatically moved to `[keys.command]`, with the
+original file saved as `config.toml.bak`. If the file is read-only or managed
+through a symlink, sofka warns and uses the converted settings in memory.
+See [palette migration](keybindings.md#legacy-palette-migration).
+
 Everything below is optional. An empty config behaves exactly like no config.
 
 ## Base options

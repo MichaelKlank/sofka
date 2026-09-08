@@ -157,7 +157,9 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   under `[keys]`. Shared navigation settings and mode overrides keep text input
   separate from navigation. Help and key hints show the effective bindings.
   Changes support `:reload` and cluster/context overrides. Invalid bindings keep
-  the previous keymap. See [Configure key bindings](keybindings.md).
+  the previous keymap. Legacy palette settings are migrated with a config
+  backup; managed files produce a warning and use the converted keys in memory.
+  See [Configure key bindings](keybindings.md).
 - **Mouse support** - the wheel scrolls every view (one notch is three steps of
   that view's own up/down), clicking a row selects it, clicking a column header
   sorts by it (click again to flip). Document views (YAML/describe, diff,

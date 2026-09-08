@@ -36,6 +36,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+mod key_migration;
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -1287,10 +1289,20 @@ impl ConfigLoader {
             .clone()
             .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
         let mut overlay = toml::Value::Table(toml::map::Map::new());
+        let mut migrations = Vec::new();
+        if let Some(path) = self.base_path()
+            && let Some(migration) = key_migration::prepare(&mut merged, &path, &mut warnings)
+        {
+            migrations.push(migration);
+        }
+        let base = merged.clone();
 
         for path in self.override_paths(context, cluster) {
             match read_value(&path) {
-                Ok(Some(v)) => {
+                Ok(Some(mut v)) => {
+                    if let Some(migration) = key_migration::prepare(&mut v, &path, &mut warnings) {
+                        migrations.push(migration);
+                    }
                     merge(&mut merged, v.clone());
                     merge(&mut overlay, v);
                 }
@@ -1301,13 +1313,19 @@ impl ConfigLoader {
 
         // A type mismatch introduced by an override drops back to the base
         // config (validated at load time) rather than losing everything.
+        let mut valid_config = true;
         let mut config: Config = merged.try_into().unwrap_or_else(|e| {
+            valid_config = false;
             warnings.push(format!("ignoring cluster overrides: {e}"));
-            self.base
-                .clone()
-                .and_then(|b| b.try_into().ok())
-                .unwrap_or_default()
+            base.try_into().unwrap_or_default()
         });
+        if !migrations.is_empty() {
+            key_migration::finish(
+                migrations,
+                valid_config && crate::keymap::Keymap::compile(&config.keys).is_ok(),
+                &mut warnings,
+            );
+        }
         if let Some(dir) = &self.dir {
             crate::plugins::load_packages(&dir.join("plugins"), &mut config.plugins, &mut warnings);
         }

@@ -39,6 +39,7 @@ similar = "3.1.1"
 terminal-colorsaurus = "1.0.3"
 tokio = { version = "1.52.3", features = ["full"] }
 toml = "1.1.2"
+toml_edit = "0.25.13"
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.0", features = ["decompression-gzip", "trace", "util", "map-response-body"] }
 unicode-segmentation = "1.13.3"

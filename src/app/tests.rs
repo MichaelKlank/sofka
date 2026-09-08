@@ -6494,9 +6494,9 @@ async fn palette_completion_accepts_minus_chords() {
     let (mut app, _rx) = test_app();
     let config: crate::config::Config = toml::from_str(
         r#"
-        [keys]
-        palette_next = "ctrl--"
-        palette_prev = "alt--"
+        [keys.command]
+        down = "ctrl--"
+        up = "alt--"
         "#,
     )
     .unwrap();
@@ -6520,14 +6520,13 @@ async fn palette_shifted_minus_uses_the_resulting_character() {
         let (mut app, _rx) = test_app();
         let config: crate::config::Config = toml::from_str(
             r#"
-            [keys]
-            palette_next = ["shift--", "_"]
+            [keys.command]
+            down = "_"
             "#,
         )
         .unwrap();
         let warnings = app.configure_keys(&config.keys);
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("bind the resulting character"));
+        assert!(warnings.is_empty(), "{warnings:?}");
 
         app.handle_key(press(KeyCode::Char(':'))).unwrap();
         app.handle_key(press(KeyCode::Char('-'))).unwrap();
@@ -6548,10 +6547,10 @@ async fn palette_completion_keys_are_rebindable() {
     let (mut app, _rx) = test_app();
     let keys_cfg: crate::config::Config = toml::from_str(
         r#"
-        [keys]
-        palette_next = "ctrl-n"
-        palette_prev = "ctrl-p"
-        palette_accept = ["ctrl-y", "enter"]
+        [keys.command]
+        down = "ctrl-n"
+        up = "ctrl-p"
+        accept = ["ctrl-y", "enter"]
     "#,
     )
     .unwrap();
@@ -21669,61 +21668,152 @@ async fn explicit_shifted_navigation_bindings_remain_distinct() {
 }
 
 #[tokio::test]
-async fn legacy_palette_errors_keep_valid_chords_and_scoped_overrides() {
-    for spec in ["['shift--', '_']", "['ctrl-c', '_']", "['_', 5]"] {
-        let (mut app, _rx) = key_action_fixture("table");
-        let cfg: crate::config::Config = toml::from_str(&format!(
-            "[keys]\npalette_next = {spec}\n[keys.table]\npage_down = 'f8'"
-        ))
-        .unwrap();
-        let warnings = app.configure_keys(&cfg.keys);
-        assert!(!warnings.is_empty(), "{spec}");
-        assert!(warnings[0].contains("keys.palette_next"), "{warnings:?}");
-        app.handle_key(press(KeyCode::F(8))).unwrap();
-        assert_eq!(app.table_state.selected(), Some(7), "{spec}");
-        app.handle_key(press(KeyCode::Char(':'))).unwrap();
-        assert!(app.cmd_suggestions.len() > 1);
-        app.handle_key(press(KeyCode::Char('_'))).unwrap();
-        assert_eq!(app.cmd_sel, 1, "{spec}");
-        assert!(app.command.is_empty());
-        app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
-        assert!(app.should_quit);
-    }
-    for spec in ["[]", "['shift--', 'ctrl-c']", "5"] {
-        let (mut app, _rx) = test_app();
-        let cfg: crate::config::Config =
-            toml::from_str(&format!("[keys]\npalette_next = {spec}")).unwrap();
-        let warnings = app.configure_keys(&cfg.keys);
-        assert!(
-            warnings.iter().any(|w| w.contains("using default")),
-            "{warnings:?}"
-        );
-        app.handle_key(press(KeyCode::Char(':'))).unwrap();
-        app.handle_key(press(KeyCode::Tab)).unwrap();
-        assert_eq!(app.cmd_sel, 1, "{spec}");
-    }
-}
-
-#[tokio::test]
-async fn legacy_palette_overlaps_keep_the_original_priority() {
-    let (mut app, _rx) = test_app();
-    let cfg: crate::config::Config =
-        toml::from_str("[keys]\npalette_next = 'enter'\npalette_prev = 'enter'").unwrap();
-    let warnings = app.configure_keys(&cfg.keys);
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("handled by palette_next")),
-        "{warnings:?}"
+async fn palette_config_reload_migrates_with_a_backup() {
+    let dir = std::env::temp_dir().join(format!("sofka-palette-migrate-{}", std::process::id()));
+    let original = "# Keep this comment\nhide_header = true\n[keys]\n# Next suggestion\npalette_next = 'ctrl-n' # next\npalette_prev = 'ctrl-p'\npalette_accept = ['ctrl-y', 'enter']\n[keys.table]\npage_down = 'f8'\n";
+    write_config(&dir, original);
+    let (mut app, _rx) = key_action_fixture("table");
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    palette(&mut app, "reload");
+    assert!(app.hide_header);
+    let updated = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+    assert!(updated.contains("# Keep this comment"));
+    assert!(updated.contains("# Next suggestion"));
+    assert!(updated.contains("# next"));
+    assert!(!updated.contains("palette_next"));
+    assert!(updated.contains("[keys.command]"));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("config.toml.bak")).unwrap(),
+        original
     );
+    assert!(app.config_warnings.iter().any(|w| w.contains("backup:")));
+    app.handle_key(press(KeyCode::F(8))).unwrap();
+    assert_eq!(app.table_state.selected(), Some(7));
     app.handle_key(press(KeyCode::Char(':'))).unwrap();
-    app.handle_key(press(KeyCode::Enter)).unwrap();
-    assert_eq!(app.mode, Mode::Command);
+    app.handle_key(ctrl(KeyCode::Char('n'))).unwrap();
     assert_eq!(app.cmd_sel, 1);
+    app.handle_key(ctrl(KeyCode::Char('p'))).unwrap();
+    assert_eq!(app.cmd_sel, 0);
+    for c in "services".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.kind_plural, "services");
+    palette(&mut app, "reload");
+    assert!(app.config_warnings.is_empty(), "{:?}", app.config_warnings);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("config.toml")).unwrap(),
+        updated
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("config.toml.bak")).unwrap(),
+        original
+    );
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test]
-async fn legacy_and_scoped_palette_bindings_have_the_same_effect() {
+async fn invalid_palette_migrations_warn_without_changing_the_file() {
+    let dir = std::env::temp_dir().join(format!("sofka-palette-invalid-{}", std::process::id()));
+    for settings in [
+        "palette_next = ['shift--', '_']",
+        "palette_next = ['ctrl-c', '_']",
+        "palette_next = ['_', 5]",
+        "palette_next = 5",
+        "palette_next = 'enter'\npalette_prev = 'enter'",
+        "palette_next = 'f7'\n[keys.command]\ndown = 'f8'",
+    ] {
+        let original = format!("hide_header = true\n[keys]\n{settings}\n");
+        write_config(&dir, &original);
+        let (mut app, _rx) = test_app();
+        app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+        palette(&mut app, "reload");
+        assert!(app.hide_header);
+        assert!(!app.config_warnings.is_empty(), "{settings}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.toml")).unwrap(),
+            original
+        );
+        assert!(!dir.join("config.toml.bak").exists());
+        if settings.contains("[keys.command]") {
+            app.handle_key(press(KeyCode::Char(':'))).unwrap();
+            app.handle_key(press(KeyCode::F(8))).unwrap();
+            assert_eq!(app.cmd_sel, 1);
+            app.handle_key(press(KeyCode::F(7))).unwrap();
+            assert_eq!(app.cmd_sel, 1);
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn empty_legacy_palette_binding_migrates_without_default_fallback() {
+    let dir = std::env::temp_dir().join(format!("sofka-palette-empty-{}", std::process::id()));
+    write_config(&dir, "[keys]\npalette_next = []");
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    palette(&mut app, "reload");
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    assert_eq!(app.cmd_sel, 0);
+    assert!(app.keymap.chords("command", Action::Down).is_empty());
+    assert!(dir.join("config.toml.bak").exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_palette_config_warns_and_uses_migrated_bindings_in_memory() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let dir = std::env::temp_dir().join(format!("sofka-palette-managed-{}", std::process::id()));
+    for linked in [false, true] {
+        let original = "[keys]\npalette_next = 'ctrl-n'";
+        write_config(&dir, original);
+        let path = dir.join("config.toml");
+        let source = dir.join("managed.toml");
+        if linked {
+            std::fs::rename(&path, &source).unwrap();
+            symlink(&source, &path).unwrap();
+        } else {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        let (mut app, _rx) = test_app();
+        app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+        palette(&mut app, "reload");
+        let warnings = app.config_warnings.join("\n");
+        assert!(
+            warnings.contains("cannot save config migration"),
+            "{warnings}"
+        );
+        assert!(
+            warnings.contains("using migrated keys in memory"),
+            "{warnings}"
+        );
+        assert!(warnings.contains("Update [keys.command]"), "{warnings}");
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        app.handle_key(ctrl(KeyCode::Char('n'))).unwrap();
+        assert_eq!(app.cmd_sel, 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(!dir.join("config.toml.bak").exists());
+        if linked {
+            assert!(
+                std::fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        } else {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn migrated_and_scoped_palette_bindings_have_the_same_effect() {
+    let dir = std::env::temp_dir().join(format!("sofka-palette-equivalent-{}", std::process::id()));
     for (legacy, action, binding, event) in [
         ("palette_next", "down", "ctrl-w", ctrl(KeyCode::Char('w'))),
         ("palette_accept", "accept", "esc", press(KeyCode::Esc)),
@@ -21736,7 +21826,11 @@ async fn legacy_and_scoped_palette_bindings_have_the_same_effect() {
     ] {
         let (mut old, _rx1) = test_app();
         let (mut new, _rx2) = test_app();
-        use_keys(&mut old, &format!("[keys]\n{legacy} = '{binding}'"));
+        write_config(&dir, &format!("[keys]\n{legacy} = '{binding}'"));
+        old.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+        palette(&mut old, "reload");
+        old.flash.clear();
+        new.flash.clear();
         use_keys(&mut new, &format!("[keys.command]\n{action} = '{binding}'"));
         for app in [&mut old, &mut new] {
             app.handle_key(press(KeyCode::Char(':'))).unwrap();
@@ -21752,7 +21846,47 @@ async fn legacy_and_scoped_palette_bindings_have_the_same_effect() {
         } else {
             assert_eq!(new.command, "services");
         }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
+}
+
+#[tokio::test]
+async fn palette_migration_preserves_config_layer_precedence() {
+    let dir = std::env::temp_dir().join(format!("sofka-palette-layers-{}", std::process::id()));
+    write_config(&dir, "[keys]\npalette_next = 'f7'");
+    let cluster = dir.join("clusters/test-cluster");
+    write_config(&cluster, "[keys]\npalette_next = 'f8'");
+    let context = cluster.join("new");
+    write_config(
+        &context,
+        "[keys]\npalette_prev = 'f10'\n[keys.command]\ndown = 'f9'",
+    );
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    palette(&mut app, "reload");
+    palette(&mut app, "ctx new");
+    land_context(&mut app, "new");
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for key in [KeyCode::F(7), KeyCode::F(8)] {
+        app.handle_key(press(key)).unwrap();
+        assert_eq!(app.cmd_sel, 0);
+    }
+    app.handle_key(press(KeyCode::F(9))).unwrap();
+    assert_eq!(app.cmd_sel, 1);
+    app.handle_key(press(KeyCode::F(10))).unwrap();
+    assert_eq!(app.cmd_sel, 0);
+    for source in [&dir, &cluster, &context] {
+        assert!(source.join("config.toml.bak").exists());
+        let text = std::fs::read_to_string(source.join("config.toml")).unwrap();
+        assert!(!text.contains("palette_"), "{text}");
+    }
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    palette(&mut app, "ctx other");
+    land_context(&mut app, "other");
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    app.handle_key(press(KeyCode::F(8))).unwrap();
+    assert_eq!(app.cmd_sel, 1);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test]

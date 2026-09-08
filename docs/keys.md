@@ -154,29 +154,29 @@ See [Views](views.md#navigating-between-kinds) for adding CRD relations.
 ## Palette completion keys
 
 In the `:` palette, `tab`/`↓` and `shift-tab`/`↑` move through the suggestion
-list and `⏎` runs the highlighted one. Rebind them under `[keys]` in
-`config.toml` — emacs/cmp style, for example:
+list and `⏎` runs the highlighted one. Rebind them under `[keys.command]` in
+`config.toml`, for example:
 
 ```toml
-[keys]
-palette_next   = "ctrl-n"
-palette_prev   = "ctrl-p"
-palette_accept = ["ctrl-y", "enter"]
+[keys.command]
+down = "ctrl-n"
+up = "ctrl-p"
+accept = ["ctrl-y", "enter"]
 ```
 
 Each value is one [key combination](plugins.md) or a list of combinations.
 It replaces the default set for that action: `["tab", "down"]`,
 `["backtab", "up"]`, or `["enter"]`. Include a default in the list to keep it.
-Invalid or reserved entries produce warnings and are ignored. An empty or
-unusable list restores the action's default bindings.
+An empty list disables the action. Invalid values report errors. Explicit
+completion bindings take priority over text editing and cancellation.
+To assign `ctrl-c` or `ctrl-e`, first move or disable `quit` or `compact` under
+`[keys.global]`.
 
-The scoped settings `[keys.command]` actions `down`, `up`, and `accept`
-configure the same actions, with strict validation and `[]` to disable them.
-Both forms give explicit completion bindings priority over text editing and
-cancellation. Do not set an action through both forms.
-To assign `ctrl-c` or `ctrl-e`, use scoped settings after moving or disabling
-`quit` or `compact` under `[keys.global]`. The legacy fields still reserve those
-keys. See [conflicts and recovery](keybindings.md#conflicts-and-errors).
+Legacy `palette_next`, `palette_prev`, and `palette_accept` settings are
+automatically migrated to this format, with a `config.toml.bak` backup.
+If the file cannot be updated, sofka warns and uses the converted settings in
+memory. See [migration](keybindings.md#legacy-palette-migration) for managed
+configs, conflicts, and invalid values.
 
 ## What suspends the TUI
 

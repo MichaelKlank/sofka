@@ -27,9 +27,8 @@ the line.
 - A string sets one key combination. An array sets multiple combinations.
 - A configured value replaces the inherited bindings for that action. Include
   the default keys in the array if you want to keep them.
-- An omitted action keeps its inherited bindings. In scoped settings, an empty
-  array (`[]`) disables all keyboard bindings for that action. Legacy palette
-  fields retain their previous fallback behavior, described below.
+- An omitted action keeps its inherited bindings. An empty array (`[]`)
+  disables all keyboard bindings for that action.
 - `[keys.global]` sets `quit` and `compact` in every mode.
 - `[keys.navigation]` sets shared navigation actions in modes that support them.
   It does not affect text input modes. The shared actions are `up`, `down`,
@@ -41,12 +40,9 @@ the line.
   `accept` in text input modes that support them.
 - A mode table, such as `[keys.logs]` or `[keys.table]`, replaces the shared
   setting for that mode. File order does not affect this precedence.
-- The existing `palette_next`, `palette_prev`, and `palette_accept` fields under
-  `[keys]` configure the same actions as `down`, `up`, and `accept` under
-  `[keys.command]`. Do not set the same action through both forms. Explicit
-  completion keys take priority over text editing and cancellation in both
-  forms. For example, either form can use `ctrl-w` for the next suggestion or
-  `esc` to accept it.
+- Explicit completion keys under `[keys.command]` take priority over text
+  editing and cancellation. For example, use `down = "ctrl-w"` for the next
+  suggestion or `accept = "esc"` to accept it.
 
 Text input modes are `command`, `filter`, `log_filter`, `doc_filter`, `prompt`,
 `sort_picker`, `copy_picker`, `namespaces`, and `context_filter`.
@@ -92,15 +88,6 @@ views apply at startup or on a context switch. Key value
 errors do not reject the rest of the config file. Invalid TOML syntax can still
 prevent a file from loading. `:config` shows the source paths and key errors.
 
-Legacy `palette_*` fields keep warning-and-fallback behavior: invalid or
-reserved entries are ignored, valid entries remain active, and an empty or
-unusable list restores that action's defaults. These warnings do not reject
-valid scoped bindings. Legacy completion conflicts retain the previous priority:
-next, then previous, then accept. Warnings identify entries hidden by that
-priority. Use scoped settings for strict validation or to disable an action.
-The legacy fields continue to reserve `ctrl-c` and `ctrl-e`; use scoped settings
-to assign those keys after moving the global actions.
-
 Built-in bindings keep their current priority over bookmarks, workspaces, and
 plugins. A released key becomes available to them. `:config` reports keys hidden
 by a built-in action when that action is available. The existing exception stays:
@@ -117,6 +104,37 @@ Disabling or changing the accept binding never changes required confirmation tex
 Quit and compact mode have no reserved keys. If you disable all ways to open
 help, open the command palette, or quit, edit the config outside sofka and
 restart it to restore access.
+
+## Legacy palette migration
+
+When sofka loads a config with legacy palette fields, it moves the values to
+`[keys.command]`:
+
+| Old field under `[keys]` | New field under `[keys.command]` |
+| ------------------------ | -------------------------------- |
+| `palette_next`           | `down`                           |
+| `palette_prev`           | `up`                             |
+| `palette_accept`         | `accept`                         |
+
+Migration preserves comments and unrelated settings. Before replacing a file,
+sofka saves the original as `config.toml.bak` in the same directory. An existing
+backup is never overwritten. Each base, cluster, or context file is converted
+before the settings are merged, so override order stays the same.
+
+If a file cannot be updated, sofka shows a warning and uses the converted keys
+in memory. Symlinks and read-only files are left intact. For a Nix-managed
+config, update the Nix source to use `[keys.command]`. The warning includes the
+field mapping. After a manual change, use `:reload`.
+
+If both formats define the same action in one file, or a legacy value is
+invalid, sofka leaves that file unchanged and reports the problem. It does not
+save migration results when the effective keymap has conflicts or errors.
+Correct these settings and reload, or move them to the new format manually.
+
+The old per-key fallback is removed. Values move without substitution, and an
+empty list disables the action. Migrated keys use the same validation rules as
+other scoped settings. To assign `ctrl-c` or `ctrl-e`, first move or disable
+`quit` or `compact` under `[keys.global]`.
 
 ## Key syntax
 
