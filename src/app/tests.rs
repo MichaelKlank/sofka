@@ -11481,7 +11481,7 @@ async fn rightsize_rejects_non_workload_kinds() {
                "metadata": {"name": "cm", "namespace": "default"}}),
     );
     app.table_state.select(Some(0));
-    app.open_rightsize();
+    plugin_command(&mut app, "rightsize");
     assert_ne!(app.mode, Mode::Detail);
     assert!(app.flash.contains("right-size applies"), "{}", app.flash);
 }
@@ -11511,9 +11511,247 @@ async fn rightsize_report_renders_verdicts_and_patch() {
     }];
     assert_eq!(recs[0].cpu_verdict(), crate::rightsize::Verdict::Over);
     assert_eq!(recs[0].mem_verdict(), crate::rightsize::Verdict::Under);
-    let patch = crate::rightsize::patch_preview(&recs).unwrap();
+    let patch =
+        crate::rightsize::patch_preview(&recs, crate::rightsize::PatchTarget::Workload).unwrap();
     assert!(patch.contains("\"name\": \"app\""));
     assert!(patch.contains("cpu") && patch.contains("memory"));
+}
+
+async fn rightsize_command_report(plural: &str, name: &str) -> (App, Vec<String>) {
+    use http_body_util::BodyExt;
+
+    let (mut app, mut rx) = test_app();
+    for (kind, plural) in [
+        ("StatefulSet", "statefulsets"),
+        ("DaemonSet", "daemonsets"),
+        ("ReplicaSet", "replicasets"),
+    ] {
+        app.cluster.register_kind("apps", kind, plural, true);
+    }
+    app.switch_kind(plural);
+    let containers = json!([{
+        "name": "app",
+        "resources": {"requests": {"cpu": "500m", "memory": "64Mi"}}
+    }]);
+    let spec = if plural == "pods" {
+        json!({"containers": containers})
+    } else {
+        json!({"template": {"spec": {"containers": containers}}})
+    };
+    let resource = json!({
+        "apiVersion": if plural == "pods" { "v1" } else { "apps/v1" },
+        "kind": app.kind.as_ref().unwrap().ar.kind,
+        "metadata": {"name": name, "namespace": "default"},
+        "spec": spec,
+    });
+    apply(&mut app, resource);
+    app.table_state.select(Some(0));
+    let queries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = queries.clone();
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let seen = seen.clone();
+            async move {
+                let response = match request.uri().path() {
+                    "/api/v1/namespaces" => {
+                        assert_eq!(request.method(), http::Method::GET);
+                        json!({"apiVersion":"v1", "kind":"NamespaceList", "items":[]})
+                    }
+                    "/api/v1/services" => {
+                        assert_eq!(request.method(), http::Method::GET);
+                        json!({"apiVersion":"v1", "kind":"ServiceList", "items":[{
+                            "metadata":{"name":"prometheus", "namespace":"monitoring"},
+                            "spec":{"ports":[{"name":"http", "port":9090}]}
+                        }]})
+                    }
+                    "/api/v1/namespaces/monitoring/services/prometheus:9090/proxy/api/v1/query" => {
+                        assert_eq!(request.method(), http::Method::POST);
+                        let body = request.into_body().collect().await.unwrap().to_bytes();
+                        let query = form_urlencoded::parse(&body)
+                            .find(|(key, _)| key == "query")
+                            .unwrap()
+                            .1
+                            .into_owned();
+                        let value = if query.contains("container_cpu_usage_seconds_total") {
+                            "100"
+                        } else if query.contains("container_memory_working_set_bytes") {
+                            "134217728"
+                        } else {
+                            "0"
+                        };
+                        seen.lock().unwrap().push(query);
+                        json!({"status":"success", "data":{"resultType":"vector",
+                            "result":[{"metric":{}, "value":[1, value]}]}})
+                    }
+                    path => panic!("unexpected rightsize request: {path}"),
+                };
+                Ok::<_, std::convert::Infallible>(http::Response::new(http_body_util::Full::new(
+                    hyper::body::Bytes::from(response.to_string()),
+                )))
+            }
+        }),
+        "default",
+    );
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "rightsize".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(message) = rx.recv().await {
+            if matches!(message, Msg::Detail { .. }) {
+                app.handle_msg(message);
+                return;
+            }
+        }
+        panic!("rightsize report channel closed");
+    })
+    .await
+    .expect("rightsize report did not finish");
+    assert_eq!(app.mode, Mode::Detail, "{plural}: {}", app.flash);
+    let queries = queries.lock().unwrap().clone();
+    (app, queries)
+}
+
+#[tokio::test]
+async fn rightsize_command_excludes_other_workload_prefixes_in_every_query() {
+    for (plural, name, included, excluded) in [
+        (
+            "deployments",
+            "api",
+            vec!["api-75675f5897-bcdf2", "api-5b6ff54-ghjk4"],
+            vec![
+                "api-worker-75675f5897-bcdf2",
+                "api-gateway-5b6ff54-ghjk4",
+                "api-0",
+                "api-bcdf2",
+                "other-api-75675f5897-bcdf2",
+            ],
+        ),
+        (
+            "statefulsets",
+            "api",
+            vec!["api-0", "api-12"],
+            vec!["api-worker-0", "api-gateway-12", "api-bcdf2", "api-0-extra"],
+        ),
+        (
+            "daemonsets",
+            "api",
+            vec!["api-bcdf2", "api-ghjk4"],
+            vec![
+                "api-worker-bcdf2",
+                "api-gateway-ghjk4",
+                "api-0",
+                "api-bcdf2-extra",
+            ],
+        ),
+        (
+            "replicasets",
+            "api-75675f5897",
+            vec!["api-75675f5897-bcdf2", "api-75675f5897-ghjk4"],
+            vec![
+                "api-75675f5897-worker-bcdf2",
+                "api-5b6ff54-bcdf2",
+                "api-75675f5897-0",
+            ],
+        ),
+        (
+            "pods",
+            "api.v2",
+            vec!["api.v2"],
+            vec!["apiXv2", "api.v2-worker", "other-api.v2"],
+        ),
+        (
+            "deployments",
+            "api.v2",
+            vec!["api.v2-75675f5897-bcdf2"],
+            vec!["apiXv2-75675f5897-bcdf2", "api.v2-worker-75675f5897-bcdf2"],
+        ),
+    ] {
+        let (_, queries) = rightsize_command_report(plural, name).await;
+        assert_eq!(queries.len(), 8, "{plural}: all usage and evidence queries");
+        for query in queries {
+            assert!(query.contains("namespace=\"default\""), "{query}");
+            assert!(query.contains("container=\"app\""), "{query}");
+            let literal = query
+                .split_once("pod=~")
+                .unwrap()
+                .1
+                .split_once(",container=")
+                .unwrap()
+                .0;
+            let pattern: String = serde_json::from_str(literal).unwrap();
+            let matcher = regex::Regex::new(&pattern).unwrap();
+            for pod in &included {
+                assert!(matcher.is_match(pod), "{plural}: {pod} omitted by {query}");
+            }
+            for pod in &excluded {
+                assert!(
+                    !matcher.is_match(pod),
+                    "{plural}: {pod} included by {query}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn rightsize_command_renders_patch_for_selected_resource_kind() {
+    for plural in [
+        "pods",
+        "deployments",
+        "statefulsets",
+        "daemonsets",
+        "replicasets",
+    ] {
+        let (app, _) = rightsize_command_report(plural, "api").await;
+        let patch_start = app
+            .detail
+            .lines
+            .iter()
+            .position(|line| line == "{")
+            .unwrap();
+        let patch_text = app
+            .detail
+            .lines
+            .iter()
+            .skip(patch_start)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let patch: Value = serde_json::from_str(&patch_text).unwrap();
+        let expected = json!([{
+            "name":"app",
+            "resources":{"requests":{"cpu":"115m", "memory":"148Mi"}}
+        }]);
+        if plural == "pods" {
+            assert_eq!(patch, json!({"spec":{"containers":expected}}));
+        } else {
+            assert_eq!(
+                patch,
+                json!({"spec":{"template":{"spec":{"containers":expected}}}}),
+                "{plural}"
+            );
+        }
+        assert!(
+            app.detail
+                .lines
+                .iter()
+                .any(|line| line.contains("over-provisioned"))
+        );
+        assert!(
+            app.detail
+                .lines
+                .iter()
+                .any(|line| line.contains("under-provisioned"))
+        );
+        assert!(
+            app.detail
+                .lines
+                .iter()
+                .any(|line| line.contains("preview only"))
+        );
+    }
 }
 
 #[tokio::test]

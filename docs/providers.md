@@ -12,6 +12,20 @@ CPU and memory over the window, a suggested request (P95 plus headroom), OOM and
 throttle evidence, and a **strategic-merge patch preview** (`c` copies it). It
 **never mutates** - apply the patch with `kubectl patch` yourself if you agree.
 
+Pod queries match the exact name. Workload queries match the standard pod-name
+format for the selected controller: a template hash and random suffix for
+Deployments, an ordinal for StatefulSets, and a random suffix for ReplicaSets
+and DaemonSets. This excludes pods from workloads with longer name prefixes,
+such as `api-worker` when `api` is selected, while retaining past rollout data.
+Names are matched literally, including dots. Matching uses names, not verified
+owner references; adopted pods with other names are not included, and a name
+that follows the same format can still match. The backend must contain data
+for the selected cluster and namespace.
+
+The patch uses `spec.containers` for a Pod and `spec.template.spec.containers`
+for a workload. Kubernetes can still reject a resource change that the cluster
+does not support.
+
 With no `[providers.metrics]` section, sofka finds a Prometheus or
 VictoriaMetrics query `Service` in the cluster by well-known labels and reaches
 it through the API-server proxy.

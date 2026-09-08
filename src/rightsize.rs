@@ -125,11 +125,24 @@ pub fn mem_quantity(bytes: f64) -> String {
     format!("{mi}Mi")
 }
 
-/// Build the strategic-merge patch that would apply the suggested requests to a
-/// workload's pod template, as pretty JSON. `path_root` is the pointer prefix
-/// to the container list — `spec.template.spec` for Deployments/StatefulSets/
-/// DaemonSets. Returns `None` when no container has a suggestion.
-pub fn patch_preview(recs: &[ContainerRec]) -> Option<String> {
+#[derive(Clone, Copy)]
+pub enum PatchTarget {
+    Pod,
+    Workload,
+}
+
+impl PatchTarget {
+    pub fn containers_path(self) -> &'static str {
+        match self {
+            Self::Pod => "/spec/containers",
+            Self::Workload => "/spec/template/spec/containers",
+        }
+    }
+}
+
+/// Build a strategic-merge patch for the selected resource type.
+/// Return `None` when no container has a recommendation.
+pub fn patch_preview(recs: &[ContainerRec], target: PatchTarget) -> Option<String> {
     let containers: Vec<Value> = recs
         .iter()
         .filter(|r| r.suggested_cpu.is_some() || r.suggested_mem.is_some())
@@ -147,9 +160,12 @@ pub fn patch_preview(recs: &[ContainerRec]) -> Option<String> {
     if containers.is_empty() {
         return None;
     }
-    let patch = json!({
-        "spec": { "template": { "spec": { "containers": containers } } }
-    });
+    let patch = match target {
+        PatchTarget::Pod => json!({"spec": {"containers": containers}}),
+        PatchTarget::Workload => json!({
+            "spec": { "template": { "spec": { "containers": containers } } }
+        }),
+    };
     serde_json::to_string_pretty(&patch).ok()
 }
 
@@ -244,12 +260,13 @@ mod tests {
                 suggested_mem: None,
             },
         ];
-        let patch = patch_preview(&recs).unwrap();
+        let patch = patch_preview(&recs, PatchTarget::Workload).unwrap();
         assert!(patch.contains("\"name\": \"app\""));
         assert!(patch.contains("\"cpu\": \"120m\""));
         assert!(patch.contains("\"memory\": \"128Mi\""));
         assert!(!patch.contains("sidecar"), "no-data container omitted");
         // Empty input → no patch at all.
-        assert!(patch_preview(&[]).is_none());
+        assert!(patch_preview(&[], PatchTarget::Workload).is_none());
+        assert!(patch_preview(&[], PatchTarget::Pod).is_none());
     }
 }
