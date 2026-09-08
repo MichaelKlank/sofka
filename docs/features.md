@@ -211,6 +211,24 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   describe. Relations are data: a built-in table for core kinds, extended per
   CRD with `[[views."…".refs]]` and `children`. Reverse lookups stay in the
   row's namespace unless the rule says `cluster`.
+  Press `c` in this view to discover direct children of a namespaced custom
+  resource with a UID, including resources with no configured child kinds.
+  Wait for the initial adjacent lookup to finish first. The search uses API
+  discovery from the current cluster connection. It selects namespaced resources
+  that support listing, excludes subresources, and selects one API version per
+  resource. It searches only the source namespace and matches owner UIDs, not
+  names or labels. Results are added to the view as pages arrive. `⏎` opens a
+  result. The initial lookup and Enter action on the resource table stay the same.
+  Each search permits four concurrent requests, 200 objects per page, at most
+  200 list requests and 20,000 objects checked, five seconds per request, and
+  30 seconds in total. Objects with other owners count towards the object limit.
+  Access denial, request errors, timeouts, skipped API discovery, and search
+  limits mark the search as incomplete. Results already found remain available.
+  The search status stays above the results. Leaving the view, opening an
+  overlay, refreshing, or changing the source or context cancels the search.
+  Late replies are ignored. `c` starts another search; `r` repeats the initial
+  adjacent lookup. This action does not search across namespaces, follow
+  descendants recursively, or start background watches.
 - **Watch notifications** (`:notify`) - toggle a notification on the selected
   object and Sophie watches it for you. See [Notifications](debugging.md#notifications).
 

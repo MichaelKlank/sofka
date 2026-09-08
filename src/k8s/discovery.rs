@@ -11,10 +11,12 @@ use super::{ApiResource, Kind};
 pub(super) struct Resource {
     pub kind: Kind,
     pub short_names: Vec<String>,
+    pub listable: bool,
 }
 
 pub(super) struct Discovered {
     pub resources: Vec<Resource>,
+    pub child_kinds: Vec<Kind>,
     pub skipped: Vec<String>,
     pub fallback: Option<String>,
 }
@@ -42,10 +44,12 @@ pub(super) async fn discover(client: &Client) -> Result<Discovered> {
             Reverse(Version::parse(&r.kind.ar.version).priority()),
         )
     });
+    let child_kinds = child_candidates(&resources);
     resources
         .dedup_by(|a, b| a.kind.ar.group == b.kind.ar.group && a.kind.ar.kind == b.kind.ar.kind);
     Ok(Discovered {
         resources,
+        child_kinds,
         skipped,
         fallback,
     })
@@ -89,6 +93,7 @@ fn append_aggregated(out: &mut Vec<Resource>, list: APIGroupDiscoveryList) -> Re
                         },
                         namespaced: resource.scope.as_deref() == Some("Namespaced"),
                     },
+                    listable: resource.verbs.iter().any(|v| v == "list"),
                     short_names: resource.short_names,
                 });
             }
@@ -156,6 +161,7 @@ fn append_legacy(out: &mut Vec<Resource>, list: APIResourceList) -> Result<()> {
                 },
                 namespaced: resource.namespaced,
             },
+            listable: resource.verbs.iter().any(|v| v == "list"),
             short_names: resource.short_names.unwrap_or_default(),
         });
     }
@@ -167,5 +173,65 @@ fn api_version(group: &str, version: &str) -> String {
         version.to_string()
     } else {
         format!("{group}/{version}")
+    }
+}
+
+fn child_candidates(resources: &[Resource]) -> Vec<Kind> {
+    let mut kinds: Vec<_> = resources
+        .iter()
+        .filter(|r| r.listable && r.kind.namespaced && !r.kind.ar.plural.contains('/'))
+        .map(|r| r.kind.clone())
+        .collect();
+    kinds.sort_by_cached_key(|k| {
+        (
+            k.ar.group.clone(),
+            k.ar.plural.clone(),
+            Reverse(Version::parse(&k.ar.version).priority()),
+        )
+    });
+    kinds.dedup_by(|a, b| a.ar.group == b.ar.group && a.ar.plural == b.ar.plural);
+    kinds
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn children_use_listable_namespaced_resources_and_one_version() {
+        let mut resources = Vec::new();
+        for version in ["v1beta1", "v1"] {
+            append_legacy(&mut resources, serde_json::from_value(json!({
+                "groupVersion": format!("example.io/{version}"),
+                "resources": [
+                    {"name":"widgets", "kind":"Widget", "namespaced":true, "verbs":["list"]},
+                    {"name":"widgets/status", "kind":"Widget", "namespaced":true, "verbs":["list"]},
+                    {"name":"global", "kind":"Global", "namespaced":false, "verbs":["list"]},
+                    {"name":"writeonly", "kind":"WriteOnly", "namespaced":true, "verbs":["create"]}
+                ]
+            })).unwrap()).unwrap();
+        }
+        let kinds = child_candidates(&resources);
+        assert_eq!(kinds.len(), 1);
+        assert_eq!(kinds[0].ar.plural, "widgets");
+        assert_eq!(kinds[0].ar.version, "v1");
+    }
+
+    #[test]
+    fn aggregated_children_require_the_list_verb() {
+        let mut resources = Vec::new();
+        append_aggregated(&mut resources, serde_json::from_value(json!({
+            "items": [{"metadata":{"name":"example.io"}, "versions":[{
+                "version":"v1", "resources":[
+                    {"resource":"widgets", "responseKind":{"kind":"Widget"}, "scope":"Namespaced", "verbs":["get","list"]},
+                    {"resource":"writeonly", "responseKind":{"kind":"WriteOnly"}, "scope":"Namespaced", "verbs":["create"]},
+                    {"resource":"globals", "responseKind":{"kind":"Global"}, "scope":"Cluster", "verbs":["list"]}
+                ]
+            }]}]
+        })).unwrap()).unwrap();
+        let kinds = child_candidates(&resources);
+        assert_eq!(kinds.len(), 1);
+        assert_eq!(kinds[0].ar.plural, "widgets");
     }
 }

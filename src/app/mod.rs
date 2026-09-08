@@ -1953,6 +1953,10 @@ pub struct App {
     pub adjacent_title: String,
     pub adjacent_source: Option<DynamicObject>,
     adjacent_request: u64,
+    child_request: u64,
+    child_task: Option<JoinHandle<()>>,
+    pub child_status: String,
+    pub adjacent_warning: Option<String>,
     adjacent_claim: Option<StatusClaim>,
     /// Parent of the adjacent view, kept separately because a YAML/describe
     /// opened from it uses `return_mode` to come back to the list.
@@ -2223,6 +2227,10 @@ impl App {
             adjacent_title: String::new(),
             adjacent_source: None,
             adjacent_request: 0,
+            child_request: 0,
+            child_task: None,
+            child_status: String::new(),
+            adjacent_warning: None,
             adjacent_claim: None,
             adjacent_return: Mode::Table,
             gitops_items: Vec::new(),

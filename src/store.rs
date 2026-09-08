@@ -103,6 +103,13 @@ pub enum Msg {
         /// A read that failed — the list may be incomplete.
         warn: Option<String>,
     },
+    AdjacentChildren {
+        generation: u64,
+        request: u64,
+        items: Vec<AdjacentItem>,
+        status: String,
+        done: bool,
+    },
     /// Reconciliation-chain findings for the GitOps view, gathered off-thread.
     Gitops {
         generation: u64,

@@ -2284,7 +2284,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
         bind(
             "u · :adjacent",
-            "adjacent view: owners, children, and the objects the selection names or is named by (⏎ opens one)",
+            "adjacent view: owners, children, and references (⏎ opens one; c discovers direct children of a namespaced custom resource)",
         ),
         bind(
             ":rightsize",
@@ -2846,9 +2846,46 @@ fn draw_find(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_adjacent(frame: &mut Frame, app: &mut App, area: Rect) {
+    let status = [
+        app.child_status.clone(),
+        app.adjacent_warning
+            .as_ref()
+            .map(|w| format!("adjacent: incomplete ({w})"))
+            .unwrap_or_default(),
+    ]
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n");
+    let area = if status.is_empty() {
+        area
+    } else {
+        let height = status
+            .lines()
+            .map(|line| line.width().div_ceil(usize::from(area.width.max(1))))
+            .sum::<usize>();
+        let chunks = Layout::vertical([
+            Constraint::Length(
+                height
+                    .min(4)
+                    .min(usize::from(area.height.saturating_sub(3))) as u16,
+            ),
+            Constraint::Min(0),
+        ])
+        .split(area);
+        frame.render_widget(
+            Paragraph::new(status).wrap(ratatui::widgets::Wrap { trim: true }),
+            chunks[0],
+        );
+        chunks[1]
+    };
     let items: Vec<ListItem> = if app.adjacent_items.is_empty() {
         let msg = if app.adjacent_pending() {
             "gathering…"
+        } else if app.adjacent_warning.is_some() || app.child_status.contains("incomplete") {
+            "no results found; lookup is incomplete"
+        } else if app.child_status.contains("searching") {
+            "searching for children..."
         } else {
             "nothing connected to this object was found"
         };
@@ -2889,9 +2926,14 @@ fn draw_adjacent(frame: &mut Frame, app: &mut App, area: Rect) {
             .collect()
     };
     let title = format!(
-        " {} [{}]  (⏎ open · y yaml · d describe · r refresh · esc back) ",
+        " {} [{}] {} ",
         app.adjacent_title,
-        app.adjacent_items.len()
+        app.adjacent_items.len(),
+        if app.can_discover_children() {
+            "(c discover children)"
+        } else {
+            ""
+        },
     );
     render_framed_list(
         frame,
@@ -3979,7 +4021,7 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
             theme::dim(),
         )),
         Mode::Adjacent => Line::from(Span::styled(
-            "  j/k: move   ⏎: open the object   y: yaml   d: describe   r: refresh   esc: back",
+            "  j/k: move   ⏎: open the object   y: yaml   d: describe   c: discover children   r: refresh   esc: back",
             theme::dim(),
         )),
         Mode::FluxMenu => Line::from(Span::styled(
