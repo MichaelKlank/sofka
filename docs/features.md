@@ -81,7 +81,7 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   view history.
 - **Command palette** (`:`) - fuzzy search over the full resource catalog, your
   saved bookmarks and workspaces, and the built-in commands (`ctx`, `helm`,
-  `pulse`, `xray`, `explain`, `timeline`, `gitops`, `can-i`, `journal`, `debug`,
+  `pulse`, `xray`, `explain`, `timeline`, `gitops`, `adjacent`, `can-i`, `journal`, `debug`,
   `debug-clean`, `bundle`, `bundle-save`, `snapshot`, `snapshots`, `diff`,
   `events`, `pf`, `notify`, `find`, `vlogs`, `rightsize`, `fleet`, `skin`,
   `reload`, `config`, `info`). `:` and `?` open the palette and help from every
@@ -200,6 +200,14 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 - **Pulse dashboard** (`:pulse`) - cluster-health tiles, refreshed every 5s.
 - **Xray tree** (`:xray`) - a hierarchical view from the current kind down
   through owner references to pods and containers.
+- **Adjacent view** (`u` / `:adjacent`) - one hop in every direction from the
+  selection: its owners, the objects it owns, the objects its spec names (a
+  pod's node, claims, ConfigMaps, Secrets; a claim's classes and volume), and
+  the objects whose specs name it (the pods mounting a claim, the claims using
+  a class). `⏎` opens one in its regular view, `y`/`d` show its YAML or
+  describe. Relations are data: a built-in table for core kinds, extended per
+  CRD with `[[views."…".refs]]` and `children`. Reverse lookups stay in the
+  row's namespace unless the rule says `cluster`.
 - **Watch notifications** (`:notify`) - toggle a notification on the selected
   object and Sophie watches it for you. See [Notifications](debugging.md#notifications).
 

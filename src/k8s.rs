@@ -516,6 +516,21 @@ impl Cluster {
         self.registry.get(&key).cloned()
     }
 
+    /// Resolve a kind within an API group, as an `ownerReference` names it
+    /// (`kind` + the group of its `apiVersion`), so a kind name shared by
+    /// several groups lands on the right one. "" is the core group.
+    pub fn resolve_in_group(&self, kind: &str, group: &str) -> Option<Kind> {
+        let mut found: Vec<&Kind> = self
+            .registry
+            .values()
+            .filter(|k| {
+                k.ar.kind.eq_ignore_ascii_case(kind) && k.ar.group.eq_ignore_ascii_case(group)
+            })
+            .collect();
+        found.sort_by(|a, b| a.ar.api_version.cmp(&b.ar.api_version));
+        found.first().cloned().cloned()
+    }
+
     /// Spawn a watch task for `kind` in `namespace` ("" = all namespaces),
     /// optionally scoped by a label and/or field selector (used for drill-down,
     /// e.g. deployment -> its pods, or node -> pods on that node).

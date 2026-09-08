@@ -14,6 +14,7 @@ impl App {
         self.return_mode = match self.mode {
             Mode::Xray => Mode::Xray,
             Mode::Explain => Mode::Explain,
+            Mode::Adjacent => Mode::Adjacent,
             _ => Mode::Table,
         };
         // Remember the selected row so we can land back on it.
@@ -52,6 +53,13 @@ impl App {
             }
             return;
         }
+        let obj = obj.clone();
+        self.show_yaml(&obj);
+    }
+
+    /// The YAML view of one object — the selected row, or a row of a list
+    /// view that already holds the object.
+    pub(super) fn show_yaml(&mut self, obj: &DynamicObject) {
         let title = obj.metadata.name.clone().unwrap_or_else(|| "object".into());
         self.detail = Scrollable {
             title: format!("{title} — YAML"),
@@ -129,8 +137,15 @@ impl App {
             }
             return;
         }
-        let name = obj.metadata.name.clone().unwrap_or_default();
         let plural = self.kind_plural.clone();
+        let obj = obj.clone();
+        self.describe_object(plural, &obj);
+    }
+
+    /// `kubectl describe` one object of `plural`, off-thread; the result
+    /// arrives as `Msg::Detail`, falling back to the object's YAML.
+    pub(super) fn describe_object(&mut self, plural: String, obj: &DynamicObject) {
+        let name = obj.metadata.name.clone().unwrap_or_default();
         let ns = obj.metadata.namespace.clone();
 
         // Compute the YAML fallback up front while we hold the object; the

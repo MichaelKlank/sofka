@@ -292,6 +292,43 @@ Kinds with a built-in drill-down keep it - a `drill` on pods won't replace the
 container picker, and `:config` warns that the stanza is ignored. When a view
 sets both `drill` and `node`, `enter` drills and `o` still jumps to the node.
 
+**Everything connected to a row** - `u` opens the adjacent view: the row's
+owners, the objects it owns, the objects its spec names, and the objects whose
+specs name it, each one `⏎` away. Core kinds are built in (a pod's node, claims,
+ConfigMaps, Secrets and service account; a claim's storage class, attributes
+class and volume; an ingress's services and TLS secrets). A CRD declares its
+own references and owned kinds:
+
+```toml
+[views."karpenter.sh/v1/nodeclaims"]
+children = ["nodes"]                 # kinds to scan for ownerReferences to the row
+
+[[views."karpenter.sh/v1/nodeclaims".refs]]
+path = "/spec/nodeClassRef/name"     # JSON Pointer; `*` fans out over an array
+kind = "ec2nodeclasses"
+relation = "shaped by"               # row label; default "references"
+reverse = "cluster"                  # usages listed: namespace (default) | cluster | none
+```
+
+`reverse` decides how far the lookup goes when the _target_ is selected: with
+`namespace`, the referencing kind is listed in the row's namespace (the
+namespace the table shows, for a cluster-scoped row); with `cluster`, across the
+cluster; `none` skips it. A `namespace_path` names where the target's namespace
+lives when it isn't the row's own, as a PersistentVolume's `claimRef.namespace`.
+A cluster-scoped kind naming a namespaced one must set it - there is no row
+namespace to fall back on - or the view reports the rule as unfollowable
+instead of quietly finding nothing.
+
+Each lookup reads the current source object. Press `r` to include changes to
+its references, such as a new pod node assignment or PVC binding. If the source
+was deleted or replaced, the view reports the error. Return to the table to
+select the new object.
+
+Navigation and describe keep each object's API group. A group-qualified view
+key also works when another API group has the same resource name. Within one
+lookup, rules share each list response for the same resource and namespace.
+Refresh reads these lists again.
+
 Both settings are resolved key by key across the view keys for a kind
 (`apiVersion/plural`, `group/plural`, plural, kind), not off the single most
 specific view the way `columns` and `sort` are. A specific view that only sets

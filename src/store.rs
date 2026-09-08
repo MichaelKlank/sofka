@@ -86,6 +86,23 @@ pub enum Msg {
         source: Option<Box<DynamicObject>>,
         findings: Vec<crate::explain::Finding>,
     },
+    /// Current source data for an adjacent lookup.
+    AdjacentSource {
+        generation: u64,
+        request: u64,
+        claim: StatusClaim,
+        source: Box<DynamicObject>,
+    },
+    /// The objects connected to the selection, for the adjacent view.
+    Adjacent {
+        generation: u64,
+        request: u64,
+        claim: StatusClaim,
+        title: String,
+        items: Vec<AdjacentItem>,
+        /// A read that failed — the list may be incomplete.
+        warn: Option<String>,
+    },
     /// Reconciliation-chain findings for the GitOps view, gathered off-thread.
     Gitops {
         generation: u64,
@@ -303,6 +320,21 @@ pub enum Msg {
     /// A state change on a `:notify`-watched object. Generation-free like
     /// [`Msg::Panic`]: the whole point is firing from any view.
     Notify(String),
+}
+
+/// One row of the adjacent view: an object connected to the selection, with
+/// the object itself so `y`/`d` need no second read.
+#[derive(Clone, Debug)]
+pub struct AdjacentItem {
+    pub direction: crate::adjacent::Direction,
+    /// How it relates: `owned by`, `owns`, `mounts`, `runs on`.
+    pub relation: String,
+    pub kind: String,
+    /// Resource name for navigation and describe, including its API group.
+    pub plural: String,
+    pub namespace: Option<String>,
+    pub name: String,
+    pub object: Box<DynamicObject>,
 }
 
 /// One hit from the global fuzzy find (`:find <text>`).
