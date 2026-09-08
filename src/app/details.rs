@@ -137,14 +137,14 @@ impl App {
             }
             return;
         }
-        let plural = self.kind_plural.clone();
+        let resource = self.kubectl_resource();
         let obj = obj.clone();
-        self.describe_object(plural, &obj);
+        self.describe_object(resource, &obj);
     }
 
-    /// `kubectl describe` one object of `plural`, off-thread; the result
-    /// arrives as `Msg::Detail`, falling back to the object's YAML.
-    pub(super) fn describe_object(&mut self, plural: String, obj: &DynamicObject) {
+    /// Describe one object with its qualified resource name. If kubectl fails,
+    /// return the object's YAML through `Msg::Detail`.
+    pub(super) fn describe_object(&mut self, resource: String, obj: &DynamicObject) {
         let name = obj.metadata.name.clone().unwrap_or_default();
         let ns = obj.metadata.namespace.clone();
 
@@ -156,7 +156,7 @@ impl App {
         let tx = self.tx.clone();
         let genr = self.generation;
         let mut argv = self.kubectl_base();
-        argv.extend(["describe".to_string(), plural, name.clone()]);
+        argv.extend(["describe".to_string(), resource, name.clone()]);
         if let Some(ns) = &ns {
             argv.push("-n".into());
             argv.push(ns.clone());

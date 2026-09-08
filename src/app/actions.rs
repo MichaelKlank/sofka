@@ -849,7 +849,7 @@ impl App {
         // warn (and confirm) before opening the editor.
         let flux = flux_managed_by(obj);
         let mut argv = self.kubectl_base();
-        argv.extend(["edit".into(), self.kind_plural.clone(), name]);
+        argv.extend(["edit".into(), self.kubectl_resource(), name]);
         if !ns.is_empty() {
             argv.push("-n".into());
             argv.push(ns);
@@ -2461,6 +2461,15 @@ impl App {
             } else {
                 self.status_claim = None;
             }
+        }
+    }
+
+    pub(super) fn kubectl_resource(&self) -> String {
+        match &self.kind {
+            Some(kind) if !kind.ar.group.is_empty() => {
+                format!("{}.{}.{}", kind.ar.plural, kind.ar.version, kind.ar.group)
+            }
+            _ => self.kind_plural.clone(),
         }
     }
 
