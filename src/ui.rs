@@ -2633,9 +2633,20 @@ fn draw_namespaces(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 ("", theme::text())
             };
+            let shortcut = if browsing {
+                app.namespace_favorites
+                    .iter()
+                    .position(|favorite| favorite == n)
+                    .and_then(|index| Action::FAVORITE_NAMESPACES.get(index))
+                    .map(|action| format!(" [{}]", app.keymap.label("table", *action)))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             ListItem::new(Line::from(vec![
                 Span::styled(tag.to_string(), theme::dim()),
                 Span::styled(n.clone(), Style::default().fg(color)),
+                Span::styled(shortcut, theme::dim()),
             ]))
         })
         .collect();

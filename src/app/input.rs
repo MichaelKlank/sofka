@@ -251,6 +251,20 @@ impl App {
     }
 
     pub(super) fn key_table(&mut self, key: KeyInput) {
+        if let Some(index) = Action::FAVORITE_NAMESPACES
+            .iter()
+            .position(|action| Some(*action) == key.action)
+        {
+            if let Some(namespace) = self
+                .namespace_favorites
+                .get(index)
+                .filter(|n| !n.is_empty())
+                .cloned()
+            {
+                self.set_namespace(namespace);
+            }
+            return;
+        }
         match (key.action, key.code) {
             (Some(Action::Delete), _) => self.request_delete(false),
             (Some(Action::ForceDelete), _) => self.request_delete(true),

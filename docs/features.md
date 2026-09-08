@@ -147,7 +147,10 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   `list`. An explicit search checks the full discovery catalog, because some
   delegated authorizers return incomplete rule reviews.
 - **Namespace switcher** (`n`) with pinned favourites (★) and per-context
-  session recents (·) above the rest, plus a context switcher (`:ctx`). The
+  session recents (·) above the rest, plus a context switcher (`:ctx`). In the
+  resource table, `1` to `9` select the first nine configured favourites in fixed
+  configuration order. The picker shows these shortcuts beside favourites.
+  Unconfigured slots do nothing. `0` selects all namespaces. The
   last namespace picked in each context is remembered across restarts
   (`<state-dir>/namespaces.toml`); `-n`/`-A` override it for a session.
 - **Default sort** - `[views."*"].sort` sets a global initial sort, with

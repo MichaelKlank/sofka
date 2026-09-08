@@ -22104,3 +22104,128 @@ async fn context_key_errors_name_the_destination_config() {
     assert_eq!(app.keymap.label("table", Action::PageDown), "f8");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn favorite_namespace_keys_keep_config_order_and_record_history() {
+    let (mut app, _rx) = test_app();
+    app.namespace = "default".into();
+    app.switch_kind("pods");
+    app.namespace_favorites = (1..=10).map(|i| format!("team-{i}")).collect();
+    for digit in ['9', '1', '4', '2', '3', '5', '6', '7', '8', '1'] {
+        app.handle_key(press(KeyCode::Char(digit))).unwrap();
+        let expected = format!("team-{digit}");
+        assert_eq!(app.namespace, expected);
+        assert_eq!(app.namespace_memory.get("test"), Some(expected.clone()));
+        assert!(app.is_recent_namespace(&expected));
+        assert_eq!(app.kind_plural, "pods");
+    }
+    app.handle_key(press(KeyCode::Char('['))).unwrap();
+    assert_eq!(app.namespace, "team-8");
+    app.handle_key(press(KeyCode::Char(']'))).unwrap();
+    assert_eq!(app.namespace, "team-1");
+    app.handle_key(press(KeyCode::Char('0'))).unwrap();
+    assert!(app.all_namespaces());
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    assert_eq!(app.mode, Mode::Namespaces);
+    assert!(app.filtered_namespaces().contains(&"team-10".to_string()));
+}
+
+#[tokio::test]
+async fn favorite_namespace_keys_ignore_empty_slots_and_preserve_text_input() {
+    let (mut app, _rx) = test_app();
+    app.namespace = "default".into();
+    app.switch_kind("pods");
+    for digit in '1'..='9' {
+        app.handle_key(press(KeyCode::Char(digit))).unwrap();
+        assert_eq!(app.namespace, "default");
+    }
+    app.namespace_favorites = vec![String::new(), "team-2".into()];
+    app.handle_key(press(KeyCode::Char('1'))).unwrap();
+    assert_eq!(app.namespace, "default");
+    app.handle_key(press(KeyCode::Char('2'))).unwrap();
+    assert_eq!(app.namespace, "team-2");
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    app.handle_key(press(KeyCode::Char('1'))).unwrap();
+    assert_eq!(app.ns_filter, "1");
+    assert_eq!(app.namespace, "team-2");
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    app.handle_key(press(KeyCode::Char('9'))).unwrap();
+    assert_eq!(app.filter, "9");
+    assert_eq!(app.namespace, "team-2");
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    app.handle_key(press(KeyCode::Char('1'))).unwrap();
+    assert_eq!(app.command, "1");
+    assert_eq!(app.namespace, "team-2");
+}
+
+#[tokio::test]
+async fn favorite_namespace_key_clears_drill_scope() {
+    let (mut app, _rx) = test_app();
+    app.namespace_favorites = vec!["target".into()];
+    app.switch_kind("cronjobs");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "batch/v1", "kind": "CronJob",
+            "metadata": {"name": "backup", "namespace": "ops"},
+            "spec": {"schedule": "* * * * *", "jobTemplate": {"spec": {}}}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(app.owner.is_some());
+    app.handle_key(press(KeyCode::Char('1'))).unwrap();
+    assert_eq!(app.namespace, "target");
+    assert_eq!(app.kind_plural, "jobs");
+    assert_eq!(app.owner, None);
+    assert_eq!(app.scope_label, None);
+    assert_eq!(app.table_state.selected(), Some(0));
+}
+
+#[tokio::test]
+async fn favorite_namespace_shortcuts_follow_key_configuration_in_picker_and_help() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.namespace = "default".into();
+    app.switch_kind("pods");
+    app.namespace_favorites = vec!["production".into(), "staging".into()];
+    use_keys(
+        &mut app,
+        "[keys.table]\nfavorite_namespace_1 = 'f1'\nfavorite_namespace_2 = []\n",
+    );
+    app.handle_key(press(KeyCode::Char('1'))).unwrap();
+    app.handle_key(press(KeyCode::Char('2'))).unwrap();
+    assert_eq!(app.namespace, "default");
+    app.handle_key(press(KeyCode::F(1))).unwrap();
+    assert_eq!(app.namespace, "production");
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+    let screen = |app: &mut App, terminal: &mut Terminal<TestBackend>| {
+        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>()
+    };
+    let text = screen(&mut app, &mut terminal);
+    assert!(text.contains("production [f1]"), "{text}");
+    assert!(text.contains("staging [unbound]"), "{text}");
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Char('?'))).unwrap();
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "favourite namespace".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    let text = screen(&mut app, &mut terminal);
+    assert!(
+        text.contains("select configured favourite namespace 1"),
+        "{text}"
+    );
+    assert!(text.contains("f1"), "{text}");
+}

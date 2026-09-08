@@ -37,6 +37,7 @@ for the grammar and selector persistence rules.
 | `/`                                           | filter: fuzzy text · `"exact"` · `/regex/` · `!inverse` · `-l`/`-f` selectors (server-side on ⏎) · `status=X` `cpu>500m` `age<2h`                                   |
 | `Ctrl+Z`                                      | toggle faults filter in pod views; configured actions take precedence; combine with `/`; press again to turn off                                                    |
 | `n` / `0`                                     | namespace switcher / all namespaces                                                                                                                                 |
+| `1` to `9`                                    | select a configured favourite namespace in fixed configuration order                                                                                                |
 | `shift-j`                                     | jump to owner/controller                                                                                                                                            |
 | `o`                                           | show the node the selected row names (pods built in; other kinds via `[views."…"].node`)                                                                            |
 | `ctrl-r`                                      | refresh the watch                                                                                                                                                   |
