@@ -47,7 +47,9 @@ conditions) flashes in the status line, rings the terminal bell, and fires a
 
 Each notify is its own bounded single-object watch, so it keeps firing while you
 browse other views - "tell me when this rollout finishes" and keep working.
-`:notify` on the same row turns it off. Everything is session-local.
+`:notify` on the same row turns it off. Switching contexts stops all active
+notifications so events from the previous cluster cannot cross contexts.
+Everything is session-local.
 
 ```toml
 [notify]

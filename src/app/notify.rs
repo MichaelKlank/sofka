@@ -7,7 +7,8 @@ impl App {
     /// waiting reasons, conditions) flashes, rings the terminal bell, and
     /// emits a desktop notification (`[notify]`). Each notify is its own bounded
     /// single-object watch, so it keeps firing no matter which view is open,
-    /// until toggled off or the session ends. Nothing touches disk.
+    /// until toggled off, the context changes, or the session ends. Nothing
+    /// touches disk.
     pub(super) fn toggle_notify(&mut self) {
         if matches!(self.kind_plural.as_str(), "helm" | "helmhistory") {
             self.flash_warn("notify is not available for Helm views");
@@ -47,6 +48,7 @@ impl App {
         let ar = kind.ar.clone();
         let namespaced = kind.namespaced;
         let tx = self.tx.clone();
+        let epoch = self.notify_epoch;
 
         let handle = tokio::spawn(async move {
             let api: Api<DynamicObject> = if namespaced && !ns.is_empty() {
@@ -81,7 +83,7 @@ impl App {
                         };
                         if !items.is_empty() {
                             let text = format!("{label}: {}", items.join(" · "));
-                            if tx.send(Msg::Notify(text)).await.is_err() {
+                            if tx.send(Msg::Notify { epoch, text }).await.is_err() {
                                 return;
                             }
                         }
@@ -90,7 +92,10 @@ impl App {
                     Ok(watcher::Event::Delete(_)) => {
                         prev = None;
                         if tx
-                            .send(Msg::Notify(format!("{label}: deleted")))
+                            .send(Msg::Notify {
+                                epoch,
+                                text: format!("{label}: deleted"),
+                            })
                             .await
                             .is_err()
                         {
@@ -111,6 +116,16 @@ impl App {
             self.notify_tasks.len()
         );
         self.flash_err = false;
+    }
+
+    /// Stop watches tied to the old cluster and invalidate anything they
+    /// already queued before their cancellation completed.
+    pub(super) fn stop_notifications(&mut self) {
+        self.notify_epoch += 1;
+        for (_, task) in self.notify_tasks.drain() {
+            task.abort();
+        }
+        self.pending_notify.clear();
     }
 
     /// The message the main loop should deliver (bell, escape sequence,

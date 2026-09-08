@@ -1974,8 +1974,11 @@ pub struct App {
     /// Active `:notify` watches, keyed by `plural/ns/name`. Each is its own
     /// single-object background watcher, deliberately NOT in [`Self::tasks`]:
     /// a notify must survive `bump_generation` (view switches) and fire from
-    /// anywhere until toggled off.
+    /// anywhere until toggled off or the context changes.
     pub(super) notify_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
+    /// Lifecycle shared by notification watchers and their messages. Unlike
+    /// the view generation, this advances only when the cluster context changes.
+    pub(super) notify_epoch: u64,
     /// Notifications waiting for the main loop to deliver (bell, desktop
     /// escape sequence, notifier subprocess). Drained once per frame and
     /// joined, so a burst arriving in one batch is one delivery — sinks
@@ -2231,6 +2234,7 @@ impl App {
             timeline: crate::timeline::Timeline::default(),
             table_hit: RefCell::new(None),
             notify_tasks: HashMap::new(),
+            notify_epoch: 0,
             pending_notify: Vec::new(),
             prev_revisions: PrevRevisions::default(),
             timeline_target: None,
