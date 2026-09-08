@@ -20601,6 +20601,60 @@ async fn hide_header_reloads_and_keeps_command_input_in_compact_mode() {
 }
 
 #[tokio::test]
+async fn compact_startup_preference_preserves_session_toggles() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let dir = std::env::temp_dir().join(format!("sofka-compact-startup-{}", std::process::id()));
+    write_config(&dir, "compact_mode = false\n");
+    write_config(
+        &dir.join("clusters/test-cluster/dev"),
+        "compact_mode = true\n",
+    );
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    assert!(
+        !app.config
+            .resolve("prod", "test-cluster")
+            .config
+            .compact_mode
+    );
+    let cfg = app.config.resolve("dev", "test-cluster").config;
+    app.compact = cfg.compact_mode;
+    assert!(app.compact);
+    palette(&mut app, "pods");
+    let mut terminal = Terminal::new(TestBackend::new(180, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let compact = app.table_hit.borrow().clone().unwrap();
+
+    app.handle_key(ctrl(KeyCode::Char('e'))).unwrap();
+    assert!(!app.compact);
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let full = app.table_hit.borrow().clone().unwrap();
+    assert_eq!(full.header_y, compact.header_y + 6);
+    assert_eq!(compact.rows_h, full.rows_h + 8);
+
+    land_context(&mut app, "dev");
+    palette(&mut app, "reload");
+    assert!(
+        !app.compact,
+        "true preference must not override session toggle"
+    );
+    app.handle_key(ctrl(KeyCode::Char('e'))).unwrap();
+    assert!(app.compact);
+    land_context(&mut app, "prod");
+    palette(&mut app, "reload");
+    assert!(
+        app.compact,
+        "false preference must not override session toggle"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
 async fn hide_header_follows_context_overrides() {
     let dir =
         std::env::temp_dir().join(format!("sofka-hide-header-context-{}", std::process::id()));

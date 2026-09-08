@@ -8,6 +8,10 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   The namespace is `all` when all namespaces are selected. Set
   `terminal_title = false` to disable title changes. Sofka clears the title on exit.
 
+- **Compact startup** - set `compact_mode = true` to start with a one-line
+  header and no footer. `Ctrl-E` toggles the layout for the session; reloads and
+  context switches preserve it.
+
 - **Optional header** - set `hide_header = true` in the configuration to hide
   the header and logo, including the one-line header in compact mode.
 
