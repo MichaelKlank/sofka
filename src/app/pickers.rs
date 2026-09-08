@@ -829,6 +829,7 @@ impl App {
         self.user_aliases = resolved.config.aliases;
         self.namespace_favorites = resolved.config.favorite_namespaces;
         self.remember_sort = resolved.config.remember_sort.unwrap_or(true);
+        self.hide_header = resolved.config.hide_header;
         self.plugins = resolved.config.plugins;
         self.bookmarks = resolved.config.bookmarks;
         self.workspaces = resolved.config.workspaces;

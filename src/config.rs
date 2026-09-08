@@ -52,6 +52,8 @@ pub struct Config {
     /// and plugins. Overridden by the `--readonly`/`--write` CLI flags. Set
     /// it in a per-cluster/per-context override file to lock down just prod.
     pub readonly: bool,
+    /// Hide the header, including the logo. Defaults to false.
+    pub hide_header: bool,
     /// Custom alias -> canonical resource (plural/kind) mappings.
     pub aliases: HashMap<String, String>,
     /// Namespaces pinned to the top of the switcher (a curated team list, in
