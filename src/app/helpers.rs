@@ -858,7 +858,7 @@ pub(super) fn xray_status(kind: &str, o: &DynamicObject) -> String {
             o.data
                 .pointer("/spec/replicas")
                 .and_then(Value::as_i64)
-                .unwrap_or(0),
+                .unwrap_or(1),
         ),
         "daemonset" => format!(
             "{}/{}",

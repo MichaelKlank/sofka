@@ -9204,6 +9204,50 @@ fn xray_emits_cronjob_job_pod_container_chain() {
     assert_eq!(items[3].container.as_deref(), Some("worker"));
 }
 
+#[tokio::test]
+async fn xray_defaults_omitted_workload_replicas_to_one() {
+    for (plural, kind) in [
+        ("deployments", "Deployment"),
+        ("replicasets", "ReplicaSet"),
+        ("statefulsets", "StatefulSet"),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.cluster.register_kind("apps", kind, plural, true);
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for ch in plural.chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for ch in "xray".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.mode, Mode::Xray);
+
+        let workload = obj(json!({
+            "apiVersion": "apps/v1",
+            "kind": kind,
+            "metadata": {"name": "web", "namespace": "default"},
+            "spec": {},
+            "status": {"readyReplicas": 1},
+        }));
+        let mut items = Vec::new();
+        emit_xray(trim_s(plural), &workload, 0, &HashMap::new(), &mut items);
+        let generation = app.generation;
+        let claim = current_claim(&app);
+        app.handle_msg(Msg::XrayData {
+            generation,
+            claim,
+            items,
+            warn: None,
+        });
+
+        assert_eq!(app.xray_items[0].status, "1/1", "{kind}");
+    }
+}
+
 #[test]
 fn trim_plural_suffix() {
     assert_eq!(trim_s("deployments"), "deployment");
