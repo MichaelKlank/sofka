@@ -492,11 +492,18 @@ pub trait Kinds {
 /// Resolve a `[views."…"]`-style key (`v1/pods`, `apps/deployments`, `pods`)
 /// to a kind, holding it to the group or apiVersion the key names.
 pub fn resolve_view_key(kinds: &impl Kinds, key: &str) -> Option<KindRef> {
-    let resolved = kinds.by_name(key_plural(key))?;
+    let plural = key_plural(key);
     let Some((prefix, _)) = key.rsplit_once('/') else {
-        return Some(resolved);
+        return kinds.by_name(plural);
     };
     let prefix = prefix.to_lowercase();
+    let group = prefix.split_once('/').map_or(prefix.as_str(), |(g, _)| g);
+    let name = if group == "v1" {
+        plural.to_string()
+    } else {
+        format!("{plural}.{group}")
+    };
+    let resolved = kinds.by_name(&name)?;
     let ar = &resolved.ar;
     (prefix == ar.api_version.to_lowercase() || prefix == ar.group.to_lowercase())
         .then_some(resolved)
@@ -735,7 +742,12 @@ mod tests {
         fn by_name(&self, name: &str) -> Option<KindRef> {
             self.0
                 .iter()
-                .find(|k| k.plural == name || k.ar.kind.eq_ignore_ascii_case(name))
+                .find(|k| {
+                    k.plural == name
+                        || k.ar.kind.eq_ignore_ascii_case(name)
+                        || (!k.ar.group.is_empty()
+                            && format!("{}.{}", k.plural, k.ar.group) == name)
+                })
                 .cloned()
         }
         fn by_kind_in_group(&self, kind: &str, group: &str) -> Option<KindRef> {
@@ -1073,6 +1085,17 @@ mod tests {
         assert!(resolve_view_key(&kinds, "nope").is_none());
         // A namespace suffix is not part of the plural.
         assert!(resolve_view_key(&kinds, "v1/pods@prod").is_some());
+        for key in [
+            "cluster.x-k8s.io/clusters",
+            "cluster.x-k8s.io/v1/clusters",
+            "cluster.x-k8s.io/v1/clusters@prod",
+        ] {
+            assert_eq!(
+                resolve_view_key(&kinds, key).unwrap().ar.group,
+                "cluster.x-k8s.io"
+            );
+        }
+        assert!(resolve_view_key(&kinds, "cluster.x-k8s.io/v2/clusters").is_none());
     }
 
     #[test]

@@ -319,6 +319,16 @@ A cluster-scoped kind naming a namespaced one must set it - there is no row
 namespace to fall back on - or the view reports the rule as unfollowable
 instead of quietly finding nothing.
 
+Each lookup reads the current source object. Press `r` to include changes to
+its references, such as a new pod node assignment or PVC binding. If the source
+was deleted or replaced, the view reports the error. Return to the table to
+select the new object.
+
+Navigation and describe keep each object's API group. A group-qualified view
+key also works when another API group has the same resource name. Within one
+lookup, rules share each list response for the same resource and namespace.
+Refresh reads these lists again.
+
 Both settings are resolved key by key across the view keys for a kind
 (`apiVersion/plural`, `group/plural`, plural, kind), not off the single most
 specific view the way `columns` and `sort` are. A specific view that only sets

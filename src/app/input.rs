@@ -435,6 +435,7 @@ impl App {
         }
         self.cancel_explain_request();
         self.cancel_gitops_request();
+        self.cancel_adjacent_request();
         self.help_return = Mode::Table;
         self.palette_return = Mode::Table;
         let query_head = typed.split_whitespace().next().unwrap_or("");

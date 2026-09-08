@@ -86,6 +86,13 @@ pub enum Msg {
         source: Option<Box<DynamicObject>>,
         findings: Vec<crate::explain::Finding>,
     },
+    /// Current source data for an adjacent lookup.
+    AdjacentSource {
+        generation: u64,
+        request: u64,
+        claim: StatusClaim,
+        source: Box<DynamicObject>,
+    },
     /// The objects connected to the selection, for the adjacent view.
     Adjacent {
         generation: u64,
@@ -323,6 +330,7 @@ pub struct AdjacentItem {
     /// How it relates: `owned by`, `owns`, `mounts`, `runs on`.
     pub relation: String,
     pub kind: String,
+    /// Resource name for navigation and describe, including its API group.
     pub plural: String,
     pub namespace: Option<String>,
     pub name: String,

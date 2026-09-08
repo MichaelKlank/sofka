@@ -1136,6 +1136,15 @@ impl App {
                 // progress flash has done its job now the findings are up.
                 self.clear_claimed_status(claim);
             }
+            Msg::AdjacentSource {
+                generation,
+                request,
+                claim,
+                source,
+            } if generation == self.generation && request == self.adjacent_request => {
+                self.adjacent_source = Some(*source);
+                self.gather_adjacent(request, claim);
+            }
             Msg::Adjacent {
                 generation,
                 request,

@@ -3394,6 +3394,297 @@ async fn adjacent_owner_resolves_within_its_group() {
     assert!(app.cluster.resolve_in_group("Cluster", "nope.io").is_none());
 }
 
+async fn receive_adjacent(app: &mut App, rx: &mut Receiver<Msg>) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(message) = rx.recv().await {
+            let done = matches!(message, Msg::Adjacent { .. });
+            if done || matches!(message, Msg::AdjacentSource { .. }) {
+                app.handle_msg(message);
+            }
+            if done {
+                return;
+            }
+        }
+        panic!("adjacent response channel closed");
+    })
+    .await
+    .expect("adjacent lookup did not finish");
+}
+
+#[tokio::test]
+async fn adjacent_owner_actions_keep_the_api_group() {
+    let root = json!({"apiVersion":"v1","kind":"Pod","metadata":{
+    "name":"web","namespace":"default","uid":"pod-uid","ownerReferences":[
+        {"apiVersion":"postgresql.cnpg.io/v1","kind":"Cluster","name":"db","uid":"cnpg-uid"},
+        {"apiVersion":"cluster.x-k8s.io/v1","kind":"Cluster","name":"db","uid":"capi-uid"}
+    ]}});
+    let (mut app, mut rx, responses, _) = health_report_app("pods", root.clone());
+    app.cluster
+        .register_kind("postgresql.cnpg.io", "Cluster", "clusters", true);
+    app.cluster
+        .register_kind("cluster.x-k8s.io", "Cluster", "clusters", true);
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert("/api/v1/namespaces/default/pods/web".into(), (200, root));
+        for group in ["postgresql.cnpg.io", "cluster.x-k8s.io"] {
+            replies.insert(format!("/apis/{group}/v1/namespaces/default/clusters/db"),
+                (200, json!({"apiVersion":format!("{group}/v1"),"kind":"Cluster","metadata":{"name":"db","namespace":"default"}})));
+        }
+    }
+    app.handle_key(press(KeyCode::Char('u'))).unwrap();
+    receive_adjacent(&mut app, &mut rx).await;
+    assert_eq!(app.adjacent_items.len(), 2);
+    assert_eq!(app.adjacent_items[0].plural, "clusters.postgresql.cnpg.io");
+    assert_eq!(app.adjacent_items[1].plural, "clusters.cluster.x-k8s.io");
+    app.handle_key(press(KeyCode::Char('d'))).unwrap();
+    let (_, argv) = app.describe_source.as_ref().unwrap();
+    assert!(
+        argv.windows(3)
+            .any(|args| args == ["describe", "clusters.postgresql.cnpg.io", "db"])
+    );
+    app.cluster.client = Cluster::fake().client;
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.kind.as_ref().unwrap().ar.group, "postgresql.cnpg.io");
+    assert_eq!(app.namespace, "default");
+    assert_eq!(app.fields.as_deref(), Some("metadata.name=db"));
+}
+
+#[tokio::test]
+async fn adjacent_refresh_reads_current_references_without_watch_updates() {
+    let root = json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"web","namespace":"default","uid":"pod-uid"}});
+    let (mut app, mut rx, responses, requests) = health_report_app("pods", root.clone());
+    let path = "/api/v1/namespaces/default/pods/web";
+    responses
+        .lock()
+        .unwrap()
+        .insert(path.into(), (200, root.clone()));
+    app.handle_key(press(KeyCode::Char('u'))).unwrap();
+    receive_adjacent(&mut app, &mut rx).await;
+    assert!(app.adjacent_items.is_empty());
+    let mut fresh = root;
+    fresh["spec"] = json!({"nodeName":"node-new"});
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(path.into(), (200, fresh));
+        replies.insert(
+            "/api/v1/nodes/node-new".into(),
+            (
+                200,
+                json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"node-new"}}),
+            ),
+        );
+    }
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    receive_adjacent(&mut app, &mut rx).await;
+    assert_eq!(app.adjacent_items.len(), 1);
+    assert_eq!(app.adjacent_items[0].name, "node-new");
+    assert_eq!(
+        app.adjacent_source.as_ref().unwrap().data["spec"]["nodeName"],
+        "node-new"
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| *request == path)
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn adjacent_refresh_reports_replacement_and_read_errors() {
+    let root = json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"web","namespace":"default","uid":"pod-uid"}});
+    let (mut app, mut rx, responses, _) = health_report_app("pods", root.clone());
+    let path = "/api/v1/namespaces/default/pods/web";
+    responses
+        .lock()
+        .unwrap()
+        .insert(path.into(), (200, root.clone()));
+    app.handle_key(press(KeyCode::Char('u'))).unwrap();
+    receive_adjacent(&mut app, &mut rx).await;
+    let mut replacement = root;
+    replacement["metadata"]["uid"] = json!("new-uid");
+    for (code, response, expected) in [
+        (200, replacement, "was replaced"),
+        (
+            404,
+            json!({"kind":"Status","apiVersion":"v1","status":"Failure","code":404,"reason":"NotFound","message":"resource is gone"}),
+            "resource is gone",
+        ),
+        (
+            403,
+            json!({"kind":"Status","apiVersion":"v1","status":"Failure","code":403,"reason":"Forbidden","message":"access denied"}),
+            "access denied",
+        ),
+    ] {
+        responses
+            .lock()
+            .unwrap()
+            .insert(path.into(), (code, response));
+        app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        receive_adjacent(&mut app, &mut rx).await;
+        assert!(app.flash_err);
+        assert!(app.flash.contains(expected), "{}", app.flash);
+        assert!(app.adjacent_items.is_empty());
+        assert!(!app.adjacent_pending());
+        assert_eq!(
+            app.adjacent_source
+                .as_ref()
+                .unwrap()
+                .metadata
+                .uid
+                .as_deref(),
+            Some("pod-uid")
+        );
+    }
+}
+
+#[tokio::test]
+async fn adjacent_reverse_rules_resolve_a_qualified_source_group() {
+    let root = json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":"credentials","namespace":"default","uid":"secret-uid"}});
+    let (mut app, mut rx, responses, requests) = health_report_app("secrets", root.clone());
+    app.cluster
+        .register_kind("postgresql.cnpg.io", "Cluster", "clusters", true);
+    app.cluster
+        .register_kind("cluster.x-k8s.io", "Cluster", "clusters", true);
+    let cfg: crate::config::Config = toml::from_str(
+        r#"
+        [[views."postgresql.cnpg.io/v1/clusters@prod".refs]]
+        path = "/spec/secret/name"
+        namespace_path = "/spec/secret/namespace"
+        kind = "secrets"
+        reverse = "cluster"
+    "#,
+    )
+    .unwrap();
+    let (views, warnings) = crate::views::compile(&cfg.views);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    app.user_views = views;
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(
+            "/api/v1/namespaces/default/secrets/credentials".into(),
+            (200, root),
+        );
+        replies.insert("/apis/postgresql.cnpg.io/v1/namespaces/prod/clusters".into(),
+            (200, json!({"apiVersion":"postgresql.cnpg.io/v1","kind":"ClusterList","metadata":{},"items":[
+                {"apiVersion":"postgresql.cnpg.io/v1","kind":"Cluster","metadata":{"name":"db","namespace":"prod"},"spec":{"secret":{"name":"credentials","namespace":"default"}}}
+            ]})));
+    }
+    app.handle_key(press(KeyCode::Char('u'))).unwrap();
+    receive_adjacent(&mut app, &mut rx).await;
+    assert_eq!(app.adjacent_items.len(), 1);
+    assert_eq!(app.adjacent_items[0].name, "db");
+    assert_eq!(app.adjacent_items[0].namespace.as_deref(), Some("prod"));
+    assert!(
+        !requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path.contains("cluster.x-k8s.io"))
+    );
+}
+
+#[tokio::test]
+async fn adjacent_rules_share_pod_lists_and_refresh_reads_them_again() {
+    let root = json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":"credentials","namespace":"default","uid":"secret-uid"}});
+    let (mut app, mut rx, responses, requests) = health_report_app("secrets", root.clone());
+    let pod_path = "/api/v1/namespaces/default/pods";
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(
+            "/api/v1/namespaces/default/secrets/credentials".into(),
+            (200, root),
+        );
+        replies.insert(pod_path.into(), (200, json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":[
+            {"apiVersion":"v1","kind":"Pod","metadata":{"name":"web","namespace":"default"},"spec":{
+                "volumes":[{"secret":{"secretName":"credentials"}}, {"projected":{"sources":[{"secret":{"name":"credentials"}}]}}],
+                "containers":[{"envFrom":[{"secretRef":{"name":"credentials"}}]}],
+                "imagePullSecrets":[{"name":"credentials"}]
+            }}
+        ]})));
+    }
+    app.handle_key(press(KeyCode::Char('u'))).unwrap();
+    receive_adjacent(&mut app, &mut rx).await;
+    let mut relations: Vec<_> = app
+        .adjacent_items
+        .iter()
+        .map(|it| (it.name.as_str(), it.relation.as_str()))
+        .collect();
+    relations.sort();
+    assert_eq!(
+        relations,
+        [("web", "mounts"), ("web", "pulls with"), ("web", "reads")]
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| *path == pod_path)
+            .count(),
+        1
+    );
+    responses.lock().unwrap().insert(
+        pod_path.into(),
+        (
+            200,
+            json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":[]}),
+        ),
+    );
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    receive_adjacent(&mut app, &mut rx).await;
+    assert!(app.adjacent_items.is_empty());
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| *path == pod_path)
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn adjacent_source_reply_is_dropped_after_leaving_or_refreshing() {
+    for exit in ["esc", "palette", "refresh"] {
+        let (mut app, _rx) = test_app();
+        open_adjacent_on_a_pod(&mut app);
+        let message = Msg::AdjacentSource {
+            generation: app.generation,
+            request: app.adjacent_request,
+            claim: current_claim(&app),
+            source: Box::new(obj(
+                json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"stale","namespace":"db","uid":"stale-uid"}}),
+            )),
+        };
+        match exit {
+            "esc" => app.handle_key(press(KeyCode::Esc)).unwrap(),
+            "palette" => {
+                app.handle_key(press(KeyCode::Char(':'))).unwrap();
+                for key in "info".chars() {
+                    app.handle_key(press(KeyCode::Char(key))).unwrap();
+                }
+                app.handle_key(press(KeyCode::Enter)).unwrap();
+            }
+            _ => app.handle_key(press(KeyCode::Char('r'))).unwrap(),
+        }
+        app.handle_msg(message);
+        assert_eq!(
+            app.adjacent_source
+                .as_ref()
+                .unwrap()
+                .metadata
+                .name
+                .as_deref(),
+            Some("db-0")
+        );
+    }
+}
+
 #[tokio::test]
 async fn panic_msg_flashes_regardless_of_generation() {
     let (mut app, _rx) = test_app();

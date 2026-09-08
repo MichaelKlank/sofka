@@ -4,6 +4,10 @@ use crate::adjacent::{
     Backward, Direction, Forward, KindRef, Kinds, dedup, names_source, owned_by,
 };
 use crate::store::AdjacentItem;
+use kube::core::GroupVersionResource;
+use std::collections::hash_map::Entry;
+
+type ListCache = HashMap<(GroupVersionResource, String), Vec<DynamicObject>>;
 
 /// The cluster's registry, answering the plan's kind lookups.
 struct ClusterKinds<'a>(&'a crate::k8s::Cluster);
@@ -75,9 +79,48 @@ impl App {
         self.adjacent_claim.is_some()
     }
 
-    /// Decide what to read on the UI thread (the kind registry lives here),
-    /// then read it off-thread and send one [`Msg::Adjacent`].
+    /// Read the current source before planning its connections.
     fn spawn_adjacent(&mut self) {
+        let Some(obj) = self.adjacent_source.clone() else {
+            return;
+        };
+        let Some(kind) = self.kind.clone() else {
+            return;
+        };
+        let client = self.cluster.client.clone();
+        let tx = self.tx.clone();
+        let generation = self.generation;
+        let title = self.adjacent_title.clone();
+        let claim = self.claim_status(format!(
+            "gathering connections for {}...",
+            obj.metadata.name.clone().unwrap_or_default()
+        ));
+        self.adjacent_claim = Some(claim);
+        self.adjacent_request = self.adjacent_request.wrapping_add(1);
+        let request = self.adjacent_request;
+        tokio::spawn(async move {
+            let msg = match report_source(&client, &kind.ar, kind.namespaced, &obj).await {
+                Ok(source) => Msg::AdjacentSource {
+                    generation,
+                    request,
+                    claim,
+                    source: Box::new(source),
+                },
+                Err(warn) => Msg::Adjacent {
+                    generation,
+                    request,
+                    claim,
+                    title,
+                    items: Vec::new(),
+                    warn: Some(warn),
+                },
+            };
+            let _ = tx.send(msg).await;
+        });
+    }
+
+    /// Plan on the UI thread, then read the connected objects in a task.
+    pub(super) fn gather_adjacent(&mut self, request: u64, claim: StatusClaim) {
         let Some(obj) = self.adjacent_source.clone() else {
             return;
         };
@@ -101,17 +144,10 @@ impl App {
         let tx = self.tx.clone();
         let genr = self.generation;
         let title = self.adjacent_title.clone();
-        let claim = self.claim_status(format!(
-            "gathering what's adjacent to {}…",
-            obj.metadata.name.clone().unwrap_or_default()
-        ));
-        self.adjacent_claim = Some(claim);
-        self.adjacent_request = self.adjacent_request.wrapping_add(1);
-        let request = self.adjacent_request;
-
         tokio::spawn(async move {
             let mut warn = (!plan.warns.is_empty()).then(|| plan.warns.join("; "));
             let mut items: Vec<AdjacentItem> = Vec::new();
+            let mut lists = ListCache::new();
             let ns = obj.metadata.namespace.clone().unwrap_or_default();
             let source_uid = obj.metadata.uid.clone();
             let source_name = obj.metadata.name.clone().unwrap_or_default();
@@ -125,9 +161,9 @@ impl App {
             }
             for r in plan.children {
                 let scope = if r.namespaced { ns.as_str() } else { "" };
-                for o in list_or_warn(&client, &r.ar, r.namespaced, scope, &mut warn).await {
-                    if owned_by(&o, source_uid.as_deref()) {
-                        items.push(item(Direction::Child, "owns", &r, o));
+                for o in cached_list(&mut lists, &client, &r, scope, &mut warn).await {
+                    if owned_by(o, source_uid.as_deref()) {
+                        items.push(item(Direction::Child, "owns", &r, o.clone()));
                     }
                 }
             }
@@ -144,9 +180,9 @@ impl App {
                 }
             }
             for Backward { rule, from, scope } in plan.backward {
-                for o in list_or_warn(&client, &from.ar, from.namespaced, &scope, &mut warn).await {
-                    if names_source(&o, &rule, &source_name, source_ns) {
-                        items.push(item(Direction::NamedBy, &rule.relation, &from, o));
+                for o in cached_list(&mut lists, &client, &from, &scope, &mut warn).await {
+                    if names_source(o, &rule, &source_name, source_ns) {
+                        items.push(item(Direction::NamedBy, &rule.relation, &from, o.clone()));
                     }
                 }
             }
@@ -252,10 +288,34 @@ fn item(direction: Direction, relation: &str, r: &KindRef, o: DynamicObject) -> 
         direction,
         relation: relation.to_string(),
         kind: r.ar.kind.clone(),
-        plural: r.plural.clone(),
+        plural: if r.ar.group.is_empty() {
+            r.plural.clone()
+        } else {
+            format!("{}.{}", r.plural, r.ar.group)
+        },
         namespace: o.metadata.namespace.clone(),
         name: o.metadata.name.clone().unwrap_or_default(),
         object: Box::new(o),
+    }
+}
+
+async fn cached_list<'a>(
+    lists: &'a mut ListCache,
+    client: &Client,
+    kind: &KindRef,
+    scope: &str,
+    warn: &mut Option<String>,
+) -> &'a [DynamicObject] {
+    let scope = if kind.namespaced { scope } else { "" };
+    let key = (
+        GroupVersionResource::gvr(&kind.ar.group, &kind.ar.version, &kind.ar.plural),
+        scope.to_string(),
+    );
+    match lists.entry(key) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => {
+            entry.insert(list_or_warn(client, &kind.ar, kind.namespaced, scope, warn).await)
+        }
     }
 }
 
