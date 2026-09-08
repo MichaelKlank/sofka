@@ -20492,3 +20492,46 @@ async fn hide_header_follows_context_overrides() {
     assert!(app.hide_header);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test]
+async fn timeline_key_keeps_recently_changed_history_at_capacity() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let pod = |name: &str, generation: i64| {
+        json!({"apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": name, "namespace": "default",
+                "generation": generation, "resourceVersion": generation.to_string(),
+                "creationTimestamp": "2999-01-01T00:00:00Z"}})
+    };
+    apply(&mut app, pod("a-active", 1));
+    for i in 0..1999 {
+        apply(&mut app, pod(&format!("idle-{i:04}"), 1));
+    }
+    for generation in 2..=3 {
+        apply(&mut app, pod("a-active", generation));
+    }
+    apply(&mut app, pod("z-new", 1));
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::Char('T'))).unwrap();
+    assert_eq!(app.mode, Mode::Timeline);
+    let (plural, key) = app.timeline_target.as_ref().unwrap();
+    assert_eq!(key, "default/a-active");
+    let entries = app.timeline.entries(plural, key).unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].text, "Pod created");
+    assert_eq!(entries[2].text, "spec changed: generation 2 → 3");
+    assert!(app.timeline.entries("pods", "default/idle-0000").is_none());
+    assert!(app.timeline.entries("pods", "default/idle-0001").is_some());
+    assert!(app.timeline.entries("pods", "default/z-new").is_some());
+
+    apply(&mut app, pod("idle-0000", 2));
+    assert!(app.timeline.entries("pods", "default/idle-0000").is_some());
+    assert!(app.timeline.entries("pods", "default/idle-0001").is_none());
+    assert_eq!(
+        app.timeline
+            .entries("pods", "default/a-active")
+            .unwrap()
+            .len(),
+        3
+    );
+}
