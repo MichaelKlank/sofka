@@ -24,6 +24,9 @@ clippy: rust::clippy
 # Run the unit test suite.
 test: rust::test
 
+# Generate an HTML coverage report.
+coverage: rust::coverage
+
 # Fast local confidence check.
 check: fmt-check clippy test
 
