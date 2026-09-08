@@ -97,6 +97,12 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   `events`, `pf`, `notify`, `find`, `vlogs`, `rightsize`, `fleet`, `skin`,
   `reload`, `config`, `info`). `:` and `?` open the palette and help from every
   navigation screen, then close back to the screen where they were opened.
+- **Cross-context resource navigation** - `:pods @production-cluster default`
+  switches context, resource, and namespace together without changing kubeconfig's
+  `current-context`. Context names after `@` fuzzy-complete: Tab/Shift-Tab select
+  a suggestion and Enter opens it. Omit the namespace to use the target context's
+  remembered or default namespace. Namespace completion after `@context` is not
+  provided.
 - **Help scrolling** (`?`) - browse all bindings, including plugins, bookmarks,
   and workspaces. `j` / `k` and `↑` / `↓` scroll one line. `ctrl-f`, `PgDn`,
   and `space` move forward one page; `ctrl-b` and `PgUp` move back one page.

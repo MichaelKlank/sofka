@@ -2246,6 +2246,10 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
             "query resource, namespace, context and filter together",
         ),
         bind(
+            ":resource @context [namespace]",
+            "switch context and resource (context fuzzy-completes; kubeconfig unchanged)",
+        ),
+        bind(
             "ctrl-u · ctrl-w",
             "text inputs: clear line (cmd-⌫) · delete word (opt-⌫)",
         ),

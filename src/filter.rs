@@ -589,6 +589,17 @@ impl ResourceQuery {
             let slot = match word {
                 "-n" | "--namespace" => &mut query.namespace,
                 "--context" => &mut query.context,
+                _ if word.starts_with('@') => {
+                    let context = &word[1..];
+                    if context.is_empty() {
+                        return Err("expected context after @".into());
+                    }
+                    if query.context.is_some() {
+                        return Err("duplicate context".into());
+                    }
+                    query.context = Some(context.into());
+                    continue;
+                }
                 _ if !word.starts_with('-') && query.namespace.is_none() => {
                     query.namespace = Some(word.into());
                     continue;

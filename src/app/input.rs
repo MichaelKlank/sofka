@@ -419,7 +419,7 @@ impl App {
 
     /// Run the highlighted palette suggestion (or the raw typed text).
     fn palette_accept(&mut self) {
-        let typed = self.command.trim().to_string();
+        let mut typed = self.command.trim().to_string();
         let picked = self.cmd_suggestions.get(self.cmd_sel).cloned();
         self.mode = Mode::Table;
         self.command.clear();
@@ -453,8 +453,14 @@ impl App {
             && (typed.contains(" /")
                 || typed
                     .split_whitespace()
-                    .any(|s| matches!(s, "-n" | "--namespace" | "--context")))
+                    .any(|s| s.starts_with('@') || matches!(s, "-n" | "--namespace" | "--context")))
         {
+            if let Some(s) = picked.as_ref().filter(|s| s.kind == SuggestKind::Context)
+                && let Some((head, rest)) = typed.split_once(char::is_whitespace)
+                && rest.trim_start().starts_with('@')
+            {
+                typed = format!("{head} @{}", s.label);
+            }
             match crate::filter::ResourceQuery::parse(&typed) {
                 Ok(query) => self.apply_resource_query(query),
                 Err(error) => self.flash_warn(&format!("query: {error}")),
@@ -702,6 +708,26 @@ impl App {
         }) {
             if is_ctx_command(&head) {
                 self.suggest_contexts(&arg);
+                return;
+            }
+            if let Some(context) = arg.strip_prefix('@')
+                && (self.cluster.resolve(&head).is_some()
+                    || (!PALETTE_COMMANDS
+                        .iter()
+                        .any(|c| c.names.contains(&head.as_str()))
+                        && !self
+                            .plugins
+                            .iter()
+                            .any(|p| p.palette.as_deref() == Some(&head))))
+            {
+                if self.command.split_whitespace().count() == 2
+                    && !self.command.ends_with(char::is_whitespace)
+                {
+                    self.suggest_contexts(context);
+                } else {
+                    self.cmd_suggestions.clear();
+                    self.cmd_sel = 0;
+                }
                 return;
             }
             if self.cluster.resolve(&head).is_some() {
