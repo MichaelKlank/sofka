@@ -19,6 +19,10 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   Resource names and built-in aliases take priority over discovered short names.
   Shared short names use group priority, then alphabetical group and resource
   order. User aliases override discovered aliases.
+  Sofka can connect when it cannot read one API group. Examples: the
+  extension API server is down, or it sends an `apiVersion` that is not `v1`.
+  Sofka does not load that group. It shows a warning at startup and a flash
+  on the first screen. `:info` shows the group and the reason.
 - **Live watch** of any kind through `kube::runtime::watcher`, streamed into an
   in-memory store. Watch requests use uncompressed responses to avoid gzip
   stream errors. List requests retain gzip compression.
@@ -82,6 +86,13 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   `events`, `pf`, `notify`, `find`, `vlogs`, `rightsize`, `fleet`, `skin`,
   `reload`, `config`, `info`). `:` and `?` open the palette and help from every
   navigation screen, then close back to the screen where they were opened.
+- **Help scrolling** (`?`) - browse all bindings, including plugins, bookmarks,
+  and workspaces. `j` / `k` and `↑` / `↓` scroll one line. `ctrl-f`, `PgDn`,
+  and `space` move forward one page; `ctrl-b` and `PgUp` move back one page.
+  Each page uses the visible content height. `g` / `Home` go to the top;
+  `G` / `End` go to the bottom. `/` filters the bindings and resets the scroll
+  position. `esc` clears the filter first, then closes help. `q` or `?` closes
+  help and returns to the previous screen.
 - **Filtering** (`/`) with matched-character highlighting: fuzzy text, `"text"`
   contiguous match, `/re/` regular expression (both case-insensitive), `!text`
   inverse match (also `!"text"` and `!/re/`), `-l`/`-f` label and field selectors (evaluated server-side on
@@ -413,12 +424,18 @@ pod is rejected; browse through a pod that already mounts the claim instead.
 - **Snapshots** (`:snapshot`, `:snapshots`) - capture the current table view to
   text, JSON, or YAML, then browse and open saved captures. See
   [Snapshots](debugging.md#snapshots).
-- **Runtime diagnostics** (`:info`, or `sofka --info`) - version and build,
-  config sources, live context/cluster/API server and Kubernetes revision,
-  discovery and Metrics API status, watch error counts, and the
-  state/snapshot/bundle directories. The connected Kubernetes revision also
+- **Runtime diagnostics** (`:info`, or `sofka info`) - version and build, config
+  sources, live context/cluster/API server and Kubernetes revision, discovery
+  with warnings for unread API groups, Metrics API status, watch error and reconnect counts, API request latency
+  per class, active skin, loaded plugins and views, and the
+  state/log/snapshot/bundle directories. The connected Kubernetes revision also
   stays visible in the main header.
-  Identifiers and counts only, never credentials, tokens, or Secret values.
+  Identifiers, paths, and counts only, never credentials, tokens, or Secret
+  values. See [Runtime diagnostics](debugging.md#runtime-diagnostics).
+- **Structured logging** (`[logging]`, or `SOFKA_LOG=debug`) - sofka's own
+  session log as logfmt lines under the state directory, with every value
+  redacted on the way in and writes off the UI thread. Off by default. See
+  [Structured logging](debugging.md#structured-logging).
 
 ## Bundled plugins
 

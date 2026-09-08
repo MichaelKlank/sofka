@@ -3569,6 +3569,144 @@ async fn drill_into_workload_then_esc_restores() {
 }
 
 #[tokio::test]
+async fn drill_into_machinedeployment_shows_machines() {
+    let (mut app, _rx) = test_app();
+    app.cluster.register_kind(
+        "cluster.x-k8s.io",
+        "MachineDeployment",
+        "machinedeployments",
+        true,
+    );
+    app.cluster
+        .register_kind("cluster.x-k8s.io", "Machine", "machines", true);
+    app.switch_kind("machinedeployments");
+    assert_eq!(app.kind_plural, "machinedeployments");
+
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "cluster.x-k8s.io/v1", "kind": "MachineDeployment",
+            "metadata": {"name": "md-1", "namespace": "default"},
+            "spec": {"selector": {"matchLabels": {"cluster.x-k8s.io/cluster-name": "my-cluster"}}}
+        }),
+    );
+    app.table_state.select(Some(0));
+    assert_eq!(app.rows().len(), 1);
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.kind_plural, "machines");
+    assert_eq!(
+        app.labels.as_deref(),
+        Some("cluster.x-k8s.io/cluster-name=my-cluster")
+    );
+    assert_eq!(app.scope_label.as_deref(), Some("machinedeployment/md-1"));
+    assert_eq!(app.stack.len(), 1);
+
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.kind_plural, "machinedeployments");
+    assert_eq!(app.labels, None);
+    assert!(app.stack.is_empty());
+}
+
+#[tokio::test]
+async fn machinedeployment_without_selector_warns() {
+    let (mut app, _rx) = test_app();
+    app.cluster.register_kind(
+        "cluster.x-k8s.io",
+        "MachineDeployment",
+        "machinedeployments",
+        true,
+    );
+    app.cluster
+        .register_kind("cluster.x-k8s.io", "Machine", "machines", true);
+    app.switch_kind("machinedeployments");
+
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "cluster.x-k8s.io/v1", "kind": "MachineDeployment",
+            "metadata": {"name": "md-1", "namespace": "default"},
+            "spec": {"selector": {}}
+        }),
+    );
+    app.table_state.select(Some(0));
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(
+        app.kind_plural, "machinedeployments",
+        "stays on machinedeployments"
+    );
+    assert!(app.flash.contains("no machine selector"));
+}
+
+#[tokio::test]
+async fn machinedeployment_drill_resolves_qualified_machine_group() {
+    let (mut app, _rx) = test_app();
+    app.cluster.register_kind(
+        "cluster.x-k8s.io",
+        "MachineDeployment",
+        "machinedeployments",
+        true,
+    );
+    app.cluster
+        .register_kind("cluster.x-k8s.io", "Machine", "machines", true);
+    // A competing CRD with the same plural but a different group. The bare
+    // `machines` key in the registry is last-write-wins, so it now resolves
+    // to the wrong kind. The drill must use the qualified name to avoid this.
+    app.cluster
+        .register_kind("other.example.com", "Machine", "machines", true);
+
+    app.switch_kind("machinedeployments");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "cluster.x-k8s.io/v1", "kind": "MachineDeployment",
+            "metadata": {"name": "md-1", "namespace": "default"},
+            "spec": {"selector": {"matchLabels": {"app": "web"}}}
+        }),
+    );
+    app.table_state.select(Some(0));
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.kind_plural, "machines");
+    assert_eq!(
+        app.kind.as_ref().unwrap().ar.group,
+        "cluster.x-k8s.io",
+        "qualified name resolves to Cluster API, not the competing CRD"
+    );
+}
+
+#[tokio::test]
+async fn non_capi_machinedeployments_falls_through_to_yaml() {
+    let (mut app, _rx) = test_app();
+    app.cluster.register_kind(
+        "other.example.com",
+        "MachineDeployment",
+        "machinedeployments",
+        true,
+    );
+    app.switch_kind("machinedeployments");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "other.example.com/v1", "kind": "MachineDeployment",
+            "metadata": {"name": "md-1", "namespace": "default"},
+            "spec": {"selector": {"matchLabels": {"app": "web"}}}
+        }),
+    );
+    app.table_state.select(Some(0));
+
+    // Enter on a non-CAPI machinedeployments opens YAML, not Cluster API
+    // Machines — the group guard prevents the CAPI drill from firing.
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Detail, "opens YAML, not machines");
+    assert_eq!(
+        app.kind_plural, "machinedeployments",
+        "stays on machinedeployments"
+    );
+}
+
+#[tokio::test]
 async fn o_on_pod_scopes_to_its_host_node() {
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
@@ -10398,6 +10536,164 @@ async fn help_search_uses_own_buffer() {
 }
 
 #[tokio::test]
+async fn help_pages_use_the_rendered_height() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for (height, page) in [(12, 1), (19, 8), (24, 13), (40, 29)] {
+        let (mut app, _rx) = test_app();
+        app.handle_key(press(KeyCode::Char('?'))).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.help_viewport_h, page);
+        for forward in [
+            press(KeyCode::PageDown),
+            press(KeyCode::Char(' ')),
+            ctrl(KeyCode::Char('f')),
+        ] {
+            for backward in [press(KeyCode::PageUp), ctrl(KeyCode::Char('b'))] {
+                app.handle_key(forward).unwrap();
+                term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+                assert_eq!(app.help_scroll, page);
+                app.handle_key(backward).unwrap();
+                assert_eq!(app.help_scroll, 0);
+                app.handle_key(backward).unwrap();
+                assert_eq!(app.help_scroll, 0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn help_scrolls_and_resets_on_reopen() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, _rx) = test_app();
+    app.handle_key(press(KeyCode::Char('?'))).unwrap();
+    let mut term = Terminal::new(TestBackend::new(120, 19)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert!(app.help_max_scroll > app.help_viewport_h);
+
+    for (down, up) in [
+        (KeyCode::Char('j'), KeyCode::Char('k')),
+        (KeyCode::Down, KeyCode::Up),
+    ] {
+        app.handle_key(press(down)).unwrap();
+        assert_eq!(app.help_scroll, 1);
+        app.handle_key(press(up)).unwrap();
+        assert_eq!(app.help_scroll, 0);
+        app.handle_key(press(up)).unwrap();
+        assert_eq!(app.help_scroll, 0);
+    }
+    for (bottom, top) in [
+        (KeyCode::Char('G'), KeyCode::Char('g')),
+        (KeyCode::End, KeyCode::Home),
+    ] {
+        app.handle_key(press(bottom)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.help_scroll, app.help_max_scroll);
+        let text: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("close help and return to the previous screen"));
+        for key in [
+            press(KeyCode::Down),
+            press(KeyCode::PageDown),
+            press(KeyCode::Char(' ')),
+            ctrl(KeyCode::Char('f')),
+        ] {
+            app.handle_key(key).unwrap();
+            assert_eq!(app.help_scroll, app.help_max_scroll);
+        }
+        app.handle_key(press(top)).unwrap();
+        assert_eq!(app.help_scroll, 0);
+    }
+
+    app.handle_key(press(KeyCode::End)).unwrap();
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    assert_eq!(app.help_scroll, 0);
+    for c in "help".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.help_max_scroll, 0);
+    app.handle_key(press(KeyCode::End)).unwrap();
+    assert_eq!(app.help_scroll, 0);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.mode, Mode::Help);
+    assert!(app.help_filter.is_empty());
+    assert_eq!(app.help_scroll, 0);
+    assert!(app.help_max_scroll > 0);
+
+    app.handle_key(press(KeyCode::End)).unwrap();
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    app.handle_key(press(KeyCode::Char('?'))).unwrap();
+    assert_eq!(app.help_scroll, 0);
+}
+
+#[tokio::test]
+async fn help_pages_use_new_dimensions_immediately_after_resize() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for (before, after, page) in [(24, 19, 8), (19, 24, 13)] {
+        let (mut app, _rx) = test_app();
+        app.handle_key(press(KeyCode::Char('?'))).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, before)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        term.backend_mut().resize(120, after);
+        crate::ui::resize(&mut term, &mut app).unwrap();
+        app.handle_key(press(KeyCode::PageDown)).unwrap();
+        assert_eq!(app.help_scroll, page);
+        app.handle_key(press(KeyCode::PageUp)).unwrap();
+        assert_eq!(app.help_scroll, 0);
+        app.handle_key(press(KeyCode::End)).unwrap();
+        assert_eq!(app.help_scroll, app.help_max_scroll);
+    }
+}
+
+#[tokio::test]
+async fn help_paging_updates_after_resize_and_compact_mode() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, _rx) = test_app();
+    app.handle_key(press(KeyCode::Char('?'))).unwrap();
+    let mut term = Terminal::new(TestBackend::new(120, 19)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    app.handle_key(press(KeyCode::End)).unwrap();
+    let old_max = app.help_max_scroll;
+
+    term.backend_mut().resize(120, 24);
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.help_viewport_h, 13);
+    assert_eq!(app.help_max_scroll, old_max - 5);
+    assert_eq!(app.help_scroll, app.help_max_scroll);
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::PageDown)).unwrap();
+    assert_eq!(app.help_scroll, 13);
+
+    app.handle_key(ctrl(KeyCode::Char('e'))).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.help_viewport_h, 21);
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::PageDown)).unwrap();
+    assert_eq!(app.help_scroll, 21);
+
+    term.backend_mut().resize(120, 200);
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.help_scroll, 0);
+    assert_eq!(app.help_max_scroll, 0);
+    app.handle_key(press(KeyCode::PageDown)).unwrap();
+    assert_eq!(app.help_scroll, 0);
+}
+
+#[tokio::test]
 async fn copy_doc_copies_the_whole_document() {
     let (mut app, _rx) = test_app();
     app.detail = Scrollable {
@@ -11055,6 +11351,73 @@ async fn fleet_seeds_connecting_rows_and_applies_summaries() {
 }
 
 #[tokio::test]
+async fn fleet_command_counts_terminating_pods_as_unhealthy() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, _rx) = test_app();
+    app.fleet_cfg.contexts = vec!["staging".into()];
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for ch in "fleet".chars() {
+        app.handle_key(press(KeyCode::Char(ch))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Fleet);
+
+    for deleting in [false, true] {
+        if deleting {
+            app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        }
+        assert_eq!(
+            app.fleet_rows[0].status,
+            crate::fleet::FleetStatus::Connecting
+        );
+        let pods = [
+            ("running", "Running", false),
+            ("completed", "Succeeded", false),
+            ("deleting-running", "Running", deleting),
+            ("deleting-completed", "Succeeded", deleting),
+        ]
+        .map(|(name, phase, terminating)| {
+            obj(json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": name,
+                    "deletionTimestamp": terminating.then_some("2026-09-07T10:00:00Z"),
+                },
+                "status": {
+                    "phase": phase,
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                },
+            }))
+        });
+        let mut row = crate::fleet::FleetRow::connecting("staging".into(), false);
+        super::fleet::update_pod_counts(&mut row, &pods);
+        row.status = crate::fleet::FleetStatus::Ok;
+        app.handle_msg(Msg::FleetRow {
+            generation: app.generation,
+            row: Box::new(row),
+        });
+
+        let expected_unhealthy = if deleting { 2 } else { 0 };
+        assert_eq!(app.fleet_rows[0].pods_total, 4);
+        assert_eq!(app.fleet_rows[0].pods_unhealthy, expected_unhealthy);
+        assert_eq!(app.fleet_rows[0].is_healthy(), !deleting);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect();
+        assert!(
+            screen.contains(&format!("pods {expected_unhealthy}✗/4")),
+            "{screen}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn ctrl_e_toggles_compact_mode_from_any_mode() {
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
@@ -11626,6 +11989,90 @@ fn land_context(app: &mut App, name: &str) {
         name: name.into(),
         result: Ok(Box::new(cluster)),
     });
+}
+
+#[tokio::test]
+async fn landing_a_context_flashes_skipped_discovery_groups() {
+    let (mut app, _rx) = test_app();
+    let mut cluster = Cluster::fake();
+    cluster.context = "dev".into();
+    cluster.discovery_warnings =
+        vec!["API discovery could not read odd.example.com/v1alpha3: expected v1".into()];
+    app.handle_msg(Msg::ContextSwitched {
+        generation: app.generation,
+        name: "dev".into(),
+        result: Ok(Box::new(cluster)),
+    });
+    assert_eq!(
+        app.flash,
+        "API discovery could not read 1 API group. Refer to :info for details."
+    );
+    assert!(app.flash_err);
+
+    land_context(&mut app, "prod");
+    assert_eq!(app.flash, "Viewing pods");
+    assert!(!app.flash_err);
+}
+
+#[tokio::test]
+async fn discovery_flash_yields_to_a_config_warning_on_context_switch() {
+    let dir = std::env::temp_dir().join(format!(
+        "sofka-discovery-flash-yields-{}",
+        std::process::id()
+    ));
+    let cluster_dir = dir.join("clusters").join("test-cluster");
+    std::fs::create_dir_all(&cluster_dir).unwrap();
+    std::fs::write(cluster_dir.join("config.toml"), "readonly = \n").unwrap();
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+
+    let mut cluster = Cluster::fake();
+    cluster.context = "dev".into();
+    cluster.discovery_warnings =
+        vec!["API discovery could not read odd.example.com/v1alpha3: expected v1".into()];
+    app.handle_msg(Msg::ContextSwitched {
+        generation: app.generation,
+        name: "dev".into(),
+        result: Ok(Box::new(cluster)),
+    });
+    assert!(app.flash_err);
+    assert!(
+        app.flash.starts_with("ignoring invalid "),
+        "config warning must stay visible, got: {}",
+        app.flash
+    );
+    assert_eq!(app.config_warnings.len(), 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn info_lists_skipped_discovery_groups() {
+    let (mut app, _rx) = test_app();
+    app.cluster.discovery_fallback =
+        Some("Aggregated API discovery failed: boom. Sofka read each API group separately.".into());
+    app.cluster.discovery_warnings = vec![
+        "API discovery could not read odd.example.com/v1alpha3: expected v1".into(),
+        "API discovery could not read broken.example.com/v1beta1: 503".into(),
+    ];
+    palette(&mut app, "info");
+    let lines: Vec<String> = app.detail.lines.iter().map(|l| l.to_string()).collect();
+    let discovery = lines
+        .iter()
+        .position(|l| l.starts_with("  discovery:"))
+        .expect("discovery line");
+    assert_eq!(
+        lines[discovery + 1],
+        "    • Aggregated API discovery failed: boom. Sofka read each API group separately."
+    );
+    assert_eq!(
+        lines[discovery + 2],
+        "    • API discovery could not read odd.example.com/v1alpha3: expected v1"
+    );
+    assert_eq!(
+        lines[discovery + 3],
+        "    • API discovery could not read broken.example.com/v1beta1: 503"
+    );
+    assert!(app.config_warnings.is_empty());
 }
 
 /// Choose `name` in the context switcher, through the switcher's own keys.
@@ -12539,25 +12986,162 @@ async fn info_view_reports_version_cluster_and_watch_health() {
     let (mut app, _rx) = test_app();
     app.cluster.server_version = "v1.36.2-eks-bca9cf6".into();
     app.watch_errors = 3;
+    app.watch_reconnects = 2;
     app.last_error = Some("connection refused".into());
+    app.plugins = vec![crate::config::Plugin {
+        name: "argocd-sync".into(),
+        ..Default::default()
+    }];
     assert!(app.run_palette_command("info"));
     assert_eq!(app.mode, Mode::Detail);
-    let text = app
-        .detail
-        .lines
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = info_text(&app);
     assert!(text.contains(&format!("sofka v{}", crate::diagnostics::VERSION)));
     assert!(text.contains("Cluster"), "{text}");
     assert!(text.contains("api server:"), "{text}");
     assert!(text.contains("k8s rev:     v1.36.2-eks-bca9cf6"), "{text}");
-    assert!(text.contains("errors: 3"), "{text}");
+    assert!(text.contains("errors:     3"), "{text}");
+    assert!(text.contains("reconnects: 2"), "{text}");
     assert!(text.contains("connection refused"), "{text}");
+    // Loaded plugins and views are named, not just counted.
+    assert!(text.contains("plugins:    1  (argocd-sync)"), "{text}");
+    assert!(text.contains("Logging"), "{text}");
+    assert!(text.contains("level: off"), "{text}");
     assert!(text.contains("Directories"), "{text}");
+    assert!(text.contains("logs:"), "{text}");
     // Never leaks credentials — the report is identifiers and counts only.
     assert!(!text.to_lowercase().contains("bearer"), "{text}");
+}
+
+#[tokio::test]
+async fn info_view_redacts_credentials_in_cluster_identity() {
+    let (mut app, _rx) = test_app();
+    // A kubeconfig can put basic-auth userinfo in the server URL, and an error
+    // string can echo a request header back at us. Neither reaches the screen.
+    app.cluster.cluster_url = "https://admin:hunter2@api.example.com:6443".into();
+    app.last_error = Some("401 Unauthorized for authorization: Bearer abc.def.ghi".into());
+    app.metrics_error = Some("token=s3cr3t rejected".into());
+    assert!(app.run_palette_command("info"));
+    let text = info_text(&app);
+    assert!(!text.contains("hunter2"), "{text}");
+    assert!(!text.contains("abc.def.ghi"), "{text}");
+    assert!(!text.contains("s3cr3t"), "{text}");
+    assert!(text.contains("api.example.com:6443"), "{text}");
+    assert!(text.contains(crate::redact::REDACTED), "{text}");
+}
+
+#[tokio::test]
+async fn info_redacts_complete_credentials_through_the_keyboard() {
+    let (mut app, _rx) = test_app();
+    app.cluster.cluster_url = "https://api.example/?token_value=private123&limit=5".into();
+    app.last_error = Some(r#"{"password":"abc\"private456","status":"denied"}"#.into());
+    for ch in ":info".chars() {
+        app.handle_key(press(KeyCode::Char(ch))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Detail);
+    let text = info_text(&app);
+    assert!(
+        !text.contains("private123") && !text.contains("private456"),
+        "{text}"
+    );
+    assert!(
+        text.contains("limit=5") && text.contains(r#""status":"denied""#),
+        "{text}"
+    );
+    assert!(text.contains(crate::redact::REDACTED), "{text}");
+}
+
+#[tokio::test]
+async fn info_masks_ip_addresses_in_the_report_header_and_status() {
+    use ratatui::{Terminal, backend::TestBackend};
+    for (server, ip) in [
+        ("https://10.40.0.3:6443/", "10.40.0.3"),
+        ("https://[fd00::3]:6443/", "fd00::3"),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.cluster.cluster_url = server.into();
+        app.handle_msg(Msg::Error {
+            generation: app.generation,
+            error: format!("connection to {server} failed"),
+        });
+        for ch in ":info".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.mode, Mode::Detail);
+        assert!(!info_text(&app).contains(ip));
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!rendered.contains(ip), "{rendered}");
+        assert!(
+            rendered.contains("«redacted»") && rendered.contains(":6443/"),
+            "{rendered}"
+        );
+        assert_eq!(app.cluster.cluster_url, server);
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            rendered.contains(ip),
+            "the resource view must still identify the server"
+        );
+    }
+}
+
+#[tokio::test]
+async fn watch_relist_after_sync_counts_as_a_reconnect() {
+    let (mut app, _rx) = test_app();
+    let generation = app.generation;
+    // Initial list: reset, rows, sync. Nothing has reconnected yet.
+    app.handle_msg(Msg::Reset { generation });
+    apply(
+        &mut app,
+        json!({"metadata": {"name": "a", "namespace": "default"}}),
+    );
+    app.handle_msg(Msg::Synced { generation });
+    assert!(app.run_palette_command("info"));
+    assert!(
+        info_text(&app).contains("reconnects: 0"),
+        "{}",
+        info_text(&app)
+    );
+
+    // The watcher heals a desync by re-listing: reset again after a sync.
+    app.handle_msg(Msg::Reset { generation });
+    app.handle_msg(Msg::Synced { generation });
+    assert_eq!(app.watch_reconnects, 1);
+    assert!(app.run_palette_command("info"));
+    assert!(
+        info_text(&app).contains("reconnects: 1"),
+        "{}",
+        info_text(&app)
+    );
+}
+
+fn info_text(app: &App) -> String {
+    app.detail
+        .lines
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[tokio::test]
@@ -13652,6 +14236,42 @@ async fn plugin_result(rx: &mut Receiver<Msg>) -> Msg {
     })
     .await
     .expect("plugin did not finish")
+}
+
+/// The action journal is the only thing the structured log records for a
+/// plugin run, so what it holds is exactly what can reach the log file. A
+/// plugin input is arbitrary user text — an API token, a password — and must
+/// never be part of it.
+#[tokio::test]
+async fn plugin_secret_inputs_never_reach_the_journal_or_diagnostics() {
+    let (mut app, _rx) = app_with_pod();
+    let mut plugin = named_plugin("echo", &["${input.token}"]);
+    plugin.inputs = toml::from_str(
+        r#"
+        [token]
+        type = "string"
+        default = ""
+    "#,
+    )
+    .unwrap();
+    app.plugins = vec![plugin];
+
+    plugin_command(&mut app, "example-plugin token=hunter2-s3cr3t");
+    let Some(Suspend::Shell(argv)) = app.pending.take() else {
+        panic!("plugin not invoked");
+    };
+    // The value reaches the subprocess, and nowhere else.
+    assert_eq!(argv, ["echo", "hunter2-s3cr3t"]);
+
+    let journal = app.journal.lines().join("\n");
+    assert!(journal.contains("plugin: Example"), "{journal}");
+    assert!(journal.contains("1 target"), "{journal}");
+    assert!(!journal.contains("hunter2-s3cr3t"), "{journal}");
+
+    assert!(app.run_palette_command("info"));
+    let info = info_text(&app);
+    assert!(info.contains("plugins:    1  (Example)"), "{info}");
+    assert!(!info.contains("hunter2-s3cr3t"), "{info}");
 }
 
 #[tokio::test]
@@ -15985,6 +16605,38 @@ async fn workload_table_reports_rollout_generation_and_desired_readiness() {
 }
 
 #[tokio::test]
+async fn workload_tables_default_omitted_replicas_to_one() {
+    for (plural, kind, header, expected) in [
+        ("replicasets", "ReplicaSet", "DESIRED", "1"),
+        ("statefulsets", "StatefulSet", "READY", "1/1"),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.cluster.register_kind("apps", kind, plural, true);
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for ch in plural.chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "apps/v1",
+                "kind": kind,
+                "metadata": {"name": "web", "namespace": "default"},
+                "spec": {},
+                "status": {"replicas": 1, "readyReplicas": 1, "updatedReplicas": 1},
+            }),
+        );
+        let (headers, rows) = app.snapshot_table();
+        assert_eq!(
+            rows[0][headers.iter().position(|h| h == header).unwrap()],
+            expected,
+            "{kind} {header}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn workload_table_keeps_active_rollouts_progressing_when_unavailable() {
     for (current, ready, updated, stalled, expected) in [
         (3, 1, 1, false, "Progressing"),
@@ -16331,6 +16983,22 @@ fn explain_selected_with_pure_evidence(app: &mut App) {
         source: None,
         findings,
     });
+}
+
+#[tokio::test]
+async fn explain_key_reports_terminating_ready_pods_as_unhealthy() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let mut pod = health_test_pod("web");
+    pod["metadata"]["deletionTimestamp"] = json!("2026-09-07T10:00:00Z");
+    apply(&mut app, pod);
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    explain_selected_with_pure_evidence(&mut app);
+    assert_eq!(app.explain_items[0].level, crate::explain::Level::Warn);
+    assert_eq!(
+        app.explain_items[0].text,
+        "Pod/web is Terminating (1/1 ready)"
+    );
 }
 
 #[tokio::test]

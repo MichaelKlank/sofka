@@ -78,24 +78,25 @@ switches live, `:skin gruvbox-dark` applies directly.
 
 Each of these is documented where the feature itself is:
 
-| Section               | What it does                                             | Docs                                                       |
-| --------------------- | -------------------------------------------------------- | ---------------------------------------------------------- |
-| `[views]`             | columns (path, built-in, metric) and navigation per view | [Views and thresholds](views.md)                           |
-| `[thresholds]`        | RESTARTS/CPU/MEM/utilization coloring bands              | [Views and thresholds](views.md#thresholds)                |
-| `[[plugins]]`         | shell-out commands bound to key chords                   | [Plugins](plugins.md)                                      |
-| `[[bookmarks]]`       | saved navigation commands                                | [Plugins](plugins.md#bookmarks)                            |
-| `[[workspaces]]`      | named sets of views for one task                         | [Plugins](plugins.md#workspaces)                           |
-| `[[forwards]]`        | saved port-forwards, optionally autostarted              | [Plugins](plugins.md#saved-forwards)                       |
-| `[[guardrails]]`      | enforced rules on destructive actions                    | [Safety](safety.md#guardrails)                             |
-| `[logs]`              | log tail, follow buffer, `since` lookback                | [Log controls](debugging.md#log-controls)                  |
-| `[notify]`            | bell and desktop notification delivery                   | [Notifications](debugging.md#notifications)                |
-| `[keys]`              | palette completion key rebinds                           | [Key reference](keys.md#palette-completion-keys)           |
-| `[debug]`             | ephemeral and node debug images                          | [Debug containers](debugging.md#debug-containers-and-pods) |
-| `[bundle]`            | redaction and size caps for `:bundle`                    | [Diagnostic bundles](debugging.md#diagnostic-bundles)      |
-| `[pvc_explore]`       | helper pod image and TTL for PVC explore                 | [PVC explore](features.md#pvc-explore)                     |
-| `[providers.metrics]` | Prometheus/VictoriaMetrics for `:rightsize`              | [Providers](providers.md#right-sizing-metrics-provider)    |
-| `[providers.logs]`    | VictoriaLogs backend for `L`                             | [Providers](providers.md#log-provider-victorialogs)        |
-| `[fleet]`             | contexts in the cross-cluster dashboard                  | [Providers](providers.md#fleet-dashboard)                  |
+| Section               | What it does                                | Docs                                                       |
+| --------------------- | ------------------------------------------- | ---------------------------------------------------------- |
+| `[views]`             | columns and navigation per view             | [Views and thresholds](views.md)                           |
+| `[thresholds]`        | RESTARTS/CPU/MEM/utilization coloring bands | [Views and thresholds](views.md#thresholds)                |
+| `[[plugins]]`         | shell-out commands bound to key chords      | [Plugins](plugins.md)                                      |
+| `[[bookmarks]]`       | saved navigation commands                   | [Plugins](plugins.md#bookmarks)                            |
+| `[[workspaces]]`      | named sets of views for one task            | [Plugins](plugins.md#workspaces)                           |
+| `[[forwards]]`        | saved port-forwards, optionally autostarted | [Plugins](plugins.md#saved-forwards)                       |
+| `[[guardrails]]`      | enforced rules on destructive actions       | [Safety](safety.md#guardrails)                             |
+| `[logs]`              | log tail, follow buffer, `since` lookback   | [Log controls](debugging.md#log-controls)                  |
+| `[notify]`            | bell and desktop notification delivery      | [Notifications](debugging.md#notifications)                |
+| `[keys]`              | palette completion key rebinds              | [Key reference](keys.md#palette-completion-keys)           |
+| `[debug]`             | ephemeral and node debug images             | [Debug containers](debugging.md#debug-containers-and-pods) |
+| `[bundle]`            | redaction and size caps for `:bundle`       | [Diagnostic bundles](debugging.md#diagnostic-bundles)      |
+| `[logging]`           | sofka's own structured log file             | [Runtime diagnostics](debugging.md#runtime-diagnostics)    |
+| `[pvc_explore]`       | helper pod image and TTL for PVC explore    | [PVC explore](features.md#pvc-explore)                     |
+| `[providers.metrics]` | Prometheus/VictoriaMetrics for `:rightsize` | [Providers](providers.md#right-sizing-metrics-provider)    |
+| `[providers.logs]`    | VictoriaLogs backend for `L`                | [Providers](providers.md#log-provider-victorialogs)        |
+| `[fleet]`             | contexts in the cross-cluster dashboard     | [Providers](providers.md#fleet-dashboard)                  |
 
 ## Per-cluster and per-context overrides
 

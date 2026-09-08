@@ -11,6 +11,7 @@
 pub mod adjacent;
 pub mod altscroll;
 pub mod app;
+pub mod applog;
 pub mod atomicfile;
 #[cfg(feature = "bench")]
 pub mod benchsupport;
@@ -33,6 +34,7 @@ pub mod nsmem;
 pub mod plugins;
 pub mod providers;
 pub mod pvcexplore;
+pub mod redact;
 pub mod rightsize;
 pub mod sanitize;
 mod server_tls;
