@@ -36,6 +36,7 @@ for the grammar and selector persistence rules.
 | `y` / `d` / `E`                               | view YAML / describe (`kubectl`) / live events                                                                                                                      |
 | `x`                                           | secrets: show `data` base64-decoded (as `stringData`) · PVCs: browse the volume                                                                                     |
 | `X` / `T`                                     | explain why the selection is unhealthy / session-local state-change timeline                                                                                        |
+| `u` / `:adjacent`                             | adjacent view: owners, children, and the objects the selection names or is named by (`⏎` opens one)                                                                 |
 | `:gitops` / `:flux`                           | Flux owner, source, revisions & reconciliation chain for the selection (`⏎` to jump)                                                                                |
 | `:can-i` / `:can-i <verb> <resource> [ns]`    | what you can do here / check a single action (`SelfSubjectAccessReview`)                                                                                            |
 | `:journal` / `:audit`                         | session-local log of the mutating actions you've taken                                                                                                              |
@@ -127,6 +128,16 @@ closes help. `q` or `?` closes help and returns to the previous screen.
 its events, `l` its logs, `r` gathers again, `esc` goes back. After opening
 logs or events, one `esc` returns to Explain and another returns to the table. A
 finding you can drill into has a trailing `→`.
+
+## Adjacent view (`u`)
+
+Every object directly connected to the selection: what owns it, what it owns,
+what its spec names (a pod's node, claims, ConfigMaps, Secrets), and what names
+it (the pods mounting a claim, the claims using a class). `j` / `k` move, `⏎`
+opens the object in its own view - name-filtered, so every action there applies
+to it - `y` shows its YAML, `d` describes it, `r` gathers again, `esc` goes back.
+Not offered on namespaces (`enter` re-scopes to one) or Helm rows.
+See [Views](views.md#navigating-between-kinds) for adding CRD relations.
 
 ## Text inputs (palette, filters, prompts)
 

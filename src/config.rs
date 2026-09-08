@@ -807,7 +807,36 @@ pub struct ViewConfig {
     /// Where `enter` drills to: another kind, listed under a label selector
     /// built from the selected row. See [`DrillConfig`].
     pub drill: Option<DrillConfig>,
+    /// References this kind's objects make to other objects, for the
+    /// adjacent view (`u`). See [`RefConfig`].
+    pub refs: Vec<RefConfig>,
+    /// Kinds this kind's objects own (through `ownerReferences`), scanned for
+    /// children by the adjacent view.
+    pub children: Vec<String>,
     pub columns: Vec<ViewColumnConfig>,
+}
+
+/// One reference in `[[views."…".refs]]`: a field of this kind's objects that
+/// names an object of another kind. The adjacent view (`u`) follows it both
+/// ways — from a row to what it names, and from a named object back to the
+/// rows naming it.
+///
+/// ```toml
+/// [[views."karpenter.sh/v1/nodeclaims".refs]]
+/// path = "/spec/nodeClassRef/name"   # JSON Pointer; `*` fans out over an array
+/// kind = "ec2nodeclasses"
+/// relation = "shaped by"             # row label; default "references"
+/// reverse = "cluster"                # usages listed: namespace (default) | cluster | none
+/// ```
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct RefConfig {
+    pub path: String,
+    pub kind: String,
+    pub relation: Option<String>,
+    pub reverse: Option<String>,
+    /// Where the target's namespace lives when it isn't the row's own.
+    pub namespace_path: Option<String>,
 }
 
 /// The `drill` of a [`ViewConfig`]: `enter` on a row of this kind opens
