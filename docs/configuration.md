@@ -28,7 +28,7 @@ remember_sort     = true   # save and restore sort choices per resource kind
                            # false makes sort changes temporary
 
 # Namespaces pinned to the top of the `n` switcher (★); session recents (·)
-# follow them.
+# follow them. Keys 1 to 9 select the first nine entries in this fixed order.
 favorite_namespaces = ["kube-system", "monitoring"]
 
 [aliases]
@@ -79,6 +79,19 @@ under `[aliases]`. Use a group-qualified target when resource names overlap:
 ```toml
 [aliases]
 md = "machinedeployments.cluster.x-k8s.io"
+```
+
+The resource table actions `favorite_namespace_1` through
+`favorite_namespace_9` select entries from `favorite_namespaces` in configuration
+order. Recent namespace changes do not change these assignments. Extra entries
+remain available through `n`. Empty or unconfigured slots do nothing.
+
+To change or disable a shortcut, use the existing key configuration:
+
+```toml
+[keys.table]
+favorite_namespace_1 = "f1"
+favorite_namespace_2 = []
 ```
 
 ## Skins

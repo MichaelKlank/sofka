@@ -58,6 +58,15 @@ actions! {
     Exit => ("exit", "quit from table"),
     Explain => ("explain", "explain"),
     Faults => ("faults", "faults"),
+    FavoriteNamespace1 => ("favorite_namespace_1", "select configured favourite namespace 1"),
+    FavoriteNamespace2 => ("favorite_namespace_2", "select configured favourite namespace 2"),
+    FavoriteNamespace3 => ("favorite_namespace_3", "select configured favourite namespace 3"),
+    FavoriteNamespace4 => ("favorite_namespace_4", "select configured favourite namespace 4"),
+    FavoriteNamespace5 => ("favorite_namespace_5", "select configured favourite namespace 5"),
+    FavoriteNamespace6 => ("favorite_namespace_6", "select configured favourite namespace 6"),
+    FavoriteNamespace7 => ("favorite_namespace_7", "select configured favourite namespace 7"),
+    FavoriteNamespace8 => ("favorite_namespace_8", "select configured favourite namespace 8"),
+    FavoriteNamespace9 => ("favorite_namespace_9", "select configured favourite namespace 9"),
     Filter => ("filter", "filter"),
     First => ("first", "first row"),
     FleetMark => ("fleet_mark", "fleet mark"),
@@ -125,6 +134,18 @@ impl Action {
             _ => None,
         }
     }
+
+    pub const FAVORITE_NAMESPACES: [Self; 9] = [
+        Self::FavoriteNamespace1,
+        Self::FavoriteNamespace2,
+        Self::FavoriteNamespace3,
+        Self::FavoriteNamespace4,
+        Self::FavoriteNamespace5,
+        Self::FavoriteNamespace6,
+        Self::FavoriteNamespace7,
+        Self::FavoriteNamespace8,
+        Self::FavoriteNamespace9,
+    ];
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -409,6 +430,15 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("table", Action::ActionMenu, &["t"]),
     ("table", Action::Adjacent, &["u"]),
     ("table", Action::AllNamespaces, &["0"]),
+    ("table", Action::FavoriteNamespace1, &["1"]),
+    ("table", Action::FavoriteNamespace2, &["2"]),
+    ("table", Action::FavoriteNamespace3, &["3"]),
+    ("table", Action::FavoriteNamespace4, &["4"]),
+    ("table", Action::FavoriteNamespace5, &["5"]),
+    ("table", Action::FavoriteNamespace6, &["6"]),
+    ("table", Action::FavoriteNamespace7, &["7"]),
+    ("table", Action::FavoriteNamespace8, &["8"]),
+    ("table", Action::FavoriteNamespace9, &["9"]),
     ("table", Action::Attach, &["a"]),
     ("table", Action::Back, &["esc"]),
     ("table", Action::CopyCell, &["Y"]),
