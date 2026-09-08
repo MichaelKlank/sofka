@@ -5500,6 +5500,107 @@ async fn background_status_borrows_the_bar_without_orphaning_an_action() {
 }
 
 #[tokio::test]
+async fn can_i_overview_displays_rule_evaluation_errors() {
+    let error = "webhook authorizer does not support user rule resolution";
+    for (incomplete, evaluation_error) in [
+        (true, Some(error)),
+        (false, Some(error)),
+        (true, None),
+        (false, None),
+        (true, Some("")),
+        (false, Some("  ")),
+    ] {
+        let (mut app, mut rx) = test_app();
+        app.cluster.client = kube::Client::new(
+            tower::service_fn(move |request: http::Request<kube::client::Body>| {
+                let is_review =
+                    request.uri().path() == "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews";
+                if is_review {
+                    assert_eq!(request.method(), http::Method::POST);
+                }
+                let body = json!({
+                    "apiVersion": "authorization.k8s.io/v1",
+                    "kind": "SelfSubjectRulesReview",
+                    "spec": {"namespace": "default"},
+                    "status": {
+                        "incomplete": incomplete,
+                        "evaluationError": evaluation_error,
+                        "resourceRules": [{
+                            "verbs": ["get", "list"],
+                            "apiGroups": [""],
+                            "resources": ["pods"]
+                        }],
+                        "nonResourceRules": []
+                    }
+                });
+                let (status, body) = if is_review {
+                    (200, body)
+                } else {
+                    (
+                        403,
+                        json!({"kind": "Status", "apiVersion": "v1",
+                        "status": "Failure", "reason": "Forbidden",
+                        "message": "unused test request", "code": 403}),
+                    )
+                };
+                async move {
+                    Ok::<_, std::convert::Infallible>(
+                        http::Response::builder()
+                            .status(status)
+                            .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                                body.to_string(),
+                            )))
+                            .unwrap(),
+                    )
+                }
+            }),
+            "default",
+        );
+        for key in ":can-i".chars() {
+            app.handle_key(press(KeyCode::Char(key))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let reply = rx.recv().await.expect("rules review must return a message");
+                if matches!(reply, Msg::Detail { .. }) {
+                    break reply;
+                }
+            }
+        })
+        .await
+        .expect("rules review must finish");
+        app.handle_msg(reply);
+        assert_eq!(app.mode, Mode::Detail);
+        let output = app
+            .detail
+            .lines
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(output.contains("⚠ incomplete:"), incomplete, "{output}");
+        assert!(!output.contains("delegates authorization"), "{output}");
+        if evaluation_error.is_some_and(|value| !value.trim().is_empty()) {
+            assert!(
+                output.contains(&format!("⚠ evaluation error: {error}")),
+                "{output}"
+            );
+        } else {
+            assert!(!output.contains("evaluation error:"), "{output}");
+        }
+        assert!(
+            output.contains("get,list") && output.contains("pods"),
+            "{output}"
+        );
+        assert!(
+            output.contains(":can-i <verb> <resource> [namespace]"),
+            "{output}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn can_i_verdict_arrives_as_a_flash() {
     let (mut app, _rx) = test_app();
     // `:can-i` shares `Msg::Flash` with the action results. A denial is an
