@@ -26,18 +26,19 @@ wrong.
 
 ## What it does
 
-sofka is a reimagining of [k9s](https://github.com/derailed/k9s) with one generic
-object pipeline instead of a renderer per resource kind. Same purpose, different
-architecture. The short version:
+sofka is a Kubernetes terminal interface inspired by
+[k9s](https://github.com/derailed/k9s). It uses a shared object pipeline. Both
+programs support built-in and custom resources. The main functions are:
 
-- **Every CRD works on day one** - one generic render pipeline, curated columns
+- **Custom resource browsing** - one generic render pipeline, built-in columns
   for common kinds, NAME/AGE for the rest, and `enter` on a CRD drills into its
   custom resources.
 - **Flux CD built in** - `t` suspends, resumes, and reconciles through native API
   patches. No `flux` binary. Plus a native Helm inspector that decodes release
   Secrets itself.
-- **Argo CD built in** - `t` suspends, resumes, and syncs ArgoCD Applications
-  and ApplicationSets through native API patches. No `argocd` binary.
+- **Argo CD built in** - `t` suspends, resumes, and syncs ArgoCD Applications.
+  ApplicationSets support suspend and resume. These actions use native API
+  patches. No `argocd` binary.
 - **It tells you why something is broken** - `X` opens a deterministic,
   evidence-based incident view. No AI, no external service.
 - **Bulk actions** - `space` marks rows for delete, kill, or Flux actions across
@@ -51,7 +52,7 @@ architecture. The short version:
   detection.
 
 The [full feature list](docs/features.md) is long. So is the
-[comparison with k9s](docs/vs-k9s.md), including why it's faster.
+[comparison with k9s](docs/vs-k9s.md), with shared functions and design differences.
 
 ## Installation
 
@@ -163,7 +164,7 @@ be read-only in a light skin while everything else stays as is. See the
 | Doc                                            | What's in it                                                |
 | ---------------------------------------------- | ----------------------------------------------------------- |
 | [Features](docs/features.md)                   | the complete feature list                                   |
-| [vs k9s](docs/vs-k9s.md)                       | design differences and why it's faster                      |
+| [vs k9s](docs/vs-k9s.md)                       | shared functions and design differences                     |
 | [Performance benchmark](docs/benchmark-k9s.md) | measured TUI latency, memory use, and binary size           |
 | [Keys](docs/keys.md)                           | full keymap, per-view keys                                  |
 | [Configuration](docs/configuration.md)         | every config section, per-cluster/per-context overrides     |
