@@ -72,6 +72,24 @@ cargo test                   # unit tests (no cluster required)
 cargo clippy --all-targets   # lints (clean)
 ```
 
+### Test coverage
+
+Install the coverage tools once:
+
+```sh
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov --version 0.9.1 --locked
+```
+
+Run `just coverage` to test the code with coverage enabled and generate
+`target/llvm-cov/html/index.html`. Open this file in a browser to inspect which
+lines the tests execute. The report uses the default Cargo features.
+
+Pull requests run a separate coverage job. Download the `coverage-html` artifact
+from the CI run, extract it, and open `index.html`. Reports are kept for 14 days.
+There is no minimum coverage percentage. Use the report to find missing tests;
+coverage alone does not show whether a test checks the correct behavior.
+
 ## Release
 
 After merging the release-ready changes to `main`, run one of:

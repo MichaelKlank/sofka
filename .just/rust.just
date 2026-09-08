@@ -23,6 +23,10 @@ clippy:
 test:
     cd "{{ root }}" && cargo test --locked
 
+# Generate an HTML coverage report.
+coverage:
+    cd "{{ root }}" && cargo llvm-cov --locked --html
+
 # Build the debug binary.
 build:
     cd "{{ root }}" && cargo build
