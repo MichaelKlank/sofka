@@ -48,6 +48,34 @@ the layout. By default columns overlay the curated ones: a matching header
 replaces it in place, new columns go before AGE. Invalid entries are skipped with
 a warning in the app - they never take down the TUI.
 
+### Image tags
+
+Use `format = "image-tag"` on a text path column to show the image tag:
+
+```toml
+[[views."v1/pods".columns]]
+name = "TAG"
+path = "/spec/containers/0/image"
+format = "image-tag"
+```
+
+The path selects one image field with JSON Pointer. This example selects the
+first container. The formatter separates registry ports, tags, and digests:
+
+- `registry:5000/app:1.2.3` shows `1.2.3`.
+- `app` or `registry:5000/app` shows `latest`.
+- `app@sha256:…` shows `-` because the reference has no tag.
+- `app:1.2.3@sha256:…` shows `1.2.3`.
+
+The digest examples are abbreviated. Missing or null fields still show `<none>`.
+Empty strings and values that are not strings keep their usual display.
+Sorting and text filters use the displayed tag. If `format` is omitted, the
+column keeps its usual behavior. The default Pod columns do not change.
+
+The formatter accepts an omitted `type` or `type = "text"`. Other types,
+`metric` sources, and `builtin` sources are incompatible with `format`.
+Unsupported formats and incompatible columns are skipped with a config warning.
+
 ### Built-in and metric columns
 
 Set exactly one source for each column: `path`, `builtin`, or `metric`.

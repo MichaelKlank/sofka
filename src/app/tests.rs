@@ -21147,3 +21147,57 @@ async fn terminal_title_removes_control_characters() {
     palette(&mut app, "pods kube-system");
     assert_eq!(app.terminal_title(), Some("sofka: dev/kube-system".into()));
 }
+
+#[tokio::test]
+async fn image_tag_columns_render_selected_paths_and_filter_by_tag() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/pods"]
+        replace = true
+        columns = [
+            { name = "NAME", builtin = "NAME" },
+            { name = "IMAGE", path = "/spec/containers/0/image" },
+            { name = "TAG", path = "/spec/containers/0/image", format = "image-tag" },
+            { name = "SECOND", path = "/spec/containers/1/image", format = "image-tag", wide = true },
+        ]
+        "#,
+    );
+    palette(&mut app, "pods");
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let cases = [
+        (Some("registry:5000/app:1.2.3".to_string()), "1.2.3"),
+        (Some("app".to_string()), "latest"),
+        (Some(format!("app@{digest}")), "-"),
+        (Some(format!("app:1.2.3@{digest}")), "1.2.3"),
+        (None, "<none>"),
+    ];
+    for (i, (image, _)) in cases.iter().enumerate() {
+        let mut first = json!({"name": "app"});
+        if let Some(image) = image {
+            first["image"] = json!(image);
+        }
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": format!("pod-{i}"), "namespace": "default"},
+                "spec": {"containers": [first, {"name": "sidecar", "image": "sidecar:2"}]}
+            }),
+        );
+    }
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    let (headers, rows) = app.snapshot_table();
+    assert_eq!(headers, ["NAME", "IMAGE", "TAG", "SECOND"]);
+    for (row, (image, tag)) in rows.iter().zip(&cases) {
+        assert_eq!(row[1], image.as_deref().unwrap_or("<none>"));
+        assert_eq!(row[2], *tag);
+        assert_eq!(row[3], "2");
+    }
+    assert_eq!(rows.len(), cases.len());
+    type_filter(&mut app, "tag=1.2.3");
+    let (_, rows) = app.snapshot_table();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row[2] == "1.2.3"));
+}
