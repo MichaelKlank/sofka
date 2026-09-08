@@ -35,10 +35,9 @@ pub enum ColumnKind {
     /// RFC 3339 timestamp — rendered as compact elapsed time (`3d4h`, or
     /// `in 30d` for the future), sorted by the timestamp.
     Time,
-    /// A `status.conditions` entry looked up **by its `type` name** (held in
-    /// [`UserColumn::pointer`]) instead of a fragile array index — condition
-    /// order isn't guaranteed by anything. Renders the condition's `status`
-    /// (`True`/`False`/`Unknown`) and drives row coloring like `Status`.
+    /// A condition lookup using [`UserColumn::condition_match`] and
+    /// [`UserColumn::pointer`]. Shows `status` (`True`/`False`/`Unknown`)
+    /// and controls row colors like `Status`.
     Condition,
 }
 
@@ -49,28 +48,36 @@ pub enum Align {
     Right,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionMatch {
+    Type,
+    Status,
+}
+
+impl ConditionMatch {
+    fn field(self) -> &'static str {
+        match self {
+            Self::Type => "type",
+            Self::Status => "status",
+        }
+    }
+}
+
 /// One compiled custom column.
 #[derive(Debug, Clone)]
 pub struct UserColumn {
     /// Header, uppercased for display.
     pub header: String,
-    /// JSON Pointer into the object — except when this column looks up a
-    /// `status.conditions` entry by `type` name, where it's the condition
-    /// type (`Ready`, `Available`, …). That happens for
-    /// [`ColumnKind::Condition`] and for printer columns whose JSONPath
-    /// selected a non-status field of a named condition (see
-    /// [`Self::condition_field`]).
+    /// JSON Pointer, or the value to match for a condition lookup.
     pub pointer: String,
     pub kind: ColumnKind,
     /// Shown only in wide mode (`w`).
     pub wide: bool,
     pub width: Option<u16>,
     pub align: Option<Align>,
-    /// When set, [`Self::pointer`] is a condition `type` name and this is
-    /// the field to read from that condition (`reason`, `message`, …).
-    /// Used by CRD printer columns like
-    /// `.status.conditions[?(@.type=="Ready")].message`.
-    /// [`ColumnKind::Condition`] always reads `status` and leaves this `None`.
+    /// The condition field to match against [`Self::pointer`].
+    pub condition_match: ConditionMatch,
+    /// The output field for a condition lookup. `Condition` reads `status`.
     pub condition_field: Option<String>,
 }
 
@@ -380,6 +387,7 @@ pub fn compile(
                 wide: c.wide,
                 width: c.width,
                 align,
+                condition_match: ConditionMatch::Type,
                 condition_field: None,
             });
         }
@@ -745,7 +753,10 @@ pub fn render_cell(obj: &DynamicObject, col: &UserColumn, now: i64) -> String {
         return "-".into();
     }
     if col.kind == ColumnKind::Condition {
-        return condition_status(obj, &col.pointer).unwrap_or_else(|| "<none>".into());
+        return condition_value(obj, &col.pointer, col.condition_match, "status")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "<none>".into());
     }
     let Some(v) = cell_value(obj, col) else {
         return "<none>".into();
@@ -774,32 +785,36 @@ fn render_image_tag(v: &Extracted<'_>) -> String {
     }
 }
 
-/// Value of a non-`Condition` column: a JSON Pointer extract, or a named
-/// field of a `status.conditions` entry looked up by type.
+/// Read a non-`Condition` column through a JSON Pointer or condition filter.
 fn cell_value<'a>(obj: &'a DynamicObject, col: &UserColumn) -> Option<Extracted<'a>> {
     match col.condition_field.as_deref() {
-        Some(field) => condition_value(obj, &col.pointer, field).map(Extracted::Json),
+        Some(field) => {
+            condition_value(obj, &col.pointer, col.condition_match, field).map(Extracted::Json)
+        }
         None => extract_ref(obj, &col.pointer),
     }
 }
 
-/// The `status` of the `status.conditions` entry whose `type` is `cond_type`,
-/// found by name — array order isn't guaranteed by anything.
+/// Read the status of a condition selected by type name.
 pub fn condition_status(obj: &DynamicObject, cond_type: &str) -> Option<String> {
-    condition_value(obj, cond_type, "status")?
+    condition_value(obj, cond_type, ConditionMatch::Type, "status")?
         .as_str()
         .map(str::to_string)
 }
 
-/// One field of the `status.conditions` entry whose `type` is `cond_type`,
-/// found by name — array order isn't guaranteed by anything.
-fn condition_value<'a>(obj: &'a DynamicObject, cond_type: &str, field: &str) -> Option<&'a Value> {
+/// Read the first available output field from matching conditions.
+fn condition_value<'a>(
+    obj: &'a DynamicObject,
+    value: &str,
+    selector: ConditionMatch,
+    field: &str,
+) -> Option<&'a Value> {
     obj.data
         .pointer("/status/conditions")?
         .as_array()?
         .iter()
-        .find(|c| c.get("type").and_then(Value::as_str) == Some(cond_type))?
-        .get(field)
+        .filter(|c| c.get(selector.field()).and_then(Value::as_str) == Some(value))
+        .find_map(|c| c.get(field))
 }
 
 fn render_value(v: &Value) -> String {
@@ -838,7 +853,9 @@ fn render_time(v: &Extracted<'_>, now: i64) -> String {
 pub fn sort_value(obj: &DynamicObject, col: &UserColumn, now: i64) -> SortValue {
     if col.kind == ColumnKind::Condition {
         return SortValue::Text(
-            condition_status(obj, &col.pointer)
+            condition_value(obj, &col.pointer, col.condition_match, "status")
+                .and_then(Value::as_str)
+                .map(str::to_string)
                 .unwrap_or_default()
                 .to_lowercase(),
         );
@@ -926,13 +943,10 @@ pub fn parse_quantity(s: &str) -> Option<f64> {
     s.parse::<f64>().ok()
 }
 
-/// Build a fallback view from a CRD's `additionalPrinterColumns` for one
-/// served `version` — the automatic upgrade over NAME/AGE for custom
-/// resources without an explicit user view. Condition-filter JSONPath of
-/// the form `.status.conditions[?(@.type=="Ready")].field` is translated
-/// into a by-name lookup of that field; other filters and wildcards are
-/// skipped. Columns with `priority > 0` become wide-only, matching
-/// kubectl's `-o wide`.
+/// Build a view from CRD printer columns for resources without a user view.
+/// Equality filters on condition type or status select the first available
+/// output field. Other filters and wildcards are skipped. Columns with
+/// priority above zero appear only in wide mode, like kubectl's `-o wide`.
 pub fn printer_columns_view(crd: &Value, version: &str) -> Option<View> {
     let versions = crd.pointer("/spec/versions")?.as_array()?;
     let ver = versions
@@ -950,12 +964,9 @@ pub fn printer_columns_view(crd: &Value, version: &str) -> Option<View> {
                 Some("date") => ColumnKind::Time,
                 _ => ColumnKind::Text,
             };
-            // `.status.conditions[?(@.type=="Ready")].status` (and the same
-            // filter for `.reason` / `.message` / other simple fields) used
-            // to be dropped as untranslatable. It's a condition lookup by
-            // name. Only the `status` field is a coloring `Condition`
-            // column; the rest keep the CRD's declared type.
-            if let Some((cond, field)) = condition_json_path(json_path) {
+            // Only the status output controls condition colors.
+            // Other output fields keep the CRD column type.
+            if let Some((condition_match, cond, field)) = condition_json_path(json_path) {
                 let (kind, condition_field) = if field == "status" {
                     (ColumnKind::Condition, None)
                 } else {
@@ -968,6 +979,7 @@ pub fn printer_columns_view(crd: &Value, version: &str) -> Option<View> {
                     wide,
                     width: None,
                     align: None,
+                    condition_match,
                     condition_field,
                 });
             }
@@ -979,6 +991,7 @@ pub fn printer_columns_view(crd: &Value, version: &str) -> Option<View> {
                 wide,
                 width: None,
                 align: None,
+                condition_match: ConditionMatch::Type,
                 condition_field: None,
             })
         })
@@ -998,17 +1011,22 @@ pub fn printer_columns_view(crd: &Value, version: &str) -> Option<View> {
     }
 }
 
-/// Recognize a condition-lookup JSONPath —
-/// `.status.conditions[?(@.type=="Ready")].status` (single or double quotes),
-/// and the same filter for `.reason` / `.message` / other simple fields —
-/// and return `(condition type, field)`. Anything else is `None`.
-pub fn condition_json_path(path: &str) -> Option<(String, String)> {
+/// Recognize a condition equality filter on `type` or `status` with a simple
+/// output field. Accept single or double quotes, with optional outer braces.
+/// Return the selector, value, and output field, or `None` for other paths.
+pub fn condition_json_path(path: &str) -> Option<(ConditionMatch, String, String)> {
     let p = path.trim();
     let p = p
         .strip_prefix('{')
         .and_then(|s| s.strip_suffix('}'))
         .unwrap_or(p);
-    let rest = p.strip_prefix(".status.conditions[?(@.type==")?;
+    let rest = p.strip_prefix(".status.conditions[?(@.")?;
+    let (selector, rest) = rest.split_once("==")?;
+    let selector = match selector {
+        "type" => ConditionMatch::Type,
+        "status" => ConditionMatch::Status,
+        _ => return None,
+    };
     let (quoted, tail) = rest.split_once(")]")?;
     let field = tail.strip_prefix('.')?;
     if field.is_empty()
@@ -1021,7 +1039,8 @@ pub fn condition_json_path(path: &str) -> Option<(String, String)> {
         .strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))
         .or_else(|| t.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))?;
-    (!t.is_empty() && !t.contains(['"', '\''])).then(|| (t.to_string(), field.to_string()))
+    (!t.is_empty() && !t.contains(['"', '\'']))
+        .then(|| (selector, t.to_string(), field.to_string()))
 }
 
 /// Convert a simple kubectl JSONPath (`.status.phase`,
@@ -1178,6 +1197,7 @@ mod tests {
             wide: false,
             width: None,
             align: None,
+            condition_match: ConditionMatch::Type,
             condition_field: None,
         }
     }
@@ -1242,23 +1262,27 @@ mod tests {
     fn condition_json_path_recognizes_the_canonical_filter() {
         assert_eq!(
             condition_json_path(r#".status.conditions[?(@.type=="Ready")].status"#),
-            Some(("Ready".into(), "status".into()))
+            Some((ConditionMatch::Type, "Ready".into(), "status".into()))
         );
         assert_eq!(
             condition_json_path(".status.conditions[?(@.type=='Available')].status"),
-            Some(("Available".into(), "status".into()))
+            Some((ConditionMatch::Type, "Available".into(), "status".into()))
         );
         assert_eq!(
             condition_json_path(r#".status.conditions[?(@.type=="Ready")].reason"#),
-            Some(("Ready".into(), "reason".into()))
+            Some((ConditionMatch::Type, "Ready".into(), "reason".into()))
         );
         assert_eq!(
             condition_json_path(r#".status.conditions[?(@.type=="Ready")].message"#),
-            Some(("Ready".into(), "message".into()))
+            Some((ConditionMatch::Type, "Ready".into(), "message".into()))
         );
         assert_eq!(
             condition_json_path("{.status.conditions[?(@.type=='Ready')].lastTransitionTime}"),
-            Some(("Ready".into(), "lastTransitionTime".into()))
+            Some((
+                ConditionMatch::Type,
+                "Ready".into(),
+                "lastTransitionTime".into()
+            ))
         );
         // Nested fields, wildcards, and non-condition paths stay untranslated.
         assert_eq!(
@@ -2190,6 +2214,50 @@ mod tests {
         // The version without printer columns yields nothing.
         assert!(printer_columns_view(&crd, "v1alpha1").is_none());
         assert!(printer_columns_view(&crd, "v9").is_none());
+    }
+
+    #[test]
+    fn status_filters_read_first_available_output() {
+        for quote in ["'", "\""] {
+            for status in ["True", "False", "Unknown"] {
+                let path =
+                    format!("{{.status.conditions[?(@.status=={quote}{status}{quote})].reason}}");
+                assert_eq!(
+                    condition_json_path(&path),
+                    Some((ConditionMatch::Status, status.into(), "reason".into()))
+                );
+                let crd = json!({"spec": {"versions": [{"name": "v1", "additionalPrinterColumns": [
+                    {"name": "Reason", "type": "string", "jsonPath": path}
+                ]}]}});
+                let view = printer_columns_view(&crd, "v1").unwrap();
+                let col = &view.columns[0];
+                let object = obj(json!({"status": {"conditions": [
+                    {"status": "Other", "reason": "Wrong"},
+                    {"status": status},
+                    {"status": status, "reason": "First"},
+                    {"status": status, "reason": "Second"}
+                ]}}));
+                assert_eq!(render_cell(&object, col, 0), "First");
+                assert!(matches!(sort_value(&object, col, 0), SortValue::Text(t) if t == "first"));
+                for conditions in [
+                    json!([]),
+                    json!([{"status": "Other", "reason": "Wrong"}]),
+                    json!([{"status": status}]),
+                    Value::Null,
+                ] {
+                    let object = obj(json!({"status": {"conditions": conditions}}));
+                    assert_eq!(render_cell(&object, col, 0), "<none>");
+                }
+            }
+        }
+        for path in [
+            ".status.conditions[?(@.reason=='Ready')].type",
+            ".status.conditions[?(@.status!='True')].type",
+            ".status.conditions[?(@.status=='True')].foo.bar",
+            ".status.conditions[?(@.status=='True')].*",
+        ] {
+            assert_eq!(condition_json_path(path), None);
+        }
     }
 
     #[test]

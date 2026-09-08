@@ -374,7 +374,15 @@ An explicit user view with columns still takes precedence. A condition lookup
 (`.status.conditions[?(@.type=="Ready")].status` - how most CRDs express their
 READY column) becomes a `condition` column, found by type name. The same filter
 selecting another field (`.reason`, `.message`, `.lastTransitionTime`, …) keeps
-the column and reads that field from the named condition. Other JSONPath filter
+the column and reads that field from the named condition.
+Filters on `status` also work. For example,
+`.status.conditions[?(@.status=="True")].type` shows the type of a matching
+condition. Use `.reason` or `.message` to show those fields. Both filter forms
+accept single or double quotes and use the first available output value in
+array order. Matching conditions without the output field are skipped. If no
+output exists, the cell shows `<none>`. Only an output field of `.status`
+controls condition colors; other fields keep the CRD column type.
+Other JSONPath filter
 or wildcard expressions aren't representable and those columns are skipped. So
 most custom resources get useful columns with zero configuration.
 
