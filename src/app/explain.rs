@@ -129,10 +129,10 @@ impl App {
         }
     }
 
-    pub(super) fn key_explain(&mut self, key: KeyEvent) {
+    pub(super) fn key_explain(&mut self, key: KeyInput) {
         let len = self.explain_items.len();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => {
                 let destination = self.explain_return;
                 self.mode = destination;
                 self.explain_return = Mode::Table;
@@ -140,26 +140,26 @@ impl App {
                     self.restore_selection();
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => list_step(&mut self.explain_state, len, true),
-            KeyCode::Char('k') | KeyCode::Up => list_step(&mut self.explain_state, len, false),
-            KeyCode::Char('g') | KeyCode::Home => {
+            (Some(Action::Down), _) => list_step(&mut self.explain_state, len, true),
+            (Some(Action::Up), _) => list_step(&mut self.explain_state, len, false),
+            (Some(Action::First), _) => {
                 if len > 0 {
                     self.explain_state.select(Some(0));
                 }
             }
-            KeyCode::Char('G') | KeyCode::End => {
+            (Some(Action::Last), _) => {
                 if len > 0 {
                     self.explain_state.select(Some(len - 1));
                 }
             }
-            KeyCode::Char('r') => self.refresh_explain(),
+            (Some(Action::Refresh), _) => self.refresh_explain(),
             // Direct evidence navigation: jump to the resource behind the
             // selected finding (⏎), or open its events (E) / logs (l). With no
             // target on the current line, E/l fall back to the object being
             // explained — so the whole evidence trail is one keystroke away.
-            KeyCode::Enter => self.explain_goto(),
-            KeyCode::Char('E') => self.explain_events(),
-            KeyCode::Char('l') => self.explain_logs(),
+            (Some(Action::Accept), _) => self.explain_goto(),
+            (Some(Action::Events), _) => self.explain_events(),
+            (Some(Action::Logs), _) => self.explain_logs(),
             _ => {}
         }
         if !matches!(self.mode, Mode::Explain | Mode::Events | Mode::Logs) {

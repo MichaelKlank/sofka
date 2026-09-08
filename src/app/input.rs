@@ -4,6 +4,11 @@ impl App {
     // ----- key handling --------------------------------------------------
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        let action = self.keymap.action(self.key_scope(), &key);
+        self.handle_input(KeyInput::new(action, key))
+    }
+
+    pub(super) fn handle_input(&mut self, key: KeyInput) -> Result<()> {
         let before = match self.mode {
             Mode::Command => self.palette_return,
             Mode::Help => self.help_return,
@@ -58,96 +63,26 @@ impl App {
         result
     }
 
-    fn handle_key_inner(&mut self, key: KeyEvent) -> Result<()> {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('c') => {
-                    self.stop_plugins();
-                    self.should_quit = true;
-                    return Ok(());
-                }
-                // Compact mode: collapse the header to one line and hide the
-                // footer (k9s ctrl-e/ctrl-g, folded into one toggle). Works in
-                // every mode, so it never reaches the plain-key bindings.
-                KeyCode::Char('e') => {
-                    self.compact = !self.compact;
-                    return Ok(());
-                }
-                KeyCode::Char('d') if self.mode == Mode::Table => {
-                    self.request_delete(false);
-                    return Ok(());
-                }
-                KeyCode::Char('k') if self.mode == Mode::Table => {
-                    self.request_delete(true); // kill = force delete
-                    return Ok(());
-                }
-                KeyCode::Char('r') if self.mode == Mode::Table => {
-                    self.start_watch();
-                    return Ok(());
-                }
-                KeyCode::Char('z')
-                    if self.mode == Mode::Table
-                        && self.kind_plural == "pods"
-                        && key.modifiers == KeyModifiers::CONTROL =>
-                {
-                    if self.try_bookmark_key(key)
-                        || self.try_workspace_key(key)
-                        || self.try_plugin_key(key)
-                    {
-                        return Ok(());
-                    }
-                    self.faults_only = !self.faults_only;
-                    self.invalidate_rows();
-                    self.table_state.select(Some(0));
-                    return Ok(());
-                }
-                KeyCode::Char('f')
-                    if self.mode == Mode::Table && key.modifiers == KeyModifiers::CONTROL =>
-                {
-                    self.move_page(1);
-                    return Ok(());
-                }
-                KeyCode::Char('b')
-                    if self.mode == Mode::Table && key.modifiers == KeyModifiers::CONTROL =>
-                {
-                    self.move_page(-1);
-                    return Ok(());
-                }
-                _ => {}
+    fn handle_key_inner(&mut self, key: KeyInput) -> Result<()> {
+        match key.action {
+            Some(Action::Quit) => {
+                self.stop_plugins();
+                self.should_quit = true;
+                return Ok(());
             }
-        }
-
-        // Ctrl/alt combos in the table are user plugin chords (the reserved
-        // built-in ctrl keys above already returned). Route them here so they
-        // never fall through to the plain-key table bindings — `ctrl-g` must
-        // not trigger `g`. Unmatched combos are swallowed rather than misfiring.
-        if self.mode == Mode::Table
-            && (key.modifiers.contains(KeyModifiers::CONTROL)
-                || key.modifiers.contains(KeyModifiers::ALT))
-        {
-            if !self.try_bookmark_key(key) && !self.try_workspace_key(key) {
-                self.try_plugin_key(key);
+            Some(Action::Compact) => {
+                self.compact = !self.compact;
+                return Ok(());
             }
-            return Ok(());
-        }
-
-        // Navigation screens share the command-palette and help bindings.
-        // Text-entry pickers deliberately stay out of this path so `:` and `?`
-        // remain ordinary input while filtering or filling a prompt.
-        let plain = !key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT);
-        if plain && self.has_global_view_shortcuts() {
-            match key.code {
-                KeyCode::Char(':') => {
-                    self.open_palette();
-                    return Ok(());
-                }
-                KeyCode::Char('?') if self.mode != Mode::Help => {
-                    self.open_help();
-                    return Ok(());
-                }
-                _ => {}
+            Some(Action::Command) => {
+                self.open_palette();
+                return Ok(());
             }
+            Some(Action::Help) => {
+                self.open_help();
+                return Ok(());
+            }
+            _ => {}
         }
 
         match self.mode {
@@ -186,32 +121,113 @@ impl App {
         Ok(())
     }
 
-    fn has_global_view_shortcuts(&self) -> bool {
-        matches!(
-            self.mode,
-            Mode::Table
-                | Mode::Detail
-                | Mode::Logs
-                | Mode::Help
-                | Mode::Containers
-                | Mode::Confirm
-                | Mode::Pulse
-                | Mode::Xray
-                | Mode::Explain
-                | Mode::Timeline
-                | Mode::Gitops
-                | Mode::Adjacent
-                | Mode::Diff
-                | Mode::Events
-                | Mode::FluxMenu
-                | Mode::TransferMenu
-                | Mode::PortForwards
-                | Mode::Skins
-                | Mode::Snapshots
-                | Mode::Fleet
-                | Mode::Find
-                | Mode::PvcExplore
-        )
+    pub fn key_scope(&self) -> &'static str {
+        match self.mode {
+            Mode::Contexts if self.ctx_filtering => "context_filter",
+            Mode::Table => "table",
+            Mode::Command => "command",
+            Mode::Filter => "filter",
+            Mode::Detail => "detail",
+            Mode::Diff => "diff",
+            Mode::Events => "events",
+            Mode::Logs => "logs",
+            Mode::LogFilter => "log_filter",
+            Mode::DocFilter => "doc_filter",
+            Mode::Help => "help",
+            Mode::Namespaces => "namespaces",
+            Mode::Contexts => "contexts",
+            Mode::SortPicker => "sort_picker",
+            Mode::CopyPicker => "copy_picker",
+            Mode::Containers => "containers",
+            Mode::SetImage => "set_image",
+            Mode::Confirm => "confirm",
+            Mode::Prompt => "prompt",
+            Mode::Pulse => "pulse",
+            Mode::Xray => "xray",
+            Mode::Explain => "explain",
+            Mode::Timeline => "timeline",
+            Mode::Gitops => "gitops",
+            Mode::Adjacent => "adjacent",
+            Mode::FluxMenu => "flux_menu",
+            Mode::TransferMenu => "transfer_menu",
+            Mode::PortForwards => "port_forwards",
+            Mode::Skins => "skins",
+            Mode::Snapshots => "snapshots",
+            Mode::Fleet => "fleet",
+            Mode::Find => "find",
+            Mode::PvcExplore => "pvc_explore",
+            Mode::PortForwardPicker => "port_forward_picker",
+        }
+    }
+
+    pub fn configure_keys(&mut self, cfg: &crate::config::KeysConfig) -> Vec<String> {
+        let mut warnings = match Keymap::compile(cfg) {
+            Ok(map) => {
+                self.keymap = map;
+                Vec::new()
+            }
+            Err(errors) => {
+                let paths = self
+                    .config
+                    .base_path()
+                    .into_iter()
+                    .chain(
+                        self.config
+                            .override_paths(&self.cluster.context, &self.cluster.cluster_name),
+                    )
+                    .filter(|p| p.exists())
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                errors
+                    .into_iter()
+                    .map(|e| format!("{paths}: {e}; previous keymap kept"))
+                    .collect()
+            }
+        };
+        for (kind, name, binding, resources) in self
+            .plugins
+            .iter()
+            .map(|p| {
+                (
+                    "plugin",
+                    p.name.as_str(),
+                    Some(p.key.as_str()),
+                    p.scopes.as_slice(),
+                )
+            })
+            .chain(
+                self.bookmarks
+                    .iter()
+                    .map(|b| ("bookmark", b.name.as_str(), b.key.as_deref(), &[][..])),
+            )
+            .chain(
+                self.workspaces
+                    .iter()
+                    .map(|w| ("workspace", w.name.as_str(), w.key.as_deref(), &[][..])),
+            )
+        {
+            if let Some(binding) = binding
+                && let Ok(chord) = crate::keys::KeyChord::parse(binding)
+            {
+                for (scope, action, chords) in self.keymap.entries() {
+                    if scope == "table"
+                        && action != Action::Faults
+                        && (action != Action::Inspect
+                            || resources.is_empty()
+                            || resources.iter().any(|s| {
+                                matches!(s.as_str(), "secrets" | "persistentvolumeclaims")
+                            }))
+                        && chords
+                            .iter()
+                            .any(|other| crate::keymap::overlaps(&chord, other))
+                    {
+                        warnings.push(format!("{kind} {name:?}: {} is hidden by keys.table.{} when that action is available", chord.label(), action.name()));
+                    }
+                }
+            }
+        }
+        warnings
     }
 
     fn open_help(&mut self) {
@@ -221,11 +237,24 @@ impl App {
         self.mode = Mode::Help;
     }
 
-    pub(super) fn key_table(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('/') => self.mode = Mode::Filter,
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Esc => {
+    pub(super) fn key_table(&mut self, key: KeyInput) {
+        match (key.action, key.code) {
+            (Some(Action::Delete), _) => self.request_delete(false),
+            (Some(Action::ForceDelete), _) => self.request_delete(true),
+            (Some(Action::Refresh), _) => self.start_watch(),
+            (Some(Action::Faults), _) if self.kind_plural == "pods" => {
+                if !self.try_bookmark_key(key.event())
+                    && !self.try_workspace_key(key.event())
+                    && !self.try_plugin_key(key.event())
+                {
+                    self.faults_only = !self.faults_only;
+                    self.invalidate_rows();
+                    self.table_state.select(Some(0));
+                }
+            }
+            (Some(Action::Filter), _) => self.mode = Mode::Filter,
+            (Some(Action::Exit), _) => self.should_quit = true,
+            (Some(Action::Back), _) => {
                 if !self.marked.is_empty() {
                     self.marked.clear();
                 } else if !self.filter.is_empty() {
@@ -239,44 +268,46 @@ impl App {
                     // at root, nothing to pop
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-            KeyCode::Char('g') | KeyCode::Home => self.table_state.select(Some(0)),
-            KeyCode::Char('G') | KeyCode::End => {
+            (Some(Action::Down), _) => self.move_selection(1),
+            (Some(Action::Up), _) => self.move_selection(-1),
+            (Some(Action::First), _) => self.table_state.select(Some(0)),
+            (Some(Action::Last), _) => {
                 let len = self.row_count();
                 if len > 0 {
                     self.table_state.select(Some(len - 1));
                 }
             }
-            KeyCode::PageDown => self.move_page(1),
-            KeyCode::PageUp => self.move_page(-1),
+            (Some(Action::PageDown), _) => self.move_page(1),
+            (Some(Action::PageUp), _) => self.move_page(-1),
             // Move the viewport; keep NAMESPACE/NAME in place.
-            KeyCode::Right => self.scroll_columns(1),
-            KeyCode::Left => self.scroll_columns(-1),
+            (Some(Action::Right), _) => self.scroll_columns(1),
+            (Some(Action::Left), _) => self.scroll_columns(-1),
             // k9s: SPACE marks/unmarks the current row for bulk actions, then
             // advances so a range can be marked with repeated taps.
-            KeyCode::Char(' ') => {
+            (Some(Action::Mark), _) => {
                 self.toggle_mark();
                 self.move_selection(1);
             }
-            KeyCode::Enter => self.drill(),
-            KeyCode::Char('y') => self.open_detail(),
-            KeyCode::Char('d') => self.describe(),
+            (Some(Action::Open), _) => self.drill(),
+            (Some(Action::Yaml), _) => self.open_detail(),
+            (Some(Action::Describe), _) => self.describe(),
             // k9s: `x` shows a secret's data base64-decoded. Elsewhere `x`
             // stays free for user plugins (the fallthrough arm below).
-            KeyCode::Char('x') if self.kind_plural == "secrets" => self.open_decoded_secret(),
+            (Some(Action::Inspect), _) if self.kind_plural == "secrets" => {
+                self.open_decoded_secret()
+            }
             // `x` on a PVC opens the split-pane volume browser.
-            KeyCode::Char('x') if self.kind_plural == "persistentvolumeclaims" => {
+            (Some(Action::Inspect), _) if self.kind_plural == "persistentvolumeclaims" => {
                 self.open_pvc_explore()
             }
-            KeyCode::Char('E') => self.open_events(),
-            KeyCode::Char('l') => self.open_logs(),
+            (Some(Action::Events), _) => self.open_events(),
+            (Some(Action::Logs), _) => self.open_logs(),
             // Logs from the configured external provider ([providers.logs]).
-            KeyCode::Char('L') => self.open_provider_logs(),
-            KeyCode::Char('p') => self.open_previous_logs(),
-            KeyCode::Char('e') => self.request_edit(),
+            (Some(Action::ProviderLogs), _) => self.open_provider_logs(),
+            (Some(Action::PreviousLogs), _) => self.open_previous_logs(),
+            (Some(Action::Edit), _) => self.request_edit(),
             // k9s: `s` = shell on pods, scale on scalable workloads.
-            KeyCode::Char('s') => {
+            (Some(Action::ShellOrScale), _) => {
                 if self.kind_plural == "pods" {
                     self.request_exec();
                 } else if self.kind_plural == "persistentvolumeclaims" {
@@ -287,43 +318,43 @@ impl App {
                     self.request_scale();
                 }
             }
-            KeyCode::Char('a') => self.request_attach(),
-            KeyCode::Char('i') => self.request_set_image(),
-            KeyCode::Char('o') => self.show_node(),
-            KeyCode::Char('c') => self.copy_name(),
+            (Some(Action::Attach), _) => self.request_attach(),
+            (Some(Action::SetImage), _) => self.request_set_image(),
+            (Some(Action::Node), _) => self.show_node(),
+            (Some(Action::CopyName), _) => self.copy_name(),
             // Copy any displayed cell of the row via a field picker (`c`
             // above copies just the name).
-            KeyCode::Char('Y') => self.open_copy_picker(),
-            KeyCode::Char('J') => self.jump_owner(),
+            (Some(Action::CopyCell), _) => self.open_copy_picker(),
+            (Some(Action::Owner), _) => self.jump_owner(),
             // `X` — explain why the selection is unhealthy (evidence-backed).
-            KeyCode::Char('X') => self.open_explain(),
+            (Some(Action::Explain), _) => self.open_explain(),
             // `T` — session-local state-change timeline for the selection.
-            KeyCode::Char('T') => self.open_timeline(),
+            (Some(Action::Timeline), _) => self.open_timeline(),
             // `u` — the objects directly connected to the selection.
-            KeyCode::Char('u') => self.open_adjacent(),
-            KeyCode::Char('C') => self.request_cordon(true),
-            KeyCode::Char('U') => self.request_cordon(false),
-            KeyCode::Char('D') => self.request_drain(),
+            (Some(Action::Adjacent), _) => self.open_adjacent(),
+            (Some(Action::Cordon), _) => self.request_cordon(true),
+            (Some(Action::Uncordon), _) => self.request_cordon(false),
+            (Some(Action::Drain), _) => self.request_drain(),
             // Sorting: S opens the column picker, I inverts the direction.
-            KeyCode::Char('S') => self.open_sort_picker(),
-            KeyCode::Char('I') => self.toggle_sort_dir(),
+            (Some(Action::Sort), _) => self.open_sort_picker(),
+            (Some(Action::InvertSort), _) => self.toggle_sort_dir(),
             // Wide mode: show wide-only columns (kubectl `-o wide`).
-            KeyCode::Char('w') => self.toggle_wide(),
+            (Some(Action::Wide), _) => self.toggle_wide(),
             // `f`/Shift-F = port-forward.
-            KeyCode::Char('f') | KeyCode::Char('F') => self.request_port_forward(),
-            KeyCode::Char('n') => self.open_namespaces(),
+            (Some(Action::PortForward), _) => self.request_port_forward(),
+            (Some(Action::Namespaces), _) => self.open_namespaces(),
             // Browser-style view history: [ back, ] forward.
-            KeyCode::Char('[') => self.history_back(),
-            KeyCode::Char(']') => self.history_forward(),
+            (Some(Action::HistoryBack), _) => self.history_back(),
+            (Some(Action::HistoryForward), _) => self.history_forward(),
             // Cycle workspace views, or the default resources in this namespace.
-            KeyCode::Tab => {
+            (Some(Action::NextView), _) => {
                 self.cycle_views(true);
             }
-            KeyCode::BackTab => {
+            (Some(Action::PreviousView), _) => {
                 self.cycle_views(false);
             }
             // k9s: 0 = all namespaces.
-            KeyCode::Char('0') => {
+            (Some(Action::AllNamespaces), _) => {
                 self.save_history_filter();
                 self.namespace.clear();
                 self.drop_owner_scope();
@@ -337,7 +368,7 @@ impl App {
             // k9s: `r` = rollout restart on workloads, force-sync on external
             // secrets, rollback on a Helm release's revision history, else
             // refresh the watch.
-            KeyCode::Char('r') => {
+            (Some(Action::RestartOrRefresh), _) => {
                 if matches!(
                     self.kind_plural.as_str(),
                     "deployments" | "statefulsets" | "daemonsets"
@@ -355,7 +386,7 @@ impl App {
             // suspend/resume/reconcile, ArgoCD Application suspend/resume/sync,
             // ArgoCD ApplicationSet suspend/resume, CronJob trigger/suspend/resume.
             // On pods, `t` is the file-transfer menu (kubectl cp) instead.
-            KeyCode::Char('t') => {
+            (Some(Action::ActionMenu), _) => {
                 if self.kind_plural == "pods" {
                     self.request_transfer();
                 } else {
@@ -368,25 +399,21 @@ impl App {
             // are routed earlier, in `handle_key`, before the plain-key
             // bindings above can claim them.
             _ => {
-                if !self.try_bookmark_key(key) && !self.try_workspace_key(key) {
-                    self.try_plugin_key(key);
+                if !self.try_bookmark_key(key.event()) && !self.try_workspace_key(key.event()) {
+                    self.try_plugin_key(key.event());
                 }
             }
         }
     }
 
-    pub(super) fn key_command(&mut self, key: KeyEvent) {
-        // Configured completion chords win over everything else (including
-        // the shared line-editing chords), so a `[keys]` rebind like ctrl-w
-        // always does what the user asked. Defaults: tab/down, backtab/up,
-        // enter — see [`crate::config::PaletteKeys`].
-        if self.palette_keys.next.iter().any(|c| c.matches(&key)) {
+    pub(super) fn key_command(&mut self, key: KeyInput) {
+        if key.action == Some(Action::Down) {
             if !self.cmd_suggestions.is_empty() {
                 self.cmd_sel = (self.cmd_sel + 1) % self.cmd_suggestions.len();
             }
             return;
         }
-        if self.palette_keys.prev.iter().any(|c| c.matches(&key)) {
+        if key.action == Some(Action::Up) {
             if !self.cmd_suggestions.is_empty() {
                 self.cmd_sel = self
                     .cmd_sel
@@ -395,21 +422,21 @@ impl App {
             }
             return;
         }
-        if self.palette_keys.accept.iter().any(|c| c.matches(&key)) {
+        if key.action == Some(Action::Accept) {
             self.palette_accept();
             return;
         }
-        if edit_chord(&key, &mut self.command) {
+        if edit_action(key.action, &mut self.command) {
             self.update_suggestions();
             return;
         }
-        match key.code {
-            KeyCode::Esc => self.mode = self.palette_return,
-            KeyCode::Backspace => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) => self.mode = self.palette_return,
+            (Some(Action::Backspace), _) => {
                 self.command.pop();
                 self.update_suggestions();
             }
-            KeyCode::Char(c) => {
+            (None, KeyCode::Char(c)) => {
                 self.command.push(c);
                 self.update_suggestions();
             }
@@ -946,20 +973,20 @@ impl App {
     /// Type the row filter. Local terms (fuzzy/inverse/column comparisons)
     /// apply live per keystroke; `-l`/`-f` selectors are sent to the API on
     /// ⏎, since that restarts the watch (see `sync_filter_selectors`).
-    pub(super) fn key_filter(&mut self, key: KeyEvent) {
-        if edit_chord(&key, &mut self.filter) {
+    pub(super) fn key_filter(&mut self, key: KeyInput) {
+        if edit_action(key.action, &mut self.filter) {
             self.invalidate_rows();
             self.table_state.select(Some(0));
             return;
         }
-        match key.code {
-            KeyCode::Esc => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) => {
                 self.filter.clear();
                 self.mode = Mode::Table;
                 self.sync_filter_selectors();
                 self.save_history_filter();
             }
-            KeyCode::Enter => {
+            (Some(Action::Accept), _) => {
                 if let Some(err) = self.filter_error() {
                     self.flash_warn(&format!("filter: {err}"));
                 } else {
@@ -968,29 +995,29 @@ impl App {
                     self.save_history_filter();
                 }
             }
-            KeyCode::Backspace => {
+            (Some(Action::Backspace), _) => {
                 self.filter.pop();
             }
-            KeyCode::Char(c) => self.filter.push(c),
+            (None, KeyCode::Char(c)) => self.filter.push(c),
             _ => {}
         }
         self.invalidate_rows();
         self.table_state.select(Some(0));
     }
 
-    pub(super) fn key_scroll(&mut self, key: KeyEvent, detail: bool) {
+    pub(super) fn key_scroll(&mut self, key: KeyInput, detail: bool) {
         let target = if detail {
             &mut self.detail
         } else {
             &mut self.logs.view
         };
-        match key.code {
+        match (key.action, key.code) {
             // Esc backs out of an active search first (like the table view);
             // `q` always leaves.
-            KeyCode::Esc if detail && !target.filter.is_empty() => {
+            (Some(Action::Back), _) if detail && !target.filter.is_empty() => {
                 target.filter.clear();
             }
-            KeyCode::Esc | KeyCode::Char('q') => {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => {
                 // The underlying view (table/xray) watch kept running, so there
                 // is nothing to restart — just stop the log streams and return,
                 // landing back on the same row.
@@ -1009,41 +1036,43 @@ impl App {
             // Search within the document (k9s `/` in YAML/describe views):
             // matches are highlighted in place while the full document stays
             // rendered, vim-style, and `n`/`N` step between them.
-            KeyCode::Char('/') if detail => {
+            (Some(Action::Filter), _) if detail => {
                 self.doc_filter_return = self.mode;
                 self.mode = Mode::DocFilter;
             }
             // Jump to the next / previous search match (vim `n`/`N`). No-op
             // when no search is active.
-            KeyCode::Char('n') if detail => target.step_match(true),
-            KeyCode::Char('N') if detail => target.step_match(false),
-            KeyCode::Char('r') if self.mode == Mode::Detail => self.toggle_describe_refresh(),
+            (Some(Action::NextMatch), _) if detail => target.step_match(true),
+            (Some(Action::PreviousMatch), _) if detail => target.step_match(false),
+            (Some(Action::AutoRefresh), _) if self.mode == Mode::Detail => {
+                self.toggle_describe_refresh()
+            }
             // Copy the document to the clipboard (k9s `c`), same as the logs
             // view: an active search copies only the matching lines.
-            KeyCode::Char('c') if detail => {
+            (Some(Action::Copy), _) if detail => {
                 self.copy_doc();
             }
             // `x` decodes the secret's data from inside its describe/YAML
             // view too — no need to back out to the table first.
-            KeyCode::Char('x') if self.mode == Mode::Detail && self.kind_plural == "secrets" => {
+            (Some(Action::DecodeSecret), _)
+                if self.mode == Mode::Detail && self.kind_plural == "secrets" =>
+            {
                 self.show_decoded_secret();
             }
-            KeyCode::Char('j') | KeyCode::Down => target.scroll_by(1),
-            KeyCode::Char('k') | KeyCode::Up => target.scroll_by(-1),
-            KeyCode::Char('h') | KeyCode::Left => target.scroll_h(-5),
-            KeyCode::Char('l') | KeyCode::Right => target.scroll_h(5),
-            KeyCode::PageDown | KeyCode::Char(' ') => target.scroll_by(20),
-            KeyCode::PageUp => target.scroll_by(-20),
-            KeyCode::Char('f') if key.modifiers == KeyModifiers::CONTROL => target.scroll_by(20),
-            KeyCode::Char('b') if key.modifiers == KeyModifiers::CONTROL => target.scroll_by(-20),
-            KeyCode::Char('g') | KeyCode::Home => {
+            (Some(Action::Down), _) => target.scroll_by(1),
+            (Some(Action::Up), _) => target.scroll_by(-1),
+            (Some(Action::Left), _) => target.scroll_h(-5),
+            (Some(Action::Right), _) => target.scroll_h(5),
+            (Some(Action::PageDown), _) => target.scroll_by(20),
+            (Some(Action::PageUp), _) => target.scroll_by(-20),
+            (Some(Action::First), _) => {
                 target.scroll = 0;
                 target.hscroll = 0;
             }
-            KeyCode::Char('G') | KeyCode::End => target.scroll_to_bottom(),
+            (Some(Action::Last), _) => target.scroll_to_bottom(),
             // k9s: `w` toggles line wrap; folding long lines is the other way to
             // read content that runs past the right edge.
-            KeyCode::Char('w') => {
+            (Some(Action::Wrap), _) => {
                 let on = target.toggle_wrap();
                 self.flash = format!("wrap: {}", if on { "on" } else { "off" });
                 self.flash_err = false;
@@ -1052,15 +1081,15 @@ impl App {
         }
     }
 
-    pub(super) fn key_logs(&mut self, key: KeyEvent) {
+    pub(super) fn key_logs(&mut self, key: KeyInput) {
         // Ctrl-S saves the buffer to a file (k9s).
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+        if key.action == Some(Action::Save) {
             self.save_logs();
             return;
         }
-        match key.code {
+        match (key.action, key.code) {
             // k9s: `s` toggles autoscroll/follow (we also accept `f`).
-            KeyCode::Char('s') | KeyCode::Char('f') => {
+            (Some(Action::Follow), _) => {
                 self.logs.follow = !self.logs.follow;
                 if self.logs.follow {
                     // Resumed tailing — trim the backlog accumulated while paused.
@@ -1082,7 +1111,7 @@ impl App {
                 return;
             }
             // k9s: `w` toggles line wrap.
-            KeyCode::Char('w') => {
+            (Some(Action::Wrap), _) => {
                 self.logs.wrap = !self.logs.wrap;
                 self.flash = format!("wrap: {}", if self.logs.wrap { "on" } else { "off" });
                 self.flash_err = false;
@@ -1090,7 +1119,7 @@ impl App {
             }
             // Fullscreen: whole frame, no borders, so terminal text selection
             // copies clean lines (k9s binds `f`, taken here by follow).
-            KeyCode::Char('F') => {
+            (Some(Action::Fullscreen), _) => {
                 self.logs.fullscreen = !self.logs.fullscreen;
                 self.flash = format!(
                     "fullscreen: {}",
@@ -1100,12 +1129,33 @@ impl App {
                 return;
             }
             // k9s time anchors: `0` re-tails, `1`-`5` re-stream a window.
-            KeyCode::Char(c @ '0'..='5') => {
-                self.apply_log_anchor(c);
+            (Some(Action::Anchor0), _) => {
+                self.apply_log_anchor('0');
                 return;
             }
+            (Some(Action::Anchor1), _) => {
+                self.apply_log_anchor('1');
+                return;
+            }
+            (Some(Action::Anchor2), _) => {
+                self.apply_log_anchor('2');
+                return;
+            }
+            (Some(Action::Anchor3), _) => {
+                self.apply_log_anchor('3');
+                return;
+            }
+            (Some(Action::Anchor4), _) => {
+                self.apply_log_anchor('4');
+                return;
+            }
+            (Some(Action::Anchor5), _) => {
+                self.apply_log_anchor('5');
+                return;
+            }
+
             // Provider logs: `T` changes the lookback period (re-queries).
-            KeyCode::Char('T') => {
+            (Some(Action::Lookback), _) => {
                 if self.provider_logs_active() {
                     self.prompt_label = format!(
                         "lookback period — e.g. 30m, 4h, 2d (current: {})",
@@ -1120,7 +1170,7 @@ impl App {
                 return;
             }
             // k9s: `t` toggles timestamps (re-streams).
-            KeyCode::Char('t') => {
+            (Some(Action::Timestamps), _) => {
                 self.logs.timestamps = !self.logs.timestamps;
                 self.flash = format!(
                     "timestamps: {}",
@@ -1133,7 +1183,7 @@ impl App {
                 return;
             }
             // Stop / resume the live stream.
-            KeyCode::Char('x') => {
+            (Some(Action::Stream), _) => {
                 if self.logs.stopped {
                     self.logs.stopped = false;
                     self.flash = "log stream resumed".into();
@@ -1142,25 +1192,25 @@ impl App {
                 } else {
                     self.logs.stopped = true;
                     self.stop_log_stream(); // abort log tasks; view watch untouched
-                    self.flash = "log stream stopped (x to resume)".into();
+                    self.flash = "log stream stopped".into();
                     self.flash_err = false;
                 }
                 return;
             }
             // k9s: `c` copies the (filtered) buffer to the clipboard.
-            KeyCode::Char('c') => {
+            (Some(Action::Copy), _) => {
                 self.copy_logs();
                 return;
             }
             // Clear the on-screen buffer (the live stream keeps appending).
-            KeyCode::Char('z') => {
+            (Some(Action::Clear), _) => {
                 self.logs.view.clear_lines();
                 self.logs.view.scroll = 0;
                 self.flash = "log buffer cleared".into();
                 self.flash_err = false;
                 return;
             }
-            KeyCode::Char('/') => {
+            (Some(Action::Filter), _) => {
                 self.mode = Mode::LogFilter;
                 return;
             }
@@ -1174,35 +1224,35 @@ impl App {
         // Deepest useful offset: last full page pinned to the viewport bottom.
         let max = self.logs.viewport_rows.saturating_sub(self.logs.viewport_h);
         let cur = self.logs.view.scroll;
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => {
                 self.stop_log_stream();
                 self.mode = self.return_mode;
                 if self.return_mode == Mode::Table {
                     self.restore_selection();
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => {
+            (Some(Action::Down), _) => {
                 self.logs.follow = false;
                 self.logs.view.scroll = cur.saturating_add(1).min(max);
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            (Some(Action::Up), _) => {
                 self.logs.follow = false;
                 self.logs.view.scroll = cur.saturating_sub(1);
             }
-            KeyCode::PageDown | KeyCode::Char(' ') => {
+            (Some(Action::PageDown), _) => {
                 self.logs.follow = false;
                 self.logs.view.scroll = cur.saturating_add(page).min(max);
             }
-            KeyCode::PageUp => {
+            (Some(Action::PageUp), _) => {
                 self.logs.follow = false;
                 self.logs.view.scroll = cur.saturating_sub(page);
             }
-            KeyCode::Char('g') | KeyCode::Home => {
+            (Some(Action::First), _) => {
                 self.logs.follow = false;
                 self.logs.view.scroll = 0;
             }
-            KeyCode::Char('G') | KeyCode::End => {
+            (Some(Action::Last), _) => {
                 // Resume autoscroll; the next draw anchors to the bottom.
                 self.logs.follow = true;
             }
@@ -1210,24 +1260,24 @@ impl App {
         }
     }
 
-    pub(super) fn key_log_filter(&mut self, key: KeyEvent) {
+    pub(super) fn key_log_filter(&mut self, key: KeyInput) {
         let mut edited = self.logs.filter.clone();
-        if edit_chord(&key, &mut edited) {
+        if edit_action(key.action, &mut edited) {
             self.logs.set_filter(edited);
             return;
         }
-        match key.code {
-            KeyCode::Esc => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) => {
                 self.logs.set_filter(String::new());
                 self.mode = Mode::Logs;
             }
-            KeyCode::Enter => self.mode = Mode::Logs,
-            KeyCode::Backspace => {
+            (Some(Action::Accept), _) => self.mode = Mode::Logs,
+            (Some(Action::Backspace), _) => {
                 let mut f = self.logs.filter.clone();
                 f.pop();
                 self.logs.set_filter(f);
             }
-            KeyCode::Char(c) => {
+            (None, KeyCode::Char(c)) => {
                 let mut f = self.logs.filter.clone();
                 f.push(c);
                 self.logs.set_filter(f);
@@ -1236,47 +1286,38 @@ impl App {
         }
     }
 
-    pub(super) fn key_help(&mut self, key: KeyEvent) {
+    pub(super) fn key_help(&mut self, key: KeyInput) {
         let page = self.help_viewport_h.max(1);
-        match key.code {
+        match (key.action, key.code) {
             // Esc backs out of an active search first, then closes help.
-            KeyCode::Esc if !self.help_filter.is_empty() => {
+            (Some(Action::Back), _) if !self.help_filter.is_empty() => {
                 self.help_filter.clear();
                 self.help_scroll = 0;
             }
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => {
                 self.mode = self.help_return;
                 self.help_return = Mode::Table;
             }
-            KeyCode::Char('/') => {
+            (Some(Action::Filter), _) => {
                 self.help_scroll = 0;
                 self.doc_filter_return = self.mode;
                 self.mode = Mode::DocFilter;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
+            (Some(Action::Down), _) => {
                 self.help_scroll = self.help_scroll.saturating_add(1).min(self.help_max_scroll);
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            (Some(Action::Up), _) => {
                 self.help_scroll = self.help_scroll.saturating_sub(1);
             }
-            KeyCode::PageDown | KeyCode::Char(' ') => {
+            (Some(Action::PageDown), _) => {
                 self.help_scroll = self
                     .help_scroll
                     .saturating_add(page)
                     .min(self.help_max_scroll);
             }
-            KeyCode::Char('f') if key.modifiers == KeyModifiers::CONTROL => {
-                self.help_scroll = self
-                    .help_scroll
-                    .saturating_add(page)
-                    .min(self.help_max_scroll);
-            }
-            KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(page),
-            KeyCode::Char('b') if key.modifiers == KeyModifiers::CONTROL => {
-                self.help_scroll = self.help_scroll.saturating_sub(page);
-            }
-            KeyCode::Char('g') | KeyCode::Home => self.help_scroll = 0,
-            KeyCode::Char('G') | KeyCode::End => self.help_scroll = self.help_max_scroll,
+            (Some(Action::PageUp), _) => self.help_scroll = self.help_scroll.saturating_sub(page),
+            (Some(Action::First), _) => self.help_scroll = 0,
+            (Some(Action::Last), _) => self.help_scroll = self.help_max_scroll,
             _ => {}
         }
     }
@@ -1284,16 +1325,16 @@ impl App {
     /// Type the search query for a single-document view (YAML/describe, diff,
     /// events, help). Mirrors [`Self::key_log_filter`]: enter keeps the query,
     /// esc clears it; either returns to the view it was opened from.
-    pub(super) fn key_doc_filter(&mut self, key: KeyEvent) {
-        if edit_chord(&key, self.doc_filter_mut()) {
+    pub(super) fn key_doc_filter(&mut self, key: KeyInput) {
+        if edit_action(key.action, self.doc_filter_mut()) {
             return;
         }
-        match key.code {
-            KeyCode::Esc => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) => {
                 self.doc_filter_mut().clear();
                 self.mode = self.doc_filter_return;
             }
-            KeyCode::Enter => {
+            (Some(Action::Accept), _) => {
                 // Finalize: on a document view, jump to the first match so the
                 // hit is on screen; help filters in place and needs no jump.
                 if self.doc_filter_return != Mode::Help {
@@ -1301,10 +1342,10 @@ impl App {
                 }
                 self.mode = self.doc_filter_return;
             }
-            KeyCode::Backspace => {
+            (Some(Action::Backspace), _) => {
                 self.doc_filter_mut().pop();
             }
-            KeyCode::Char(c) => {
+            (None, KeyCode::Char(c)) => {
                 self.doc_filter_mut().push(c);
             }
             _ => {}

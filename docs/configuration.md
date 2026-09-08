@@ -116,7 +116,7 @@ Each of these is documented where the feature itself is:
 | `[[guardrails]]`      | enforced rules on destructive actions       | [Safety](safety.md#guardrails)                             |
 | `[logs]`              | log tail, follow buffer, `since` lookback   | [Log controls](debugging.md#log-controls)                  |
 | `[notify]`            | bell and desktop notification delivery      | [Notifications](debugging.md#notifications)                |
-| `[keys]`              | palette completion key rebinds              | [Key reference](keys.md#palette-completion-keys)           |
+| `[keys]`              | built-in keyboard bindings                  | [Key bindings](keybindings.md)                             |
 | `[debug]`             | ephemeral and node debug images             | [Debug containers](debugging.md#debug-containers-and-pods) |
 | `[bundle]`            | redaction and size caps for `:bundle`       | [Diagnostic bundles](debugging.md#diagnostic-bundles)      |
 | `[logging]`           | sofka's own structured log file             | [Runtime diagnostics](debugging.md#runtime-diagnostics)    |

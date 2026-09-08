@@ -778,13 +778,13 @@ impl App {
         self.mode = Mode::SetImage;
     }
 
-    pub(super) fn key_set_image(&mut self, key: KeyEvent) {
+    pub(super) fn key_set_image(&mut self, key: KeyInput) {
         let len = self.container_list.len();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Table,
-            KeyCode::Char('j') | KeyCode::Down => list_step(&mut self.container_state, len, true),
-            KeyCode::Char('k') | KeyCode::Up => list_step(&mut self.container_state, len, false),
-            KeyCode::Enter => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => self.mode = Mode::Table,
+            (Some(Action::Down), _) => list_step(&mut self.container_state, len, true),
+            (Some(Action::Up), _) => list_step(&mut self.container_state, len, false),
+            (Some(Action::Accept), _) => {
                 if let Some(i) = self.container_state.selected()
                     && let Some(container) = self.container_list.get(i).cloned()
                     && let Some((ns, name, plural)) = self.image_target.clone()
@@ -1335,21 +1335,21 @@ impl App {
     /// The `:pf` list is the running forwards followed by the saved-but-
     /// stopped `[[forwards]]` entries; `x`/`s` stops a running one, `⏎`/`s`
     /// starts a stopped one.
-    pub(super) fn key_port_forwards(&mut self, key: KeyEvent) {
+    pub(super) fn key_port_forwards(&mut self, key: KeyInput) {
         let running = self.port_forwards.len();
         let len = running + self.stopped_configured_forwards().len();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Table,
-            KeyCode::Char('j') | KeyCode::Down => list_step(&mut self.pf_state, len, true),
-            KeyCode::Char('k') | KeyCode::Up => list_step(&mut self.pf_state, len, false),
-            KeyCode::Char('x') | KeyCode::Char('s') | KeyCode::Enter => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => self.mode = Mode::Table,
+            (Some(Action::Down), _) => list_step(&mut self.pf_state, len, true),
+            (Some(Action::Up), _) => list_step(&mut self.pf_state, len, false),
+            (Some(Action::Toggle), _) | (Some(Action::Start), _) => {
                 let Some(i) = self.pf_state.selected() else {
                     return;
                 };
                 if i < running {
                     // Enter on a running forward is a no-op, not a stop — a
                     // reflexive ⏎ shouldn't kill a tunnel.
-                    if key.code != KeyCode::Enter {
+                    if key.action == Some(Action::Toggle) {
                         self.stop_selected_port_forward();
                     }
                 } else if let Some(&(idx, _)) = self.stopped_configured_forwards().get(i - running)
@@ -1370,13 +1370,13 @@ impl App {
         self.mode = Mode::Skins;
     }
 
-    pub(super) fn key_skins(&mut self, key: KeyEvent) {
+    pub(super) fn key_skins(&mut self, key: KeyInput) {
         let len = self.skin_list.len();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Table,
-            KeyCode::Char('j') | KeyCode::Down => list_step(&mut self.skin_state, len, true),
-            KeyCode::Char('k') | KeyCode::Up => list_step(&mut self.skin_state, len, false),
-            KeyCode::Enter => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => self.mode = Mode::Table,
+            (Some(Action::Down), _) => list_step(&mut self.skin_state, len, true),
+            (Some(Action::Up), _) => list_step(&mut self.skin_state, len, false),
+            (Some(Action::Accept), _) => {
                 if let Some(name) = self
                     .skin_state
                     .selected()
@@ -1472,10 +1472,7 @@ impl App {
         warnings.extend(crate::config::forward_warnings(&self.forwards_cfg));
         warnings.extend(crate::config::notify_warnings(&self.notify_cfg));
         warnings.extend(crate::config::pvc_explore_warnings(&self.pvc_cfg));
-        let (palette_keys, key_warnings) =
-            crate::config::compile_palette_keys(&resolved.config.keys);
-        self.palette_keys = palette_keys;
-        warnings.extend(key_warnings);
+        warnings.extend(self.configure_keys(&resolved.config.keys));
         // Thresholds only change cell coloring (never the column layout), so —
         // unlike custom views — they're safe to re-apply live without yanking
         // the current view.
@@ -1655,20 +1652,16 @@ impl App {
         self.mode = Mode::TransferMenu;
     }
 
-    pub(super) fn key_transfer_menu(&mut self, key: KeyEvent) {
+    pub(super) fn key_transfer_menu(&mut self, key: KeyInput) {
         let len = TRANSFER_MENU_ITEMS.len();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => {
                 self.transfer_target = None;
                 self.mode = Mode::Table;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                list_step(&mut self.transfer_menu_state, len, true)
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                list_step(&mut self.transfer_menu_state, len, false)
-            }
-            KeyCode::Enter => {
+            (Some(Action::Down), _) => list_step(&mut self.transfer_menu_state, len, true),
+            (Some(Action::Up), _) => list_step(&mut self.transfer_menu_state, len, false),
+            (Some(Action::Accept), _) => {
                 let choice = self
                     .transfer_menu_state
                     .selected()
@@ -1872,14 +1865,14 @@ impl App {
         self.mode = Mode::FluxMenu;
     }
 
-    pub(super) fn key_flux_menu(&mut self, key: KeyEvent) {
+    pub(super) fn key_flux_menu(&mut self, key: KeyInput) {
         let items = self.action_menu_items();
         let len = items.len();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Table,
-            KeyCode::Char('j') | KeyCode::Down => list_step(&mut self.flux_menu_state, len, true),
-            KeyCode::Char('k') | KeyCode::Up => list_step(&mut self.flux_menu_state, len, false),
-            KeyCode::Enter => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => self.mode = Mode::Table,
+            (Some(Action::Down), _) => list_step(&mut self.flux_menu_state, len, true),
+            (Some(Action::Up), _) => list_step(&mut self.flux_menu_state, len, false),
+            (Some(Action::Accept), _) => {
                 let choice = self
                     .flux_menu_state
                     .selected()

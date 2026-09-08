@@ -1,6 +1,8 @@
 # Key reference
 
-The full keymap. `?` inside sofka shows the same thing, including your own
+The default keymap. All built-in keyboard actions are configurable.
+See [Configure key bindings](keybindings.md) for scopes and action names.
+`?` inside sofka shows the effective bindings, including your own
 plugin, bookmark, and workspace chords. `:` and `?` work from every navigation
 screen; closing either returns to the screen where it was opened. Text-entry
 pickers keep both characters available as input.
@@ -162,10 +164,15 @@ palette_prev   = "ctrl-p"
 palette_accept = ["ctrl-y", "enter"]
 ```
 
-Each value is one [key chord](plugins.md) or a list of chords, and replaces
-the default set for that action (`["tab", "down"]`, `["backtab", "up"]`,
-`["enter"]`) — include a default in the list to keep it too. `ctrl-c` (quit)
-and `ctrl-e` (compact mode) are reserved by built-ins and can't be bound.
+Each value is one [key combination](plugins.md) or a list of combinations.
+It replaces the default set for that action: `["tab", "down"]`,
+`["backtab", "up"]`, or `["enter"]`. Include a default in the list to keep it.
+An empty list disables the bindings.
+
+These fields remain aliases for `[keys.command]` actions `down`, `up`, and
+`accept`. Do not set an action through both forms. To assign `ctrl-c` or
+`ctrl-e` to another action, first change or disable `quit` or `compact` under
+`[keys.global]`. See [conflicts](keybindings.md#conflicts-and-errors).
 
 ## What suspends the TUI
 

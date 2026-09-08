@@ -82,7 +82,15 @@ impl App {
     /// One wheel notch = three steps, like most list UIs.
     fn wheel(&mut self, code: KeyCode) -> Result<()> {
         for _ in 0..3 {
-            self.handle_key(KeyEvent::new(code, KeyModifiers::NONE))?;
+            let action = if code == KeyCode::Up {
+                Action::Up
+            } else {
+                Action::Down
+            };
+            self.handle_input(KeyInput::new(
+                Some(action),
+                KeyEvent::new(KeyCode::Null, KeyModifiers::NONE),
+            ))?;
         }
         Ok(())
     }

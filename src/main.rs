@@ -287,6 +287,7 @@ async fn run_main(args: Args) -> Result<()> {
     let (tx, mut rx) = mpsc::channel(EVENT_CHANNEL_CAP);
     let panic_tx = tx.clone();
     let mut app = App::new(cluster, tx);
+    app.config = loader;
     match sofka::state_writer::StateWriter::new(app.tx.clone()) {
         Ok(writer) => app.state_writer = Some(writer),
         Err(e) => {
@@ -350,12 +351,11 @@ async fn run_main(args: Args) -> Result<()> {
         eprintln!("warning: {w}");
         config_warnings.push(w);
     }
-    let (palette_keys, key_warnings) = config::compile_palette_keys(&cfg.keys);
+    let key_warnings = app.configure_keys(&cfg.keys);
     for w in key_warnings {
         eprintln!("warning: {w}");
         config_warnings.push(w);
     }
-    app.palette_keys = palette_keys;
     let (user_views, view_warnings) = views::compile(&cfg.views);
     for w in &view_warnings {
         eprintln!("warning: {w}");
@@ -378,7 +378,6 @@ async fn run_main(args: Args) -> Result<()> {
     }
     app.metrics_provider = metrics_provider;
     app.skin_colors = cfg.skin.colors.clone();
-    app.config = loader;
     app.session_skin = Some(session_skin);
     app.active_skin = Some(initial_skin);
     // Keep initial-load validation problems visible in-app (`:config`), not

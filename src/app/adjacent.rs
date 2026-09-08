@@ -216,10 +216,10 @@ impl App {
         }
     }
 
-    pub(super) fn key_adjacent(&mut self, key: KeyEvent) {
+    pub(super) fn key_adjacent(&mut self, key: KeyInput) {
         let len = self.adjacent_items.len();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => {
                 let destination = self.adjacent_return;
                 self.mode = destination;
                 self.adjacent_return = Mode::Table;
@@ -227,23 +227,23 @@ impl App {
                     self.restore_selection();
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => list_step(&mut self.adjacent_state, len, true),
-            KeyCode::Char('k') | KeyCode::Up => list_step(&mut self.adjacent_state, len, false),
-            KeyCode::Char('g') | KeyCode::Home => {
+            (Some(Action::Down), _) => list_step(&mut self.adjacent_state, len, true),
+            (Some(Action::Up), _) => list_step(&mut self.adjacent_state, len, false),
+            (Some(Action::First), _) => {
                 if len > 0 {
                     self.adjacent_state.select(Some(0));
                 }
             }
-            KeyCode::Char('G') | KeyCode::End => {
+            (Some(Action::Last), _) => {
                 if len > 0 {
                     self.adjacent_state.select(Some(len - 1));
                 }
             }
-            KeyCode::Char('r') => self.refresh_adjacent(),
-            KeyCode::Char('c') => self.discover_children(),
-            KeyCode::Enter => self.adjacent_goto(),
-            KeyCode::Char('y') => self.adjacent_yaml(),
-            KeyCode::Char('d') => self.adjacent_describe(),
+            (Some(Action::Refresh), _) => self.refresh_adjacent(),
+            (Some(Action::DiscoverChildren), _) => self.discover_children(),
+            (Some(Action::Accept), _) => self.adjacent_goto(),
+            (Some(Action::Yaml), _) => self.adjacent_yaml(),
+            (Some(Action::Describe), _) => self.adjacent_describe(),
             _ => {}
         }
         if !matches!(self.mode, Mode::Adjacent | Mode::Detail) {

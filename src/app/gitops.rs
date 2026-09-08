@@ -178,22 +178,22 @@ impl App {
         }
     }
 
-    pub(super) fn key_gitops(&mut self, key: KeyEvent) {
+    pub(super) fn key_gitops(&mut self, key: KeyInput) {
         let len = self.gitops_items.len();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => {
                 self.mode = self.return_mode;
                 if self.return_mode == Mode::Table {
                     self.restore_selection();
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => list_step(&mut self.gitops_state, len, true),
-            KeyCode::Char('k') | KeyCode::Up => list_step(&mut self.gitops_state, len, false),
-            KeyCode::Char('g') | KeyCode::Home if len > 0 => self.gitops_state.select(Some(0)),
-            KeyCode::Char('G') | KeyCode::End if len > 0 => self.gitops_state.select(Some(len - 1)),
-            KeyCode::Char('r') => self.refresh_gitops(),
+            (Some(Action::Down), _) => list_step(&mut self.gitops_state, len, true),
+            (Some(Action::Up), _) => list_step(&mut self.gitops_state, len, false),
+            (Some(Action::First), _) if len > 0 => self.gitops_state.select(Some(0)),
+            (Some(Action::Last), _) if len > 0 => self.gitops_state.select(Some(len - 1)),
+            (Some(Action::Refresh), _) => self.refresh_gitops(),
             // Jump to the resource behind the selected chain node.
-            KeyCode::Enter => {
+            (Some(Action::Accept), _) => {
                 let target = self
                     .gitops_state
                     .selected()

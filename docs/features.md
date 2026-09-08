@@ -153,6 +153,11 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 - **Default sort** - `[views."*"].sort` sets a global initial sort, with
   resource-specific overrides. Sort choices are saved per kind by default.
   Set `remember_sort = false` to make user sort changes temporary.
+- **Configurable key bindings** - change or disable built-in keyboard actions
+  under `[keys]`. Shared navigation settings and mode overrides keep text input
+  separate from navigation. Help and key hints show the effective bindings.
+  Changes support `:reload` and cluster/context overrides. Invalid bindings keep
+  the previous keymap. See [Configure key bindings](keybindings.md).
 - **Mouse support** - the wheel scrolls every view (one notch is three steps of
   that view's own up/down), clicking a row selects it, clicking a column header
   sorts by it (click again to flip). Document views (YAML/describe, diff,
