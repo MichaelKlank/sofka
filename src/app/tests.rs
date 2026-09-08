@@ -20620,6 +20620,312 @@ async fn hide_header_follows_context_overrides() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+fn child_discovery_app(denied: bool) -> (App, Receiver<Msg>, Arc<std::sync::Mutex<Vec<String>>>) {
+    let (mut app, rx) = test_app();
+    app.cluster
+        .register_kind("example.io", "Widget", "widgets", true);
+    app.switch_kind("widgets.example.io");
+    let root = json!({"apiVersion":"example.io/v1", "kind":"Widget", "metadata":{
+        "name":"parent", "namespace":"prod", "uid":"current-uid"
+    }});
+    apply(&mut app, root.clone());
+    app.table_state.select(Some(0));
+    app.cluster.child_kinds = vec![
+        app.cluster.resolve("pods").unwrap(),
+        app.cluster.resolve("secrets").unwrap(),
+    ];
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    app.cluster.client = Client::new(
+        tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let uri = req.uri().to_string();
+            seen.lock().unwrap().push(uri.clone());
+            let (code, body) = if req.uri().path().ends_with("/widgets/parent") {
+                (200, root.clone())
+            } else if denied && req.uri().path().ends_with("/secrets") {
+                (
+                    403,
+                    json!({"apiVersion":"v1", "kind":"Status", "status":"Failure", "reason":"Forbidden", "code":403, "message":"secrets access denied"}),
+                )
+            } else {
+                assert!(uri.starts_with("/api/v1/namespaces/prod/"), "{uri}");
+                assert!(uri.contains("limit=200"), "{uri}");
+                let secret = req.uri().path().ends_with("/secrets");
+                let second = uri.contains("continue=");
+                let kind = if secret { "Secret" } else { "Pod" };
+                let name = if secret {
+                    "settings"
+                } else if second {
+                    "pod-2"
+                } else {
+                    "pod-1"
+                };
+                (
+                    200,
+                    json!({"apiVersion":"v1", "kind":format!("{kind}List"), "metadata":{
+                        "continue":if !secret && !second {"next-page"} else {""}
+                    }, "items":[
+                        {"apiVersion":"v1", "kind":kind, "metadata":{"name":name, "namespace":"prod", "ownerReferences":[{"apiVersion":"example.io/v1", "kind":"Widget", "name":"parent", "uid":"current-uid"}]}},
+                        {"apiVersion":"v1", "kind":kind, "metadata":{"name":"old-child", "namespace":"prod", "ownerReferences":[{"apiVersion":"example.io/v1", "kind":"Widget", "name":"parent", "uid":"old-uid"}]}}
+                    ]}),
+                )
+            };
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(code)
+                        .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                            body.to_string(),
+                        )))
+                        .unwrap(),
+                )
+            }
+        }),
+        "default",
+    );
+    (app, rx, requests)
+}
+
+async fn receive_children(app: &mut App, rx: &mut Receiver<Msg>) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(message) = rx.recv().await {
+            if matches!(message, Msg::AdjacentChildren { .. }) {
+                let done = matches!(message, Msg::AdjacentChildren { done: true, .. });
+                app.handle_msg(message);
+                if done {
+                    return;
+                }
+            }
+        }
+        panic!("child search channel closed");
+    })
+    .await
+    .expect("child search did not finish");
+}
+
+#[tokio::test]
+async fn adjacent_c_discovers_multiple_kinds_and_pages_only_on_request() {
+    let (mut app, mut rx, requests) = child_discovery_app(false);
+    app.handle_key(press(KeyCode::Char('u'))).unwrap();
+    receive_adjacent(&mut app, &mut rx).await;
+    assert!(app.adjacent_items.is_empty());
+    assert!(app.child_task.is_none());
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert!(app.child_status.contains("searching"));
+    receive_children(&mut app, &mut rx).await;
+    assert!(
+        app.child_status.contains("complete (2/2"),
+        "{}",
+        app.child_status
+    );
+    assert_eq!(app.adjacent_items.len(), 3);
+    assert!(app.adjacent_items.iter().all(|i| i.name != "old-child"));
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|uri| uri.contains("continue=next-page"))
+    );
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    receive_children(&mut app, &mut rx).await;
+    assert_eq!(
+        app.adjacent_items.len(),
+        3,
+        "repeated discovery removes duplicates"
+    );
+    let row = app
+        .adjacent_items
+        .iter()
+        .position(|i| i.name == "settings")
+        .unwrap();
+    for _ in 0..row {
+        app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.kind_plural, "secrets");
+    assert_eq!(app.namespace, "prod");
+    assert_eq!(app.fields.as_deref(), Some("metadata.name=settings"));
+}
+
+#[tokio::test]
+async fn adjacent_c_keeps_usable_results_when_another_kind_is_denied() {
+    let (mut app, mut rx, _) = child_discovery_app(true);
+    app.handle_key(press(KeyCode::Char('u'))).unwrap();
+    receive_adjacent(&mut app, &mut rx).await;
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    receive_children(&mut app, &mut rx).await;
+    assert_eq!(app.adjacent_items.len(), 2);
+    assert!(app.child_status.contains("incomplete"));
+    assert!(app.child_status.contains("secrets access denied"));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.kind_plural, "pods");
+}
+
+#[tokio::test]
+async fn adjacent_c_cancels_on_exit_refresh_and_overlay_and_drops_late_results() {
+    for key in [
+        KeyCode::Esc,
+        KeyCode::Char('r'),
+        KeyCode::Char('?'),
+        KeyCode::Char(':'),
+    ] {
+        let (mut app, mut rx, _) = child_discovery_app(false);
+        app.handle_key(press(KeyCode::Char('u'))).unwrap();
+        receive_adjacent(&mut app, &mut rx).await;
+        app.handle_key(press(KeyCode::Char('c'))).unwrap();
+        let request = app.child_request;
+        let task = app.child_task.as_ref().unwrap().abort_handle();
+        app.handle_key(press(key)).unwrap();
+        assert!(app.child_task.is_none());
+        assert_ne!(app.child_request, request);
+        tokio::task::yield_now().await;
+        assert!(task.is_finished());
+        app.handle_msg(Msg::AdjacentChildren {
+            generation: app.generation,
+            request,
+            items: pod_neighbours(),
+            status: "children: complete".into(),
+            done: true,
+        });
+        assert!(app.adjacent_items.is_empty());
+        assert_ne!(app.child_status, "children: complete");
+    }
+}
+
+#[tokio::test]
+async fn adjacent_c_rejects_missing_uid_namespace_and_builtin_parents() {
+    for invalid in ["uid", "namespace", "builtin", "cluster"] {
+        let (mut app, mut rx, _) = child_discovery_app(false);
+        app.handle_key(press(KeyCode::Char('u'))).unwrap();
+        receive_adjacent(&mut app, &mut rx).await;
+        match invalid {
+            "uid" => app.adjacent_source.as_mut().unwrap().metadata.uid = None,
+            "namespace" => app.adjacent_source.as_mut().unwrap().metadata.namespace = None,
+            "builtin" => app.kind = app.cluster.resolve("pods"),
+            "cluster" => app.kind.as_mut().unwrap().namespaced = false,
+            _ => unreachable!(),
+        }
+        app.handle_key(press(KeyCode::Char('c'))).unwrap();
+        assert!(app.child_task.is_none());
+        assert!(app.flash.contains("namespaced custom resource with a UID"));
+    }
+}
+
+#[tokio::test]
+async fn adjacent_c_waits_for_the_source_lookup_and_context_change_cancels_it() {
+    let (mut app, mut rx, _) = child_discovery_app(false);
+    app.handle_key(press(KeyCode::Char('u'))).unwrap();
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert!(app.child_task.is_none());
+    assert!(app.flash.contains("initial adjacent lookup"));
+    receive_adjacent(&mut app, &mut rx).await;
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    let generation = app.generation;
+    let request = app.child_request;
+    let task = app.child_task.as_ref().unwrap().abort_handle();
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "ctx".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(app.child_task.is_none());
+    tokio::task::yield_now().await;
+    assert!(task.is_finished());
+    app.handle_msg(Msg::AdjacentChildren {
+        generation,
+        request,
+        items: pod_neighbours(),
+        status: "late".into(),
+        done: true,
+    });
+    assert!(app.adjacent_items.is_empty());
+}
+
+#[tokio::test]
+async fn adjacent_c_cancels_when_a_background_reply_opens_a_document() {
+    let (mut app, mut rx, _) = child_discovery_app(false);
+    app.handle_key(press(KeyCode::Char('u'))).unwrap();
+    receive_adjacent(&mut app, &mut rx).await;
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    let task = app.child_task.as_ref().unwrap().abort_handle();
+    let claim = app.claim_status("reading document");
+    app.handle_msg(Msg::Detail {
+        generation: app.generation,
+        claim,
+        title: "document".into(),
+        lines: vec!["document".into()],
+        warn: None,
+    });
+    assert_eq!(app.mode, Mode::Detail);
+    assert!(app.child_task.is_none());
+    tokio::task::yield_now().await;
+    assert!(task.is_finished());
+}
+
+#[tokio::test]
+async fn adjacent_c_retains_existing_rows_and_rejects_replaced_search_results() {
+    let (mut app, mut rx, _) = child_discovery_app(false);
+    app.handle_key(press(KeyCode::Char('u'))).unwrap();
+    receive_adjacent(&mut app, &mut rx).await;
+    app.adjacent_claim = Some(app.claim_status("gathering connections"));
+    deliver_adjacent(&mut app, pod_neighbours(), None);
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    let request = app.child_request;
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    assert_eq!(app.adjacent_state.selected(), Some(1));
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    app.handle_msg(Msg::AdjacentChildren {
+        generation: app.generation,
+        request,
+        items: Vec::new(),
+        status: "obsolete search".into(),
+        done: true,
+    });
+    assert!(app.child_task.is_some());
+    assert!(app.child_status.contains("searching"));
+    receive_children(&mut app, &mut rx).await;
+    assert_eq!(app.adjacent_items.len(), 6);
+    assert_eq!(app.adjacent_state.selected(), Some(1));
+}
+
+#[tokio::test]
+async fn adjacent_c_incomplete_empty_results_remain_visible_without_a_flash() {
+    let (mut app, mut rx, _) = child_discovery_app(false);
+    app.handle_key(press(KeyCode::Char('u'))).unwrap();
+    receive_adjacent(&mut app, &mut rx).await;
+    app.cluster.child_kinds.clear();
+    app.cluster
+        .discovery_warnings
+        .push("API discovery access denied".into());
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    receive_children(&mut app, &mut rx).await;
+    app.flash.clear();
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(screen.contains("children: incomplete"), "{screen}");
+    assert!(
+        screen.contains("no results found; lookup is incomplete"),
+        "{screen}"
+    );
+    assert!(
+        !screen.contains("nothing connected to this object was found"),
+        "{screen}"
+    );
+}
+
 #[tokio::test]
 async fn timeline_key_keeps_recently_changed_history_at_capacity() {
     let (mut app, _rx) = test_app();

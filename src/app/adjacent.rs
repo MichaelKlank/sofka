@@ -7,6 +7,8 @@ use crate::store::AdjacentItem;
 use kube::core::GroupVersionResource;
 use std::collections::hash_map::Entry;
 
+mod children;
+
 type ListCache = HashMap<(GroupVersionResource, String), Vec<DynamicObject>>;
 
 /// The cluster's registry, answering the plan's kind lookups.
@@ -56,6 +58,9 @@ impl App {
             self.flash_warn("no selection");
             return;
         };
+        self.cancel_adjacent_request();
+        self.child_status.clear();
+        self.adjacent_warning = None;
         self.set_return_mode();
         self.adjacent_return = self.return_mode;
         let name = obj.metadata.name.clone().unwrap_or_default();
@@ -70,6 +75,9 @@ impl App {
     /// `r` in the adjacent view — gather again for the same object.
     pub(super) fn refresh_adjacent(&mut self) {
         if self.adjacent_source.is_some() {
+            self.cancel_children();
+            self.child_status.clear();
+            self.adjacent_warning = None;
             self.spawn_adjacent();
         }
     }
@@ -201,6 +209,7 @@ impl App {
     }
 
     pub(super) fn cancel_adjacent_request(&mut self) {
+        self.cancel_children();
         self.adjacent_request = self.adjacent_request.wrapping_add(1);
         if let Some(claim) = self.adjacent_claim.take() {
             self.clear_claimed_status(claim);
@@ -231,6 +240,7 @@ impl App {
                 }
             }
             KeyCode::Char('r') => self.refresh_adjacent(),
+            KeyCode::Char('c') => self.discover_children(),
             KeyCode::Enter => self.adjacent_goto(),
             KeyCode::Char('y') => self.adjacent_yaml(),
             KeyCode::Char('d') => self.adjacent_describe(),

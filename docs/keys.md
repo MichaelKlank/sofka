@@ -37,6 +37,7 @@ for the grammar and selector persistence rules.
 | `x`                                           | secrets: show `data` base64-decoded (as `stringData`) · PVCs: browse the volume                                                                                     |
 | `X` / `T`                                     | explain why the selection is unhealthy / session-local state-change timeline                                                                                        |
 | `u` / `:adjacent`                             | adjacent view: owners, children, and the objects the selection names or is named by (`⏎` opens one)                                                                 |
+| `c` (adjacent view)                           | Discover direct children of a namespaced custom resource. Search starts on request. Results can be incomplete; see the limits in [Features](features.md).           |
 | `:gitops` / `:flux`                           | Flux owner, source, revisions & reconciliation chain for the selection (`⏎` to jump)                                                                                |
 | `:can-i` / `:can-i <verb> <resource> [ns]`    | what you can do here / check a single action (`SelfSubjectAccessReview`)                                                                                            |
 | `:journal` / `:audit`                         | session-local log of the mutating actions you've taken                                                                                                              |

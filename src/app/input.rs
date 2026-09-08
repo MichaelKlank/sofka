@@ -17,6 +17,9 @@ impl App {
         let run = self.plugin_run;
         let result = self.handle_key_inner(key);
         self.check_describe_refresh();
+        if self.should_quit || self.mode != Mode::Adjacent {
+            self.cancel_children();
+        }
         let overlay = matches!(
             self.mode,
             Mode::Command

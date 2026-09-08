@@ -252,6 +252,7 @@ pub struct Cluster {
     /// unknown, supported, or unsupported. Shared by all view watches so one
     /// negotiation failure avoids retrying the extension on every switch.
     streaming_lists: Arc<AtomicU8>,
+    pub child_kinds: Vec<Kind>,
     pub discovery_warnings: Vec<String>,
     pub discovery_fallback: Option<String>,
 }
@@ -330,6 +331,7 @@ impl Cluster {
             connected: true,
             allow_v1_client_cert,
             streaming_lists: Arc::new(AtomicU8::new(STREAMING_UNKNOWN)),
+            child_kinds: Vec::new(),
             discovery_warnings: Vec::new(),
             discovery_fallback: None,
         };
@@ -414,6 +416,7 @@ impl Cluster {
             connected: false,
             allow_v1_client_cert: false,
             streaming_lists: Arc::new(AtomicU8::new(STREAMING_UNKNOWN)),
+            child_kinds: Vec::new(),
             discovery_warnings: Vec::new(),
             discovery_fallback: None,
         }
@@ -450,6 +453,7 @@ impl Cluster {
         // Aggregated discovery needs two requests and tolerates stale APIService
         // entries. Legacy discovery is used when negotiation fails.
         let discovered = discovery::discover(&self.client).await?;
+        self.child_kinds = discovered.child_kinds;
         self.discovery_warnings = discovered.skipped;
         self.discovery_fallback = discovered.fallback;
         self.register_resources(discovered.resources);
@@ -965,6 +969,7 @@ impl Cluster {
             registry: HashMap::new(),
             catalog: Vec::new(),
             streaming_lists: Arc::new(AtomicU8::new(STREAMING_UNKNOWN)),
+            child_kinds: Vec::new(),
             discovery_warnings: Vec::new(),
             discovery_fallback: None,
         };
@@ -1056,6 +1061,9 @@ impl Cluster {
             },
             namespaced,
         };
+        if namespaced {
+            self.child_kinds.push(k.clone());
+        }
         self.registry.insert(kind.to_lowercase(), k.clone());
         self.registry.insert(plural.clone(), k.clone());
         self.catalog.push(plural.clone());

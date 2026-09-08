@@ -323,6 +323,7 @@ impl App {
         self.applied_filter_fields = filter_fields;
         self.clear_progress_flash();
         self.stop_plugins();
+        self.cancel_adjacent_request();
         self.generation += 1;
         self.gen_flag.store(self.generation, Ordering::SeqCst);
         for t in self.tasks.drain(..) {
@@ -843,6 +844,7 @@ impl App {
         self.stop_event_stream();
         self.clear_progress_flash();
         self.stop_plugins();
+        self.cancel_adjacent_request();
         self.generation += 1;
         self.gen_flag.store(self.generation, Ordering::SeqCst);
         for t in self.tasks.drain(..) {
@@ -858,6 +860,9 @@ impl App {
     pub fn handle_msg(&mut self, msg: Msg) {
         self.handle_msg_inner(msg);
         self.check_describe_refresh();
+        if self.mode != Mode::Adjacent {
+            self.cancel_children();
+        }
         let overlay = matches!(
             self.mode,
             Mode::PvcExplore
@@ -1154,6 +1159,7 @@ impl App {
                 warn,
             } if generation == self.generation && request == self.adjacent_request => {
                 self.adjacent_claim = None;
+                self.adjacent_warning = warn.clone();
                 let count = items.len();
                 self.adjacent_items = items;
                 self.adjacent_title = title;
@@ -1165,6 +1171,23 @@ impl App {
                         true,
                     ),
                     None => self.clear_claimed_status(claim),
+                }
+            }
+            Msg::AdjacentChildren {
+                generation,
+                request,
+                items,
+                status,
+                done,
+            } if generation == self.generation && request == self.child_request => {
+                self.adjacent_items.extend(items);
+                crate::adjacent::dedup(&mut self.adjacent_items);
+                if self.adjacent_state.selected().is_none() && !self.adjacent_items.is_empty() {
+                    self.adjacent_state.select(Some(0));
+                }
+                self.child_status = status;
+                if done {
+                    self.child_task = None;
                 }
             }
             Msg::Gitops {
