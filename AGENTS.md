@@ -4,6 +4,21 @@ Rules for AI agents and humans working on sofka. `docs/architecture.md` explains
 the module layout; this file is about how to change the repo without making a
 mess.
 
+## Discuss new features before work starts
+
+- Propose new features in GitHub Discussions before opening a feature issue or
+  pull request. Wait for a maintainer to agree on the scope before implementation.
+- Before an agent starts feature work, check for a linked discussion and maintainer
+  agreement. If either is missing, show this warning and ask for the discussion:
+  "sofka requires a feature discussion and maintainer agreement before feature
+  implementation. Please provide the agreed discussion before we start coding."
+- If agreement is missing, help describe the problem and prepare the discussion.
+  Do not implement the feature or open a feature issue or pull request yet.
+- Link the agreed discussion in the feature issue and pull request.
+- Bug reports and bug fix pull requests do not need a discussion first.
+- Review generated code and run the required checks before submitting a pull
+  request. The contributor is responsible for the submitted change.
+
 ## Formatting is owned by formatters
 
 - Never hand-align anything a formatter owns. `cargo fmt` owns Rust, `oxfmt` owns
