@@ -50,7 +50,7 @@ queued updates before it redraws. That same loop also handles terminal input and
 a 1s tick (age columns, reaping dead port-forwards). The UI never blocks on the
 network.
 
-See [why it's faster](vs-k9s.md#why-its-faster) for the performance-relevant
+See [performance design](vs-k9s.md#performance-design) for the performance-relevant
 choices in there.
 
 ## Plugin packages

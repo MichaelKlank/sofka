@@ -1,81 +1,60 @@
 # How sofka differs from k9s
 
-sofka is a reimagining of [k9s](https://github.com/derailed/k9s) (~51k lines of
-Go), not a line-by-line port. Same purpose - a fast, keyboard-driven cluster
-navigator - different architecture: one generic object pipeline instead of one
-renderer per resource kind.
+sofka and [k9s](https://github.com/derailed/k9s) are terminal interfaces for
+Kubernetes. This comparison covers sofka 0.24.9 and k9s 0.51.0.
+Neither the implementation language nor the source code size proves that one
+program is faster. See the [benchmark](benchmark-k9s.md) for measured results
+and test limits.
 
-For measured start time, memory use, command start time, and binary size, see the
-[performance benchmark](benchmark-k9s.md).
+## Shared functions
 
-## Design differences
+Both programs support custom resources, filters, sorting, skins, multiple row
+selection, and background port-forwards. These functions are not exclusive to
+sofka.
 
-- **One generic render pipeline, not one file per kind.** k9s has a Go file (a
-  struct and a `ColorerFunc`) for every resource type it knows. sofka has one
-  function that turns a `DynamicObject` into cells, with curated columns for
-  common kinds and a NAME/AGE fallback for everything else. A CRD with no
-  renderer still lists, sorts, and filters correctly on day one.
-- **Flux CD and Argo CD are built in, not plugins.** `t` opens a
-  suspend/resume/reconcile-now menu for Flux Kustomizations, HelmReleases,
-  git/helm/oci repositories, buckets, image automation, and notification alerts
-  and receivers, and a suspend/resume/sync-now menu for ArgoCD Applications
-  (suspend/resume only for ApplicationSets). sofka patches `spec.suspend`,
-  `spec.syncPolicy.automated`, the `reconcile.fluxcd.io/requestedAt` annotation,
-  and the ArgoCD `operation` field through the Kubernetes API - no `flux` or
-  `argocd` binary. ArgoCD suspend/resume stashes the original sync policy as a
-  base64 annotation so `prune`, `selfHeal`, and `allowEmpty` survive the
-  round-trip. Works with bulk multiselect too.
-- **Port-forwards run in the background.** Starting one doesn't freeze the TUI
-  for its lifetime. `:pf` lists the active forwards and stops them individually
-  while the others keep running. sofka tears all of them down on quit instead of
-  orphaning them.
-- **Bulk actions with multiselect.** `space` marks rows for delete, kill, or
-  Flux/ArgoCD suspend/resume/reconcile/sync across many resources at once.
-- **CRD rows drill into their custom resources**, not their YAML. `enter` on a
-  CustomResourceDefinition resolves its served version and lists the actual
-  objects.
-- **Skins, not one fixed palette.** Built-in Catppuccin, Gruvbox, Solarized,
-  Nord, Dracula, Tokyo Night, One Dark, Rosé Pine, Rosé Pine Dawn, Monokai,
-  and Flexoki, picked in the
-  config with a per-swatch hex override. With no skin configured, sofka detects a
-  light or dark terminal background. Every semantic color (row status, severity
-  badges, headers, borders) is derived from the active palette, so one skin
-  change is consistent everywhere. `background = true` fills views with the
-  skin's own background. A light per-context skin makes prod unmistakable.
-- **A combined row colorer.** sofka tints the whole row by status like k9s
-  (healthy, error, pending, completed each read as one color), _and_ shows a
-  separate STATUS badge and colors outlier values in RESTARTS, CPU, and MEM. So
-  a crash-looping or resource-hungry pod stands out inside an otherwise uniform
-  row. Warning and critical bands are configurable per resource and per context.
-- **It explains _why_ something is broken.** `X` opens a deterministic
-  evidence-based incident view: rollout state, degraded conditions, blocking pods
-  and their container failure reasons (ImagePullBackOff, CrashLoopBackOff,
-  OOMKilled, unschedulable, failed probes), and recent Warning events. No AI, no
-  external service. `⏎`, `E`, or `l` jumps from a finding to the pod, its
-  events, or its logs.
-- **A session-local timeline.** `T` shows every state change the watch saw for an
-  object - generation bumps, replica and readiness changes, pod phase, restarts,
-  waiting reasons, condition flips - as a timestamped log. Computed from the
-  watch stream, stored nowhere on disk.
+- **Custom resources:** sofka uses a shared `DynamicObject` pipeline with
+  built-in columns and fallback columns. k9s combines resource-specific code
+  with a [generic Kubernetes Table path](https://github.com/derailed/k9s/blob/v0.51.0/internal/dao/table.go).
+  k9s does not need a dedicated renderer for every custom resource.
+- **Skins:** sofka supplies built-in palettes and per-context settings.
+  k9s also supports [custom skins and per-context settings](https://k9scli.io/topics/skins/).
+- **Selection:** sofka uses `space` to mark rows for bulk actions.
+  k9s also has [multiple row selection](https://github.com/derailed/k9s/blob/v0.51.0/internal/ui/select_table.go).
+  The available actions depend on the resource and program.
+- **Port-forwards:** sofka lists active forwards with `:pf`.
+  k9s also has a port-forward view and supports background forwards. See the
+  [k9s documentation](https://github.com/derailed/k9s/blob/v0.51.0/README.md#benchmark-your-applications).
 
-## Why it's faster
+## sofka workflows
 
-Design choices you can verify in the source, not marketing numbers.
+These are reasons to try sofka. They do not establish that k9s has no equivalent
+workflow or extension.
 
-- **No garbage collector.** Rust's ownership model means no GC pauses. Watching
-  thousands of pods or custom resources grows the in-memory store, but redraw
-  latency stays smooth. A GC runtime gets jittery under constant allocation load.
-- **Batched redraws.** The event loop drains every pending watch message before
-  triggering one redraw (`while let Ok(m) = rx.try_recv()`). A rollout touching
-  50 pods costs one render pass, not fifty.
-- **Cached row computation.** Sorting and fuzzy filtering recompute only when the
-  data or the filter text changes, guarded by a dirty flag - not on every frame
-  or every keystroke across the full object set.
-- **No subprocess overhead on hot paths.** Delete, scale,
-  suspend/resume/reconcile/sync, and CRD drill-down are direct kube API calls
-  (JSON merge-patches over the existing client). No forking `kubectl`, `flux`,
-  or `argocd` per action.
-- **Generation-tagged streams.** Changing views doesn't wait for the old watcher
-  to tear down. A generation tag identifies stale messages and sofka drops them
-  the instant a newer watch takes over, so navigation never stalls behind a slow
-  stream.
+- **Flux CD and Argo CD actions:** `t` opens the supported action menu.
+  sofka sends Kubernetes API requests without a `flux` or `argocd` executable.
+  See [features](features.md) for resource and action coverage.
+- **Incident view:** `X` shows rollout state, conditions, pod failure reasons,
+  and recent Warning events. A finding can open the related resource, events,
+  or logs. This view uses rules and cluster data.
+- **Session timeline:** `T` shows object changes observed by the watch during
+  the session. It is not a durable audit log.
+- **Status display:** row colors, status badges, and configurable CPU, memory,
+  and restart thresholds help identify resources that need attention.
+
+k9s also offers plugins, custom views, XRay, Pulses, and Popeye integration.
+Users who depend on these functions must compare their workflows before they
+switch. See the [k9s commands](https://k9scli.io/topics/commands/) and
+[k9s project documentation](https://github.com/derailed/k9s/blob/v0.51.0/README.md).
+
+## Performance design
+
+sofka batches watch messages, caches row calculations, and uses generation tags
+to reject messages from old watches. Its built-in resource actions use the
+Kubernetes client. See [the event loop](../src/main.rs) and
+[row calculations](../src/app/rows.rs).
+
+These choices can reduce work. They do not prove a performance advantage over
+k9s. Rust has no tracing garbage collector, but this does not guarantee smooth
+redraws. Allocation, sorting, rendering, network delay, and scheduling can affect
+both programs. The benchmark does not isolate garbage collection or establish
+its effect on response time.
