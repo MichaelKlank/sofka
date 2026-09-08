@@ -54,6 +54,8 @@ pub struct Config {
     pub readonly: bool,
     /// Hide the header, including the logo. Defaults to false.
     pub hide_header: bool,
+    /// Start in compact mode; runtime toggles survive reloads and context switches.
+    pub compact_mode: bool,
     /// Custom alias -> canonical resource (plural/kind) mappings.
     pub aliases: HashMap<String, String>,
     /// Namespaces pinned to the top of the switcher (a curated team list, in
@@ -1523,6 +1525,20 @@ fn config_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_mode_defaults_false_and_accepts_booleans() {
+        assert!(!Config::default().compact_mode);
+        for (text, expected) in [
+            ("", false),
+            ("compact_mode = false", false),
+            ("compact_mode = true", true),
+        ] {
+            let cfg: Config = toml::from_str(text).unwrap();
+            assert_eq!(cfg.compact_mode, expected);
+        }
+        assert!(toml::from_str::<Config>("compact_mode = 'true'").is_err());
+    }
 
     #[test]
     fn palette_keys_default_when_unset() {

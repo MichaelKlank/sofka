@@ -15,6 +15,7 @@ default_resource  = "deployments"
 readonly          = false  # true disables every mutating action (delete, edit,
                            # scale, shell, plugins, …); --readonly/--write win
 hide_header = false # true hides the header and logo
+compact_mode = false # true starts with a one-line header and no footer
 mouse             = true   # false keeps the terminal's native mouse behavior
                            # (text selection) instead of scroll/click/sort
 terminal_title = true # false disables terminal title changes
@@ -41,6 +42,13 @@ Set `hide_header = true` to remove the header and logo and give more space to
 the active view. The default is `false`. This option supports cluster and
 context overrides and `:reload`. It also hides the one-line header in compact
 mode (`Ctrl-E`). The footer and command input keep their existing behavior.
+
+Set `compact_mode = true` to start with a one-line header containing resource,
+namespace, context, and live status, with the footer hidden. The default is
+`false`. `Ctrl-E` toggles compact mode during the session. Cluster and context
+overrides are resolved at startup; `:reload` and subsequent context switches do
+not reset the current compact mode. With `hide_header = true`, the compact
+header is hidden too. Command and filter input still appears when needed.
 
 `remember_sort` is enabled by default. Set it to `false` to stop saving and
 restoring sort choices from `S`, `I`, and column header clicks. Existing saved
