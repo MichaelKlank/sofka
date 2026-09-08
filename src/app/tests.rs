@@ -10391,6 +10391,73 @@ async fn workspace_opens_first_view_and_tab_cycles() {
     assert_eq!(app.namespace, "checkout");
 }
 
+#[tokio::test]
+async fn workspace_rejected_view_keeps_error_and_previous_view() {
+    for cycle in [false, true] {
+        for (resource, filter, error) in [
+            (
+                "nonexistentcrd",
+                "replacement",
+                "No resource matches 'nonexistentcrd'",
+            ),
+            ("", "replacement", "bookmark has no resource"),
+            ("pods", "(", "filter:"),
+        ] {
+            let (mut app, _rx) = test_app();
+            let initial = crate::config::WorkspaceView {
+                name: "current pods".into(),
+                resource: "pods".into(),
+                namespace: Some("checkout".into()),
+                filter: Some("api".into()),
+                sort: Some("NAME:asc".into()),
+                ..Default::default()
+            };
+            let mut bookmark = initial.as_bookmark();
+            bookmark.key = Some("z".into());
+            app.bookmarks = vec![bookmark];
+            app.handle_key(press(KeyCode::Char('z'))).unwrap();
+            assert!(!app.flash_err, "{}", app.flash);
+            let previous_sort = app.sort_column;
+            assert!(previous_sort.is_some());
+
+            let invalid = crate::config::WorkspaceView {
+                name: "invalid".into(),
+                resource: resource.into(),
+                namespace: Some("other".into()),
+                filter: Some(filter.into()),
+                sort: Some("NAME:desc".into()),
+                view: Some("pulse".into()),
+            };
+            app.workspaces = vec![crate::config::Workspace {
+                key: Some("ctrl-w".into()),
+                name: "ops".into(),
+                context: None,
+                views: if cycle {
+                    vec![initial, invalid]
+                } else {
+                    vec![invalid]
+                },
+            }];
+            app.handle_key(ctrl(KeyCode::Char('w'))).unwrap();
+            if cycle {
+                assert_eq!(app.flash, "workspace ops [1/2]: current pods");
+                assert!(!app.flash_err);
+                app.handle_key(press(KeyCode::Tab)).unwrap();
+            }
+
+            assert!(app.flash_err, "{}", app.flash);
+            assert!(app.flash.starts_with(error), "{}", app.flash);
+            assert_eq!(app.kind.as_ref().unwrap().ar.plural, "pods");
+            assert_eq!(app.kind_plural, "pods");
+            assert_eq!(app.namespace, "checkout");
+            assert_eq!(app.filter, "api");
+            assert_eq!(app.sort_column, previous_sort);
+            assert!(!app.sort_desc);
+            assert!(matches!(app.mode, Mode::Table));
+        }
+    }
+}
+
 fn resource_cycle_app() -> (App, Receiver<Msg>) {
     let (mut app, rx) = test_app();
     for (group, kind, plural) in [
