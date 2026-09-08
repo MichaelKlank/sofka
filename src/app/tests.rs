@@ -19255,3 +19255,90 @@ async fn builtin_aliases_keep_numeric_sort_and_elapsed_values() {
     assert_eq!(app.snapshot_table_at(now).1[0][2], "1m");
     assert_eq!(app.snapshot_table_at(now + 60).1[0][2], "2m");
 }
+
+#[tokio::test]
+async fn edit_and_describe_use_selected_api_resource() {
+    for (group, version, namespaced) in [
+        ("mysql.sql.m.crossplane.io", "v1alpha1", true),
+        ("mssql.sql.crossplane.io", "v1beta1", false),
+        ("", "v1", true),
+        ("", "v1", false),
+    ] {
+        for key in ['e', 'd'] {
+            let (mut app, _rx) = test_app();
+            let (kind, plural) = if group.is_empty() {
+                if namespaced {
+                    ("Pod", "pods")
+                } else {
+                    ("Node", "nodes")
+                }
+            } else {
+                ("Grant", "grants")
+            };
+            app.cluster.register_kind(group, kind, plural, namespaced);
+            if !group.is_empty() {
+                app.cluster
+                    .register_kind("other.example.com", kind, plural, true);
+            }
+            let resource = if group.is_empty() {
+                plural.to_string()
+            } else {
+                format!("{plural}.{group}")
+            };
+            app.switch_kind(&resource);
+            let selected_kind = app.kind.as_mut().unwrap();
+            selected_kind.ar.version = version.into();
+            let api_version = if group.is_empty() {
+                version.to_string()
+            } else {
+                format!("{group}/{version}")
+            };
+            selected_kind.ar.api_version = api_version.clone();
+            let mut metadata = json!({"name": "example"});
+            if namespaced {
+                metadata["namespace"] = json!("default");
+            }
+            apply(
+                &mut app,
+                json!({
+                    "apiVersion": api_version, "kind": kind, "metadata": metadata
+                }),
+            );
+            app.table_state.select(Some(0));
+            app.handle_key(press(KeyCode::Char(key))).unwrap();
+            let argv = if key == 'e' {
+                let Some(Suspend::Shell(argv)) = app.pending.take() else {
+                    panic!("expected an edit command");
+                };
+                argv
+            } else {
+                app.describe_source
+                    .as_ref()
+                    .expect("expected a describe command")
+                    .1
+                    .clone()
+            };
+            let target = if group.is_empty() {
+                plural.to_string()
+            } else {
+                format!("{plural}.{version}.{group}")
+            };
+            let mut expected = vec![
+                "kubectl".to_string(),
+                "--context".into(),
+                "test".into(),
+                if key == 'e' {
+                    "edit".into()
+                } else {
+                    "describe".into()
+                },
+                target,
+                "example".into(),
+            ];
+            if namespaced {
+                expected.extend(["-n".into(), "default".into()]);
+            }
+            assert_eq!(argv, expected);
+        }
+    }
+}

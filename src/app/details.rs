@@ -130,7 +130,7 @@ impl App {
             return;
         }
         let name = obj.metadata.name.clone().unwrap_or_default();
-        let plural = self.kind_plural.clone();
+        let resource = self.kubectl_resource();
         let ns = obj.metadata.namespace.clone();
 
         // Compute the YAML fallback up front while we hold the object; the
@@ -141,7 +141,7 @@ impl App {
         let tx = self.tx.clone();
         let genr = self.generation;
         let mut argv = self.kubectl_base();
-        argv.extend(["describe".to_string(), plural, name.clone()]);
+        argv.extend(["describe".to_string(), resource, name.clone()]);
         if let Some(ns) = &ns {
             argv.push("-n".into());
             argv.push(ns.clone());
