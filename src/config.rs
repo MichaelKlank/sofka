@@ -100,6 +100,8 @@ pub struct Config {
     /// behavior (text selection) everywhere. Document views release capture
     /// on their own regardless — see [`crate::app::App::wants_mouse_capture`].
     pub mouse: Option<bool>,
+    /// Set the terminal title to the context and namespace. Defaults to true.
+    pub terminal_title: Option<bool>,
     /// Save and restore sort choices per kind. Defaults to true.
     pub remember_sort: Option<bool>,
     /// How `:notify` events are delivered — see [`NotifyConfig`].

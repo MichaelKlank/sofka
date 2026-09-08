@@ -35,6 +35,20 @@ pub(crate) use guardrails::ConfirmLevel;
 pub use pvcexplore::{Pane, PvcExplore, PvcIntent};
 
 impl App {
+    pub fn terminal_title(&self) -> Option<String> {
+        self.terminal_title.then(|| {
+            let namespace = if self.namespace.is_empty() {
+                "all"
+            } else {
+                &self.namespace
+            };
+            format!("sofka: {}/{namespace}", self.cluster.context)
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect()
+        })
+    }
+
     /// Mark the row ordering stale without touching the store — the shape of a
     /// filter keystroke or a sort toggle. `invalidate_rows` is `pub(super)`;
     /// this exposes it to `benchsupport` under the bench feature only, rather
@@ -2043,6 +2057,7 @@ pub struct App {
     pub compact: bool,
     /// Hide the header in normal and compact modes.
     pub hide_header: bool,
+    pub terminal_title: bool,
     /// Active column layout for the current view; rebuilt by
     /// [`App::refresh_view_spec`] whenever kind/views/wide change.
     spec: crate::columns::ViewSpec,
@@ -2281,6 +2296,7 @@ impl App {
             wide: false,
             compact: false,
             hide_header: false,
+            terminal_title: true,
             spec: crate::columns::build_spec("", "", None, None, false),
         }
     }

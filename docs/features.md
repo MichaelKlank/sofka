@@ -4,6 +4,10 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 
 ## Core navigation
 
+- **Terminal title** shows `sofka: <context>/<namespace>` and follows navigation.
+  The namespace is `all` when all namespaces are selected. Set
+  `terminal_title = false` to disable title changes. Sofka clears the title on exit.
+
 - **Optional header** - set `hide_header = true` in the configuration to hide
   the header and logo, including the one-line header in compact mode.
 
