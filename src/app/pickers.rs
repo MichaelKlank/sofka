@@ -836,7 +836,6 @@ impl App {
         plugin_warnings.extend(crate::config::workspace_warnings(&self.workspaces));
         plugin_warnings.extend(crate::config::guardrail_warnings(&self.guardrails));
         plugin_warnings.extend(crate::config::pvc_explore_warnings(&self.pvc_cfg));
-        plugin_warnings.extend(self.configure_keys(&resolved.config.keys));
         let (views, view_warnings) = crate::views::compile(&resolved.config.views);
         self.user_views = views;
         let (thresholds, threshold_warnings) =
@@ -865,6 +864,7 @@ impl App {
             .or(resolved.config.default_namespace)
             .unwrap_or_else(|| cluster.default_namespace.clone());
         self.cluster = *cluster;
+        plugin_warnings.extend(self.configure_keys(&resolved.config.keys));
         self.stack.clear();
         // View history references the old cluster's kinds and namespaces.
         self.history.clear();

@@ -27,21 +27,26 @@ the line.
 - A string sets one key combination. An array sets multiple combinations.
 - A configured value replaces the inherited bindings for that action. Include
   the default keys in the array if you want to keep them.
-- An omitted action keeps its inherited bindings. An empty array (`[]`) disables
-  all keyboard bindings for that action.
+- An omitted action keeps its inherited bindings. In scoped settings, an empty
+  array (`[]`) disables all keyboard bindings for that action. Legacy palette
+  fields retain their previous fallback behavior, described below.
 - `[keys.global]` sets `quit` and `compact` in every mode.
 - `[keys.navigation]` sets shared navigation actions in modes that support them.
   It does not affect text input modes. The shared actions are `up`, `down`,
   `first`, `last`, `page_up`, `page_down`, `left`, `right`, `back`, `close`,
-  `command`, and `help`.
+  `command`, and `help`. Shared `back` settings do not change confirmation
+  dialogs. Shared `close` settings do not change the table's `exit` action or
+  the global `quit` action; configure those separately.
 - `[keys.input]` sets `clear_line`, `delete_word`, `backspace`, `back`, and
   `accept` in text input modes that support them.
 - A mode table, such as `[keys.logs]` or `[keys.table]`, replaces the shared
   setting for that mode. File order does not affect this precedence.
 - The existing `palette_next`, `palette_prev`, and `palette_accept` fields under
-  `[keys]` remain aliases for `down`, `up`, and `accept` under `[keys.command]`.
-  Do not set the same action through both forms. For compatibility, legacy
-  palette fields take priority over shared line editing bindings in the palette.
+  `[keys]` configure the same actions as `down`, `up`, and `accept` under
+  `[keys.command]`. Do not set the same action through both forms. Explicit
+  completion keys take priority over text editing and cancellation in both
+  forms. For example, either form can use `ctrl-w` for the next suggestion or
+  `esc` to accept it.
 
 Text input modes are `command`, `filter`, `log_filter`, `doc_filter`, `prompt`,
 `sort_picker`, `copy_picker`, `namespaces`, and `context_filter`.
@@ -70,18 +75,31 @@ rules: tables merge by key; strings and arrays replace earlier values.
 
 ## Conflicts and errors
 
-Two built-in actions cannot share a key when both are active in the same mode.
-The same key can be used in separate modes. Mode settings first replace shared
-settings, then validation checks the resulting bindings.
+Scoped settings reject conflicting actions in the same mode, except for the
+palette completion priority described above. The same key can be used in
+separate modes. Mode settings first replace shared settings, then validation
+checks the resulting bindings.
 
 Changing `page_down` to `ctrl-d` without moving or disabling `table.delete`
-reports a conflict. There is no silent reassignment. Unknown scopes, unknown
-actions, and invalid key combinations report errors. Equivalent spellings,
+reports a conflict. Unknown scopes, unknown actions, invalid key combinations,
+and incorrect value types report errors. Equivalent spellings,
 such as `shift-tab` and `backtab`, count as the same binding.
 
 At startup, invalid bindings leave the default keymap active. On reload or a
 context switch, they leave the previous keymap active. Other valid configuration
-settings can still apply. `:config` shows the source paths and key errors.
+settings still apply, including plugins, bookmarks, skins, and views. Custom
+views apply at startup or on a context switch. Key value
+errors do not reject the rest of the config file. Invalid TOML syntax can still
+prevent a file from loading. `:config` shows the source paths and key errors.
+
+Legacy `palette_*` fields keep warning-and-fallback behavior: invalid or
+reserved entries are ignored, valid entries remain active, and an empty or
+unusable list restores that action's defaults. These warnings do not reject
+valid scoped bindings. Legacy completion conflicts retain the previous priority:
+next, then previous, then accept. Warnings identify entries hidden by that
+priority. Use scoped settings for strict validation or to disable an action.
+The legacy fields continue to reserve `ctrl-c` and `ctrl-e`; use scoped settings
+to assign those keys after moving the global actions.
 
 Built-in bindings keep their current priority over bookmarks, workspaces, and
 plugins. A released key becomes available to them. `:config` reports keys hidden
@@ -90,8 +108,10 @@ bookmarks, workspaces, and matching plugins take priority over the table's
 `faults` action.
 
 The default confirmation dialog cancels on any unhandled key. Configuring
-`[keys.confirm].back`, or the shared navigation `back`, replaces this fallback
-with the explicit bindings. Set `back = []` to disable keyboard cancellation.
+`[keys.confirm].back` replaces this fallback with the explicit bindings.
+Shared navigation `back` settings leave the dialog's `n`, `q`, and other
+cancellation keys unchanged. The mouse wheel also cancels a default dialog.
+Set `[keys.confirm] back = []` to disable keyboard and wheel cancellation.
 Disabling or changing the accept binding never changes required confirmation text.
 
 Quit and compact mode have no reserved keys. If you disable all ways to open
@@ -118,11 +138,17 @@ For example, Ctrl+I may arrive as Tab and Ctrl+M as Enter. Bind the event that
 the terminal sends. A terminal can also intercept a key before sofka receives
 it. The keymap does not add a new terminal input protocol.
 
+Default list navigation bindings also accept Shift+arrow, Shift+PageUp/Down,
+and Shift+Home/End. These are explicit default aliases, shown in help. The
+command palette retains its previous exact completion matching. User settings
+replace the aliases, so use `["down", "shift-down"]` to accept both, or assign
+the two combinations to separate actions.
+
 Key sequences such as `gg`, macros, and new movement actions are not supported.
 
 ## Action reference
 
-The tables below list local defaults. Every mode also has `quit = "ctrl-c"` and
+The tables below list local defaults without the shifted navigation aliases. Every mode also has `quit = "ctrl-c"` and
 `compact = "ctrl-e"`. Each text input mode also has `clear_line = "ctrl-u"` and
 `delete_word = ["ctrl-w", "alt-backspace", "ctrl-backspace"]`.
 

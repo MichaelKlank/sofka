@@ -175,36 +175,14 @@ pub fn notify_warnings(cfg: &NotifyConfig) -> Vec<String> {
     warnings
 }
 
-/// Built-in key bindings. Scope tables replace bindings by action name.
-/// The three palette fields remain aliases for command down, up, and accept.
-/// See [`crate::keymap::Keymap::compile`] for validation.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct KeysConfig {
-    /// Move the suggestion highlight down.
-    pub palette_next: Option<Chords>,
-    /// Move the suggestion highlight up.
-    pub palette_prev: Option<Chords>,
-    /// Run the highlighted suggestion (or the typed text).
-    pub palette_accept: Option<Chords>,
-    #[serde(flatten)]
-    pub scopes: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Chords>>,
-}
-
-/// One key chord, or a list of chords that all trigger the same action.
+/// Keep key settings as TOML values so key errors cannot discard other settings.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum Chords {
-    One(String),
-    Many(Vec<String>),
-}
+#[serde(transparent)]
+pub struct KeysConfig(pub toml::Value);
 
-impl Chords {
-    pub(crate) fn as_slice(&self) -> &[String] {
-        match self {
-            Chords::One(s) => std::slice::from_ref(s),
-            Chords::Many(v) => v,
-        }
+impl Default for KeysConfig {
+    fn default() -> Self {
+        Self(toml::Value::Table(toml::Table::new()))
     }
 }
 

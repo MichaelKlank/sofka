@@ -161,30 +161,43 @@ impl App {
     }
 
     pub fn configure_keys(&mut self, cfg: &crate::config::KeysConfig) -> Vec<String> {
-        let mut warnings = match Keymap::compile(cfg) {
+        let paths = self
+            .config
+            .base_path()
+            .into_iter()
+            .chain(
+                self.config
+                    .override_paths(&self.cluster.context, &self.cluster.cluster_name),
+            )
+            .filter(|p| p.exists())
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let warnings = match Keymap::compile(cfg) {
             Ok(map) => {
+                let warnings = map.warnings().to_vec();
                 self.keymap = map;
-                Vec::new()
+                warnings
             }
             Err(errors) => {
-                let paths = self
-                    .config
-                    .base_path()
-                    .into_iter()
-                    .chain(
-                        self.config
-                            .override_paths(&self.cluster.context, &self.cluster.cluster_name),
-                    )
-                    .filter(|p| p.exists())
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                errors
-                    .into_iter()
-                    .map(|e| format!("{paths}: {e}; previous keymap kept"))
-                    .collect()
+                let kept = if self.keymap.is_default() {
+                    "default keymap kept"
+                } else {
+                    "previous keymap kept"
+                };
+                errors.into_iter().map(|e| format!("{e}; {kept}")).collect()
             }
         };
+        let mut warnings: Vec<_> = warnings
+            .into_iter()
+            .map(|w| {
+                if paths.is_empty() {
+                    w
+                } else {
+                    format!("{paths}: {w}")
+                }
+            })
+            .collect();
         for (kind, name, binding, resources) in self
             .plugins
             .iter()

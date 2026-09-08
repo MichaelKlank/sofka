@@ -1,9 +1,6 @@
 //! Built-in actions and their effective keyboard bindings.
 
-use crate::{
-    config::{Chords, KeysConfig},
-    keys::KeyChord,
-};
+use crate::{config::KeysConfig, keys::KeyChord};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -140,10 +137,20 @@ impl KeyInput {
 pub struct Keymap {
     bindings: BTreeMap<&'static str, BTreeMap<Action, Vec<KeyChord>>>,
     cancel_any: bool,
+    warnings: Vec<String>,
 }
+
+const LEGACY: &[(&str, Action)] = &[
+    ("palette_next", Action::Down),
+    ("palette_prev", Action::Up),
+    ("palette_accept", Action::Accept),
+];
 
 const GLOBAL: &[(Action, &[&str])] = &[(Action::Quit, &["ctrl-c"]), (Action::Compact, &["ctrl-e"])];
 const INPUT: &[(Action, &[&str])] = &[
+    (Action::Back, &["esc"]),
+    (Action::Backspace, &["backspace"]),
+    (Action::Accept, &["enter"]),
     (Action::ClearLine, &["ctrl-u"]),
     (
         Action::DeleteWord,
@@ -187,9 +194,6 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("adjacent", Action::Refresh, &["r"]),
     ("adjacent", Action::Up, &["k", "up"]),
     ("adjacent", Action::Yaml, &["y"]),
-    ("command", Action::Accept, &["enter"]),
-    ("command", Action::Back, &["esc"]),
-    ("command", Action::Backspace, &["backspace"]),
     ("command", Action::Down, &["tab", "down"]),
     ("command", Action::Up, &["backtab", "up"]),
     ("confirm", Action::Accept, &["y", "Y", "enter"]),
@@ -206,9 +210,6 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("containers", Action::Shell, &["s"]),
     ("containers", Action::Transfer, &["t"]),
     ("containers", Action::Up, &["k", "up"]),
-    ("context_filter", Action::Accept, &["enter"]),
-    ("context_filter", Action::Back, &["esc"]),
-    ("context_filter", Action::Backspace, &["backspace"]),
     ("context_filter", Action::Down, &["down"]),
     ("context_filter", Action::Up, &["up"]),
     ("contexts", Action::Accept, &["enter"]),
@@ -218,9 +219,6 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("contexts", Action::FleetMark, &["space"]),
     ("contexts", Action::Rename, &["r", "R"]),
     ("contexts", Action::Up, &["up", "k"]),
-    ("copy_picker", Action::Accept, &["enter"]),
-    ("copy_picker", Action::Back, &["esc"]),
-    ("copy_picker", Action::Backspace, &["backspace"]),
     ("copy_picker", Action::Down, &["down", "ctrl-n"]),
     ("copy_picker", Action::Up, &["up", "ctrl-p"]),
     ("detail", Action::AutoRefresh, &["r"]),
@@ -255,9 +253,6 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("diff", Action::Right, &["l", "right"]),
     ("diff", Action::Up, &["k", "up"]),
     ("diff", Action::Wrap, &["w"]),
-    ("doc_filter", Action::Accept, &["enter"]),
-    ("doc_filter", Action::Back, &["esc"]),
-    ("doc_filter", Action::Backspace, &["backspace"]),
     ("events", Action::Back, &["esc"]),
     ("events", Action::Close, &["q"]),
     ("events", Action::Copy, &["c"]),
@@ -283,9 +278,6 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("explain", Action::Logs, &["l"]),
     ("explain", Action::Refresh, &["r"]),
     ("explain", Action::Up, &["k", "up"]),
-    ("filter", Action::Accept, &["enter"]),
-    ("filter", Action::Back, &["esc"]),
-    ("filter", Action::Backspace, &["backspace"]),
     ("find", Action::Accept, &["enter"]),
     ("find", Action::Back, &["esc"]),
     ("find", Action::Close, &["q"]),
@@ -321,9 +313,6 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("help", Action::PageDown, &["pagedown", "space", "ctrl-f"]),
     ("help", Action::PageUp, &["pageup", "ctrl-b"]),
     ("help", Action::Up, &["k", "up"]),
-    ("log_filter", Action::Accept, &["enter"]),
-    ("log_filter", Action::Back, &["esc"]),
-    ("log_filter", Action::Backspace, &["backspace"]),
     ("logs", Action::Anchor0, &["0"]),
     ("logs", Action::Anchor1, &["1"]),
     ("logs", Action::Anchor2, &["2"]),
@@ -348,9 +337,6 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("logs", Action::Timestamps, &["t"]),
     ("logs", Action::Up, &["k", "up"]),
     ("logs", Action::Wrap, &["w"]),
-    ("namespaces", Action::Accept, &["enter"]),
-    ("namespaces", Action::Back, &["esc"]),
-    ("namespaces", Action::Backspace, &["backspace"]),
     ("namespaces", Action::Down, &["down"]),
     ("namespaces", Action::Up, &["up"]),
     ("port_forward_picker", Action::Accept, &["enter"]),
@@ -364,9 +350,6 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("port_forwards", Action::Start, &["enter"]),
     ("port_forwards", Action::Toggle, &["x", "s"]),
     ("port_forwards", Action::Up, &["k", "up"]),
-    ("prompt", Action::Accept, &["enter"]),
-    ("prompt", Action::Back, &["esc"]),
-    ("prompt", Action::Backspace, &["backspace"]),
     ("pulse", Action::Back, &["esc"]),
     ("pulse", Action::Close, &["q"]),
     ("pulse", Action::Refresh, &["r"]),
@@ -400,9 +383,6 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("snapshots", Action::Delete, &["d"]),
     ("snapshots", Action::Down, &["j", "down"]),
     ("snapshots", Action::Up, &["k", "up"]),
-    ("sort_picker", Action::Accept, &["enter"]),
-    ("sort_picker", Action::Back, &["esc"]),
-    ("sort_picker", Action::Backspace, &["backspace"]),
     ("sort_picker", Action::Down, &["down", "ctrl-n"]),
     ("sort_picker", Action::Up, &["up", "ctrl-p"]),
     ("table", Action::ActionMenu, &["t"]),
@@ -515,6 +495,9 @@ impl Default for Keymap {
                             .collect(),
                     );
                 }
+                for &scope in TEXT_SCOPES {
+                    bindings.entry(scope).or_default();
+                }
                 for (&scope, actions) in &mut bindings {
                     for &(action, chords) in GLOBAL
                         .iter()
@@ -535,9 +518,39 @@ impl Default for Keymap {
                         }
                     }
                 }
+                // Raw navigation matches previously accepted Shift in these modes.
+                // Keep explicit aliases in the defaults; user chords remain exact.
+                for (&scope, actions) in &mut bindings {
+                    if scope == "command" {
+                        continue;
+                    }
+                    for chords in actions.values_mut() {
+                        let shifted: Vec<_> = chords
+                            .iter()
+                            .filter(|c| {
+                                !c.ctrl
+                                    && !c.alt
+                                    && matches!(
+                                        c.code,
+                                        KeyCode::Up
+                                            | KeyCode::Down
+                                            | KeyCode::Left
+                                            | KeyCode::Right
+                                            | KeyCode::PageUp
+                                            | KeyCode::PageDown
+                                            | KeyCode::Home
+                                            | KeyCode::End
+                                    )
+                            })
+                            .map(|c| KeyChord { shift: true, ..*c })
+                            .collect();
+                        chords.extend(shifted);
+                    }
+                }
                 Keymap {
                     bindings,
                     cancel_any: true,
+                    warnings: Vec::new(),
                 }
             })
             .clone()
@@ -546,112 +559,144 @@ impl Default for Keymap {
 
 impl Keymap {
     pub fn compile(cfg: &KeysConfig) -> Result<Self, Vec<String>> {
+        let Some(settings) = cfg.0.as_table() else {
+            return Err(vec!["keys: expected a table".into()]);
+        };
         let mut map = Self::default();
         let mut errors = Vec::new();
-        for (scope, actions) in &cfg.scopes {
-            if actions.is_empty()
-                && !matches!(scope.as_str(), "global" | "navigation" | "input")
+        let mut overrides = BTreeMap::new();
+        for (scope, value) in settings {
+            if LEGACY.iter().any(|(name, _)| scope == name) {
+                continue;
+            }
+            if !matches!(scope.as_str(), "global" | "navigation" | "input")
                 && !map.bindings.contains_key(scope.as_str())
             {
                 errors.push(format!("keys.{scope}: unknown scope"));
+                continue;
             }
+            let Some(actions) = value.as_table() else {
+                errors.push(format!("keys.{scope}: expected a table of actions"));
+                continue;
+            };
             for (name, spec) in actions {
-                let targets: Vec<_> = map
-                    .bindings
-                    .iter()
-                    .filter_map(|(&target, bindings)| {
-                        let eligible = match scope.as_str() {
-                            "global" => true,
-                            "navigation" => !TEXT_SCOPES.contains(&target),
-                            "input" => TEXT_SCOPES.contains(&target),
-                            _ => target == scope,
-                        };
-                        eligible
-                            .then(|| bindings.keys().find(|a| a.name() == name).copied())
-                            .flatten()
-                            .filter(|a| match scope.as_str() {
-                                "global" => matches!(a, Action::Quit | Action::Compact),
-                                "navigation" => NAVIGATION_ACTIONS.contains(a),
-                                "input" => matches!(
-                                    a,
-                                    Action::ClearLine
-                                        | Action::DeleteWord
-                                        | Action::Backspace
-                                        | Action::Back
-                                        | Action::Accept
-                                ),
-                                _ => true,
-                            })
-                            .map(|action| (target, action))
-                    })
-                    .collect();
+                let targets = map.targets(scope, name);
                 if targets.is_empty() {
-                    errors.push(format!(
-                        "keys.{scope}.{name}: unknown scope or unsupported action"
-                    ));
+                    errors.push(format!("keys.{scope}.{name}: unsupported action"));
                     continue;
                 }
                 let chords = parse_chords(spec, &format!("keys.{scope}.{name}"), &mut errors);
-                // Shared groups are applied first below, independent of TOML order.
-                if matches!(scope.as_str(), "global" | "navigation" | "input") {
-                    for (target, action) in targets {
-                        map.bindings
-                            .get_mut(target)
-                            .unwrap()
-                            .insert(action, chords.clone());
-                    }
+                overrides.insert((scope.as_str(), name.as_str()), (targets, chords));
+            }
+        }
+        // Apply groups first, then explicit mode settings, regardless of file order.
+        for shared in [true, false] {
+            for (&(scope, _), (targets, chords)) in &overrides {
+                if matches!(scope, "global" | "navigation" | "input") != shared {
+                    continue;
+                }
+                for &(target, action) in targets {
+                    map.bindings
+                        .get_mut(target)
+                        .unwrap()
+                        .insert(action, chords.clone());
                 }
             }
         }
-        // Legacy palette fields remain aliases for the command scope.
-        for (name, action, spec) in [
-            ("palette_next", Action::Down, &cfg.palette_next),
-            ("palette_prev", Action::Up, &cfg.palette_prev),
-            ("palette_accept", Action::Accept, &cfg.palette_accept),
-        ] {
-            if let Some(spec) = spec {
-                if cfg
-                    .scopes
-                    .get("command")
-                    .is_some_and(|s| s.contains_key(action.name()))
-                {
-                    errors.push(format!(
-                        "keys.{name}: also set as keys.command.{}",
-                        action.name()
+        let command_settings = settings.get("command").and_then(toml::Value::as_table);
+        let scoped =
+            |action: Action| command_settings.is_some_and(|c| c.contains_key(action.name()));
+        let legacy = |action: Action| {
+            LEGACY
+                .iter()
+                .any(|&(name, a)| a == action && settings.contains_key(name))
+        };
+        let defaults = Self::default();
+        for &(name, action) in LEGACY {
+            let Some(spec) = settings.get(name) else {
+                continue;
+            };
+            if scoped(action) {
+                errors.push(format!(
+                    "keys.{name}: also set as keys.command.{}",
+                    action.name()
+                ));
+            }
+            let path = format!("keys.{name}");
+            let mut chords = parse_chords(spec, &path, &mut map.warnings);
+            chords.retain(|c| {
+                let reserved = (c.ctrl && matches!(c.code, KeyCode::Char('c' | 'e')))
+                    || GLOBAL.iter().any(|&(global, _)| {
+                        map.chords("command", global).iter().any(|g| overlaps(c, g))
+                    });
+                if reserved {
+                    map.warnings.push(format!(
+                        "{path}: {} is reserved by a built-in; ignored",
+                        c.label()
                     ));
                 }
-                let chords = parse_chords(spec, &format!("keys.{name}"), &mut errors);
-                // Existing palette bindings take priority over line editing.
-                if let Some(bindings) = map.bindings.get_mut("command") {
-                    for edit in [Action::ClearLine, Action::DeleteWord] {
-                        bindings
-                            .get_mut(&edit)
-                            .unwrap()
-                            .retain(|c| !chords.iter().any(|other| overlaps(c, other)));
-                    }
-                    bindings.insert(action, chords);
+                !reserved
+            });
+            if chords.is_empty() {
+                map.warnings
+                    .push(format!("{path}: no usable chord; using default"));
+                chords = defaults.chords("command", action).to_vec();
+            }
+            map.bindings
+                .get_mut("command")
+                .unwrap()
+                .insert(action, chords);
+        }
+        // Both configuration forms give explicit completion keys priority over
+        // text editing and cancellation, as the original palette handler did.
+        for &(_, action) in LEGACY {
+            if !legacy(action) && !scoped(action) {
+                continue;
+            }
+            let chords = map.chords("command", action).to_vec();
+            for &(edit, _) in INPUT {
+                if LEGACY.iter().any(|&(_, a)| a == edit) {
+                    continue;
                 }
+                map.bindings
+                    .get_mut("command")
+                    .unwrap()
+                    .get_mut(&edit)
+                    .unwrap()
+                    .retain(|c| !chords.iter().any(|other| overlaps(c, other)));
             }
         }
-        for (scope, actions) in &cfg.scopes {
-            if let Some(bindings) = map.bindings.get_mut(scope.as_str()) {
-                for (name, spec) in actions {
-                    if let Some(action) = bindings.keys().find(|a| a.name() == name).copied() {
-                        // Parsing was already checked in the first pass.
-                        let chords = parse_chords(spec, "", &mut Vec::new());
-                        bindings.insert(action, chords);
-                    }
+        // Legacy completion fields used ordered dispatch: next, previous, accept.
+        // Preserve that order when legacy fields overlap each other or defaults.
+        for (i, &(higher_name, higher)) in LEGACY.iter().enumerate() {
+            for &(lower_name, lower) in &LEGACY[i + 1..] {
+                if scoped(higher) || scoped(lower) || !(legacy(higher) || legacy(lower)) {
+                    continue;
                 }
+                let chords = map.chords("command", higher).to_vec();
+                let lower_chords = map
+                    .bindings
+                    .get_mut("command")
+                    .unwrap()
+                    .get_mut(&lower)
+                    .unwrap();
+                lower_chords.retain(|c| {
+                    if chords.iter().any(|other| overlaps(c, other)) {
+                        map.warnings.push(format!(
+                            "keys.{lower_name}: {} is handled by {higher_name}; ignored",
+                            c.label()
+                        ));
+                        false
+                    } else {
+                        true
+                    }
+                });
             }
         }
-        map.cancel_any = !cfg
-            .scopes
+        map.cancel_any = !settings
             .get("confirm")
-            .is_some_and(|s| s.contains_key("back"))
-            && !cfg
-                .scopes
-                .get("navigation")
-                .is_some_and(|s| s.contains_key("back"));
+            .and_then(toml::Value::as_table)
+            .is_some_and(|s| s.contains_key("back"));
         for (scope, bindings) in &map.bindings {
             let entries: Vec<_> = bindings.iter().collect();
             for (i, (action, chords)) in entries.iter().enumerate() {
@@ -674,6 +719,45 @@ impl Keymap {
             Ok(map)
         } else {
             Err(errors)
+        }
+    }
+
+    fn targets(&self, scope: &str, name: &str) -> Vec<(&'static str, Action)> {
+        self.bindings
+            .iter()
+            .filter_map(|(&target, bindings)| {
+                let action = bindings.keys().find(|a| a.name() == name).copied()?;
+                let applies = match scope {
+                    "global" => GLOBAL.iter().any(|&(a, _)| a == action),
+                    "input" => {
+                        TEXT_SCOPES.contains(&target) && INPUT.iter().any(|&(a, _)| a == action)
+                    }
+                    "navigation" => {
+                        !TEXT_SCOPES.contains(&target)
+                            && NAVIGATION_ACTIONS.contains(&action)
+                            && !(target == "confirm" && action == Action::Back)
+                    }
+                    _ => scope == target,
+                };
+                applies.then_some((target, action))
+            })
+            .collect()
+    }
+
+    pub fn is_default(&self) -> bool {
+        let defaults = Self::default();
+        self.bindings == defaults.bindings && self.cancel_any == defaults.cancel_any
+    }
+
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    pub(crate) fn wheel_action(&self, scope: &str, down: bool) -> Option<Action> {
+        if scope == "confirm" {
+            self.cancel_any.then_some(Action::Back)
+        } else {
+            Some(if down { Action::Down } else { Action::Up })
         }
     }
 
@@ -715,9 +799,26 @@ impl Keymap {
     }
 }
 
-fn parse_chords(spec: &Chords, path: &str, errors: &mut Vec<String>) -> Vec<KeyChord> {
+fn parse_chords(spec: &toml::Value, path: &str, errors: &mut Vec<String>) -> Vec<KeyChord> {
+    let values = match spec {
+        toml::Value::String(_) => std::slice::from_ref(spec),
+        toml::Value::Array(values) => values,
+        _ => {
+            errors.push(format!(
+                "{path}: expected a key string or an array of key strings"
+            ));
+            return Vec::new();
+        }
+    };
     let mut out = Vec::new();
-    for value in spec.as_slice() {
+    for value in values {
+        let Some(value) = value.as_str() else {
+            errors.push(format!(
+                "{path}: expected a key string, got {}",
+                value.type_str()
+            ));
+            continue;
+        };
         match KeyChord::parse(value) {
             Ok(chord) => {
                 if !out.iter().any(|other| overlaps(&chord, other)) {
@@ -835,7 +936,7 @@ mod tests {
         for (text, path) in [
             ("[keys.table]\npaeg_up = 'f8'", "keys.table.paeg_up"),
             ("[keys.unknown]", "keys.unknown"),
-            ("[keys.unknown]\npage_up = 'f8'", "keys.unknown.page_up"),
+            ("[keys.unknown]\npage_up = 'f8'", "keys.unknown"),
             ("[keys.input]\npage_up = 'f8'", "keys.input.page_up"),
             ("[keys.table]\npage_up = 'hyper-u'", "keys.table.page_up"),
             (

@@ -167,12 +167,16 @@ palette_accept = ["ctrl-y", "enter"]
 Each value is one [key combination](plugins.md) or a list of combinations.
 It replaces the default set for that action: `["tab", "down"]`,
 `["backtab", "up"]`, or `["enter"]`. Include a default in the list to keep it.
-An empty list disables the bindings.
+Invalid or reserved entries produce warnings and are ignored. An empty or
+unusable list restores the action's default bindings.
 
-These fields remain aliases for `[keys.command]` actions `down`, `up`, and
-`accept`. Do not set an action through both forms. To assign `ctrl-c` or
-`ctrl-e` to another action, first change or disable `quit` or `compact` under
-`[keys.global]`. See [conflicts](keybindings.md#conflicts-and-errors).
+The scoped settings `[keys.command]` actions `down`, `up`, and `accept`
+configure the same actions, with strict validation and `[]` to disable them.
+Both forms give explicit completion bindings priority over text editing and
+cancellation. Do not set an action through both forms.
+To assign `ctrl-c` or `ctrl-e`, use scoped settings after moving or disabling
+`quit` or `compact` under `[keys.global]`. The legacy fields still reserve those
+keys. See [conflicts and recovery](keybindings.md#conflicts-and-errors).
 
 ## What suspends the TUI
 
