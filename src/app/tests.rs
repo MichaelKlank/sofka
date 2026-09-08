@@ -3224,6 +3224,60 @@ fn adjacent_item(
     }
 }
 
+#[tokio::test]
+async fn jump_owner_uses_owner_scope_and_restores_child_view() {
+    for source_namespace in ["kube-system", ""] {
+        for (api_version, owner_kind, owner_plural, expected_namespace) in [
+            ("v1", "Node", "nodes", ""),
+            ("apps/v1", "Deployment", "deployments", "kube-system"),
+        ] {
+            let (mut app, _rx) = test_app();
+            app.switch_kind_ns("pods", Some(source_namespace));
+            apply(
+                &mut app,
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "name": "child",
+                        "namespace": "kube-system",
+                        "uid": "child-uid",
+                        "ownerReferences": [{
+                            "apiVersion": api_version,
+                            "kind": owner_kind,
+                            "name": "parent",
+                            "uid": "parent-uid"
+                        }]
+                    }
+                }),
+            );
+            app.handle_msg(Msg::Synced {
+                generation: app.generation,
+            });
+            app.handle_key(press(KeyCode::Char('J'))).unwrap();
+            assert_eq!(app.kind_plural, owner_plural);
+            assert_eq!(app.namespace, expected_namespace);
+            assert_eq!(
+                app.watch_key.as_ref().unwrap().namespace,
+                expected_namespace
+            );
+            assert_eq!(app.fields.as_deref(), Some("metadata.name=parent"));
+            assert_eq!(app.scope_label.as_deref(), Some("owner of child"));
+
+            app.handle_key(press(KeyCode::Esc)).unwrap();
+            assert_eq!(app.kind_plural, "pods");
+            assert_eq!(app.namespace, source_namespace);
+            assert_eq!(app.watch_key.as_ref().unwrap().namespace, source_namespace);
+            assert!(app.fields.is_none());
+            assert!(app.scope_label.is_none());
+            assert_eq!(
+                app.selected_ref().unwrap().metadata.name.as_deref(),
+                Some("child")
+            );
+        }
+    }
+}
+
 /// A pod with an owner, a node, and a claim, opened in the adjacent view.
 fn open_adjacent_on_a_pod(app: &mut App) {
     app.cluster

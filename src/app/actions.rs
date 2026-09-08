@@ -501,9 +501,9 @@ impl App {
         let owner_name = owner.name.clone();
         let child_name = obj.metadata.name.clone().unwrap_or_default();
         self.push_frame();
+        self.namespace = if kind.namespaced { ns } else { String::new() };
         self.kind_plural = kind.ar.plural.to_lowercase();
         self.kind = Some(kind);
-        self.namespace = ns;
         self.labels = None;
         self.fields = Some(format!("metadata.name={owner_name}"));
         self.owner = None;
