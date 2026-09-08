@@ -47,19 +47,19 @@ impl App {
     }
 
     /// Apply a bookmark against the current cluster: namespace, resource,
-    /// filter, sort, then an optional view.
-    pub(super) fn apply_bookmark_local(&mut self, bm: crate::config::Bookmark) {
+    /// filter, sort, then an optional view. Return false if validation fails.
+    pub(super) fn apply_bookmark_local(&mut self, bm: crate::config::Bookmark) -> bool {
         if bm.resource.trim().is_empty() {
             self.flash_warn("bookmark has no resource");
-            return;
+            return false;
         }
         if self.cluster.resolve(bm.resource.trim()).is_none() {
             self.flash_warn(&format!("No resource matches '{}'", bm.resource));
-            return;
+            return false;
         }
         if let Some(error) = crate::filter::parse(bm.filter.as_deref().unwrap_or("")).error() {
             self.flash_warn(&format!("filter: {error}"));
-            return;
+            return false;
         }
         self.apply_resource_query(crate::filter::ResourceQuery {
             resource: bm.resource.clone(),
@@ -77,6 +77,7 @@ impl App {
         }
         self.flash = format!("bookmark: {}", bm.name);
         self.flash_err = false;
+        true
     }
 
     /// Apply a stashed bookmark once its context switch has connected.

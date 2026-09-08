@@ -137,8 +137,7 @@ impl App {
         let bookmark = view.as_bookmark();
         // Reuse the bookmark application path (resource/ns/filter/sort/view),
         // then relabel the status line for the workspace.
-        self.apply_bookmark_local(bookmark);
-        if self.kind.is_some() {
+        if self.apply_bookmark_local(bookmark) {
             self.flash = format!("workspace {name} [{i}/{n}]: {vname}");
             self.flash_err = false;
         }
