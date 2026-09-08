@@ -13113,6 +13113,76 @@ async fn a_deferred_navigation_disarms_the_one_it_replaces() {
 }
 
 #[tokio::test]
+async fn resource_context_shortcut_preserves_explicit_namespace() {
+    let (mut app, _rx) = test_app();
+    app.all_contexts = vec!["west".into()];
+    type_resource_query(&mut app, "services @west prod");
+    assert_eq!(
+        app.pending_resource_query
+            .as_ref()
+            .unwrap()
+            .namespace
+            .as_deref(),
+        Some("prod")
+    );
+    land_context(&mut app, "west");
+    assert_eq!(app.cluster.context, "west");
+    assert_eq!(app.kind_plural, "services");
+    assert_eq!(app.namespace, "prod");
+}
+
+#[tokio::test]
+async fn resource_context_shortcut_completes_long_names_and_uses_target_default() {
+    let (mut app, _rx) = test_app();
+    let context = "gke_project_europe-west1_production-cluster";
+    app.all_contexts = vec![context.into()];
+    app.namespace = "old-namespace".into();
+    type_resource_query(&mut app, "services @gke");
+    assert_eq!(
+        app.pending_resource_query
+            .as_ref()
+            .unwrap()
+            .context
+            .as_deref(),
+        Some(context)
+    );
+    let mut cluster = Cluster::fake();
+    cluster.context = context.into();
+    cluster.default_namespace = "target-default".into();
+    app.handle_msg(Msg::ContextSwitched {
+        generation: app.generation,
+        name: context.into(),
+        result: Ok(Box::new(cluster)),
+    });
+    assert_eq!(app.kind_plural, "services");
+    assert_eq!(app.namespace, "target-default");
+}
+
+#[tokio::test]
+async fn resource_context_shortcut_rejects_malformed_and_handles_failed_switch() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    let generation = app.generation;
+    for query in ["pods @", "pods @west @east", "pods @west prod extra"] {
+        type_resource_query(&mut app, query);
+        assert!(app.flash_err, "{query}");
+        assert_eq!(app.generation, generation);
+    }
+    let context = app.cluster.context.clone();
+    type_resource_query(&mut app, "pods @missing");
+    app.handle_msg(Msg::ContextSwitched {
+        generation: app.generation,
+        name: "missing".into(),
+        result: Err("unknown context: missing".into()),
+    });
+    assert_eq!(app.cluster.context, context);
+    assert_eq!(app.kind_plural, "deployments");
+    assert!(app.flash_err);
+    assert!(app.flash.contains("missing"));
+    assert!(app.pending_resource_query.is_none());
+}
+
+#[tokio::test]
 async fn palette_query_waits_for_context_and_rejects_invalid_input() {
     let (mut app, _rx) = test_app();
     app.switch_kind("deployments");
