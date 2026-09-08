@@ -2451,7 +2451,12 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
             )));
             previous_scope = scope;
         }
-        lines.push(bind(app.keymap.label(scope, action), action.description()));
+        let description = if scope == "table" && action == Action::Logs {
+            "logs (marked pods, or current row)"
+        } else {
+            action.description()
+        };
+        lines.push(bind(app.keymap.label(scope, action), description));
     }
     lines.push(Line::from(Span::styled(
         "  Commands (enter in the command palette)",

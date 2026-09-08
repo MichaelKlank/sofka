@@ -75,6 +75,17 @@ herdr's own `ui.toast` delivery (in-app, outer terminal, or system).
 
 ## Log controls
 
+In the pod table, use `Space` to mark pods, then press `l` to open their combined
+logs. This includes pods from different namespaces. Each line has a
+`[namespace/pod:container]` prefix. Only marked pods still present in the filtered
+table are included. With no marks, `l` opens logs for the current row.
+
+The pod set is fixed when the view opens, including when timestamps or time
+anchors change, or streaming resumes. New pods are not added automatically.
+Lines appear in arrival order, without a guarantee of timestamp order. A source
+error includes its prefix, and other streams continue. The existing filter and
+buffer controls apply to the combined view. `p` and `L` still use the current row.
+
 The kubelet logs view (`l`) keeps a bounded follow buffer. Tune the initial tail,
 the buffer size, and an optional `since` lookback:
 

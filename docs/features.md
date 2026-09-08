@@ -320,7 +320,7 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   [PVC explore](#pvc-explore).
 - **Ephemeral debug containers** and **node debug pods** (`:debug`). See
   [Debug containers and pods](debugging.md#debug-containers-and-pods).
-- **Logs** (`l`) - per-container on a pod, or aggregated across all matching
+- **Logs** (`l`) - combined logs for marked pods, per-container on a pod, or aggregated across all matching
   pods on a workload/service, with filtering, previous-container logs, and
   configurable tail/buffer/lookback. If a container is waiting to start, sofka
   retries until its logs are available. sofka parses ANSI color from the source app

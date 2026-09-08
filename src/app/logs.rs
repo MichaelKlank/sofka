@@ -87,9 +87,28 @@ impl App {
             .copied()
     }
 
-    /// Logs for the current selection. For pods: stream every container. For
+    /// Logs for marked pods or the current selection. Stream every container. For
     /// workloads/services: list matching pods and aggregate all their logs.
     pub(super) fn open_logs(&mut self) {
+        if self.kind_plural == "pods" && !self.marked.is_empty() {
+            let pods: Vec<_> = self
+                .rows()
+                .into_iter()
+                .filter(|obj| self.marked.contains(&row_key(obj)))
+                .map(|obj| PodLogTarget {
+                    ns: obj.metadata.namespace.clone().unwrap_or_default(),
+                    name: obj.metadata.name.clone().unwrap_or_default(),
+                    containers: container_names(obj),
+                })
+                .collect();
+            if pods.is_empty() {
+                self.flash_warn("no marked pods in the current view");
+                return;
+            }
+            let title = format!("marked pods ({}) - logs", pods.len());
+            self.launch_logs(LogSource::Pods(pods), title);
+            return;
+        }
         let Some(obj) = self.selected_ref() else {
             return;
         };
@@ -306,6 +325,31 @@ impl App {
     pub(super) fn start_logs(&mut self) {
         let ts = self.logs.timestamps;
         match self.logs.source.clone() {
+            Some(LogSource::Pods(pods)) => {
+                for PodLogTarget {
+                    ns,
+                    name,
+                    containers,
+                } in pods
+                {
+                    if containers.is_empty() {
+                        let prefix = format!("[{ns}/{name}] ");
+                        self.spawn_one_log(ns, name, None, prefix, false, ts);
+                    } else {
+                        for c in containers {
+                            let prefix = format!("[{ns}/{name}:{c}] ");
+                            self.spawn_one_log(
+                                ns.clone(),
+                                name.clone(),
+                                Some(c),
+                                prefix,
+                                false,
+                                ts,
+                            );
+                        }
+                    }
+                }
+            }
             Some(LogSource::Pod {
                 ns,
                 name,
