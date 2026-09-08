@@ -113,6 +113,20 @@ actions! {
     Yaml => ("yaml", "yaml"),
 }
 
+impl Action {
+    pub(crate) fn log_anchor(self) -> Option<char> {
+        match self {
+            Self::Anchor0 => Some('0'),
+            Self::Anchor1 => Some('1'),
+            Self::Anchor2 => Some('2'),
+            Self::Anchor3 => Some('3'),
+            Self::Anchor4 => Some('4'),
+            Self::Anchor5 => Some('5'),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct KeyInput {
     pub action: Option<Action>,
@@ -136,8 +150,15 @@ impl KeyInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keymap {
     bindings: BTreeMap<&'static str, BTreeMap<Action, Vec<KeyChord>>>,
+    labels: BTreeMap<&'static str, BTreeMap<Action, KeyLabels>>,
     cancel_any: bool,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyLabels {
+    first: String,
+    all: String,
 }
 
 const LEGACY: &[(&str, Action)] = &[
@@ -547,11 +568,14 @@ impl Default for Keymap {
                         chords.extend(shifted);
                     }
                 }
-                Keymap {
+                let mut map = Keymap {
                     bindings,
+                    labels: BTreeMap::new(),
                     cancel_any: true,
                     warnings: Vec::new(),
-                }
+                };
+                map.cache_labels();
+                map
             })
             .clone()
     }
@@ -716,6 +740,7 @@ impl Keymap {
             }
         }
         if errors.is_empty() {
+            map.cache_labels();
             Ok(map)
         } else {
             Err(errors)
@@ -777,17 +802,41 @@ impl Keymap {
             .unwrap_or_default()
     }
 
-    pub fn label(&self, scope: &str, action: Action) -> String {
-        let chords = self.chords(scope, action);
-        if chords.is_empty() {
-            "unbound".into()
-        } else {
-            chords
-                .iter()
-                .map(KeyChord::label)
-                .collect::<Vec<_>>()
-                .join(" / ")
-        }
+    fn cache_labels(&mut self) {
+        self.labels = self
+            .bindings
+            .iter()
+            .map(|(&scope, bindings)| {
+                let labels = bindings
+                    .iter()
+                    .map(|(&action, chords)| {
+                        let labels: Vec<_> = chords.iter().map(KeyChord::label).collect();
+                        let first = labels.first().cloned().unwrap_or_else(|| "unbound".into());
+                        let all = if labels.is_empty() {
+                            first.clone()
+                        } else {
+                            labels.join(" / ")
+                        };
+                        (action, KeyLabels { first, all })
+                    })
+                    .collect();
+                (scope, labels)
+            })
+            .collect();
+    }
+
+    pub fn label(&self, scope: &str, action: Action) -> &str {
+        self.labels
+            .get(scope)
+            .and_then(|labels| labels.get(&action))
+            .map_or("unbound", |labels| labels.all.as_str())
+    }
+
+    pub fn first_label(&self, scope: &str, action: Action) -> &str {
+        self.labels
+            .get(scope)
+            .and_then(|labels| labels.get(&action))
+            .map_or("unbound", |labels| labels.first.as_str())
     }
 
     pub fn entries(&self) -> impl Iterator<Item = (&'static str, Action, &[KeyChord])> {

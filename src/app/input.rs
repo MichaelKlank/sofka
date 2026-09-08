@@ -1095,6 +1095,10 @@ impl App {
     }
 
     pub(super) fn key_logs(&mut self, key: KeyInput) {
+        if let Some(anchor) = key.action.and_then(Action::log_anchor) {
+            self.apply_log_anchor(anchor);
+            return;
+        }
         // Ctrl-S saves the buffer to a file (k9s).
         if key.action == Some(Action::Save) {
             self.save_logs();
@@ -1141,32 +1145,6 @@ impl App {
                 self.flash_err = false;
                 return;
             }
-            // k9s time anchors: `0` re-tails, `1`-`5` re-stream a window.
-            (Some(Action::Anchor0), _) => {
-                self.apply_log_anchor('0');
-                return;
-            }
-            (Some(Action::Anchor1), _) => {
-                self.apply_log_anchor('1');
-                return;
-            }
-            (Some(Action::Anchor2), _) => {
-                self.apply_log_anchor('2');
-                return;
-            }
-            (Some(Action::Anchor3), _) => {
-                self.apply_log_anchor('3');
-                return;
-            }
-            (Some(Action::Anchor4), _) => {
-                self.apply_log_anchor('4');
-                return;
-            }
-            (Some(Action::Anchor5), _) => {
-                self.apply_log_anchor('5');
-                return;
-            }
-
             // Provider logs: `T` changes the lookback period (re-queries).
             (Some(Action::Lookback), _) => {
                 if self.provider_logs_active() {

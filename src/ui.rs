@@ -472,12 +472,7 @@ fn key_hint(app: &App, scope: &str, actions: &[(Action, &str)]) -> String {
     actions
         .iter()
         .map(|&(action, label)| {
-            let key = app
-                .keymap
-                .chords(scope, action)
-                .first()
-                .map(|c| c.label())
-                .unwrap_or_else(|| "unbound".into());
+            let key = app.keymap.first_label(scope, action);
             format!("{key}:{label}")
         })
         .collect::<Vec<_>>()
@@ -491,12 +486,7 @@ fn hint_line(app: &App, pairs: &[(Action, &str)]) -> Line<'static> {
     let mut spans = Vec::new();
     let mut width = 0;
     for &(action, label) in pairs {
-        let key = app
-            .keymap
-            .chords("table", action)
-            .first()
-            .map(|c| c.label())
-            .unwrap_or_else(|| "unbound".into());
+        let key = app.keymap.first_label("table", action);
         let cell = format!("{key} {label}");
         let cell_width = cell.chars().count().max(13);
         if width + cell_width > usize::from(HEADER_HINTS_WIDTH) {
@@ -505,7 +495,7 @@ fn hint_line(app: &App, pairs: &[(Action, &str)]) -> Line<'static> {
         if width > 0 {
             spans.push(Span::raw("  "));
         }
-        spans.push(Span::styled(key, key_style));
+        spans.push(Span::styled(key.to_owned(), key_style));
         spans.push(Span::styled(
             format!(
                 " {label:<width$}",
@@ -2426,7 +2416,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
             )));
             previous_scope = scope;
         }
-        lines.push(bind(&app.keymap.label(scope, action), action.description()));
+        lines.push(bind(app.keymap.label(scope, action), action.description()));
     }
     lines.push(Line::from(Span::styled(
         "  Commands (enter in the command palette)",
@@ -2571,11 +2561,11 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         theme::title(),
     )));
     lines.push(bind(
-        &app.keymap.label("help", Action::Back),
+        app.keymap.label("help", Action::Back),
         "clear the search or close help",
     ));
     lines.push(bind(
-        &app.keymap.label("help", Action::Close),
+        app.keymap.label("help", Action::Close),
         "close help and return to the previous screen",
     ));
     // `/` search: keep only matching binding lines (section headers and
@@ -4029,17 +4019,10 @@ fn counts_tile(frame: &mut Frame, area: Rect, p: &crate::store::Pulse) {
 fn navigation_hint(app: &App, width: u16) -> String {
     let scope = app.key_scope();
     if scope == "table" {
-        let first = |action| {
-            app.keymap
-                .chords(scope, action)
-                .first()
-                .map(|c| c.label())
-                .unwrap_or_else(|| "unbound".into())
-        };
         let cycle = format!(
             "{}/{}: {}",
-            first(Action::NextView),
-            first(Action::PreviousView),
+            app.keymap.first_label(scope, Action::NextView),
+            app.keymap.first_label(scope, Action::PreviousView),
             if app.active_workspace.is_some() {
                 "workspace"
             } else {
@@ -4069,16 +4052,6 @@ fn navigation_hint(app: &App, width: u16) -> String {
         return format!("{cycle}  {}", key_hint(app, scope, &actions));
     }
     let preferred = match scope {
-        "table" => &[
-            Action::Command,
-            Action::Help,
-            Action::Filter,
-            Action::Sort,
-            Action::Mark,
-            Action::PageUp,
-            Action::PageDown,
-            Action::Back,
-        ][..],
         "logs" => &[
             Action::Back,
             Action::Filter,
