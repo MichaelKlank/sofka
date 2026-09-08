@@ -132,7 +132,13 @@ impl Timeline {
     fn push(&mut self, key: &str, at: i64, level: Level, text: String) {
         let entry = Entry { at, level, text };
         let dq = match self.history.get_mut(key) {
-            Some(dq) => dq,
+            Some(dq) => {
+                if self.order.back().is_none_or(|last| last != key) {
+                    self.order.retain(|existing| existing != key);
+                    self.order.push_back(key.to_string());
+                }
+                dq
+            }
             None => {
                 if self.order.len() >= MAX_OBJECTS
                     && let Some(evict) = self.order.pop_front()
