@@ -884,6 +884,8 @@ pub struct ViewColumnConfig {
     /// Value type: `text` (default), `status`, `number`, `quantity`, `time`.
     #[serde(rename = "type")]
     pub kind: Option<String>,
+    /// Optional text path formatter: `image-tag`.
+    pub format: Option<String>,
     /// Only shown in wide mode.
     pub wide: bool,
     /// Fixed display width in columns (defaults to a flexible share).

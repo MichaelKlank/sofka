@@ -24,6 +24,8 @@ pub enum ColumnKind {
     Builtin,
     #[default]
     Text,
+    /// Container image tag, sorted as text.
+    ImageTag,
     /// Text that also drives the row's status coloring.
     Status,
     /// Sorted numerically.
@@ -310,6 +312,17 @@ pub fn compile(
             if c.kind.is_some() && (c.metric.is_some() || c.builtin.is_some()) {
                 warnings.push(format!("views.\"{key}\": column {header}: type applies only to path columns; column skipped"));
                 continue;
+            }
+            if let Some(format) = &c.format {
+                if format != "image-tag" {
+                    warnings.push(format!("views.\"{key}\": column {header}: unknown format '{format}' (expected image-tag); column skipped"));
+                    continue;
+                }
+                if c.path.is_empty() || c.kind.as_deref().is_some_and(|kind| kind != "text") {
+                    warnings.push(format!("views.\"{key}\": column {header}: format applies only to text path columns; column skipped"));
+                    continue;
+                }
+                kind = ColumnKind::ImageTag;
             }
             let mut pointer = c.path.trim().to_string();
             if let Some(metric) = &c.metric {
@@ -739,7 +752,25 @@ pub fn render_cell(obj: &DynamicObject, col: &UserColumn, now: i64) -> String {
     };
     match col.kind {
         ColumnKind::Time => render_time(&v, now),
+        ColumnKind::ImageTag => render_image_tag(&v),
         _ => v.render(),
+    }
+}
+
+fn render_image_tag(v: &Extracted<'_>) -> String {
+    let Some(image) = v.as_str().filter(|image| !image.is_empty()) else {
+        return v.render();
+    };
+    let (name, digest) = image
+        .split_once('@')
+        .map_or((image, None), |(name, digest)| (name, Some(digest)));
+    let last_component = name.rsplit('/').next().unwrap_or(name);
+    if let Some((_, tag)) = last_component.rsplit_once(':') {
+        tag.into()
+    } else if digest.is_some() {
+        "-".into()
+    } else {
+        "latest".into()
     }
 }
 
@@ -814,6 +845,12 @@ pub fn sort_value(obj: &DynamicObject, col: &UserColumn, now: i64) -> SortValue 
     }
     let v = cell_value(obj, col);
     match col.kind {
+        ColumnKind::ImageTag => SortValue::Text(
+            v.as_ref()
+                .map(render_image_tag)
+                .unwrap_or_default()
+                .to_lowercase(),
+        ),
         ColumnKind::Number => {
             SortValue::Num(v.as_ref().and_then(Extracted::number).unwrap_or(f64::MAX))
         }
@@ -1070,6 +1107,67 @@ mod tests {
         let (views, warnings) = compile(&cfg.views);
         assert_eq!(views["v1/pods"].columns.len(), 2);
         assert_eq!(warnings.len(), 5);
+    }
+
+    #[test]
+    fn image_tag_formats_validate_without_discarding_valid_columns() {
+        let (views, warnings) = compile_toml(
+            r#"
+            [views.pods]
+            columns = [
+                { name = "TAG", path = "/spec/image", format = "image-tag" },
+                { name = "TEXT", path = "/spec/image", type = "text", format = "image-tag" },
+                { name = "RAW", path = "/spec/image" },
+                { name = "UNKNOWN", path = "/spec/image", format = "split" },
+                { name = "CPU", metric = "cpu", format = "image-tag" },
+                { name = "NAME", builtin = "NAME", format = "image-tag" },
+                { name = "NUMBER", path = "/spec/image", type = "number", format = "image-tag" },
+                { name = "QUANTITY", path = "/spec/image", type = "quantity", format = "image-tag" },
+                { name = "TIME", path = "/spec/image", type = "time", format = "image-tag" },
+                { name = "STATUS", path = "/spec/image", type = "status", format = "image-tag" },
+                { name = "CONDITION", path = "Ready", type = "condition", format = "image-tag" },
+                { name = "BADPATH", path = "image", format = "image-tag" },
+            ]
+            "#,
+        );
+        let columns = &views["pods"].columns;
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns[0].kind, ColumnKind::ImageTag);
+        assert_eq!(columns[1].kind, ColumnKind::ImageTag);
+        assert_eq!(columns[2].kind, ColumnKind::Text);
+        assert_eq!(warnings.len(), 9, "{warnings:?}");
+        assert!(warnings[0].contains("unknown format 'split'"));
+        assert!(
+            warnings[1..8]
+                .iter()
+                .all(|w| w.contains("format applies only to text path columns"))
+        );
+        assert!(warnings[8].contains("JSON Pointer"));
+    }
+
+    #[test]
+    fn image_tag_rendering_and_sorting_use_the_tag() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        for (image, expected) in [
+            (json!("registry:5000/app:1.2.3"), "1.2.3"),
+            (json!("registry:5000/team/app"), "latest"),
+            (json!("app"), "latest"),
+            (json!(format!("app@{digest}")), "-"),
+            (json!(format!("registry:5000/app@{digest}")), "-"),
+            (json!(format!("app:1.2.3@{digest}")), "1.2.3"),
+            (json!(format!("registry:5000/app:RC1@{digest}")), "RC1"),
+            (json!("[::1]:5000/app:2"), "2"),
+            (json!(""), ""),
+            (Value::Null, "<none>"),
+            (json!(42), "42"),
+        ] {
+            let o = obj(json!({"apiVersion": "v1", "kind": "Pod", "spec": {"image": image}}));
+            let column = col("/spec/image", ColumnKind::ImageTag);
+            assert_eq!(render_cell(&o, &column, 0), expected);
+            assert!(
+                matches!(sort_value(&o, &column, 0), SortValue::Text(value) if value == expected.to_lowercase())
+            );
+        }
     }
 
     fn col(pointer: &str, kind: ColumnKind) -> UserColumn {

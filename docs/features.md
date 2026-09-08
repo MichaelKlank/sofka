@@ -71,7 +71,9 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 - **Custom views** - define columns for any resource in the config file.
   Select and order built-in columns, live CPU/MEM usage, pod request and limit
   totals, and utilization percentages. Metric columns support numeric sorting,
-  structured filters, and threshold colors. An
+  structured filters, and threshold colors. Custom text path columns support
+  `format = "image-tag"` to show image tags, with registry ports and digests
+  handled separately. An
   unknown custom resource picks up its CRD `additionalPrinterColumns`
   automatically. `w` toggles wide-only columns (kubectl `-o wide`), including
   node labels. Add `@<namespace>` to a view key to select columns for one

@@ -97,6 +97,10 @@ Every semantic color - row status, severity badges, headers, borders - is derive
 from the active palette, so one skin change lands everywhere at once. `:skin`
 switches live, `:skin gruvbox-dark` applies directly.
 
+Custom text path columns accept `format = "image-tag"` to show only the image
+tag. See the [image tag example](views.md#image-tags) for configuration and
+validation rules.
+
 ## Other sections
 
 Each of these is documented where the feature itself is:
