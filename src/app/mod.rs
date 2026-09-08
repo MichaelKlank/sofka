@@ -2034,6 +2034,8 @@ pub struct App {
     /// Compact mode (`ctrl-e`): collapse the header to one line and hide the
     /// footer, so a tiled/multiplexed pane shows mostly table.
     pub compact: bool,
+    /// Hide the header in normal and compact modes.
+    pub hide_header: bool,
     /// Active column layout for the current view; rebuilt by
     /// [`App::refresh_view_spec`] whenever kind/views/wide change.
     spec: crate::columns::ViewSpec,
@@ -2266,6 +2268,7 @@ impl App {
             crd_views: HashMap::new(),
             wide: false,
             compact: false,
+            hide_header: false,
             spec: crate::columns::build_spec("", "", None, None, false),
         }
     }

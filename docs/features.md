@@ -4,6 +4,9 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 
 ## Core navigation
 
+- **Optional header** - set `hide_header = true` in the configuration to hide
+  the header and logo, including the one-line header in compact mode.
+
 - **Connect** to the current kubeconfig context, including exec credential
   plugins (GKE, EKS, and friends).
 - **Optional v1 client certificates** through `--allow-v1-client-cert`, disabled

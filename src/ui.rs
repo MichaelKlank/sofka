@@ -111,8 +111,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         return;
     }
     let mut constraints = vec![
-        Constraint::Length(if compact { 1 } else { 7 }), // header
-        Constraint::Min(3),                              // body
+        Constraint::Length(if app.hide_header {
+            0
+        } else if compact {
+            1
+        } else {
+            7
+        }), // header
+        Constraint::Min(3), // body
     ];
     let prompt_idx = if !compact || needs_prompt {
         constraints.push(Constraint::Length(1));
@@ -131,10 +137,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .constraints(constraints)
         .split(frame.area());
 
-    if compact {
-        draw_compact_header(frame, app, chunks[0]);
-    } else {
-        draw_header(frame, app, chunks[0]);
+    if !app.hide_header {
+        if compact {
+            draw_compact_header(frame, app, chunks[0]);
+        } else {
+            draw_header(frame, app, chunks[0]);
+        }
     }
 
     match app.mode {
@@ -4012,7 +4020,7 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 "Tab/⇧Tab: resources  "
             };
-            let hint = if header_hints_fit(frame.area().width) {
+            let hint = if !app.hide_header && header_hints_fit(frame.area().width) {
                 format!(
                     "  {cycle}:resource  /filter  S:sort I:invert  w:wide  space:mark  [ ]:history  0:all-ns  ?:help"
                 )

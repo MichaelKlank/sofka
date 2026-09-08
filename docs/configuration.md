@@ -14,6 +14,7 @@ default_namespace = "kube-system"  # fallback only: the last namespace picked in
 default_resource  = "deployments"
 readonly          = false  # true disables every mutating action (delete, edit,
                            # scale, shell, plugins, …); --readonly/--write win
+hide_header = false # true hides the header and logo
 mouse             = true   # false keeps the terminal's native mouse behavior
                            # (text selection) instead of scroll/click/sort
 remember_sort     = true   # save and restore sort choices per resource kind
@@ -26,6 +27,11 @@ favorite_namespaces = ["kube-system", "monitoring"]
 [aliases]
 dep = "deployments"
 ```
+
+Set `hide_header = true` to remove the header and logo and give more space to
+the active view. The default is `false`. This option supports cluster and
+context overrides and `:reload`. It also hides the one-line header in compact
+mode (`Ctrl-E`). The footer and command input keep their existing behavior.
 
 `remember_sort` is enabled by default. Set it to `false` to stop saving and
 restoring sort choices from `S`, `I`, and column header clicks. Existing saved

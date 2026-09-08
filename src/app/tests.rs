@@ -20147,3 +20147,102 @@ async fn edit_and_describe_use_selected_api_resource() {
         }
     }
 }
+
+#[tokio::test]
+async fn hide_header_reloads_and_keeps_command_input_in_compact_mode() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let dir = std::env::temp_dir().join(format!("sofka-hide-header-{}", std::process::id()));
+    write_config(&dir, "");
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    palette(&mut app, "pods");
+    let mut terminal = Terminal::new(TestBackend::new(180, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let normal = app.table_hit.borrow().clone().unwrap();
+    assert!(!app.hide_header);
+
+    write_config(&dir, "hide_header = true\n");
+    palette(&mut app, "reload");
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let hidden = app.table_hit.borrow().clone().unwrap();
+    assert!(app.hide_header);
+    assert_eq!(hidden.header_y + 7, normal.header_y);
+    assert_eq!(hidden.rows_h, normal.rows_h + 7);
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(screen.contains("y:yaml"), "{screen}");
+
+    app.handle_key(ctrl(KeyCode::Char('e'))).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    assert_eq!(
+        app.table_hit.borrow().as_ref().unwrap().header_y,
+        hidden.header_y
+    );
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "reload".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(screen.contains(":reload"), "{screen}");
+
+    write_config(&dir, "");
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    assert!(!app.hide_header);
+    assert_eq!(
+        app.table_hit.borrow().as_ref().unwrap().header_y,
+        hidden.header_y + 1
+    );
+    app.handle_key(ctrl(KeyCode::Char('e'))).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    assert_eq!(
+        app.table_hit.borrow().as_ref().unwrap().header_y,
+        normal.header_y
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn hide_header_follows_context_overrides() {
+    let dir =
+        std::env::temp_dir().join(format!("sofka-hide-header-context-{}", std::process::id()));
+    write_config(&dir, "hide_header = true\n");
+    write_config(
+        &dir.join("clusters/test-cluster/dev"),
+        "hide_header = false\n",
+    );
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    palette(&mut app, "reload");
+    assert!(app.hide_header);
+    land_context(&mut app, "dev");
+    assert!(!app.hide_header);
+    land_context(&mut app, "prod");
+    assert!(app.hide_header);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
