@@ -3025,7 +3025,7 @@ dependencies = [
 
 [[package]]
 name = "sofka"
-version = "0.24.9"
+version = "0.25.0"
 dependencies = [
  "aho-corasick",
  "anyhow",
