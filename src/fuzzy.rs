@@ -9,6 +9,7 @@ use std::cell::RefCell;
 
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// A shared fuzzy matcher.
 ///
@@ -107,8 +108,8 @@ impl Fuzzy {
         atom.score(utf32(haystack, buf), matcher).map(i64::from)
     }
 
-    /// The char positions in `haystack` that `needle` matched, ascending, or
-    /// `None` when it does not match.
+    /// The char positions of all matched graphemes in `haystack`, ascending,
+    /// or `None` when `needle` does not match.
     pub fn indices(&self, haystack: &str, needle: &str) -> Option<Vec<usize>> {
         let mut inner = self.inner.borrow_mut();
         inner.sync(needle);
@@ -125,7 +126,27 @@ impl Fuzzy {
         // repeat a position; callers highlight by walking them in order.
         indices.sort_unstable();
         indices.dedup();
-        Some(indices.iter().map(|&i| i as usize).collect())
+        if haystack.is_ascii() {
+            return Some(indices.iter().map(|&i| i as usize).collect());
+        }
+
+        // The matcher counts graphemes; the renderer counts chars. Include
+        // every char in each matched grapheme so its style stays consistent.
+        let mut matched = indices.iter().peekable();
+        let mut positions = Vec::with_capacity(indices.len());
+        let mut char_offset = 0;
+        for (i, grapheme) in haystack.graphemes(true).enumerate() {
+            if matched.peek().is_none() {
+                break;
+            }
+            let end = char_offset + grapheme.chars().count();
+            if matched.peek().is_some_and(|&&pos| pos as usize == i) {
+                positions.extend(char_offset..end);
+                matched.next();
+            }
+            char_offset = end;
+        }
+        Some(positions)
     }
 }
 

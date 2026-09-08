@@ -1226,6 +1226,32 @@ async fn filter_match_indices_highlight_matched_chars() {
 }
 
 #[tokio::test]
+async fn fuzzy_filter_highlights_complete_graphemes_at_char_positions() {
+    let (mut app, _rx) = test_app();
+    let cases = [
+        ("test-e\u{0301}lastic-role", "lastic", "lastic"),
+        ("test-e\u{0301}lastic-role", "elastic", "e\u{0301}lastic"),
+        ("a\u{0301}b\u{0308}c-role", "ac", "a\u{0301}c"),
+        ("test-👩‍💻-role", "role", "role"),
+        ("test-👩‍💻-role", "👩", "👩‍💻"),
+        ("test-élastic-role", "lastic", "lastic"),
+        ("test-elastic-role", "lastic", "lastic"),
+    ];
+    for (name, filter, expected) in cases {
+        retype_filter(&mut app, filter);
+        let indices = app.filter_match_indices(name).unwrap();
+        let highlighted: String = name
+            .chars()
+            .enumerate()
+            .filter(|(i, _)| indices.contains(i))
+            .map(|(_, ch)| ch)
+            .collect();
+        assert_eq!(highlighted, expected, "name={name:?}, filter={filter:?}");
+        assert!(indices.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+}
+
+#[tokio::test]
 async fn table_cell_cache_invalidates_on_apply() {
     let (mut app, _rx) = test_app();
     app.kind_plural = "pods".into();
