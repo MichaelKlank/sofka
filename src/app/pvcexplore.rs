@@ -1042,21 +1042,21 @@ impl App {
 
     // ----- input ---------------------------------------------------------
 
-    pub(super) fn key_pvc_explore(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.close_pvc_explore(),
-            KeyCode::Tab | KeyCode::BackTab => self.pvc.focus = self.other_pane(),
-            KeyCode::Left => self.pvc.focus = Pane::Local,
-            KeyCode::Right => self.pvc.focus = Pane::Remote,
-            KeyCode::Char('j') | KeyCode::Down => self.step_pane(true),
-            KeyCode::Char('k') | KeyCode::Up => self.step_pane(false),
-            KeyCode::Char('g') | KeyCode::Home => self.jump_pane(true),
-            KeyCode::Char('G') | KeyCode::End => self.jump_pane(false),
-            KeyCode::Enter => self.descend_pane(),
-            KeyCode::Backspace | KeyCode::Char('-') => self.ascend_pane(),
-            KeyCode::Char('c') => self.copy_across(),
-            KeyCode::Char('r') => self.refresh_pvc_panes(),
-            KeyCode::Char('s') => self.pvc_shell_here(),
+    pub(super) fn key_pvc_explore(&mut self, key: KeyInput) {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => self.close_pvc_explore(),
+            (Some(Action::SwitchPane), _) => self.pvc.focus = self.other_pane(),
+            (Some(Action::Left), _) => self.pvc.focus = Pane::Local,
+            (Some(Action::Right), _) => self.pvc.focus = Pane::Remote,
+            (Some(Action::Down), _) => self.step_pane(true),
+            (Some(Action::Up), _) => self.step_pane(false),
+            (Some(Action::First), _) => self.jump_pane(true),
+            (Some(Action::Last), _) => self.jump_pane(false),
+            (Some(Action::Accept), _) => self.descend_pane(),
+            (Some(Action::Parent), _) => self.ascend_pane(),
+            (Some(Action::Copy), _) => self.copy_across(),
+            (Some(Action::Refresh), _) => self.refresh_pvc_panes(),
+            (Some(Action::Shell), _) => self.pvc_shell_here(),
             _ => {}
         }
     }

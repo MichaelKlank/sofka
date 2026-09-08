@@ -1,6 +1,8 @@
 # Key reference
 
-The full keymap. `?` inside sofka shows the same thing, including your own
+The default keymap. All built-in keyboard actions are configurable.
+See [Configure key bindings](keybindings.md) for scopes and action names.
+`?` inside sofka shows the effective bindings, including your own
 plugin, bookmark, and workspace chords. `:` and `?` work from every navigation
 screen; closing either returns to the screen where it was opened. Text-entry
 pickers keep both characters available as input.
@@ -152,20 +154,29 @@ See [Views](views.md#navigating-between-kinds) for adding CRD relations.
 ## Palette completion keys
 
 In the `:` palette, `tab`/`↓` and `shift-tab`/`↑` move through the suggestion
-list and `⏎` runs the highlighted one. Rebind them under `[keys]` in
-`config.toml` — emacs/cmp style, for example:
+list and `⏎` runs the highlighted one. Rebind them under `[keys.command]` in
+`config.toml`, for example:
 
 ```toml
-[keys]
-palette_next   = "ctrl-n"
-palette_prev   = "ctrl-p"
-palette_accept = ["ctrl-y", "enter"]
+[keys.command]
+down = "ctrl-n"
+up = "ctrl-p"
+accept = ["ctrl-y", "enter"]
 ```
 
-Each value is one [key chord](plugins.md) or a list of chords, and replaces
-the default set for that action (`["tab", "down"]`, `["backtab", "up"]`,
-`["enter"]`) — include a default in the list to keep it too. `ctrl-c` (quit)
-and `ctrl-e` (compact mode) are reserved by built-ins and can't be bound.
+Each value is one [key combination](plugins.md) or a list of combinations.
+It replaces the default set for that action: `["tab", "down"]`,
+`["backtab", "up"]`, or `["enter"]`. Include a default in the list to keep it.
+An empty list disables the action. Invalid values report errors. Explicit
+completion bindings take priority over text editing and cancellation.
+To assign `ctrl-c` or `ctrl-e`, first move or disable `quit` or `compact` under
+`[keys.global]`.
+
+Legacy `palette_next`, `palette_prev`, and `palette_accept` settings are
+automatically migrated to this format, with a `config.toml.bak` backup.
+If the file cannot be updated, sofka warns and uses the converted settings in
+memory. See [migration](keybindings.md#legacy-palette-migration) for managed
+configs, conflicts, and invalid values.
 
 ## What suspends the TUI
 

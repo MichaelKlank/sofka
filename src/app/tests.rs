@@ -1810,7 +1810,7 @@ async fn saved_forwards_show_as_stopped_until_running() {
     // the entry reappears in the stopped tail.
     app.open_port_forwards();
     assert_eq!(app.pf_state.selected(), Some(0));
-    app.key_port_forwards(press(KeyCode::Char('x')));
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
     assert!(app.port_forwards.is_empty());
     assert_eq!(app.stopped_configured_forwards().len(), 2);
     assert_eq!(app.pf_state.selected(), Some(0), "clamped to combined list");
@@ -3204,7 +3204,7 @@ async fn find_opens_picker_and_enter_navigates_to_the_object() {
     assert_eq!(app.find_state.selected(), Some(0));
     assert!(app.flash.contains("2 hit(s)"), "{}", app.flash);
 
-    app.key_find(press(KeyCode::Enter));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.mode, Mode::Table);
     assert_eq!(app.kind_plural, "pods");
     assert_eq!(app.fields.as_deref(), Some("metadata.name=web-1"));
@@ -6411,12 +6411,12 @@ async fn namespace_picker_edit_chords() {
 #[test]
 fn edit_chord_leaves_plain_keys_alone() {
     let mut buf = "abc".to_string();
-    assert!(!edit_chord(&press(KeyCode::Char('u')), &mut buf));
-    assert!(!edit_chord(&press(KeyCode::Backspace), &mut buf));
+    assert!(!edit_action(None, &mut buf));
+    assert!(!edit_action(Some(Action::Backspace), &mut buf));
     assert_eq!(buf, "abc");
     // Word rubout trims trailing spaces before the word, readline-style.
     let mut buf = "one two   ".to_string();
-    assert!(edit_chord(&alt(KeyCode::Backspace), &mut buf));
+    assert!(edit_action(Some(Action::DeleteWord), &mut buf));
     assert_eq!(buf, "one ");
 }
 
@@ -6470,9 +6470,9 @@ async fn crd_plural_outranks_builtin_command() {
     // collides with the `:snapshots` built-in — the CRD must win.
     app.mode = Mode::Command;
     for c in "snapshots".chars() {
-        app.key_command(press(KeyCode::Char(c)));
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
     }
-    app.key_command(press(KeyCode::Enter));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.mode, Mode::Table);
     assert!(
         app.flash.contains("snapshots.kopiur.home-operations.com"),
@@ -6483,9 +6483,9 @@ async fn crd_plural_outranks_builtin_command() {
     // `:kind namespace` still works for the shadowed plural.
     app.mode = Mode::Command;
     for c in "snapshots media".chars() {
-        app.key_command(press(KeyCode::Char(c)));
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
     }
-    app.key_command(press(KeyCode::Enter));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.namespace, "media");
 }
 
@@ -6494,15 +6494,13 @@ async fn palette_completion_accepts_minus_chords() {
     let (mut app, _rx) = test_app();
     let config: crate::config::Config = toml::from_str(
         r#"
-        [keys]
-        palette_next = "ctrl--"
-        palette_prev = "alt--"
+        [keys.command]
+        down = "ctrl--"
+        up = "alt--"
         "#,
     )
     .unwrap();
-    let (palette_keys, warnings) = crate::config::compile_palette_keys(&config.keys);
-    assert!(warnings.is_empty(), "{warnings:?}");
-    app.palette_keys = palette_keys;
+    app.keymap = Keymap::compile(&config.keys).unwrap();
 
     app.handle_key(press(KeyCode::Char(':'))).unwrap();
     assert_eq!(app.mode, Mode::Command);
@@ -6522,15 +6520,13 @@ async fn palette_shifted_minus_uses_the_resulting_character() {
         let (mut app, _rx) = test_app();
         let config: crate::config::Config = toml::from_str(
             r#"
-            [keys]
-            palette_next = ["shift--", "_"]
+            [keys.command]
+            down = "_"
             "#,
         )
         .unwrap();
-        let (palette_keys, warnings) = crate::config::compile_palette_keys(&config.keys);
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("bind the resulting character"));
-        app.palette_keys = palette_keys;
+        let warnings = app.configure_keys(&config.keys);
+        assert!(warnings.is_empty(), "{warnings:?}");
 
         app.handle_key(press(KeyCode::Char(':'))).unwrap();
         app.handle_key(press(KeyCode::Char('-'))).unwrap();
@@ -6551,16 +6547,14 @@ async fn palette_completion_keys_are_rebindable() {
     let (mut app, _rx) = test_app();
     let keys_cfg: crate::config::Config = toml::from_str(
         r#"
-        [keys]
-        palette_next = "ctrl-n"
-        palette_prev = "ctrl-p"
-        palette_accept = ["ctrl-y", "enter"]
+        [keys.command]
+        down = "ctrl-n"
+        up = "ctrl-p"
+        accept = ["ctrl-y", "enter"]
     "#,
     )
     .unwrap();
-    let (palette_keys, warnings) = crate::config::compile_palette_keys(&keys_cfg.keys);
-    assert!(warnings.is_empty(), "{warnings:?}");
-    app.palette_keys = palette_keys;
+    app.keymap = Keymap::compile(&keys_cfg.keys).unwrap();
 
     app.mode = Mode::Command;
     app.update_suggestions();
@@ -6568,28 +6562,28 @@ async fn palette_completion_keys_are_rebindable() {
     assert_eq!(app.cmd_sel, 0);
 
     // ctrl-n / ctrl-p move the highlight; the overridden tab/arrows don't.
-    app.key_command(ctrl(KeyCode::Char('n')));
+    app.handle_key(ctrl(KeyCode::Char('n'))).unwrap();
     assert_eq!(app.cmd_sel, 1);
-    app.key_command(press(KeyCode::Tab));
-    app.key_command(press(KeyCode::Down));
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     assert_eq!(app.cmd_sel, 1, "tab/down were overridden away");
-    app.key_command(ctrl(KeyCode::Char('p')));
+    app.handle_key(ctrl(KeyCode::Char('p'))).unwrap();
     assert_eq!(app.cmd_sel, 0);
 
     // ctrl-y runs the command line exactly like enter does by default.
     for c in "snapshots media".chars() {
-        app.key_command(press(KeyCode::Char(c)));
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
     }
-    app.key_command(ctrl(KeyCode::Char('y')));
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
     assert_eq!(app.mode, Mode::Table);
     assert_eq!(app.namespace, "media");
 
     // Enter stays usable because the config listed it too.
     app.mode = Mode::Command;
     for c in "pods".chars() {
-        app.key_command(press(KeyCode::Char(c)));
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
     }
-    app.key_command(press(KeyCode::Enter));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.mode, Mode::Table);
 }
 
@@ -6635,9 +6629,9 @@ async fn typed_qualified_name_opens_the_kind() {
     let (mut app, _rx) = test_app();
     app.mode = Mode::Command;
     for c in "snapshots.kopiur.home-operations.com".chars() {
-        app.key_command(press(KeyCode::Char(c)));
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
     }
-    app.key_command(press(KeyCode::Enter));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.mode, Mode::Table);
     assert!(
         app.flash.contains("snapshots.kopiur.home-operations.com"),
@@ -9126,14 +9120,14 @@ async fn context_rename_prompt_opens_prefilled_and_returns_to_picker() {
         list: vec!["prod".into(), "test".into()],
     });
 
-    app.key_contexts(press(KeyCode::Char('r')));
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
     assert_eq!(app.mode, Mode::Prompt);
     assert!(app.prompt_over_contexts());
     assert_eq!(app.prompt_input, "test", "prefilled with the selected name");
     assert!(app.prompt_label.contains("Rename context test"));
 
     // Esc abandons the rename and lands back in the picker.
-    app.key_prompt(press(KeyCode::Esc));
+    app.handle_key(press(KeyCode::Esc)).unwrap();
     assert_eq!(app.mode, Mode::Contexts);
     assert!(!app.prompt_over_contexts());
 }
@@ -9147,9 +9141,9 @@ async fn context_rename_to_existing_name_warns() {
         list: vec!["prod".into(), "test".into()],
     });
 
-    app.key_contexts(press(KeyCode::Char('r')));
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
     app.prompt_input = "prod".into();
-    app.key_prompt(press(KeyCode::Enter));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.mode, Mode::Contexts);
     assert!(app.flash_err);
     assert!(app.flash.contains("already exists"), "{}", app.flash);
@@ -10894,8 +10888,8 @@ async fn resource_cycle_hint_is_visible_and_changes_for_a_workspace() {
         ..Default::default()
     }];
     for (key, expected) in [
-        (press(KeyCode::Tab), "Tab/⇧Tab: resources"),
-        (ctrl(KeyCode::Char('w')), "Tab/⇧Tab: workspace"),
+        (press(KeyCode::Tab), "tab/backtab: resources"),
+        (ctrl(KeyCode::Char('w')), "tab/backtab: workspace"),
     ] {
         app.handle_key(key).unwrap();
         for width in [60, 160] {
@@ -11279,7 +11273,7 @@ async fn help_scrolls_and_resets_on_reopen() {
     app.handle_key(press(KeyCode::End)).unwrap();
     app.handle_key(press(KeyCode::Char('/'))).unwrap();
     assert_eq!(app.help_scroll, 0);
-    for c in "help".chars() {
+    for c in "cascade".chars() {
         app.handle_key(press(KeyCode::Char(c))).unwrap();
     }
     app.handle_key(press(KeyCode::Enter)).unwrap();
@@ -11349,7 +11343,7 @@ async fn help_paging_updates_after_resize_and_compact_mode() {
     app.handle_key(press(KeyCode::PageDown)).unwrap();
     assert_eq!(app.help_scroll, 21);
 
-    term.backend_mut().resize(120, 200);
+    term.backend_mut().resize(120, 800);
     term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
     assert_eq!(app.help_scroll, 0);
     assert_eq!(app.help_max_scroll, 0);
@@ -12150,23 +12144,23 @@ async fn fleet_toggle_in_context_switcher_edits_marks() {
     app.ctx_list = vec!["prod".into(), "staging".into()];
     app.ctx_state.select(Some(1));
     app.mode = Mode::Contexts;
-    app.key_contexts(press(KeyCode::Char(' ')));
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
     assert_eq!(app.fleet_contexts(), vec!["prod", "staging"]);
     assert!(app.is_fleet_context("staging"));
     assert!(app.flash.contains("fleet + staging"), "{}", app.flash);
     assert_eq!(app.mode, Mode::Contexts, "toggling stays in the switcher");
 
     // Space again removes it.
-    app.key_contexts(press(KeyCode::Char(' ')));
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
     assert_eq!(app.fleet_contexts(), vec!["prod"]);
     assert!(app.flash.contains("fleet − staging"), "{}", app.flash);
 
     // A config-listed context can be masked out for the session too…
     app.ctx_state.select(Some(0));
-    app.key_contexts(press(KeyCode::Char(' ')));
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
     assert!(app.fleet_contexts().is_empty());
     // …and re-added.
-    app.key_contexts(press(KeyCode::Char(' ')));
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
     assert_eq!(app.fleet_contexts(), vec!["prod"]);
 }
 
@@ -12193,7 +12187,7 @@ async fn fleet_marks_persist_across_restarts() {
     app.ctx_list = vec!["prod".into(), "staging".into()];
     app.ctx_state.select(Some(1));
     app.mode = Mode::Contexts;
-    app.key_contexts(press(KeyCode::Char(' ')));
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
     assert!(path.exists(), "marks file written on toggle");
     assert!(!app.flash_err, "{}", app.flash);
 
@@ -21200,4 +21194,852 @@ async fn image_tag_columns_render_selected_paths_and_filter_by_tag() {
     let (_, rows) = app.snapshot_table();
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|row| row[2] == "1.2.3"));
+}
+
+const PAGING_KEYS: &str = r#"
+[keys.navigation]
+page_up = ["pageup", "ctrl-b", "ctrl-u"]
+page_down = ["pagedown", "ctrl-f", "ctrl-d"]
+[keys.table]
+delete = "alt-d"
+"#;
+
+fn use_keys(app: &mut App, text: &str) {
+    let cfg: crate::config::Config = toml::from_str(text).unwrap();
+    app.keymap = Keymap::compile(&cfg.keys).unwrap();
+}
+
+#[tokio::test]
+async fn configured_paging_releases_delete_and_keeps_its_confirmation() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for n in 0..25 {
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1", "kind":"Pod",
+            "metadata":{"name":format!("p{n:02}"), "namespace":"default"}}),
+        );
+    }
+    app.table_state.select(Some(0));
+    app.table_page_rows = 8;
+    use_keys(&mut app, PAGING_KEYS);
+    app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+    assert_eq!(app.table_state.selected(), Some(8));
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.confirm_action.is_none());
+    app.handle_key(ctrl(KeyCode::Char('u'))).unwrap();
+    assert_eq!(app.table_state.selected(), Some(0));
+    app.handle_key(press(KeyCode::PageDown)).unwrap();
+    assert_eq!(app.table_state.selected(), Some(8));
+    app.handle_key(alt(KeyCode::Char('d'))).unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+    assert!(matches!(
+        app.confirm_action,
+        Some(ConfirmAction::Delete { force: false, .. })
+    ));
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.readonly = true;
+    app.handle_key(alt(KeyCode::Char('d'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash.contains("read-only"), "{}", app.flash);
+    assert!(app.confirm_action.is_none());
+}
+
+#[tokio::test]
+async fn configured_paging_preserves_view_behavior_and_text_input() {
+    let (mut app, _rx) = test_app();
+    use_keys(&mut app, PAGING_KEYS);
+    for mode in [Mode::Detail, Mode::Diff, Mode::Events] {
+        app.mode = mode;
+        app.detail = Scrollable {
+            lines: (0..100).map(|n| n.to_string()).collect(),
+            ..Default::default()
+        };
+        app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+        assert_eq!(app.detail.scroll, 20, "{mode:?}");
+        app.handle_key(ctrl(KeyCode::Char('u'))).unwrap();
+        assert_eq!(app.detail.scroll, 0, "{mode:?}");
+    }
+    app.mode = Mode::Logs;
+    app.logs.viewport_h = 7;
+    app.logs.viewport_rows = 100;
+    app.logs.follow = true;
+    app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+    assert_eq!(app.logs.view.scroll, 7);
+    assert!(!app.logs.follow);
+    app.handle_key(ctrl(KeyCode::Char('u'))).unwrap();
+    assert_eq!(app.logs.view.scroll, 0);
+    app.mode = Mode::Help;
+    app.help_viewport_h = 9;
+    app.help_max_scroll = 100;
+    app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+    assert_eq!(app.help_scroll, 9);
+    app.handle_key(ctrl(KeyCode::Char('u'))).unwrap();
+    assert_eq!(app.help_scroll, 0);
+    app.mode = Mode::Prompt;
+    app.prompt_input = "keep text editing".into();
+    app.handle_key(ctrl(KeyCode::Char('u'))).unwrap();
+    assert!(app.prompt_input.is_empty());
+    assert_eq!(app.mode, Mode::Prompt);
+}
+
+#[tokio::test]
+async fn released_keys_reach_bookmarks_and_wheel_uses_actions() {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for n in 0..8 {
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1", "kind":"Pod",
+            "metadata":{"name":format!("p{n}"), "namespace":"default"}}),
+        );
+    }
+    app.table_state.select(Some(0));
+    use_keys(&mut app, "[keys.table]\ndown = []\ndelete = 'down'\n");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    })
+    .unwrap();
+    assert_eq!(app.table_state.selected(), Some(3));
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.confirm_action.is_none());
+    app.bookmarks.push(crate::config::Bookmark {
+        name: "services".into(),
+        key: Some("j".into()),
+        resource: "services".into(),
+        ..Default::default()
+    });
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    assert_eq!(app.kind_plural, "services");
+}
+
+#[tokio::test]
+async fn global_and_confirmation_bindings_can_be_replaced_or_disabled() {
+    let (mut app, _rx) = test_app();
+    use_keys(
+        &mut app,
+        r#"
+        [keys.global]
+        quit = "alt-q"
+        compact = "f6"
+        [keys.confirm]
+        accept = []
+        back = "f7"
+        force = "f8"
+    "#,
+    );
+    app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
+    assert!(!app.should_quit);
+    app.handle_key(ctrl(KeyCode::Char('e'))).unwrap();
+    assert!(!app.compact);
+    app.handle_key(press(KeyCode::F(6))).unwrap();
+    assert!(app.compact);
+    app.mode = Mode::Confirm;
+    for key in [KeyCode::Enter, KeyCode::Char('y'), KeyCode::Esc] {
+        app.handle_key(press(key)).unwrap();
+        assert_eq!(app.mode, Mode::Confirm);
+    }
+    app.handle_key(press(KeyCode::F(7))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    app.handle_key(alt(KeyCode::Char('q'))).unwrap();
+    assert!(app.should_quit);
+}
+
+#[tokio::test]
+async fn keymap_reload_is_atomic_and_context_overrides_apply() {
+    let dir = std::env::temp_dir().join(format!("sofka-keymap-{}", std::process::id()));
+    write_config(&dir, PAGING_KEYS);
+    write_config(
+        &dir.join("clusters/test-cluster/dev"),
+        "[keys.table]\npage_down = 'f8'\n",
+    );
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    palette(&mut app, "reload");
+    assert!(app.config_warnings.is_empty(), "{:?}", app.config_warnings);
+    assert!(
+        app.keymap
+            .label("table", Action::PageDown)
+            .contains("ctrl-d")
+    );
+    let good = app.keymap.clone();
+    write_config(&dir, "[keys.navigation]\npage_down = 'ctrl-d'\n");
+    palette(&mut app, "reload");
+    assert_eq!(app.keymap, good);
+    let warnings = app.config_warnings.join("\n");
+    assert!(warnings.contains("config.toml"), "{warnings}");
+    assert!(warnings.contains("conflicts"), "{warnings}");
+    write_config(&dir, PAGING_KEYS);
+    palette(&mut app, "reload");
+    palette(&mut app, "ctx dev");
+    land_context(&mut app, "dev");
+    assert_eq!(app.keymap.label("table", Action::PageDown), "f8");
+    assert!(
+        app.keymap
+            .label("logs", Action::PageDown)
+            .contains("ctrl-d")
+    );
+    palette(&mut app, "ctx prod");
+    land_context(&mut app, "prod");
+    assert!(
+        app.keymap
+            .label("table", Action::PageDown)
+            .contains("ctrl-d")
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn key_action_fixture(scope: &str) -> (App, Receiver<Msg>) {
+    let (mut app, rx) = test_app();
+    app.switch_kind("pods");
+    for n in 0..12 {
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1", "kind":"Pod",
+            "metadata":{"name":format!("p{n:02}"), "namespace":"default"},
+            "spec":{"containers":[{"name":"main", "image":"example:1"}]}}),
+        );
+    }
+    app.readonly = true;
+    app.table_page_rows = 3;
+    app.table_state.select(Some(4));
+    app.detail = Scrollable {
+        lines: (0..60).map(|n| format!("line {n}")).collect(),
+        scroll: 5,
+        ..Default::default()
+    };
+    app.logs.viewport_rows = 60;
+    app.logs.viewport_h = 5;
+    app.logs.view.scroll = 10;
+    app.help_scroll = 5;
+    app.help_max_scroll = 60;
+    app.help_viewport_h = 5;
+    app.command = "pods default".into();
+    app.prompt_input = "two words".into();
+    app.ns_list = vec!["default".into(), "tools".into(), "test".into()];
+    app.ns_state.select(Some(1));
+    app.ctx_list = vec!["test".into(), "dev".into(), "prod".into()];
+    app.ctx_state.select(Some(1));
+    app.container_list = vec!["main".into(), "sidecar".into(), "agent".into()];
+    app.container_state.select(Some(1));
+    app.mode = match scope {
+        "table" => Mode::Table,
+        "command" => Mode::Command,
+        "filter" => Mode::Filter,
+        "detail" => Mode::Detail,
+        "diff" => Mode::Diff,
+        "events" => Mode::Events,
+        "logs" => Mode::Logs,
+        "log_filter" => Mode::LogFilter,
+        "doc_filter" => Mode::DocFilter,
+        "help" => Mode::Help,
+        "namespaces" => Mode::Namespaces,
+        "contexts" | "context_filter" => Mode::Contexts,
+        "sort_picker" => Mode::SortPicker,
+        "copy_picker" => Mode::CopyPicker,
+        "containers" => Mode::Containers,
+        "set_image" => Mode::SetImage,
+        "confirm" => Mode::Confirm,
+        "prompt" => Mode::Prompt,
+        "pulse" => Mode::Pulse,
+        "xray" => Mode::Xray,
+        "explain" => Mode::Explain,
+        "timeline" => Mode::Timeline,
+        "gitops" => Mode::Gitops,
+        "adjacent" => Mode::Adjacent,
+        "flux_menu" => Mode::FluxMenu,
+        "transfer_menu" => Mode::TransferMenu,
+        "port_forwards" => Mode::PortForwards,
+        "skins" => Mode::Skins,
+        "snapshots" => Mode::Snapshots,
+        "fleet" => Mode::Fleet,
+        "find" => Mode::Find,
+        "pvc_explore" => Mode::PvcExplore,
+        "port_forward_picker" => Mode::PortForwardPicker,
+        _ => panic!("missing fixture for {scope}"),
+    };
+    app.ctx_filtering = scope == "context_filter";
+    (app, rx)
+}
+
+fn key_action_state(app: &App) -> serde_json::Value {
+    json!({
+        "navigation": {
+            "mode": format!("{:?}", app.mode), "kind": app.kind_plural,
+            "namespace": app.namespace, "selected": app.table_state.selected(),
+            "quit": app.should_quit, "compact": app.compact, "wide": app.wide,
+            "marked": app.marked, "sort": app.sort_column, "desc": app.sort_desc,
+            "faults": app.faults_only, "flash": app.flash,
+        },
+        "input": {
+            "command": app.command, "suggestion": app.cmd_sel, "filter": app.filter,
+            "prompt": app.prompt_input, "prompt_label": app.prompt_label,
+            "confirm": app.confirm_label, "confirm_pending": app.confirm_action.is_some(),
+            "suspend": app.pending.is_some(), "namespaces": app.ns_state.selected(),
+            "namespace_filter": app.ns_filter, "contexts": app.ctx_state.selected(),
+            "context_filter": app.ctx_filter, "context_filtering": app.ctx_filtering,
+            "container": app.container_state.selected(),
+            "sort_picker": app.sort_picker_state.selected(), "copy_picker": app.copy_picker_state.selected(),
+        },
+        "document": {
+            "title": app.detail.title, "scroll": app.detail.scroll,
+            "horizontal": app.detail.hscroll, "wrap": app.detail.wrap,
+            "filter": app.detail.filter, "match": app.detail.match_idx,
+            "help_scroll": app.help_scroll, "help_filter": app.help_filter,
+        },
+        "logs": {
+            "scroll": app.logs.view.scroll, "follow": app.logs.follow, "wrap": app.logs.wrap,
+            "fullscreen": app.logs.fullscreen, "timestamps": app.logs.timestamps,
+            "stopped": app.logs.stopped, "since": app.logs.since_anchor, "filter": app.logs.filter,
+        },
+        "lists": [app.xray_state.selected(), app.timeline_state.selected(), app.explain_state.selected(),
+            app.gitops_state.selected(), app.adjacent_state.selected(), app.find_state.selected(),
+            app.fleet_state.selected(), app.snapshot_state.selected(), app.skin_state.selected(),
+            app.flux_menu_state.selected(), app.transfer_menu_state.selected(), app.pf_state.selected()],
+    })
+}
+
+#[tokio::test]
+async fn every_builtin_action_has_the_same_effect_after_rebinding() {
+    let defaults = Keymap::default();
+    for (scope, action, chords) in defaults.entries() {
+        let cfg: crate::config::Config =
+            toml::from_str(&format!("[keys.{scope}]\n{} = 'f24'\n", action.name())).unwrap();
+        let configured = Keymap::compile(&cfg.keys).unwrap();
+        for chord in chords {
+            let (mut original, _rx1) = key_action_fixture(scope);
+            let (mut changed, _rx2) = key_action_fixture(scope);
+            changed.keymap = configured.clone();
+            let mut modifiers = KeyModifiers::NONE;
+            modifiers.set(KeyModifiers::CONTROL, chord.ctrl);
+            modifiers.set(KeyModifiers::ALT, chord.alt);
+            modifiers.set(KeyModifiers::SHIFT, chord.shift);
+            original
+                .handle_key(KeyEvent::new(chord.code, modifiers))
+                .unwrap();
+            changed.handle_key(press(KeyCode::F(24))).unwrap();
+            assert_eq!(
+                key_action_state(&original),
+                key_action_state(&changed),
+                "keys.{scope}.{} with {}",
+                action.name(),
+                chord.label()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn custom_keys_are_visible_in_help_header_and_footer() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    use_keys(&mut app, &format!("{PAGING_KEYS}\nyaml = []\n"));
+    let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
+    let screen = |app: &mut App, terminal: &mut Terminal<TestBackend>| {
+        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>()
+    };
+    // The header shows the reassigned delete key and disabled YAML action.
+    let text = screen(&mut app, &mut terminal);
+    assert!(text.contains("alt-d"), "{text}");
+    assert!(text.contains("unbound yaml"), "{text}");
+    app.hide_header = true;
+    let text = screen(&mut app, &mut terminal);
+    assert!(text.contains("alt-d:delete"), "{text}");
+    assert!(text.contains("unbound:yaml"), "{text}");
+    app.handle_key(press(KeyCode::Char('?'))).unwrap();
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "page down".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let text = screen(&mut app, &mut terminal);
+    assert!(text.contains("ctrl-d"), "{text}");
+    assert!(text.contains("pagedown"), "{text}");
+}
+
+#[tokio::test]
+async fn key_warnings_report_hidden_bindings_without_blocking_released_keys() {
+    let (mut app, _rx) = test_app();
+    app.plugins = vec![crate::config::Plugin {
+        name: "pod-inspect".into(),
+        key: "x".into(),
+        scopes: vec!["pods".into()],
+        ..Default::default()
+    }];
+    app.bookmarks = vec![crate::config::Bookmark {
+        name: "services".into(),
+        key: Some("ctrl-d".into()),
+        resource: "services".into(),
+        ..Default::default()
+    }];
+    let warnings = app.configure_keys(&Default::default());
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("services"));
+    assert!(warnings[0].contains("keys.table.delete"));
+    let cfg: crate::config::Config = toml::from_str("[keys.table]\ndelete = []").unwrap();
+    assert!(app.configure_keys(&cfg.keys).is_empty());
+    app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+    assert_eq!(app.kind_plural, "services");
+}
+
+#[tokio::test]
+async fn shifted_navigation_keeps_default_list_behavior() {
+    let defaults = Keymap::default();
+    let mut scopes = std::collections::BTreeSet::new();
+    for (scope, _, _) in defaults.entries() {
+        scopes.insert(scope);
+    }
+    for scope in scopes {
+        // Palette completion already used exact chord matching before this PR.
+        if scope == "command" {
+            continue;
+        }
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            if defaults.action(scope, &press(code)).is_none() {
+                continue;
+            }
+            let (mut plain, _rx1) = key_action_fixture(scope);
+            let (mut shifted, _rx2) = key_action_fixture(scope);
+            plain.handle_key(press(code)).unwrap();
+            shifted
+                .handle_key(KeyEvent::new(code, KeyModifiers::SHIFT))
+                .unwrap();
+            assert_eq!(
+                key_action_state(&plain),
+                key_action_state(&shifted),
+                "{scope}: {code:?}"
+            );
+        }
+    }
+    let (mut app, _rx) = key_action_fixture("table");
+    for (code, row) in [
+        (KeyCode::Down, 5),
+        (KeyCode::Up, 4),
+        (KeyCode::PageDown, 7),
+        (KeyCode::PageUp, 4),
+        (KeyCode::Home, 0),
+        (KeyCode::End, 11),
+    ] {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(app.table_state.selected(), Some(row), "{code:?}");
+    }
+}
+
+#[tokio::test]
+async fn explicit_shifted_navigation_bindings_remain_distinct() {
+    let (mut app, _rx) = key_action_fixture("table");
+    use_keys(
+        &mut app,
+        "[keys.table]\ndown = 'down'\nup = ['up', 'shift-down']",
+    );
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    assert_eq!(app.table_state.selected(), Some(5));
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(app.table_state.selected(), Some(4));
+    use_keys(&mut app, "[keys.table]\ndown = ['down', 'shift-down']");
+    for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+        app.handle_key(KeyEvent::new(KeyCode::Down, modifiers))
+            .unwrap();
+    }
+    assert_eq!(app.table_state.selected(), Some(6));
+}
+
+#[tokio::test]
+async fn palette_config_reload_migrates_with_a_backup() {
+    let dir = std::env::temp_dir().join(format!("sofka-palette-migrate-{}", std::process::id()));
+    let original = "# Keep this comment\nhide_header = true\n[keys]\n# Next suggestion\npalette_next = 'ctrl-n' # next\npalette_prev = 'ctrl-p'\npalette_accept = ['ctrl-y', 'enter']\n[keys.table]\npage_down = 'f8'\n";
+    write_config(&dir, original);
+    let (mut app, _rx) = key_action_fixture("table");
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    palette(&mut app, "reload");
+    assert!(app.hide_header);
+    let updated = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+    assert!(updated.contains("# Keep this comment"));
+    assert!(updated.contains("# Next suggestion"));
+    assert!(updated.contains("# next"));
+    assert!(!updated.contains("palette_next"));
+    assert!(updated.contains("[keys.command]"));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("config.toml.bak")).unwrap(),
+        original
+    );
+    assert!(app.config_warnings.iter().any(|w| w.contains("backup:")));
+    app.handle_key(press(KeyCode::F(8))).unwrap();
+    assert_eq!(app.table_state.selected(), Some(7));
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    app.handle_key(ctrl(KeyCode::Char('n'))).unwrap();
+    assert_eq!(app.cmd_sel, 1);
+    app.handle_key(ctrl(KeyCode::Char('p'))).unwrap();
+    assert_eq!(app.cmd_sel, 0);
+    for c in "services".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.kind_plural, "services");
+    palette(&mut app, "reload");
+    assert!(app.config_warnings.is_empty(), "{:?}", app.config_warnings);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("config.toml")).unwrap(),
+        updated
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("config.toml.bak")).unwrap(),
+        original
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn invalid_palette_migrations_warn_without_changing_the_file() {
+    let dir = std::env::temp_dir().join(format!("sofka-palette-invalid-{}", std::process::id()));
+    for settings in [
+        "palette_next = ['shift--', '_']",
+        "palette_next = ['ctrl-c', '_']",
+        "palette_next = ['_', 5]",
+        "palette_next = 5",
+        "palette_next = 'enter'\npalette_prev = 'enter'",
+        "palette_next = 'f7'\n[keys.command]\ndown = 'f8'",
+    ] {
+        let original = format!("hide_header = true\n[keys]\n{settings}\n");
+        write_config(&dir, &original);
+        let (mut app, _rx) = test_app();
+        app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+        palette(&mut app, "reload");
+        assert!(app.hide_header);
+        assert!(!app.config_warnings.is_empty(), "{settings}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.toml")).unwrap(),
+            original
+        );
+        assert!(!dir.join("config.toml.bak").exists());
+        if settings.contains("[keys.command]") {
+            app.handle_key(press(KeyCode::Char(':'))).unwrap();
+            app.handle_key(press(KeyCode::F(8))).unwrap();
+            assert_eq!(app.cmd_sel, 1);
+            app.handle_key(press(KeyCode::F(7))).unwrap();
+            assert_eq!(app.cmd_sel, 1);
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn empty_legacy_palette_binding_migrates_without_default_fallback() {
+    let dir = std::env::temp_dir().join(format!("sofka-palette-empty-{}", std::process::id()));
+    write_config(&dir, "[keys]\npalette_next = []");
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    palette(&mut app, "reload");
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    assert_eq!(app.cmd_sel, 0);
+    assert!(app.keymap.chords("command", Action::Down).is_empty());
+    assert!(dir.join("config.toml.bak").exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_palette_config_warns_and_uses_migrated_bindings_in_memory() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let dir = std::env::temp_dir().join(format!("sofka-palette-managed-{}", std::process::id()));
+    for linked in [false, true] {
+        let original = "[keys]\npalette_next = 'ctrl-n'";
+        write_config(&dir, original);
+        let path = dir.join("config.toml");
+        let source = dir.join("managed.toml");
+        if linked {
+            std::fs::rename(&path, &source).unwrap();
+            symlink(&source, &path).unwrap();
+        } else {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        let (mut app, _rx) = test_app();
+        app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+        palette(&mut app, "reload");
+        let warnings = app.config_warnings.join("\n");
+        assert!(
+            warnings.contains("cannot save config migration"),
+            "{warnings}"
+        );
+        assert!(
+            warnings.contains("using migrated keys in memory"),
+            "{warnings}"
+        );
+        assert!(warnings.contains("Update [keys.command]"), "{warnings}");
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        app.handle_key(ctrl(KeyCode::Char('n'))).unwrap();
+        assert_eq!(app.cmd_sel, 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(!dir.join("config.toml.bak").exists());
+        if linked {
+            assert!(
+                std::fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        } else {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn migrated_and_scoped_palette_bindings_have_the_same_effect() {
+    let dir = std::env::temp_dir().join(format!("sofka-palette-equivalent-{}", std::process::id()));
+    for (legacy, action, binding, event) in [
+        ("palette_next", "down", "ctrl-w", ctrl(KeyCode::Char('w'))),
+        ("palette_accept", "accept", "esc", press(KeyCode::Esc)),
+        (
+            "palette_accept",
+            "accept",
+            "backspace",
+            press(KeyCode::Backspace),
+        ),
+    ] {
+        let (mut old, _rx1) = test_app();
+        let (mut new, _rx2) = test_app();
+        write_config(&dir, &format!("[keys]\n{legacy} = '{binding}'"));
+        old.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+        palette(&mut old, "reload");
+        old.flash.clear();
+        new.flash.clear();
+        use_keys(&mut new, &format!("[keys.command]\n{action} = '{binding}'"));
+        for app in [&mut old, &mut new] {
+            app.handle_key(press(KeyCode::Char(':'))).unwrap();
+            for c in "services".chars() {
+                app.handle_key(press(KeyCode::Char(c))).unwrap();
+            }
+            app.handle_key(event).unwrap();
+        }
+        assert_eq!(key_action_state(&old), key_action_state(&new), "{legacy}");
+        if action == "accept" {
+            assert_eq!(new.mode, Mode::Table);
+            assert_eq!(new.kind_plural, "services");
+        } else {
+            assert_eq!(new.command, "services");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn palette_migration_preserves_config_layer_precedence() {
+    let dir = std::env::temp_dir().join(format!("sofka-palette-layers-{}", std::process::id()));
+    write_config(&dir, "[keys]\npalette_next = 'f7'");
+    let cluster = dir.join("clusters/test-cluster");
+    write_config(&cluster, "[keys]\npalette_next = 'f8'");
+    let context = cluster.join("new");
+    write_config(
+        &context,
+        "[keys]\npalette_prev = 'f10'\n[keys.command]\ndown = 'f9'",
+    );
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    palette(&mut app, "reload");
+    palette(&mut app, "ctx new");
+    land_context(&mut app, "new");
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for key in [KeyCode::F(7), KeyCode::F(8)] {
+        app.handle_key(press(key)).unwrap();
+        assert_eq!(app.cmd_sel, 0);
+    }
+    app.handle_key(press(KeyCode::F(9))).unwrap();
+    assert_eq!(app.cmd_sel, 1);
+    app.handle_key(press(KeyCode::F(10))).unwrap();
+    assert_eq!(app.cmd_sel, 0);
+    for source in [&dir, &cluster, &context] {
+        assert!(source.join("config.toml.bak").exists());
+        let text = std::fs::read_to_string(source.join("config.toml")).unwrap();
+        assert!(!text.contains("palette_"), "{text}");
+    }
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    palette(&mut app, "ctx other");
+    land_context(&mut app, "other");
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    app.handle_key(press(KeyCode::F(8))).unwrap();
+    assert_eq!(app.cmd_sel, 1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn wheel_and_keyboard_arrows_cancel_default_confirmations() {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+    for (code, kind) in [
+        (KeyCode::Up, MouseEventKind::ScrollUp),
+        (KeyCode::Down, MouseEventKind::ScrollDown),
+    ] {
+        for settings in [
+            "",
+            "[keys.navigation]\nback = ['esc', 'ctrl-g']",
+            "[keys.confirm]\nback = []",
+        ] {
+            let (mut keyboard, _rx1) = key_action_fixture("table");
+            let (mut wheel, _rx2) = key_action_fixture("table");
+            for app in [&mut keyboard, &mut wheel] {
+                app.readonly = false;
+                use_keys(app, settings);
+                app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+                assert_eq!(app.mode, Mode::Confirm);
+            }
+            for _ in 0..3 {
+                keyboard.handle_key(press(code)).unwrap();
+            }
+            wheel
+                .handle_mouse(MouseEvent {
+                    kind,
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                })
+                .unwrap();
+            assert_eq!(
+                key_action_state(&keyboard),
+                key_action_state(&wheel),
+                "{settings}: {code:?}"
+            );
+            assert_eq!(
+                wheel.mode,
+                if settings.contains("back = []") {
+                    Mode::Confirm
+                } else {
+                    Mode::Table
+                }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn shared_navigation_back_keeps_confirmation_cancel_keys() {
+    let (mut app, _rx) = key_action_fixture("table");
+    app.readonly = false;
+    use_keys(&mut app, "[keys.navigation]\nback = ['esc', 'ctrl-g']");
+    for event in [
+        press(KeyCode::Char('n')),
+        press(KeyCode::Char('q')),
+        ctrl(KeyCode::Char('g')),
+    ] {
+        app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+        assert_eq!(app.mode, Mode::Confirm);
+        app.handle_key(event).unwrap();
+        assert_eq!(app.mode, Mode::Table);
+        assert!(app.confirm_action.is_none());
+    }
+}
+
+#[tokio::test]
+async fn malformed_key_settings_do_not_discard_other_configuration() {
+    let dir = std::env::temp_dir().join(format!("sofka-key-shapes-{}", std::process::id()));
+    let other_settings = r#"
+hide_header = true
+[skin]
+name = "catppuccin-mocha"
+[[bookmarks]]
+name = "services"
+key = "alt-b"
+resource = "services"
+[[plugins]]
+name = "example"
+key = "alt-p"
+command = "true"
+mutating = false
+[views.pods]
+columns = [{ name = "NAME", path = "/metadata/name" }]
+"#;
+    for bad in [
+        "[keys]\npalette_nxt = 'ctrl-n'",
+        "[keys.table]\ndelete = 5",
+        "[keys.table]\ndelete = ['alt-d', 5]",
+        "[keys]\ntable = 5",
+    ] {
+        write_config(&dir, &format!("{other_settings}\n{bad}"));
+        let (mut app, _rx) = test_app();
+        app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+        palette(&mut app, "reload");
+        palette(&mut app, "ctx new");
+        land_context(&mut app, "new");
+        assert!(app.hide_header, "{bad}");
+        assert!(app.plugins.iter().any(|p| p.name == "example"), "{bad}");
+        assert!(app.user_views.contains_key("pods"), "{bad}");
+        assert_eq!(app.active_skin.as_deref(), Some("catppuccin-mocha"));
+        assert!(app.keymap.is_default(), "{bad}");
+        let warnings = app.config_warnings.join("\n");
+        assert!(warnings.contains("keys."), "{warnings}");
+        assert!(warnings.contains("default keymap kept"), "{warnings}");
+        app.handle_key(alt(KeyCode::Char('b'))).unwrap();
+        assert_eq!(app.kind_plural, "services");
+    }
+    // A later key shape error retains the existing keymap but applies other settings.
+    write_config(&dir, "[keys.table]\npage_down = 'f8'");
+    let (mut app, _rx) = key_action_fixture("table");
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    palette(&mut app, "reload");
+    write_config(&dir, "hide_header = true\n[keys.table]\ndelete = 5");
+    palette(&mut app, "reload");
+    assert!(app.hide_header);
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::F(8))).unwrap();
+    assert_eq!(app.table_state.selected(), Some(3));
+    assert!(
+        app.config_warnings
+            .iter()
+            .any(|w| w.contains("previous keymap kept"))
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn context_key_errors_name_the_destination_config() {
+    let dir = std::env::temp_dir().join(format!("sofka-key-paths-{}", std::process::id()));
+    write_config(&dir, "");
+    write_config(
+        &dir.join("clusters/test-cluster/old"),
+        "[keys.table]\npage_down = 'f8'",
+    );
+    write_config(
+        &dir.join("clusters/test-cluster/new"),
+        "[keys.table]\ndelete = 5",
+    );
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    palette(&mut app, "ctx old");
+    land_context(&mut app, "old");
+    assert_eq!(app.keymap.label("table", Action::PageDown), "f8");
+    palette(&mut app, "ctx new");
+    land_context(&mut app, "new");
+    let warnings = app.config_warnings.join("\n");
+    assert!(warnings.contains("new/config.toml"), "{warnings}");
+    assert!(!warnings.contains("old/config.toml"), "{warnings}");
+    assert!(warnings.contains("keys.table.delete"), "{warnings}");
+    assert!(warnings.contains("previous keymap kept"), "{warnings}");
+    assert_eq!(app.keymap.label("table", Action::PageDown), "f8");
+    std::fs::remove_dir_all(dir).unwrap();
 }

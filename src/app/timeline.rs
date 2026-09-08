@@ -28,26 +28,24 @@ impl App {
         self.mode = Mode::Timeline;
     }
 
-    pub(super) fn key_timeline(&mut self, key: KeyEvent) {
+    pub(super) fn key_timeline(&mut self, key: KeyInput) {
         let len = self
             .timeline_target
             .as_ref()
             .and_then(|(p, rk)| self.timeline.entries(p, rk))
             .map(|e| e.len())
             .unwrap_or(0);
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => {
                 self.mode = self.return_mode;
                 if self.return_mode == Mode::Table {
                     self.restore_selection();
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => list_step(&mut self.timeline_state, len, true),
-            KeyCode::Char('k') | KeyCode::Up => list_step(&mut self.timeline_state, len, false),
-            KeyCode::Char('g') | KeyCode::Home if len > 0 => self.timeline_state.select(Some(0)),
-            KeyCode::Char('G') | KeyCode::End if len > 0 => {
-                self.timeline_state.select(Some(len - 1))
-            }
+            (Some(Action::Down), _) => list_step(&mut self.timeline_state, len, true),
+            (Some(Action::Up), _) => list_step(&mut self.timeline_state, len, false),
+            (Some(Action::First), _) if len > 0 => self.timeline_state.select(Some(0)),
+            (Some(Action::Last), _) if len > 0 => self.timeline_state.select(Some(len - 1)),
             _ => {}
         }
     }

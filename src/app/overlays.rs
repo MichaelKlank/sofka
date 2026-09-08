@@ -2,13 +2,13 @@ use super::actions::forward_target;
 use super::*;
 
 impl App {
-    pub(super) fn key_containers(&mut self, key: KeyEvent) {
+    pub(super) fn key_containers(&mut self, key: KeyInput) {
         let len = self.container_list.len();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Table,
-            KeyCode::Char('j') | KeyCode::Down => list_step(&mut self.container_state, len, true),
-            KeyCode::Char('k') | KeyCode::Up => list_step(&mut self.container_state, len, false),
-            KeyCode::Enter | KeyCode::Char('l') => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => self.mode = Mode::Table,
+            (Some(Action::Down), _) => list_step(&mut self.container_state, len, true),
+            (Some(Action::Up), _) => list_step(&mut self.container_state, len, false),
+            (Some(Action::Logs), _) => {
                 if let Some(i) = self.container_state.selected()
                     && let Some(c) = self.container_list.get(i).cloned()
                     && let Some((ns, name)) = self.container_pod.clone()
@@ -24,7 +24,7 @@ impl App {
                     );
                 }
             }
-            KeyCode::Char('p') => {
+            (Some(Action::PreviousLogs), _) => {
                 if let Some(i) = self.container_state.selected()
                     && let Some(c) = self.container_list.get(i).cloned()
                     && let Some((ns, name)) = self.container_pod.clone()
@@ -40,7 +40,7 @@ impl App {
                     );
                 }
             }
-            KeyCode::Char('s') => {
+            (Some(Action::Shell), _) => {
                 if let Some(i) = self.container_state.selected()
                     && let Some(c) = self.container_list.get(i).cloned()
                     && let Some((ns, name)) = self.container_pod.clone()
@@ -48,7 +48,7 @@ impl App {
                     self.exec_into(ns, name, Some(c));
                 }
             }
-            KeyCode::Char('L') => {
+            (Some(Action::ProviderLogs), _) => {
                 if let Some(i) = self.container_state.selected()
                     && let Some(c) = self.container_list.get(i).cloned()
                     && let Some((ns, name)) = self.container_pod.clone()
@@ -57,7 +57,7 @@ impl App {
                 }
             }
             // Transfer files to/from this container (`kubectl cp -c`).
-            KeyCode::Char('t') => {
+            (Some(Action::Transfer), _) => {
                 if let Some(i) = self.container_state.selected()
                     && let Some(c) = self.container_list.get(i).cloned()
                     && let Some((ns, name)) = self.container_pod.clone()
@@ -68,7 +68,7 @@ impl App {
             // Debug an ephemeral container targeting this container's namespace
             // (`kubectl debug --target`). The picker's pod is the selected row,
             // so request_debug reads it back from the table selection.
-            KeyCode::Char('d') => {
+            (Some(Action::Debug), _) => {
                 if let Some(i) = self.container_state.selected()
                     && let Some(c) = self.container_list.get(i).cloned()
                 {
@@ -171,9 +171,9 @@ impl App {
         }
     }
 
-    pub(super) fn key_confirm(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+    pub(super) fn key_confirm(&mut self, key: KeyInput) {
+        match (key.action, key.code) {
+            (Some(Action::Accept), _) => {
                 let back = self.overlay_return();
                 if let Some(action) = self.confirm_action.take() {
                     self.run_confirm_action(action);
@@ -186,7 +186,7 @@ impl App {
                 }
                 self.confirm_return = Mode::Table;
             }
-            KeyCode::Char('f') | KeyCode::Char('F') => {
+            (Some(Action::Force), _) => {
                 let update = match self.confirm_action.as_mut() {
                     Some(ConfirmAction::Delete {
                         targets,
@@ -209,7 +209,7 @@ impl App {
                     );
                 }
             }
-            KeyCode::Char('c') | KeyCode::Char('C') => {
+            (Some(Action::Cascade), _) => {
                 let update = match self.confirm_action.as_mut() {
                     Some(ConfirmAction::Delete {
                         targets,
@@ -232,7 +232,7 @@ impl App {
                     );
                 }
             }
-            _ => {
+            (Some(Action::Back), _) => {
                 // A cancelled PVC shell leaves state (possibly a helper pod)
                 // that only the suspend-and-return path would have cleaned up.
                 let cancelled = self.confirm_action.take();
@@ -242,15 +242,16 @@ impl App {
                 self.mode = self.overlay_return();
                 self.confirm_return = Mode::Table;
             }
+            _ => {}
         }
     }
 
-    pub(super) fn key_prompt(&mut self, key: KeyEvent) {
-        if edit_chord(&key, &mut self.prompt_input) {
+    pub(super) fn key_prompt(&mut self, key: KeyInput) {
+        if edit_action(key.action, &mut self.prompt_input) {
             return;
         }
-        match key.code {
-            KeyCode::Esc => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) => {
                 // Most prompts start at (and return to) the table; the
                 // lookback and rename-context prompts return to the view
                 // they were opened from.
@@ -273,7 +274,7 @@ impl App {
                 }
                 self.confirm_return = Mode::Table;
             }
-            KeyCode::Enter => {
+            (Some(Action::Accept), _) => {
                 let input = self.prompt_input.trim().to_string();
                 self.mode = if self.prompt_over_logs() {
                     Mode::Logs
@@ -392,10 +393,10 @@ impl App {
                 // has nothing to do with it.
                 self.confirm_return = Mode::Table;
             }
-            KeyCode::Backspace => {
+            (Some(Action::Backspace), _) => {
                 self.prompt_input.pop();
             }
-            KeyCode::Char(c) => self.prompt_input.push(c),
+            (None, KeyCode::Char(c)) => self.prompt_input.push(c),
             _ => {}
         }
     }
@@ -403,13 +404,13 @@ impl App {
     /// Port-forward picker (`f` on a pod/service): single-select over the
     /// object's declared ports, plus a "Custom…" entry that falls through to
     /// the typed prompt.
-    pub(super) fn key_port_forward_picker(&mut self, key: KeyEvent) {
+    pub(super) fn key_port_forward_picker(&mut self, key: KeyInput) {
         let len = self.pf_picker_items.len();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Table,
-            KeyCode::Char('j') | KeyCode::Down => list_step(&mut self.pf_picker_state, len, true),
-            KeyCode::Char('k') | KeyCode::Up => list_step(&mut self.pf_picker_state, len, false),
-            KeyCode::Enter => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => self.mode = Mode::Table,
+            (Some(Action::Down), _) => list_step(&mut self.pf_picker_state, len, true),
+            (Some(Action::Up), _) => list_step(&mut self.pf_picker_state, len, false),
+            (Some(Action::Accept), _) => {
                 let Some(i) = self.pf_picker_state.selected() else {
                     return;
                 };

@@ -158,13 +158,13 @@ impl App {
         }
     }
 
-    pub(super) fn key_fleet(&mut self, key: KeyEvent) {
+    pub(super) fn key_fleet(&mut self, key: KeyInput) {
         let len = self.fleet_rows.len();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Table,
-            KeyCode::Char('j') | KeyCode::Down => list_step(&mut self.fleet_state, len, true),
-            KeyCode::Char('k') | KeyCode::Up => list_step(&mut self.fleet_state, len, false),
-            KeyCode::Char('r') => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => self.mode = Mode::Table,
+            (Some(Action::Down), _) => list_step(&mut self.fleet_state, len, true),
+            (Some(Action::Up), _) => list_step(&mut self.fleet_state, len, false),
+            (Some(Action::Refresh), _) => {
                 // Re-gather: reset rows to connecting, keeping resolved policy.
                 for r in &mut self.fleet_rows {
                     *r = FleetRow::connecting(r.context.clone(), r.readonly);
@@ -173,7 +173,7 @@ impl App {
             }
             // Enter switches to the highlighted context via the normal
             // context-switch path, landing on its default view.
-            KeyCode::Enter => {
+            (Some(Action::Accept), _) => {
                 if let Some(ctx) = self
                     .fleet_state
                     .selected()

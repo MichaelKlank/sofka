@@ -128,14 +128,14 @@ impl App {
             .collect();
     }
 
-    pub(super) fn key_snapshots(&mut self, key: KeyEvent) {
+    pub(super) fn key_snapshots(&mut self, key: KeyInput) {
         let len = self.snapshot_list.len();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Table,
-            KeyCode::Char('j') | KeyCode::Down => list_step(&mut self.snapshot_state, len, true),
-            KeyCode::Char('k') | KeyCode::Up => list_step(&mut self.snapshot_state, len, false),
-            KeyCode::Enter => self.open_selected_snapshot(),
-            KeyCode::Char('d') => self.delete_selected_snapshot(),
+        match (key.action, key.code) {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => self.mode = Mode::Table,
+            (Some(Action::Down), _) => list_step(&mut self.snapshot_state, len, true),
+            (Some(Action::Up), _) => list_step(&mut self.snapshot_state, len, false),
+            (Some(Action::Accept), _) => self.open_selected_snapshot(),
+            (Some(Action::Delete), _) => self.delete_selected_snapshot(),
             _ => {}
         }
     }

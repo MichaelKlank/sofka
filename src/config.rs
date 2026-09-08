@@ -34,10 +34,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crossterm::event::KeyCode;
 use serde::Deserialize;
 
-use crate::keys::KeyChord;
+mod key_migration;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -108,8 +107,7 @@ pub struct Config {
     pub remember_sort: Option<bool>,
     /// How `:notify` events are delivered — see [`NotifyConfig`].
     pub notify: NotifyConfig,
-    /// Command-palette completion key rebinds — see [`KeysConfig`]. Compiled
-    /// and validated by [`compile_palette_keys`].
+    /// Built-in keyboard bindings, validated by [`crate::keymap::Keymap::compile`].
     pub keys: KeysConfig,
     /// Structured application logging — see [`LoggingConfig`].
     pub logging: LoggingConfig,
@@ -179,115 +177,15 @@ pub fn notify_warnings(cfg: &NotifyConfig) -> Vec<String> {
     warnings
 }
 
-/// Key overrides for the `:` command-palette completion popup — emacs/cmp
-/// style rebinds, for example:
-///
-/// ```toml
-/// [keys]
-/// palette_next   = "ctrl-n"            # default: ["tab", "down"]
-/// palette_prev   = "ctrl-p"            # default: ["backtab", "up"]
-/// palette_accept = ["ctrl-y", "enter"] # default: ["enter"]
-/// ```
-///
-/// Each value is one key chord (see [`crate::keys::KeyChord`]) or a list of
-/// them, and *replaces* the default set for that action — include a default
-/// chord in the list to keep it too. Compiled and validated by
-/// [`compile_palette_keys`].
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct KeysConfig {
-    /// Move the suggestion highlight down.
-    pub palette_next: Option<Chords>,
-    /// Move the suggestion highlight up.
-    pub palette_prev: Option<Chords>,
-    /// Run the highlighted suggestion (or the typed text).
-    pub palette_accept: Option<Chords>,
-}
-
-/// One key chord, or a list of chords that all trigger the same action.
+/// Keep key settings as TOML values so key errors cannot discard other settings.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum Chords {
-    One(String),
-    Many(Vec<String>),
-}
+#[serde(transparent)]
+pub struct KeysConfig(pub toml::Value);
 
-impl Chords {
-    fn as_slice(&self) -> &[String] {
-        match self {
-            Chords::One(s) => std::slice::from_ref(s),
-            Chords::Many(v) => v,
-        }
-    }
-}
-
-/// Compiled `[keys]` palette bindings, with defaults filled in.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PaletteKeys {
-    pub next: Vec<KeyChord>,
-    pub prev: Vec<KeyChord>,
-    pub accept: Vec<KeyChord>,
-}
-
-impl Default for PaletteKeys {
+impl Default for KeysConfig {
     fn default() -> Self {
-        let plain = |code| KeyChord {
-            code,
-            ctrl: false,
-            alt: false,
-            shift: false,
-        };
-        Self {
-            next: vec![plain(KeyCode::Tab), plain(KeyCode::Down)],
-            prev: vec![plain(KeyCode::BackTab), plain(KeyCode::Up)],
-            accept: vec![plain(KeyCode::Enter)],
-        }
+        Self(toml::Value::Table(toml::Table::new()))
     }
-}
-
-impl PaletteKeys {
-    pub fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
-}
-
-/// Compile `[keys]` palette bindings. A chord that doesn't parse, or that
-/// collides with a reserved global (`ctrl-c` quit, `ctrl-e` compact toggle),
-/// warns and is dropped; an action left with no usable chord falls back to
-/// its default so the palette never becomes unusable.
-pub fn compile_palette_keys(cfg: &KeysConfig) -> (PaletteKeys, Vec<String>) {
-    let mut warnings = Vec::new();
-    let defaults = PaletteKeys::default();
-    let mut action = |name: &str, spec: &Option<Chords>, default: &[KeyChord]| {
-        let Some(spec) = spec else {
-            return default.to_vec();
-        };
-        let mut out = Vec::new();
-        for s in spec.as_slice() {
-            match KeyChord::parse(s) {
-                Ok(c) if c.ctrl && matches!(c.code, KeyCode::Char('c' | 'e')) => {
-                    warnings.push(format!(
-                        "keys: {name}: {} is reserved by a built-in; ignored",
-                        c.label()
-                    ));
-                }
-                Ok(c) => out.push(c),
-                Err(e) => warnings.push(format!("keys: {name}: {e}")),
-            }
-        }
-        if out.is_empty() {
-            warnings.push(format!("keys: {name} has no usable chord; using default"));
-            default.to_vec()
-        } else {
-            out
-        }
-    };
-    let keys = PaletteKeys {
-        next: action("palette_next", &cfg.palette_next, &defaults.next),
-        prev: action("palette_prev", &cfg.palette_prev, &defaults.prev),
-        accept: action("palette_accept", &cfg.palette_accept, &defaults.accept),
-    };
-    (keys, warnings)
 }
 
 /// A named, saved port-forward. Shows up in `:pf` even when stopped, so one
@@ -1391,10 +1289,20 @@ impl ConfigLoader {
             .clone()
             .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
         let mut overlay = toml::Value::Table(toml::map::Map::new());
+        let mut migrations = Vec::new();
+        if let Some(path) = self.base_path()
+            && let Some(migration) = key_migration::prepare(&mut merged, &path, &mut warnings)
+        {
+            migrations.push(migration);
+        }
+        let base = merged.clone();
 
         for path in self.override_paths(context, cluster) {
             match read_value(&path) {
-                Ok(Some(v)) => {
+                Ok(Some(mut v)) => {
+                    if let Some(migration) = key_migration::prepare(&mut v, &path, &mut warnings) {
+                        migrations.push(migration);
+                    }
                     merge(&mut merged, v.clone());
                     merge(&mut overlay, v);
                 }
@@ -1405,13 +1313,19 @@ impl ConfigLoader {
 
         // A type mismatch introduced by an override drops back to the base
         // config (validated at load time) rather than losing everything.
+        let mut valid_config = true;
         let mut config: Config = merged.try_into().unwrap_or_else(|e| {
+            valid_config = false;
             warnings.push(format!("ignoring cluster overrides: {e}"));
-            self.base
-                .clone()
-                .and_then(|b| b.try_into().ok())
-                .unwrap_or_default()
+            base.try_into().unwrap_or_default()
         });
+        if !migrations.is_empty() {
+            key_migration::finish(
+                migrations,
+                valid_config && crate::keymap::Keymap::compile(&config.keys).is_ok(),
+                &mut warnings,
+            );
+        }
         if let Some(dir) = &self.dir {
             crate::plugins::load_packages(&dir.join("plugins"), &mut config.plugins, &mut warnings);
         }
@@ -1540,63 +1454,6 @@ mod tests {
             assert_eq!(cfg.compact_mode, expected);
         }
         assert!(toml::from_str::<Config>("compact_mode = 'true'").is_err());
-    }
-
-    #[test]
-    fn palette_keys_default_when_unset() {
-        let cfg: Config = toml::from_str("").unwrap();
-        let (keys, warnings) = compile_palette_keys(&cfg.keys);
-        assert!(warnings.is_empty());
-        assert!(keys.is_default());
-    }
-
-    #[test]
-    fn palette_keys_accept_string_or_list() {
-        let toml = r#"
-            [keys]
-            palette_next = "ctrl-n"
-            palette_prev = "ctrl-p"
-            palette_accept = ["ctrl-y", "enter"]
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let (keys, warnings) = compile_palette_keys(&cfg.keys);
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(keys.next, vec![KeyChord::parse("ctrl-n").unwrap()]);
-        assert_eq!(keys.prev, vec![KeyChord::parse("ctrl-p").unwrap()]);
-        assert_eq!(
-            keys.accept,
-            vec![
-                KeyChord::parse("ctrl-y").unwrap(),
-                KeyChord::parse("enter").unwrap()
-            ]
-        );
-        assert!(!keys.is_default());
-    }
-
-    #[test]
-    fn palette_keys_bad_chord_warns_and_falls_back() {
-        let toml = r#"
-            [keys]
-            palette_next = "hyper-n"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let (keys, warnings) = compile_palette_keys(&cfg.keys);
-        assert_eq!(warnings.len(), 2, "{warnings:?}"); // parse error + fallback
-        assert!(warnings[0].contains("palette_next"), "{warnings:?}");
-        assert_eq!(keys.next, PaletteKeys::default().next);
-    }
-
-    #[test]
-    fn palette_keys_reserved_chord_is_dropped() {
-        let toml = r#"
-            [keys]
-            palette_accept = ["ctrl-c", "ctrl-y"]
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let (keys, warnings) = compile_palette_keys(&cfg.keys);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("reserved"), "{warnings:?}");
-        assert_eq!(keys.accept, vec![KeyChord::parse("ctrl-y").unwrap()]);
     }
 
     #[test]

@@ -249,14 +249,14 @@ impl App {
         value
     }
 
-    pub(super) fn key_sort_picker(&mut self, key: KeyEvent) {
-        if edit_chord(&key, &mut self.sort_picker_filter) {
+    pub(super) fn key_sort_picker(&mut self, key: KeyInput) {
+        if edit_action(key.action, &mut self.sort_picker_filter) {
             self.select_best_sort_match();
             return;
         }
         let len = self.filtered_sort_entries().len();
-        match key.code {
-            KeyCode::Esc => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) => {
                 // First esc clears the filter, second closes the picker.
                 if self.sort_picker_filter.is_empty() {
                     self.mode = Mode::Table;
@@ -265,15 +265,9 @@ impl App {
                     self.select_best_sort_match();
                 }
             }
-            KeyCode::Down => list_step(&mut self.sort_picker_state, len, true),
-            KeyCode::Up => list_step(&mut self.sort_picker_state, len, false),
-            KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
-                list_step(&mut self.sort_picker_state, len, true)
-            }
-            KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
-                list_step(&mut self.sort_picker_state, len, false)
-            }
-            KeyCode::Enter => {
+            (Some(Action::Down), _) => list_step(&mut self.sort_picker_state, len, true),
+            (Some(Action::Up), _) => list_step(&mut self.sort_picker_state, len, false),
+            (Some(Action::Accept), _) => {
                 if let Some(entry) = self
                     .sort_picker_state
                     .selected()
@@ -282,11 +276,11 @@ impl App {
                     self.apply_sort_choice(&entry);
                 }
             }
-            KeyCode::Backspace => {
+            (Some(Action::Backspace), _) => {
                 self.sort_picker_filter.pop();
                 self.select_best_sort_match();
             }
-            KeyCode::Char(c) => {
+            (None, KeyCode::Char(c)) => {
                 self.sort_picker_filter.push(c);
                 self.select_best_sort_match();
             }
@@ -392,14 +386,14 @@ impl App {
         value
     }
 
-    pub(super) fn key_copy_picker(&mut self, key: KeyEvent) {
-        if edit_chord(&key, &mut self.copy_picker_filter) {
+    pub(super) fn key_copy_picker(&mut self, key: KeyInput) {
+        if edit_action(key.action, &mut self.copy_picker_filter) {
             self.select_best_copy_match();
             return;
         }
         let len = self.filtered_copy_entries().len();
-        match key.code {
-            KeyCode::Esc => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) => {
                 // First esc clears the filter, second closes the picker.
                 if self.copy_picker_filter.is_empty() {
                     self.mode = Mode::Table;
@@ -408,15 +402,9 @@ impl App {
                     self.select_best_copy_match();
                 }
             }
-            KeyCode::Down => list_step(&mut self.copy_picker_state, len, true),
-            KeyCode::Up => list_step(&mut self.copy_picker_state, len, false),
-            KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
-                list_step(&mut self.copy_picker_state, len, true)
-            }
-            KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
-                list_step(&mut self.copy_picker_state, len, false)
-            }
-            KeyCode::Enter => {
+            (Some(Action::Down), _) => list_step(&mut self.copy_picker_state, len, true),
+            (Some(Action::Up), _) => list_step(&mut self.copy_picker_state, len, false),
+            (Some(Action::Accept), _) => {
                 if let Some((header, value)) = self
                     .copy_picker_state
                     .selected()
@@ -425,11 +413,11 @@ impl App {
                     self.copy_field(&header, value);
                 }
             }
-            KeyCode::Backspace => {
+            (Some(Action::Backspace), _) => {
                 self.copy_picker_filter.pop();
                 self.select_best_copy_match();
             }
-            KeyCode::Char(c) => {
+            (None, KeyCode::Char(c)) => {
                 self.copy_picker_filter.push(c);
                 self.select_best_copy_match();
             }
@@ -460,14 +448,14 @@ impl App {
         );
     }
 
-    pub(super) fn key_namespaces(&mut self, key: KeyEvent) {
-        if edit_chord(&key, &mut self.ns_filter) {
+    pub(super) fn key_namespaces(&mut self, key: KeyInput) {
+        if edit_action(key.action, &mut self.ns_filter) {
             self.select_best_namespace_match();
             return;
         }
         let len = self.filtered_namespaces().len();
-        match key.code {
-            KeyCode::Esc => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) => {
                 // First esc clears the filter and jumps back to the top
                 // (`<all>`); a second esc closes the switcher.
                 if self.ns_filter.is_empty() {
@@ -477,9 +465,9 @@ impl App {
                     self.ns_state.select(Some(0));
                 }
             }
-            KeyCode::Down => list_step(&mut self.ns_state, len, true),
-            KeyCode::Up => list_step(&mut self.ns_state, len, false),
-            KeyCode::Enter => {
+            (Some(Action::Down), _) => list_step(&mut self.ns_state, len, true),
+            (Some(Action::Up), _) => list_step(&mut self.ns_state, len, false),
+            (Some(Action::Accept), _) => {
                 let filtered = self.filtered_namespaces();
                 let has_real_match = filtered.iter().any(|n| n != "<all>");
                 let chosen = if !self.ns_filter.trim().is_empty() && !has_real_match {
@@ -495,11 +483,11 @@ impl App {
                     self.set_namespace(ns);
                 }
             }
-            KeyCode::Backspace => {
+            (Some(Action::Backspace), _) => {
                 self.ns_filter.pop();
                 self.select_best_namespace_match();
             }
-            KeyCode::Char(c) => {
+            (None, KeyCode::Char(c)) => {
                 self.ns_filter.push(c);
                 self.select_best_namespace_match();
             }
@@ -615,27 +603,27 @@ impl App {
     /// Contexts type-to-filter like the namespace picker. Existing action keys
     /// remain available while browsing; `/` explicitly starts filter input
     /// when a context name begins with one of those keys.
-    pub(super) fn key_contexts(&mut self, key: KeyEvent) {
+    pub(super) fn key_contexts(&mut self, key: KeyInput) {
         let len = self.filtered_contexts().len();
         if self.ctx_filtering {
-            if edit_chord(&key, &mut self.ctx_filter) {
+            if edit_action(key.action, &mut self.ctx_filter) {
                 self.select_best_context_match();
                 return;
             }
-            match key.code {
-                KeyCode::Esc => {
+            match (key.action, key.code) {
+                (Some(Action::Back), _) => {
                     self.ctx_filter.clear();
                     self.ctx_filtering = false;
                     self.select_current_context();
                 }
-                KeyCode::Enter => self.switch_selected_context(),
-                KeyCode::Down => list_step(&mut self.ctx_state, len, true),
-                KeyCode::Up => list_step(&mut self.ctx_state, len, false),
-                KeyCode::Backspace => {
+                (Some(Action::Accept), _) => self.switch_selected_context(),
+                (Some(Action::Down), _) => list_step(&mut self.ctx_state, len, true),
+                (Some(Action::Up), _) => list_step(&mut self.ctx_state, len, false),
+                (Some(Action::Backspace), _) => {
                     self.ctx_filter.pop();
                     self.select_best_context_match();
                 }
-                KeyCode::Char(c) => {
+                (None, KeyCode::Char(c)) => {
                     self.ctx_filter.push(c);
                     self.select_best_context_match();
                 }
@@ -643,8 +631,8 @@ impl App {
             }
             return;
         }
-        match key.code {
-            KeyCode::Esc => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) => {
                 if self.ctx_filter.is_empty() {
                     self.mode = Mode::Table;
                 } else {
@@ -652,11 +640,11 @@ impl App {
                     self.select_current_context();
                 }
             }
-            KeyCode::Char('/') => self.ctx_filtering = true,
-            KeyCode::Char('r') | KeyCode::Char('R') => self.open_rename_context(),
+            (Some(Action::Filter), _) => self.ctx_filtering = true,
+            (Some(Action::Rename), _) => self.open_rename_context(),
             // Space toggles the highlighted context in/out of the `:fleet`
             // dashboard for this session (the bulk-mark idiom).
-            KeyCode::Char(' ') => {
+            (Some(Action::FleetMark), _) => {
                 if let Some(name) = self
                     .ctx_state
                     .selected()
@@ -665,10 +653,10 @@ impl App {
                     self.toggle_fleet_context(&name);
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => list_step(&mut self.ctx_state, len, true),
-            KeyCode::Up | KeyCode::Char('k') => list_step(&mut self.ctx_state, len, false),
-            KeyCode::Enter => self.switch_selected_context(),
-            KeyCode::Char(c) => {
+            (Some(Action::Down), _) => list_step(&mut self.ctx_state, len, true),
+            (Some(Action::Up), _) => list_step(&mut self.ctx_state, len, false),
+            (Some(Action::Accept), _) => self.switch_selected_context(),
+            (None, KeyCode::Char(c)) => {
                 self.ctx_filtering = true;
                 self.ctx_filter.push(c);
                 self.select_best_context_match();
@@ -848,10 +836,6 @@ impl App {
         plugin_warnings.extend(crate::config::workspace_warnings(&self.workspaces));
         plugin_warnings.extend(crate::config::guardrail_warnings(&self.guardrails));
         plugin_warnings.extend(crate::config::pvc_explore_warnings(&self.pvc_cfg));
-        let (palette_keys, key_warnings) =
-            crate::config::compile_palette_keys(&resolved.config.keys);
-        self.palette_keys = palette_keys;
-        plugin_warnings.extend(key_warnings);
         let (views, view_warnings) = crate::views::compile(&resolved.config.views);
         self.user_views = views;
         let (thresholds, threshold_warnings) =
@@ -880,6 +864,7 @@ impl App {
             .or(resolved.config.default_namespace)
             .unwrap_or_else(|| cluster.default_namespace.clone());
         self.cluster = *cluster;
+        plugin_warnings.extend(self.configure_keys(&resolved.config.keys));
         self.stack.clear();
         // View history references the old cluster's kinds and namespaces.
         self.history.clear();

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::keymap::{Action, KeyInput, Keymap};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures_util::StreamExt;
@@ -1900,8 +1901,8 @@ pub struct App {
     pub forwards_cfg: Vec<crate::config::Forward>,
     /// `[notify]` delivery options (bell, desktop-notification protocol).
     pub notify_cfg: crate::config::NotifyConfig,
-    /// Compiled `[keys]` palette-completion bindings.
-    pub palette_keys: crate::config::PaletteKeys,
+    /// Effective bindings for all input modes.
+    pub keymap: Keymap,
 
     pub skin_list: Vec<String>,
     pub skin_state: ListState,
@@ -2206,7 +2207,7 @@ impl App {
             pf_picker_state: ListState::default(),
             pf_picker_target: None,
             notify_cfg: crate::config::NotifyConfig::default(),
-            palette_keys: crate::config::PaletteKeys::default(),
+            keymap: Keymap::default(),
             pf_state: ListState::default(),
             skin_list: crate::theme::BUILTIN_NAMES
                 .iter()

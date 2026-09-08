@@ -109,13 +109,13 @@ impl App {
         self.tasks.push(handle);
     }
 
-    pub(super) fn key_pulse(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+    pub(super) fn key_pulse(&mut self, key: KeyInput) {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => {
                 self.mode = Mode::Table;
                 self.start_watch();
             }
-            KeyCode::Char('r') => {
+            (Some(Action::Refresh), _) => {
                 self.bump_generation();
                 self.spawn_pulse();
             }
@@ -208,27 +208,27 @@ impl App {
         self.tasks.push(handle);
     }
 
-    pub(super) fn key_xray(&mut self, key: KeyEvent) {
+    pub(super) fn key_xray(&mut self, key: KeyInput) {
         let len = self.xray_items.len();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => {
                 self.mode = Mode::Table;
                 self.start_watch();
             }
-            KeyCode::Char('j') | KeyCode::Down => list_step(&mut self.xray_state, len, true),
-            KeyCode::Char('k') | KeyCode::Up => list_step(&mut self.xray_state, len, false),
-            KeyCode::Char('g') | KeyCode::Home => {
+            (Some(Action::Down), _) => list_step(&mut self.xray_state, len, true),
+            (Some(Action::Up), _) => list_step(&mut self.xray_state, len, false),
+            (Some(Action::First), _) => {
                 if len > 0 {
                     self.xray_state.select(Some(0));
                 }
             }
-            KeyCode::Char('G') | KeyCode::End => {
+            (Some(Action::Last), _) => {
                 if len > 0 {
                     self.xray_state.select(Some(len - 1));
                 }
             }
             // Enter on a pod/container streams logs.
-            KeyCode::Enter | KeyCode::Char('l') => {
+            (Some(Action::Logs), _) => {
                 if let Some(i) = self.xray_state.selected()
                     && let Some(item) = self.xray_items.get(i).cloned()
                 {
@@ -258,7 +258,7 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('r') => {
+            (Some(Action::Refresh), _) => {
                 self.bump_generation();
                 self.spawn_xray();
             }

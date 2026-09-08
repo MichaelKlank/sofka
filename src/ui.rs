@@ -1,5 +1,6 @@
 //! All ratatui rendering.
 
+use crate::keymap::Action;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -466,19 +467,43 @@ fn header_hints_fit(frame_width: u16) -> bool {
     frame_width.saturating_sub(26 + 2) >= HEADER_INFO_MIN + HEADER_HINTS_WIDTH
 }
 
-/// One hint row of fixed-width cells (right-aligned key, padded label) so
-/// consecutive rows line up into a table. Labels must stay ≤ 10 chars.
-fn hint_line(pairs: &[(&str, &str)]) -> Line<'static> {
+/// Show the first effective binding for each action.
+fn key_hint(app: &App, scope: &str, actions: &[(Action, &str)]) -> String {
+    actions
+        .iter()
+        .map(|&(action, label)| {
+            let key = app.keymap.first_label(scope, action);
+            format!("{key}:{label}")
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+fn hint_line(app: &App, pairs: &[(Action, &str)]) -> Line<'static> {
     let key_style = Style::default()
         .fg(theme::sky())
         .add_modifier(Modifier::BOLD);
-    let mut spans = Vec::with_capacity(pairs.len() * 3);
-    for (i, (key, label)) in pairs.iter().enumerate() {
-        if i > 0 {
+    let mut spans = Vec::new();
+    let mut width = 0;
+    for &(action, label) in pairs {
+        let key = app.keymap.first_label("table", action);
+        let cell = format!("{key} {label}");
+        let cell_width = cell.chars().count().max(13);
+        if width + cell_width > usize::from(HEADER_HINTS_WIDTH) {
+            break;
+        }
+        if width > 0 {
             spans.push(Span::raw("  "));
         }
-        spans.push(Span::styled(format!("{key:>2}"), key_style));
-        spans.push(Span::styled(format!(" {label:<10}"), theme::dim()));
+        spans.push(Span::styled(key.to_owned(), key_style));
+        spans.push(Span::styled(
+            format!(
+                " {label:<width$}",
+                width = cell_width - cell.chars().count() + label.chars().count()
+            ),
+            theme::dim(),
+        ));
+        width += cell_width + 2;
     }
     Line::from(spans)
 }
@@ -509,71 +534,270 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
     }
     let mut lines = match app.kind_plural.as_str() {
         "pods" => vec![
-            hint_line(&[("⏎", "containers"), ("l", "logs"), ("p", "prev logs")]),
-            hint_line(&[("s", "shell"), ("t", "transfer"), ("f", "port-fwd")]),
-            hint_line(&[("y", "yaml"), ("d", "describe"), ("E", "events")]),
-            hint_line(&[("e", "edit"), ("o", "node"), ("J", "owner")]),
-            hint_line(&[("X", "explain"), ("T", "timeline"), ("^d", "delete")]),
+            hint_line(
+                app,
+                &[
+                    (Action::Open, "containers"),
+                    (Action::Logs, "logs"),
+                    (Action::PreviousLogs, "prev logs"),
+                ],
+            ),
+            hint_line(
+                app,
+                &[
+                    (Action::ShellOrScale, "shell"),
+                    (Action::ActionMenu, "transfer"),
+                    (Action::PortForward, "port-fwd"),
+                ],
+            ),
+            hint_line(
+                app,
+                &[
+                    (Action::Yaml, "yaml"),
+                    (Action::Describe, "describe"),
+                    (Action::Events, "events"),
+                ],
+            ),
+            hint_line(
+                app,
+                &[
+                    (Action::Edit, "edit"),
+                    (Action::Node, "node"),
+                    (Action::Owner, "owner"),
+                ],
+            ),
+            hint_line(
+                app,
+                &[
+                    (Action::Explain, "explain"),
+                    (Action::Timeline, "timeline"),
+                    (Action::Delete, "delete"),
+                ],
+            ),
         ],
         "deployments" | "statefulsets" => vec![
-            hint_line(&[("⏎", "pods"), ("l", "logs"), ("E", "events")]),
-            hint_line(&[("s", "scale"), ("r", "restart"), ("i", "image")]),
-            hint_line(&[("y", "yaml"), ("d", "describe"), ("e", "edit")]),
-            hint_line(&[("X", "explain"), ("T", "timeline"), ("f", "port-fwd")]),
-            hint_line(&[("^d", "delete")]),
+            hint_line(
+                app,
+                &[
+                    (Action::Open, "pods"),
+                    (Action::Logs, "logs"),
+                    (Action::Events, "events"),
+                ],
+            ),
+            hint_line(
+                app,
+                &[
+                    (Action::ShellOrScale, "scale"),
+                    (Action::RestartOrRefresh, "restart"),
+                    (Action::SetImage, "image"),
+                ],
+            ),
+            hint_line(
+                app,
+                &[
+                    (Action::Yaml, "yaml"),
+                    (Action::Describe, "describe"),
+                    (Action::Edit, "edit"),
+                ],
+            ),
+            hint_line(
+                app,
+                &[
+                    (Action::Explain, "explain"),
+                    (Action::Timeline, "timeline"),
+                    (Action::PortForward, "port-fwd"),
+                ],
+            ),
+            hint_line(app, &[(Action::Delete, "delete")]),
         ],
         "daemonsets" => vec![
-            hint_line(&[("⏎", "pods"), ("l", "logs"), ("E", "events")]),
-            hint_line(&[("r", "restart"), ("i", "image")]),
-            hint_line(&[("y", "yaml"), ("d", "describe"), ("e", "edit")]),
-            hint_line(&[("X", "explain"), ("^d", "delete")]),
+            hint_line(
+                app,
+                &[
+                    (Action::Open, "pods"),
+                    (Action::Logs, "logs"),
+                    (Action::Events, "events"),
+                ],
+            ),
+            hint_line(
+                app,
+                &[
+                    (Action::RestartOrRefresh, "restart"),
+                    (Action::SetImage, "image"),
+                ],
+            ),
+            hint_line(
+                app,
+                &[
+                    (Action::Yaml, "yaml"),
+                    (Action::Describe, "describe"),
+                    (Action::Edit, "edit"),
+                ],
+            ),
+            hint_line(
+                app,
+                &[(Action::Explain, "explain"), (Action::Delete, "delete")],
+            ),
         ],
         "replicasets" | "jobs" => vec![
-            hint_line(&[("⏎", "pods"), ("l", "logs"), ("E", "events")]),
-            hint_line(&[("y", "yaml"), ("d", "describe"), ("e", "edit")]),
-            hint_line(&[("X", "explain"), ("J", "owner"), ("^d", "delete")]),
+            hint_line(
+                app,
+                &[
+                    (Action::Open, "pods"),
+                    (Action::Logs, "logs"),
+                    (Action::Events, "events"),
+                ],
+            ),
+            hint_line(
+                app,
+                &[
+                    (Action::Yaml, "yaml"),
+                    (Action::Describe, "describe"),
+                    (Action::Edit, "edit"),
+                ],
+            ),
+            hint_line(
+                app,
+                &[
+                    (Action::Explain, "explain"),
+                    (Action::Owner, "owner"),
+                    (Action::Delete, "delete"),
+                ],
+            ),
         ],
         "services" => vec![
-            hint_line(&[("⏎", "pods"), ("f", "port-fwd")]),
-            hint_line(&[("y", "yaml"), ("d", "describe"), ("e", "edit")]),
-            hint_line(&[("Y", "copy cell"), ("^d", "delete")]),
+            hint_line(
+                app,
+                &[(Action::Open, "pods"), (Action::PortForward, "port-fwd")],
+            ),
+            hint_line(
+                app,
+                &[
+                    (Action::Yaml, "yaml"),
+                    (Action::Describe, "describe"),
+                    (Action::Edit, "edit"),
+                ],
+            ),
+            hint_line(
+                app,
+                &[(Action::CopyCell, "copy cell"), (Action::Delete, "delete")],
+            ),
         ],
         "nodes" => vec![
-            hint_line(&[("⏎", "pods"), ("y", "yaml"), ("d", "describe")]),
-            hint_line(&[("C", "cordon"), ("U", "uncordon"), ("D", "drain")]),
-            hint_line(&[("^d", "delete")]),
+            hint_line(
+                app,
+                &[
+                    (Action::Open, "pods"),
+                    (Action::Yaml, "yaml"),
+                    (Action::Describe, "describe"),
+                ],
+            ),
+            hint_line(
+                app,
+                &[
+                    (Action::Cordon, "cordon"),
+                    (Action::Uncordon, "uncordon"),
+                    (Action::Drain, "drain"),
+                ],
+            ),
+            hint_line(app, &[(Action::Delete, "delete")]),
         ],
         "namespaces" => vec![
-            hint_line(&[("⏎", "switch to"), ("y", "yaml"), ("d", "describe")]),
-            hint_line(&[("e", "edit"), ("^d", "delete")]),
+            hint_line(
+                app,
+                &[
+                    (Action::Open, "switch to"),
+                    (Action::Yaml, "yaml"),
+                    (Action::Describe, "describe"),
+                ],
+            ),
+            hint_line(app, &[(Action::Edit, "edit"), (Action::Delete, "delete")]),
         ],
         "helm" => vec![
-            hint_line(&[("⏎", "history")]),
-            hint_line(&[("y", "yaml"), ("d", "describe")]),
-            hint_line(&[("^d", "uninstall")]),
+            hint_line(app, &[(Action::Open, "history")]),
+            hint_line(
+                app,
+                &[(Action::Yaml, "yaml"), (Action::Describe, "describe")],
+            ),
+            hint_line(app, &[(Action::Delete, "uninstall")]),
         ],
         "helmhistory" => vec![
-            hint_line(&[("⏎", "values"), ("r", "rollback")]),
-            hint_line(&[("^d", "uninstall")]),
+            hint_line(
+                app,
+                &[
+                    (Action::Open, "values"),
+                    (Action::RestartOrRefresh, "rollback"),
+                ],
+            ),
+            hint_line(app, &[(Action::Delete, "uninstall")]),
         ],
         "customresourcedefinitions" => vec![
-            hint_line(&[("⏎", "resources"), ("y", "yaml"), ("d", "describe")]),
-            hint_line(&[("e", "edit"), ("^d", "delete")]),
+            hint_line(
+                app,
+                &[
+                    (Action::Open, "resources"),
+                    (Action::Yaml, "yaml"),
+                    (Action::Describe, "describe"),
+                ],
+            ),
+            hint_line(app, &[(Action::Edit, "edit"), (Action::Delete, "delete")]),
         ],
         "secrets" => vec![
-            hint_line(&[("x", "decode"), ("y", "yaml"), ("d", "describe")]),
-            hint_line(&[("e", "edit"), ("E", "events"), ("c", "copy name")]),
-            hint_line(&[("^d", "delete")]),
+            hint_line(
+                app,
+                &[
+                    (Action::Inspect, "decode"),
+                    (Action::Yaml, "yaml"),
+                    (Action::Describe, "describe"),
+                ],
+            ),
+            hint_line(
+                app,
+                &[
+                    (Action::Edit, "edit"),
+                    (Action::Events, "events"),
+                    (Action::CopyName, "copy name"),
+                ],
+            ),
+            hint_line(app, &[(Action::Delete, "delete")]),
         ],
         "persistentvolumeclaims" => vec![
-            hint_line(&[("x", "browse"), ("s", "shell"), ("d", "describe")]),
-            hint_line(&[("y", "yaml"), ("E", "events"), ("c", "copy name")]),
-            hint_line(&[("^d", "delete")]),
+            hint_line(
+                app,
+                &[
+                    (Action::Inspect, "browse"),
+                    (Action::ShellOrScale, "shell"),
+                    (Action::Describe, "describe"),
+                ],
+            ),
+            hint_line(
+                app,
+                &[
+                    (Action::Yaml, "yaml"),
+                    (Action::Events, "events"),
+                    (Action::CopyName, "copy name"),
+                ],
+            ),
+            hint_line(app, &[(Action::Delete, "delete")]),
         ],
         _ => vec![
-            hint_line(&[("⏎", "yaml"), ("d", "describe"), ("E", "events")]),
-            hint_line(&[("e", "edit"), ("c", "copy name"), ("Y", "copy cell")]),
-            hint_line(&[("^d", "delete")]),
+            hint_line(
+                app,
+                &[
+                    (Action::Open, "yaml"),
+                    (Action::Describe, "describe"),
+                    (Action::Events, "events"),
+                ],
+            ),
+            hint_line(
+                app,
+                &[
+                    (Action::Edit, "edit"),
+                    (Action::CopyName, "copy name"),
+                    (Action::CopyCell, "copy cell"),
+                ],
+            ),
+            hint_line(app, &[(Action::Delete, "delete")]),
         ],
     };
     if app.kind_plural == "machinedeployments"
@@ -583,24 +807,31 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
             .is_some_and(|k| k.ar.group == "cluster.x-k8s.io")
     {
         lines = vec![
-            hint_line(&[("⏎", "machines"), ("y", "yaml"), ("d", "describe")]),
-            hint_line(&[("e", "edit"), ("^d", "delete")]),
+            hint_line(
+                app,
+                &[
+                    (Action::Open, "machines"),
+                    (Action::Yaml, "yaml"),
+                    (Action::Describe, "describe"),
+                ],
+            ),
+            hint_line(app, &[(Action::Edit, "edit"), (Action::Delete, "delete")]),
         ];
     }
     if app.flux_suspendable() {
-        lines.push(hint_line(&[("t", "flux menu")]));
+        lines.push(hint_line(app, &[(Action::ActionMenu, "flux menu")]));
     }
     if app.argocd_kind() {
-        lines.push(hint_line(&[("t", "suspend/sync")]));
+        lines.push(hint_line(app, &[(Action::ActionMenu, "suspend/sync")]));
     }
     if app.kind_plural == "helmreleases" {
-        lines.push(hint_line(&[("⏎", "helm history")]));
+        lines.push(hint_line(app, &[(Action::Open, "helm history")]));
     }
     if app.cronjob_kind() {
-        lines.push(hint_line(&[("t", "trigger/suspend")]));
+        lines.push(hint_line(app, &[(Action::ActionMenu, "trigger/suspend")]));
     }
     if app.external_secret_kind() {
-        lines.push(hint_line(&[("r", "force-sync")]));
+        lines.push(hint_line(app, &[(Action::RestartOrRefresh, "force-sync")]));
     }
     // The header box has 5 inner rows.
     lines.truncate(5);
@@ -2174,234 +2405,95 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(d.to_string(), theme::dim()),
         ])
     };
-    let mut lines = vec![
-        Line::from(Span::styled("  Navigation", theme::title())),
-        bind(
-            ":<resource>",
-            "global command palette — fuzzy over kinds + commands (tab/↑↓)",
-        ),
-        bind(
-            ":<res> <ns>",
-            "switch kind and namespace at once (all/* = all namespaces)",
-        ),
-        bind("[ · ]", "view history — back · forward"),
-        bind(
-            "Tab · ⇧Tab",
-            "next · previous resource in this namespace (workspace views when open)",
-        ),
-        bind(":ctx · :pulse", "switch context · cluster-health dashboard"),
-        bind(
-            ":fleet",
-            "cross-context health dashboard ([fleet] contexts or space in :ctx; ⏎ switches)",
-        ),
-        bind(
-            ":xray · :diff",
-            "hierarchical tree · live-vs-last-applied diff",
-        ),
-        bind(
-            ":events · E",
-            "browse all events · events for the selected object",
-        ),
-        bind(":pf", "view/stop background port-forwards"),
-        bind(":skin", "switch color skin live"),
-        bind(
-            ":reload · :config · :info",
-            "reload config · config sources + warnings · runtime diagnostics",
-        ),
-        bind(
-            ":can-i",
-            "what you can do here · :can-i <verb> <resource> [ns] checks one action",
-        ),
-        bind(
-            "enter",
-            "drill down (deploy→pods, pod→containers, ns→re-scope)",
-        ),
-        bind("shift-j", "jump to owner (controller)"),
-        bind("o", "show node hosting the pod"),
-        bind(
-            "←/→",
-            "scroll sideways (5 cells; NAMESPACE/NAME stay fixed)",
-        ),
-        bind("esc", "go back / pop view / clear filter"),
-        bind("j/k g/G", "move · top/bottom"),
-        bind(
-            "ctrl-f/ctrl-b",
-            "page tables and documents forward/back (also PgDn/PgUp)",
-        ),
-        bind("S · I", "sort by column (fuzzy picker) · invert direction"),
-        bind(
-            "w",
-            "toggle wide columns (kubectl -o wide), including node labels",
-        ),
-        bind(
-            "ctrl-e",
-            "compact mode: collapse header + footer (for tiled panes)",
-        ),
-        bind(
-            "/",
-            "filter: fuzzy · \"exact\" · /regex/ · !inverse · -l/-f selectors (server-side on ⏎) · col=val cpu>500m age<2h · && || !(...)",
-        ),
-        bind(
-            ":resource -n ns --context ctx /filter",
-            "query resource, namespace, context and filter together",
-        ),
-        bind(
-            ":resource @context [namespace]",
-            "switch context and resource (context fuzzy-completes; kubeconfig unchanged)",
-        ),
-        bind(
-            "ctrl-u · ctrl-w",
-            "text inputs: clear line (cmd-⌫) · delete word (opt-⌫)",
-        ),
-        bind("n · 0", "namespace switcher · 0 = all namespaces"),
-        bind("ctrl-r", "refresh watch"),
-        bind("ctrl-z", "toggle faults filter (pods only)"),
-        Line::from(""),
-        Line::from(Span::styled("  Inspect", theme::title())),
-        bind("y · d", "view YAML · describe (kubectl)"),
-        bind("r (describe)", "turn automatic refresh on/off (5s)"),
-        bind("l · p", "logs (workload = all pods) · previous logs"),
-        bind(
-            "shift-l · :vlogs",
-            "VictoriaLogs history (autodiscovered or [providers.logs]) — pods/workloads/ns",
-        ),
-        bind("c", "copy resource name · in doc views: copy the document"),
-        bind(
-            "shift-y",
-            "copy any cell of the selected row (picker: type to match a column or value)",
-        ),
-        bind(
-            "/ · n/N",
-            "search within YAML/describe/diff/events (highlight in place, n/N to jump); filters help",
-        ),
-        bind(
-            "x",
-            "secrets: show data base64-decoded (also inside YAML/describe) · PVCs: browse the volume",
-        ),
-        bind(
-            "shift-x · :explain",
-            "explain why the selection is unhealthy (evidence-backed)",
-        ),
-        bind(
-            "shift-t · :timeline",
-            "session-local state-change history for the selection",
-        ),
-        bind(
-            "u · :adjacent",
-            "adjacent view: owners, children, and references (⏎ opens one; c discovers direct children of a namespaced custom resource)",
-        ),
-        bind(
-            ":rightsize",
-            "historical right-sizing: P50/P95/P99 usage → suggested requests + patch (needs [providers.metrics])",
-        ),
-        bind(
-            ":gitops · :flux",
-            "Flux owner, source, revisions & reconciliation chain (⏎ to jump)",
-        ),
-        bind(
-            ":journal · :audit",
-            "session-local log of the mutating actions you've taken",
-        ),
-        Line::from(""),
-        Line::from(Span::styled("  Act", theme::title())),
-        bind("e", "edit in $EDITOR (kubectl edit)"),
-        bind("s", "shell into pod / PVC volume · scale workload"),
-        bind("a", "attach to pod"),
-        bind(
-            ":debug",
-            "pod: ephemeral debug container (d in picker targets one) · node: privileged debug pod",
-        ),
-        bind(
-            ":debug-clean",
-            "delete the node debugger pods launched this session",
-        ),
-        bind(
-            ":bundle · :bundle-save",
-            "assemble a redacted diagnostic bundle for the selection · write it to a file",
-        ),
-        bind(
-            ":snapshot [fmt] · :snapshots",
-            "capture the current view (text/json/yaml) · browse saved snapshots",
-        ),
-        bind("i", "set container image"),
-        bind(
-            "r",
-            "rollout restart (deploy/sts/ds) · force-sync (external secrets)",
-        ),
-        bind(
-            "f / shift-f",
-            "port-forward (pod/svc) — runs in the background",
-        ),
-        bind(
-            "t",
-            "pods: file transfer (kubectl cp, in picker targets a container) · flux: suspend/resume/reconcile · argocd apps: suspend/resume/sync, appsets: suspend/resume · cronjobs: trigger/suspend/resume",
-        ),
-        bind("C · U · D", "nodes: cordon · uncordon · drain"),
-        bind("space", "mark/unmark row for bulk actions (esc clears)"),
-        bind(
-            "ctrl-d · ctrl-k",
-            "delete · force-delete (in confirm: f force, c cascade)",
-        ),
-        Line::from(""),
-        Line::from(Span::styled("  PVC explore (x on a PVC)", theme::title())),
-        bind(
-            "x · s · :pvc-explore",
-            "browse the volume (local left, PVC right; also :pvc-browse) · shell into it at the mount point",
-        ),
-        bind(
-            "tab · ←/→",
-            "switch pane · j/k g/G move · ⏎ open directory · ⌫ or - go up (stops at the mount)",
-        ),
-        bind(
-            "esc · q",
-            "close the browser (and delete the helper pod, if any)",
-        ),
-        bind(
-            "c · r",
-            "copy the selection into the other pane (download or upload) · refresh both",
-        ),
-        bind(
-            ":pvc-clean",
-            "delete helper pods left behind by a session that exited uncleanly (:pvc-cleanup)",
-        ),
-        Line::from(""),
-        Line::from(Span::styled("  Logs view", theme::title())),
-        bind(
-            "/ · s · w · t",
-            "filter (text · /regex/ · !invert) · autoscroll · wrap · timestamps",
-        ),
-        bind(
-            "x · z · c · ctrl-s",
-            "stop/resume · clear buffer · copy · save to file",
-        ),
-        bind("shift-f", "fullscreen (no borders — easy terminal copying)"),
-        bind(
-            "0 – 5",
-            "time anchor: tail · 1m · 5m · 15m · 30m · 1h (re-streams)",
-        ),
-        bind(
-            "shift-t",
-            "provider logs: change lookback period (30m, 4h, 2d)",
-        ),
-        Line::from(""),
-        bind(
-            ":plugin-cancel",
-            "cancel the active plugin and its temporary forward",
-        ),
-        bind(":q / ctrl-c", "quit"),
-        Line::from(""),
-        Line::from(Span::styled("  Help view", theme::title())),
-        bind("j/k · ↑/↓", "scroll one line"),
-        bind("ctrl-f · PgDn", "next page (space also moves forward)"),
-        bind("ctrl-b · PgUp", "previous page"),
-        bind("g/G · Home/End", "go to the top/bottom"),
-        bind("/", "filter help bindings"),
-        bind(
-            "esc",
-            "clear the filter, or close help if no filter is active",
-        ),
-        bind("q · ?", "close help and return to the previous screen"),
-    ];
+    let mut lines = Vec::new();
+    let mut previous_scope = "";
+    for (scope, action, _) in app.keymap.entries() {
+        if scope != previous_scope {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  Keys: {scope}"),
+                theme::title(),
+            )));
+            previous_scope = scope;
+        }
+        lines.push(bind(app.keymap.label(scope, action), action.description()));
+    }
+    lines.push(Line::from(Span::styled(
+        "  Commands (enter in the command palette)",
+        theme::title(),
+    )));
+    lines.push(bind(
+        ":<resource>",
+        "global command palette - fuzzy over kinds + commands",
+    ));
+    lines.push(bind(
+        ":<res> <ns>",
+        "switch kind and namespace at once (all/* = all namespaces)",
+    ));
+    lines.push(bind(
+        ":ctx · :pulse",
+        "switch context · cluster-health dashboard",
+    ));
+    lines.push(bind(
+        ":fleet",
+        "cross-context health dashboard for configured contexts",
+    ));
+    lines.push(bind(
+        ":xray · :diff",
+        "hierarchical tree · live-vs-last-applied diff",
+    ));
+    lines.push(bind(":events", "browse all events"));
+    lines.push(bind(":pf", "view/stop background port-forwards"));
+    lines.push(bind(":skin", "switch color skin live"));
+    lines.push(bind(
+        ":reload · :config · :info",
+        "reload config · config sources + warnings · runtime diagnostics",
+    ));
+    lines.push(bind(
+        ":can-i",
+        "what you can do here · :can-i <verb> <resource> [ns] checks one action",
+    ));
+    lines.push(bind(
+        ":resource -n ns --context ctx /filter",
+        "query resource, namespace, context and filter together",
+    ));
+    lines.push(bind(
+        ":resource @context [namespace]",
+        "switch context and resource (context fuzzy-completes; kubeconfig unchanged)",
+    ));
+    lines.push(bind(":rightsize", "historical right-sizing: P50/P95/P99 usage → suggested requests + patch (needs [providers.metrics])"));
+    lines.push(bind(
+        ":gitops · :flux",
+        "Flux owner, source, revisions & reconciliation chain",
+    ));
+    lines.push(bind(
+        ":journal · :audit",
+        "session-local log of the mutating actions you've taken",
+    ));
+    lines.push(bind(
+        ":debug",
+        "pod: ephemeral debug container · node: privileged debug pod",
+    ));
+    lines.push(bind(
+        ":debug-clean",
+        "delete the node debugger pods launched this session",
+    ));
+    lines.push(bind(
+        ":bundle · :bundle-save",
+        "assemble a redacted diagnostic bundle for the selection · write it to a file",
+    ));
+    lines.push(bind(
+        ":snapshot [fmt] · :snapshots",
+        "capture the current view (text/json/yaml) · browse saved snapshots",
+    ));
+    lines.push(bind(
+        ":pvc-clean",
+        "delete helper pods left behind by a session that exited uncleanly (:pvc-cleanup)",
+    ));
+    lines.push(bind(
+        ":plugin-cancel",
+        "cancel the active plugin and its temporary forward",
+    ));
     // Config-defined plugins, with their (possibly modified) key chords.
     if !app.plugins.is_empty() {
         lines.push(Line::from(""));
@@ -2464,6 +2556,18 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
             ));
         }
     }
+    lines.push(Line::from(Span::styled(
+        "  Help navigation",
+        theme::title(),
+    )));
+    lines.push(bind(
+        app.keymap.label("help", Action::Back),
+        "clear the search or close help",
+    ));
+    lines.push(bind(
+        app.keymap.label("help", Action::Close),
+        "close help and return to the previous screen",
+    ));
     // `/` search: keep only matching binding lines (section headers and
     // spacers match like any other text), highlighting the matched runs.
     let needle = app.help_filter.to_lowercase();
@@ -2486,7 +2590,14 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
     let scroll = app.help_scroll.min(max_scroll);
     app.help_scroll = scroll;
     let title = if max_scroll > 0 {
-        format!("{title}· j/k scroll · / search ")
+        format!(
+            "{title} {} ",
+            key_hint(
+                app,
+                "help",
+                &[(Action::Down, "scroll"), (Action::Filter, "search")]
+            )
+        )
     } else {
         title
     };
@@ -2530,7 +2641,7 @@ fn draw_namespaces(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     // Show the type-to-filter buffer in the title so it reads like an input.
     let title = if app.ns_filter.is_empty() {
-        " Namespaces (★ fav · recent · ⏎ switch) ".to_string()
+        " Namespaces (★ favorites and recent) ".to_string()
     } else {
         format!(" Namespaces · /{}_ ", app.ns_filter)
     };
@@ -2578,7 +2689,7 @@ fn draw_contexts(frame: &mut Frame, app: &mut App, area: Rect) {
     } else if !app.ctx_filter.is_empty() {
         format!(" Contexts · /{} ", app.ctx_filter)
     } else {
-        " Contexts (type to filter · r rename · space fleet · ⏎ switch) ".to_string()
+        " Contexts (type to filter) ".to_string()
     };
     render_popup_list(
         frame,
@@ -2619,7 +2730,7 @@ fn draw_sort_picker(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     // Show the type-to-filter buffer in the title so it reads like an input.
     let title = if app.sort_picker_filter.is_empty() {
-        " Sort by (⏎ again inverts) ".to_string()
+        " Sort by ".to_string()
     } else {
         format!(" Sort by · /{}_ ", app.sort_picker_filter)
     };
@@ -2655,7 +2766,7 @@ fn draw_copy_picker(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     // Show the type-to-filter buffer in the title so it reads like an input.
     let title = if app.copy_picker_filter.is_empty() {
-        " Copy (⏎ copies the value) ".to_string()
+        " Copy ".to_string()
     } else {
         format!(" Copy · /{}_ ", app.copy_picker_filter)
     };
@@ -2806,10 +2917,7 @@ fn draw_port_forwards(frame: &mut Frame, app: &mut App, area: Rect) {
             ),
         ])));
     }
-    let title = format!(
-        " Port-forwards [{}]  (x/s stop · ⏎ start · esc close) ",
-        app.port_forwards.len()
-    );
+    let title = format!(" Port-forwards [{}] ", app.port_forwards.len());
     render_framed_list(
         frame,
         area,
@@ -2835,11 +2943,7 @@ fn draw_find(frame: &mut Frame, app: &mut App, area: Rect) {
             ]))
         })
         .collect();
-    let title = format!(
-        " Find '{}' [{}]  (⏎ open · esc close) ",
-        app.find_query,
-        app.find_items.len()
-    );
+    let title = format!(" Find '{}' [{}] ", app.find_query, app.find_items.len());
     render_framed_list(
         frame,
         area,
@@ -2965,7 +3069,7 @@ fn draw_skins(frame: &mut Frame, app: &mut App, area: Rect) {
         42,
         58,
         items,
-        Span::styled(" Skins (enter apply · esc close) ", theme::title()),
+        Span::styled(" Skins ", theme::title()),
         &mut app.skin_state,
     );
 }
@@ -2987,10 +3091,7 @@ fn draw_snapshots(frame: &mut Frame, app: &mut App, area: Rect) {
         70,
         70,
         items,
-        Span::styled(
-            " Snapshots (⏎ open · d delete · esc close) ",
-            theme::title(),
-        ),
+        Span::styled(" Snapshots ", theme::title()),
         &mut app.snapshot_state,
     );
 }
@@ -3126,7 +3227,18 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
         format!(" · {}", app.container_qos)
     };
     let title = format!(" Containers{qos} ");
-    let footer = " ⏎ logs · p previous · s shell · t transfer · d debug · L provider ";
+    let footer = key_hint(
+        app,
+        "containers",
+        &[
+            (Action::Logs, "logs"),
+            (Action::PreviousLogs, "previous"),
+            (Action::Shell, "shell"),
+            (Action::Transfer, "transfer"),
+            (Action::Debug, "debug"),
+            (Action::ProviderLogs, "provider"),
+        ],
+    );
 
     // Size the box to its contents: header + rows + borders, and wide enough
     // for the columns, the title, or the footer — whichever needs the most.
@@ -3191,7 +3303,14 @@ fn draw_prompt_popup(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("█", Style::default().fg(theme::peach())),
         ]),
         Line::from(""),
-        Line::from(Span::styled("  enter: apply    esc: cancel", theme::dim())),
+        Line::from(Span::styled(
+            key_hint(
+                app,
+                "prompt",
+                &[(Action::Accept, "apply"), (Action::Back, "cancel")],
+            ),
+            theme::dim(),
+        )),
     ];
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -3225,7 +3344,7 @@ fn draw_set_image(frame: &mut Frame, app: &mut App, area: Rect) {
         70,
         60,
         items,
-        Span::styled(" Set Image (⏎ to edit container) ", theme::title()),
+        Span::styled(" Set Image ", theme::title()),
         &mut app.container_state,
     );
 }
@@ -3241,7 +3360,7 @@ fn draw_confirm(frame: &mut Frame, app: &App, area: Rect) {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            confirm_action_hint(app.confirm_allows_force_toggle(), ConfirmHintStyle::Popup),
+            confirm_action_hint(app, app.confirm_allows_force_toggle()),
             Style::default().fg(theme::yellow()),
         )),
     ];
@@ -3312,21 +3431,18 @@ fn draw_palette(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     let mut state = ListState::default();
     state.select(Some(app.cmd_sel));
-    // The hint mirrors the user's `[keys]` rebinds (first chord of each
-    // action); the default set keeps its compact symbols.
-    let hint = if app.palette_keys.is_default() {
-        " commands & resources (tab/↑↓ · ⏎) ".to_string()
-    } else {
-        let first = |chords: &[crate::keys::KeyChord]| {
-            chords.first().map(|c| c.label()).unwrap_or_default()
-        };
-        format!(
-            " commands & resources ({}/{} · {}) ",
-            first(&app.palette_keys.next),
-            first(&app.palette_keys.prev),
-            first(&app.palette_keys.accept),
+    let hint = format!(
+        " commands & resources ({}) ",
+        key_hint(
+            app,
+            "command",
+            &[
+                (Action::Down, "next"),
+                (Action::Up, "previous"),
+                (Action::Accept, "run")
+            ]
         )
-    };
+    );
     render_framed_list(
         frame,
         rect,
@@ -3369,10 +3485,7 @@ fn draw_xray(frame: &mut Frame, app: &mut App, area: Rect) {
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let title = format!(
-        " Xray [{}]  (⏎ logs · r refresh · esc back) ",
-        app.xray_items.len()
-    );
+    let title = format!(" Xray [{}] ", app.xray_items.len());
     render_framed_list(
         frame,
         area,
@@ -3456,10 +3569,7 @@ fn draw_fleet(frame: &mut Frame, app: &mut App, area: Rect) {
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let title = format!(
-        " Fleet [{}]  (⏎ switch · r refresh · esc back) ",
-        app.fleet_rows.len()
-    );
+    let title = format!(" Fleet [{}] ", app.fleet_rows.len());
     render_framed_list(
         frame,
         area,
@@ -3532,7 +3642,7 @@ fn draw_explain(frame: &mut Frame, app: &mut App, area: Rect) {
         format!(" {} ", app.explain_title)
     } else {
         format!(
-            " {}  ({} findings · ⏎/E/l evidence · r refresh) ",
+            " {} ({} findings) ",
             app.explain_title,
             app.explain_items.len()
         )
@@ -3548,11 +3658,7 @@ fn draw_explain(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_gitops(frame: &mut Frame, app: &mut App, area: Rect) {
-    let title = if app.gitops_items.is_empty() {
-        format!(" {} ", app.gitops_title)
-    } else {
-        format!(" {}  (⏎ jump · r refresh · esc back) ", app.gitops_title)
-    };
+    let title = format!(" {} ", app.gitops_title);
     draw_findings(
         frame,
         area,
@@ -3910,6 +4016,109 @@ fn counts_tile(frame: &mut Frame, area: Rect, p: &crate::store::Pulse) {
     );
 }
 
+fn navigation_hint(app: &App, width: u16) -> String {
+    let scope = app.key_scope();
+    if scope == "table" {
+        let cycle = format!(
+            "{}/{}: {}",
+            app.keymap.first_label(scope, Action::NextView),
+            app.keymap.first_label(scope, Action::PreviousView),
+            if app.active_workspace.is_some() {
+                "workspace"
+            } else {
+                "resources"
+            }
+        );
+        let mut actions = vec![
+            (Action::Command, "command"),
+            (Action::Help, "help"),
+            (Action::Filter, "filter"),
+        ];
+        if app.hide_header || !header_hints_fit(width) {
+            actions.extend([
+                (Action::Yaml, "yaml"),
+                (Action::Describe, "describe"),
+                (Action::Logs, "logs"),
+                (Action::Edit, "edit"),
+                (Action::ShellOrScale, "shell/scale"),
+                (Action::Delete, "delete"),
+            ]);
+        }
+        actions.extend([
+            (Action::Sort, "sort"),
+            (Action::Mark, "mark"),
+            (Action::Back, "back"),
+        ]);
+        return format!("{cycle}  {}", key_hint(app, scope, &actions));
+    }
+    let preferred = match scope {
+        "logs" => &[
+            Action::Back,
+            Action::Filter,
+            Action::Follow,
+            Action::Wrap,
+            Action::Stream,
+            Action::Copy,
+            Action::Save,
+            Action::PageUp,
+            Action::PageDown,
+        ][..],
+        "detail" | "diff" | "events" => &[
+            Action::Back,
+            Action::Filter,
+            Action::NextMatch,
+            Action::PreviousMatch,
+            Action::Wrap,
+            Action::Copy,
+            Action::PageUp,
+            Action::PageDown,
+        ][..],
+        "pvc_explore" => &[
+            Action::Back,
+            Action::SwitchPane,
+            Action::Accept,
+            Action::Parent,
+            Action::Copy,
+            Action::Shell,
+            Action::Refresh,
+        ][..],
+        "port_forwards" => &[
+            Action::Back,
+            Action::Up,
+            Action::Down,
+            Action::Start,
+            Action::Toggle,
+        ][..],
+        "contexts" => &[
+            Action::Back,
+            Action::Accept,
+            Action::Rename,
+            Action::FleetMark,
+        ][..],
+        _ => &[
+            Action::Back,
+            Action::Up,
+            Action::Down,
+            Action::Accept,
+            Action::Logs,
+            Action::Refresh,
+            Action::Filter,
+            Action::Delete,
+            Action::Help,
+        ][..],
+    };
+    let available: Vec<_> = preferred
+        .iter()
+        .filter(|&&action| {
+            app.keymap
+                .entries()
+                .any(|(s, a, _)| s == scope && a == action)
+        })
+        .map(|&action| (action, action.description()))
+        .collect();
+    key_hint(app, scope, &available)
+}
+
 fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
     let line = match app.mode {
         Mode::Command => Line::from(vec![
@@ -3943,7 +4152,10 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
                 ));
             } else if app.filter_selectors_pending() {
                 spans.push(Span::styled(
-                    "  ⏎ apply server-side",
+                    format!(
+                        "  {} apply server-side",
+                        app.keymap.label("filter", Action::Accept)
+                    ),
                     Style::default().fg(theme::yellow()),
                 ));
             } else {
@@ -3979,104 +4191,13 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
             ])
         }
         Mode::Confirm => Line::from(Span::styled(
-            confirm_action_hint(app.confirm_allows_force_toggle(), ConfirmHintStyle::Prompt),
+            confirm_action_hint(app, app.confirm_allows_force_toggle()),
             Style::default().fg(theme::yellow()),
         )),
-        Mode::Logs => {
-            let hint = if app.provider_logs_active() {
-                "  /filter  s:autoscroll  w:wrap  t:timestamps  F:fullscreen  0-5:since  T:period  x:stop/resume  z:clear  c:copy  ^s:save  esc:back"
-            } else {
-                "  /filter  s:autoscroll  w:wrap  t:timestamps  F:fullscreen  0-5:since  x:stop/resume  z:clear  c:copy  ^s:save  esc:back"
-            };
-            Line::from(Span::styled(hint, theme::dim()))
-        }
-        Mode::Detail | Mode::Events | Mode::Diff => {
-            // The `x` decode binding only applies to a secret's document view.
-            let hint = if app.mode == Mode::Detail && app.kind_plural == "secrets" {
-                "  j/k:scroll  ^f/^b:page  h/l:← →  g/G:top/bottom  /:search  n/N:next/prev  w:wrap  c:copy  x:decode  esc:back"
-            } else {
-                "  j/k:scroll  ^f/^b:page  h/l:← →  g/G:top/bottom  /:search  n/N:next/prev  w:wrap  c:copy  esc:back"
-            };
-            let hint = if app.mode == Mode::Detail && app.describe_source.is_some() {
-                format!(
-                    "{hint}  r:refresh {}",
-                    if app.describe_refresh_task.is_some() {
-                        "on"
-                    } else {
-                        "off"
-                    }
-                )
-            } else {
-                hint.to_string()
-            };
-            Line::from(Span::styled(hint, theme::dim()))
-        }
-        Mode::Help => Line::from(Span::styled("  /:search  ?/esc:back", theme::dim())),
-        Mode::Explain => Line::from(Span::styled(
-            "  j/k: move   ⏎: go to resource   E: events   l: logs   r: refresh   esc: back",
+        _ => Line::from(Span::styled(
+            navigation_hint(app, frame.area().width),
             theme::dim(),
         )),
-        Mode::Timeline => Line::from(Span::styled(
-            "  j/k: move   g/G: top/bottom   esc: back",
-            theme::dim(),
-        )),
-        Mode::Gitops => Line::from(Span::styled(
-            "  j/k: move   ⏎: jump to owner/source   r: refresh   esc: back",
-            theme::dim(),
-        )),
-        Mode::Adjacent => Line::from(Span::styled(
-            "  j/k: move   ⏎: open the object   y: yaml   d: describe   c: discover children   r: refresh   esc: back",
-            theme::dim(),
-        )),
-        Mode::FluxMenu => Line::from(Span::styled(
-            "  j/k: move   enter: confirm   esc: cancel",
-            theme::dim(),
-        )),
-        Mode::PortForwardPicker => Line::from(Span::styled(
-            "  j/k: move   ⏎: forward this port   esc: cancel",
-            theme::dim(),
-        )),
-        Mode::PortForwards => Line::from(Span::styled(
-            "  j/k: move   x/s: stop   esc: close (others keep running)",
-            theme::dim(),
-        )),
-        Mode::Snapshots => Line::from(Span::styled(
-            "  j/k: move   ⏎: open   d: delete   esc: close",
-            theme::dim(),
-        )),
-        Mode::Fleet => Line::from(Span::styled(
-            "  j/k: move   ⏎: switch to context   r: refresh   esc: back",
-            theme::dim(),
-        )),
-        Mode::Find => Line::from(Span::styled(
-            "  j/k: move   ⏎: open the object   esc: close",
-            theme::dim(),
-        )),
-        Mode::PvcExplore => Line::from(Span::styled(
-            "  tab/←→: pane   j/k: move   ⏎: open   ⌫/-: up   c: copy to other pane   s: shell   r: refresh   esc: back",
-            theme::dim(),
-        )),
-        _ => {
-            // Per-resource verbs live in the header hint column when it
-            // fits; only repeat the full line when the header dropped it.
-            let cycle = if app.mode != Mode::Table {
-                ""
-            } else if app.active_workspace.is_some() {
-                "Tab/⇧Tab: workspace  "
-            } else {
-                "Tab/⇧Tab: resources  "
-            };
-            let hint = if !app.hide_header && header_hints_fit(frame.area().width) {
-                format!(
-                    "  {cycle}:resource  /filter  S:sort I:invert  w:wide  space:mark  [ ]:history  0:all-ns  ?:help"
-                )
-            } else {
-                format!(
-                    "  {cycle}:resource  /filter  S:sort I:invert  w:wide  ⏎drill  y:yaml d:describe l:logs e:edit s:shell/scale i:image r:restart f:fwd ^d:del  ?:help"
-                )
-            };
-            Line::from(Span::styled(hint, theme::dim()))
-        }
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -4136,23 +4257,15 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-#[derive(Clone, Copy)]
-enum ConfirmHintStyle {
-    Popup,
-    Prompt,
-}
-
-fn confirm_action_hint(allows_force: bool, style: ConfirmHintStyle) -> &'static str {
-    match (allows_force, style) {
-        (true, ConfirmHintStyle::Popup) => {
-            "  [y] confirm    [f] toggle force    [c] cascade    [n] cancel"
-        }
-        (false, ConfirmHintStyle::Popup) => "  [y] confirm    [n] cancel",
-        (true, ConfirmHintStyle::Prompt) => {
-            "  y/enter: confirm   f: toggle force   c: cascade   n/esc: cancel"
-        }
-        (false, ConfirmHintStyle::Prompt) => "  y/enter: confirm   n/esc: cancel",
+fn confirm_action_hint(app: &App, allows_force: bool) -> String {
+    let mut actions = vec![(Action::Accept, "confirm"), (Action::Back, "cancel")];
+    if allows_force {
+        actions.extend([
+            (Action::Force, "toggle force"),
+            (Action::Cascade, "cascade"),
+        ]);
     }
+    key_hint(app, "confirm", &actions)
 }
 
 /// Clear a popup region before drawing on top of it. `Clear` resets the cells
@@ -4480,16 +4593,14 @@ mod tests {
         assert_eq!(centered_rect_with_min(50, 20, 56, 7, tiny), tiny);
     }
 
-    #[test]
-    fn confirm_hint_mentions_force_only_when_supported() {
-        assert!(confirm_action_hint(true, ConfirmHintStyle::Popup).contains("toggle force"));
-        assert!(confirm_action_hint(true, ConfirmHintStyle::Prompt).contains("toggle force"));
-        assert!(!confirm_action_hint(false, ConfirmHintStyle::Popup).contains("toggle force"));
-        assert!(!confirm_action_hint(false, ConfirmHintStyle::Prompt).contains("toggle force"));
-        assert!(confirm_action_hint(true, ConfirmHintStyle::Popup).contains("cascade"));
-        assert!(confirm_action_hint(true, ConfirmHintStyle::Prompt).contains("cascade"));
-        assert!(!confirm_action_hint(false, ConfirmHintStyle::Popup).contains("cascade"));
-        assert!(!confirm_action_hint(false, ConfirmHintStyle::Prompt).contains("cascade"));
+    #[tokio::test]
+    async fn confirm_hint_mentions_force_only_when_supported() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let app = App::new(crate::k8s::Cluster::fake(), tx);
+        assert!(confirm_action_hint(&app, true).contains("toggle force"));
+        assert!(!confirm_action_hint(&app, false).contains("toggle force"));
+        assert!(confirm_action_hint(&app, true).contains("cascade"));
+        assert!(!confirm_action_hint(&app, false).contains("cascade"));
     }
 
     #[test]

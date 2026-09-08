@@ -117,23 +117,23 @@ impl App {
         });
     }
 
-    pub(super) fn key_find(&mut self, key: KeyEvent) {
+    pub(super) fn key_find(&mut self, key: KeyInput) {
         let len = self.find_items.len();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Table,
-            KeyCode::Char('j') | KeyCode::Down => list_step(&mut self.find_state, len, true),
-            KeyCode::Char('k') | KeyCode::Up => list_step(&mut self.find_state, len, false),
-            KeyCode::Char('g') | KeyCode::Home => {
+        match (key.action, key.code) {
+            (Some(Action::Back), _) | (Some(Action::Close), _) => self.mode = Mode::Table,
+            (Some(Action::Down), _) => list_step(&mut self.find_state, len, true),
+            (Some(Action::Up), _) => list_step(&mut self.find_state, len, false),
+            (Some(Action::First), _) => {
                 if len > 0 {
                     self.find_state.select(Some(0));
                 }
             }
-            KeyCode::Char('G') | KeyCode::End => {
+            (Some(Action::Last), _) => {
                 if len > 0 {
                     self.find_state.select(Some(len - 1));
                 }
             }
-            KeyCode::Enter => {
+            (Some(Action::Accept), _) => {
                 let Some(item) = self
                     .find_state
                     .selected()
