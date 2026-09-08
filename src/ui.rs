@@ -2398,22 +2398,38 @@ fn value_style(value: &str) -> Style {
     Style::default().fg(theme::text())
 }
 
-fn wrap_help_span(span: Span<'static>, width: usize) -> Vec<Line<'static>> {
+fn wrap_help_span(span: Span<'static>, width: usize, needle: &str) -> Vec<Line<'static>> {
+    let highlighted = highlight_matches(Line::from(span.clone()), needle);
+    let render = |start: usize, end: usize| {
+        let mut offset = 0;
+        let mut spans = Vec::new();
+        for part in &highlighted.spans {
+            let part_end = offset + part.content.len();
+            let from = start.max(offset);
+            let to = end.min(part_end);
+            if from < to {
+                spans.push(Span::styled(
+                    part.content[from - offset..to - offset].to_string(),
+                    part.style,
+                ));
+            }
+            offset = part_end;
+        }
+        wrap_line(Line::from(spans), width)
+    };
     let mut rows = Vec::new();
-    let mut text = String::new();
+    let mut start = 0;
+    let mut end = 0;
     for word in span.content.split_whitespace() {
-        if !text.is_empty() && text.width() + 1 + word.width() > width {
-            rows.extend(wrap_line(
-                Line::from(Span::styled(std::mem::take(&mut text), span.style)),
-                width,
-            ));
+        let word_start = end + span.content[end..].find(word).unwrap();
+        let word_end = word_start + word.len();
+        if start < end && span.content[start..word_end].width() > width {
+            rows.extend(render(start, end));
+            start = word_start;
         }
-        if !text.is_empty() {
-            text.push(' ');
-        }
-        text.push_str(word);
+        end = word_end;
     }
-    rows.extend(wrap_line(Line::from(Span::styled(text, span.style)), width));
+    rows.extend(render(start, end));
     rows
 }
 
@@ -2613,13 +2629,14 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         .into_iter()
         .flat_map(|line| {
             if line.spans.len() != 2 {
-                return wrap_line(line, width);
+                return wrap_line(highlight_matches(line, &app.help_filter), width);
             }
             let mut spans = line.spans.into_iter();
-            let keys = wrap_help_span(spans.next().unwrap(), key_width);
+            let keys = wrap_help_span(spans.next().unwrap(), key_width, &app.help_filter);
             let descriptions = wrap_help_span(
                 spans.next().unwrap(),
                 width.saturating_sub(key_width + 4).max(1),
+                &app.help_filter,
             );
             (0..keys.len().max(descriptions.len()))
                 .map(|i| {
@@ -2636,7 +2653,6 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
                 })
                 .collect()
         })
-        .map(|line| highlight_matches(line, &app.help_filter))
         .collect();
     // Record the content height for paging and clamp the offset after layout changes.
     let inner_h = area.height.saturating_sub(2);

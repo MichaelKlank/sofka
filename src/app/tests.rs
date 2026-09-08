@@ -21637,6 +21637,53 @@ async fn help_keeps_long_key_lists_separate_from_descriptions() {
 }
 
 #[tokio::test]
+async fn help_highlights_search_phrases_across_wrapped_rows() {
+    use ratatui::{Terminal, backend::TestBackend, style::Modifier};
+
+    for filter in [
+        "switch kind and namespace at once",
+        "pagedown / space / ctrl-f / shift-pagedown",
+        "hierarchical tree · live-vs-last-applied diff",
+    ] {
+        for width in [40, 60] {
+            let (mut app, _rx) = test_app();
+            app.handle_key(press(KeyCode::Char('?'))).unwrap();
+            app.handle_key(press(KeyCode::Char('/'))).unwrap();
+            for c in filter.chars() {
+                app.handle_key(press(KeyCode::Char(c))).unwrap();
+            }
+            app.handle_key(press(KeyCode::Enter)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let highlighted: Vec<String> = terminal
+                .backend()
+                .buffer()
+                .content
+                .chunks(usize::from(width))
+                .map(|row| {
+                    row.iter()
+                        .filter(|cell| {
+                            cell.bg == crate::theme::yellow()
+                                && cell.modifier.contains(Modifier::BOLD)
+                        })
+                        .map(|cell| cell.symbol())
+                        .collect::<String>()
+                })
+                .filter(|row| !row.is_empty())
+                .collect();
+            assert!(highlighted.len() >= 2, "{filter}: {highlighted:?}");
+            let matched: String = highlighted
+                .concat()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            let expected: String = filter.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(matched.starts_with(&expected), "{filter}: {highlighted:?}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn custom_keys_are_visible_in_help_header_and_footer() {
     use ratatui::{Terminal, backend::TestBackend};
     let (mut app, _rx) = test_app();
