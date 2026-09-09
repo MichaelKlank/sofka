@@ -6,8 +6,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, Gauge, HighlightSpacing, LineGauge, List, ListItem,
-    ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Sparkline,
+    Block, BorderType, Borders, Clear, Gauge, HighlightSpacing, List, ListItem, ListState,
+    Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Sparkline,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -3434,7 +3434,12 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
     // +2 borders, +1 so the last column doesn't touch the right border.
     let popup_w = (inner_w as u16 + 3).min(area.width);
     let rows = app.container_list.len() as u16;
-    let popup_h = rows.saturating_add(8).max(10).min(area.height);
+    let trend_height = if popup_w >= 80 && area.height >= 7 && rows > 0 {
+        3
+    } else {
+        0
+    };
+    let popup_h = rows.saturating_add(3 + trend_height).min(area.height);
 
     let popup = centered_rect_exact(popup_w, popup_h, area);
     clear_region(frame, popup);
@@ -3448,20 +3453,9 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let gauge_height = if inner.height >= 4 && inner.width >= 44 {
-        2
-    } else {
-        0
-    };
-    let trend_height = if inner.height >= 7 && inner.width >= 78 {
-        3
-    } else {
-        0
-    };
-    let [header_area, list_area, gauge_area, trend_area] = Layout::vertical([
+    let [header_area, list_area, trend_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
-        Constraint::Length(gauge_height),
         Constraint::Length(trend_height),
     ])
     .areas(inner);
@@ -3494,9 +3488,6 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
         usize::from(list_area.height),
         false,
     );
-    if gauge_height > 0 {
-        draw_container_gauges(frame, app, gauge_area);
-    }
     if trend_height > 0 {
         draw_container_trends(frame, app, trend_area);
     }
@@ -3534,77 +3525,6 @@ fn draw_container_trends(frame: &mut Frame, app: &App, area: Rect) {
             .absent_value_symbol("·")
             .absent_value_style(theme::dim());
         frame.render_widget(sparkline, Rect::new(area.x + 18, area.y + row, 60, 1));
-    }
-}
-
-fn draw_container_gauges(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(container) = app
-        .container_state
-        .selected()
-        .and_then(|i| app.container_list.get(i))
-    else {
-        return;
-    };
-    let usage = app.selected_pod_container_metrics(container);
-    let resources = app
-        .container_resources
-        .get(container)
-        .cloned()
-        .unwrap_or_default();
-    for (row, label, value, request, limit, format) in [
-        (
-            0,
-            "CPU",
-            usage.map(|u| u.0),
-            resources.cpu_request,
-            resources.cpu_limit,
-            crate::columns::fmt_cpu as fn(i64) -> String,
-        ),
-        (
-            1,
-            "MEM",
-            usage.map(|u| u.1),
-            resources.mem_request,
-            resources.mem_limit,
-            crate::columns::fmt_mem as fn(i64) -> String,
-        ),
-    ] {
-        let denominator = limit
-            .filter(|v| *v > 0)
-            .map(|v| ("limit", v))
-            .or_else(|| request.filter(|v| *v > 0).map(|v| ("request", v)));
-        let pct = value.and_then(|v| crate::columns::usage_pct(v, denominator.map(|d| d.1)));
-        let value_label = value
-            .map(|v| {
-                if v == 0 {
-                    if label == "CPU" {
-                        "0m".into()
-                    } else {
-                        "0B".into()
-                    }
-                } else {
-                    format(v)
-                }
-            })
-            .unwrap_or_else(|| "unavailable".into());
-        let base_label = denominator
-            .map(|(kind, v)| format!("{kind} {}", format(v)))
-            .unwrap_or_else(|| "no request or limit".into());
-        let percent = pct.map(|v| format!(" ({v}%)")).unwrap_or_default();
-        let stale = if app.metrics_error.is_some() {
-            " [stale]"
-        } else {
-            ""
-        };
-        let label = format!("{label} {value_label} / {base_label}{percent}{stale} ");
-        let gauge = LineGauge::default()
-            .label(label)
-            .ratio(pct.map_or(0.0, |p| (p as f64 / 100.0).clamp(0.0, 1.0)))
-            .filled_style(
-                Style::default().fg(util_color(pct, app.resolved_thresholds().utilization)),
-            )
-            .unfilled_style(theme::dim());
-        frame.render_widget(gauge, Rect::new(area.x, area.y + row, area.width, 1));
     }
 }
 
