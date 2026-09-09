@@ -1,5 +1,6 @@
 use super::*;
 use crate::store::RefreshContent;
+use kube::ResourceExt;
 
 #[derive(Clone)]
 pub(super) struct RefreshSource {
@@ -54,7 +55,8 @@ impl RefreshSource {
                 findings,
             });
         }
-        let source = self.read().await?;
+        let mut source = self.read().await?;
+        source.managed_fields_mut().clear();
         let lines = match &self.view {
             RefreshView::Yaml => serde_yaml::to_string(&source)
                 .map_err(|e| e.to_string())?
