@@ -25,6 +25,7 @@ impl App {
         let run = self.plugin_run;
         let result = self.handle_key_inner(key);
         self.check_resource_refresh();
+        self.sync_container_history();
         if self.should_quit || self.mode != Mode::Adjacent {
             self.cancel_children();
         }

@@ -4,6 +4,14 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 
 ## Core navigation
 
+- **Container trends** show CPU and memory for the selected container on wide
+  screens. Each chart covers the last five minutes in five-second bins, with
+  the newest sample on the right. The scale is zero to the largest visible
+  value. A dot marks a missing sample; measured zero has an empty bar.
+  History starts while the container is selected and keeps at most 60 samples.
+  It clears on a selection or view change, context change, or pod replacement.
+  It uses the existing metrics polls and is not saved between sessions.
+
 - **Container gauges** show CPU and memory for the selected container when space
   is available. The bars use a positive limit, or a positive request when no
   limit is set. Labels keep the numeric usage and percentages above 100%.
