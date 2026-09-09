@@ -602,6 +602,24 @@ impl ViewSpec {
         Some(&self.columns.get(idx)?.original_header)
     }
 
+    /// Whether `header`'s sort key depends on `now` (AGE, running-job
+    /// DURATION, user `time` columns) and so can't be cached by
+    /// resourceVersion alone.
+    pub fn is_time_sort(&self, header: &str, plural: &str) -> bool {
+        let idx = match self.header_index(header) {
+            Some(i) => i,
+            None => return false,
+        };
+        if let SpecSource::User(uc) = &self.columns[idx].source {
+            return uc.kind == crate::views::ColumnKind::Time;
+        }
+        match self.canonical_header(idx) {
+            Some("AGE") => true,
+            Some("DURATION") if plural == "jobs" => true,
+            _ => false,
+        }
+    }
+
     pub fn headers(&self) -> Vec<String> {
         self.columns.iter().map(|c| c.header.clone()).collect()
     }
