@@ -3546,7 +3546,7 @@ fn draw_container_gauges(frame: &mut Frame, app: &App, area: Rect) {
             .map(|(kind, v)| format!("{kind} {}", format(v)))
             .unwrap_or_else(|| "no request or limit".into());
         let percent = pct.map(|v| format!(" ({v}%)")).unwrap_or_default();
-        let stale = if app.metrics_error.is_some() {
+        let stale = if value.is_some() && app.metrics_error.is_some() {
             " [stale]"
         } else {
             ""

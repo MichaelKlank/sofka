@@ -23682,17 +23682,39 @@ async fn container_gauges_follow_selection_and_missing_metrics() {
         "{text}"
     );
     assert!(text.contains("no request or limit"));
+    app.handle_msg(Msg::MetricsError {
+        generation: app.generation,
+        error: "offline".into(),
+    });
+    let text = render(&mut terminal, &mut app);
+    assert!(text.contains("CPU 0m / request 50m (0%) [stale]"), "{text}");
+    assert!(
+        text.contains("MEM 0B / no request or limit [stale]"),
+        "{text}"
+    );
+    app.handle_key(press(KeyCode::Up)).unwrap();
+    let text = render(&mut terminal, &mut app);
+    assert!(
+        text.contains("CPU 250m / limit 100m (250%) [stale]"),
+        "{text}"
+    );
     app.handle_msg(Msg::Metrics {
         generation: app.generation,
         data: HashMap::new(),
         containers: HashMap::new(),
     });
-    assert!(render(&mut terminal, &mut app).contains("CPU unavailable"));
+    let text = render(&mut terminal, &mut app);
+    assert!(text.contains("CPU unavailable"), "{text}");
+    assert!(text.contains("MEM unavailable"), "{text}");
+    assert!(!text.contains("[stale]"), "{text}");
     app.handle_msg(Msg::MetricsError {
         generation: app.generation,
         error: "offline".into(),
     });
-    assert!(render(&mut terminal, &mut app).contains("[stale]"));
+    let text = render(&mut terminal, &mut app);
+    assert!(text.contains("CPU unavailable"), "{text}");
+    assert!(text.contains("MEM unavailable"), "{text}");
+    assert!(!text.contains("[stale]"), "{text}");
     for (width, height) in [(1, 1), (20, 8), (80, 24)] {
         terminal.backend_mut().resize(width, height);
         crate::ui::resize(&mut terminal, &mut app).unwrap();
