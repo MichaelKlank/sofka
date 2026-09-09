@@ -23637,6 +23637,88 @@ async fn explain_refresh_clears_a_removed_selection_and_blocks_implicit_root_act
 }
 
 #[tokio::test]
+async fn container_trends_follow_keys_and_reject_stale_samples() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let pod = |uid: &str| {
+        json!({"apiVersion":"v1", "kind":"Pod",
+        "metadata":{"name":"api", "namespace":"default", "uid":uid},
+        "spec":{"containers":[{"name":"app"}, {"name":"sidecar"}]}})
+    };
+    apply(&mut app, pod("first"));
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Containers);
+    let metrics = |generation| Msg::Metrics {
+        generation,
+        data: HashMap::new(),
+        containers: HashMap::from([
+            ("default/api/app".into(), (100, 2000)),
+            ("default/api/sidecar".into(), (0, 0)),
+        ]),
+    };
+    app.handle_msg(metrics(app.generation.wrapping_sub(1)));
+    assert_eq!(app.container_trend_bars(true), [None; 60]);
+    app.handle_msg(metrics(app.generation));
+    assert_eq!(app.container_trend_bars(true)[59], Some(100));
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("last 5 min, 5 s bins"));
+    assert!(text.contains("CPU 0..100m"));
+    assert!(!text.contains(" / limit "));
+    assert!(!text.contains(" / request "));
+    let buffer = terminal.backend().buffer();
+    let heading_y = (0..40)
+        .find(|&y| {
+            (0..160)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .contains("last 5 min")
+        })
+        .unwrap();
+    let rows_above: String = (0..160)
+        .map(|x| buffer[(x, heading_y - 1)].symbol())
+        .collect();
+    assert!(
+        rows_above.contains("sidecar"),
+        "the charts must follow the table without gauges or empty rows"
+    );
+
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    assert_eq!(app.container_trend_bars(true), [None; 60]);
+    app.handle_msg(metrics(app.generation));
+    assert_eq!(app.container_trend_bars(true)[59], Some(0));
+    app.handle_msg(Msg::MetricsError {
+        generation: app.generation,
+        error: "offline".into(),
+    });
+    assert_eq!(app.container_trend_bars(true)[59], None);
+    app.handle_msg(metrics(app.generation));
+    apply(&mut app, pod("replacement"));
+    assert_eq!(app.container_trend_bars(true), [None; 60]);
+    app.handle_msg(metrics(app.generation));
+    app.handle_msg(Msg::Deleted {
+        generation: app.generation,
+        key: "default/api".into(),
+    });
+    assert_eq!(app.container_trend_bars(true), [None; 60]);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.container_trend_bars(true), [None; 60]);
+    for (width, height) in [(3, 3), (60, 12), (160, 40)] {
+        terminal.backend_mut().resize(width, height);
+        crate::ui::resize(&mut terminal, &mut app).unwrap();
+    }
+}
+
+#[tokio::test]
 async fn popup_shadows_follow_open_close_and_resize() {
     use ratatui::{Terminal, backend::TestBackend};
     let (mut app, _rx) = test_app();

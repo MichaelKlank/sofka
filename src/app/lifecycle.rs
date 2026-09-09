@@ -335,6 +335,7 @@ impl App {
         self.stop_plugins();
         self.cancel_adjacent_request();
         self.generation += 1;
+        self.container_history = metrics_history::ContainerHistory::default();
         self.gen_flag.store(self.generation, Ordering::SeqCst);
         for t in self.tasks.drain(..) {
             t.abort();
@@ -859,6 +860,7 @@ impl App {
         self.stop_plugins();
         self.cancel_adjacent_request();
         self.generation += 1;
+        self.container_history = metrics_history::ContainerHistory::default();
         self.gen_flag.store(self.generation, Ordering::SeqCst);
         for t in self.tasks.drain(..) {
             t.abort();
@@ -1028,6 +1030,7 @@ impl App {
                 self.metrics_error = None;
                 self.metrics = data;
                 self.container_metrics = containers;
+                self.record_container_history(false);
                 if sort_uses_metrics
                     || self
                         .parsed_filter()
@@ -1054,6 +1057,7 @@ impl App {
             }
             Msg::MetricsError { generation, error } if generation == self.generation => {
                 self.metrics_error = Some(error);
+                self.record_container_history(true);
             }
             Msg::PrinterColumns {
                 generation,

@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, Gauge, HighlightSpacing, List, ListItem, ListState,
-    Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Shadow,
+    Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Shadow, Sparkline,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -3429,11 +3429,17 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
         + C_GAP + C_MEM_PCT;
     let inner_w = content_w
         .max(title.chars().count())
-        .max(footer.chars().count());
+        .max(footer.chars().count())
+        .max(78);
     // +2 borders, +1 so the last column doesn't touch the right border.
     let popup_w = (inner_w as u16 + 3).min(area.width);
     let rows = app.container_list.len() as u16;
-    let popup_h = (rows + 3).clamp(5, area.height); // header + rows + 2 borders
+    let trend_height = if popup_w >= 80 && area.height >= 7 && rows > 0 {
+        3
+    } else {
+        0
+    };
+    let popup_h = rows.saturating_add(3 + trend_height).min(area.height);
 
     let popup = centered_rect_exact(popup_w, popup_h, area);
     clear_region(frame, popup);
@@ -3447,8 +3453,12 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let [header_area, list_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    let [header_area, list_area, trend_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(trend_height),
+    ])
+    .areas(inner);
     // Indent the header past the 2-column highlight gutter so it lines up with
     // the rows underneath it.
     frame.render_widget(
@@ -3467,8 +3477,8 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
     draw_border_scrollbar(
         frame,
         Rect {
-            y: popup.y.saturating_add(1),
-            height: popup.height.saturating_sub(1),
+            y: list_area.y.saturating_sub(1),
+            height: list_area.height.saturating_add(2),
             ..popup
         },
         app.container_state.offset(),
@@ -3478,6 +3488,44 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
         usize::from(list_area.height),
         false,
     );
+    if trend_height > 0 {
+        draw_container_trends(frame, app, trend_area);
+    }
+}
+
+fn draw_container_trends(frame: &mut Frame, app: &App, area: Rect) {
+    frame.render_widget(
+        Line::styled(
+            "Selected container: last 5 min, 5 s bins; · = no sample",
+            theme::dim(),
+        ),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    for (row, cpu, name, color) in [
+        (1, true, "CPU", theme::yellow()),
+        (2, false, "MEM", theme::teal()),
+    ] {
+        let bars = app.container_trend_bars(cpu);
+        let maximum = bars.iter().flatten().copied().max().unwrap_or(0);
+        let scale = if cpu {
+            format!("{maximum}m")
+        } else if maximum == 0 {
+            "0B".into()
+        } else {
+            crate::columns::fmt_mem(maximum as i64)
+        };
+        frame.render_widget(
+            Line::styled(format!("{name} 0..{scale}"), theme::dim()),
+            Rect::new(area.x, area.y + row, 18, 1),
+        );
+        let sparkline = Sparkline::default()
+            .data(bars)
+            .max(maximum.max(1))
+            .style(Style::default().fg(color))
+            .absent_value_symbol("·")
+            .absent_value_style(theme::dim());
+        frame.render_widget(sparkline, Rect::new(area.x + 18, area.y + row, 60, 1));
+    }
 }
 
 fn draw_prompt_popup(frame: &mut Frame, app: &App, area: Rect) {
