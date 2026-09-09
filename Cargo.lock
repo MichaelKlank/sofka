@@ -3044,6 +3044,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-timeout",
  "hyper-util",
+ "ipnet",
  "k8s-openapi",
  "kube",
  "memchr",

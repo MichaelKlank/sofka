@@ -24,6 +24,7 @@ use crate::diagnostics::Op;
 use crate::store::{Msg, row_key};
 
 mod discovery;
+mod proxy;
 
 pub(crate) fn build_client(config: Config, allow_v1_client_cert: bool) -> Result<Client> {
     let builder = crate::legacy_tls::client_builder(config, allow_v1_client_cert)?;
@@ -276,12 +277,16 @@ fn sanitize_server_version(version: &str) -> String {
 
 impl Cluster {
     pub async fn connect(allow_v1_client_cert: bool) -> Result<Self> {
-        let config = Config::infer()
+        let mut config = Config::infer()
             .await
             .context("loading kubeconfig (is KUBECONFIG / ~/.kube/config present?)")?;
         // The real kubeconfig current-context (if any) is what kubectl uses by
         // default; pass it explicitly so shell-outs can't drift from us.
-        let cli_context = current_context_name();
+        let kubeconfig = Kubeconfig::read().ok();
+        if let Some(kubeconfig) = &kubeconfig {
+            proxy::configure(&mut config, kubeconfig, None);
+        }
+        let cli_context = kubeconfig.and_then(|config| config.current_context);
         let context = cli_context.clone().unwrap_or_else(|| "default".into());
         Self::from_config(config, context, cli_context, allow_v1_client_cert).await
     }
@@ -294,9 +299,10 @@ impl Cluster {
             cluster: None,
             user: None,
         };
-        let config = Config::from_custom_kubeconfig(kubeconfig, &opts)
+        let mut config = Config::from_custom_kubeconfig(kubeconfig.clone(), &opts)
             .await
             .with_context(|| format!("building config for context '{name}'"))?;
+        proxy::configure(&mut config, &kubeconfig, Some(name));
         Self::from_config(
             config,
             name.to_string(),
@@ -836,12 +842,6 @@ fn group_priority(group: &str) -> u8 {
         "metrics.k8s.io" => 0, // virtual metrics API — never shadow real kinds
         _ => 50,
     }
-}
-
-fn current_context_name() -> Option<String> {
-    // Config::infer() doesn't surface the context name, so read it directly.
-    let kubeconfig = kube::config::Kubeconfig::read().ok()?;
-    kubeconfig.current_context
 }
 
 /// A requested kubeconfig context (or the current one when none was requested),
