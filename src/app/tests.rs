@@ -23037,6 +23037,48 @@ async fn take_resource_refresh(rx: &mut Receiver<Msg>) -> Msg {
 }
 
 #[tokio::test]
+async fn yaml_refresh_keeps_managed_fields_hidden() {
+    let root = json!({"apiVersion":"v1","kind":"Pod",
+        "metadata":{"name":"web","namespace":"default","uid":"original",
+            "managedFields":[]},
+        "status":{"phase":"Running"}});
+    let (mut app, mut rx, responses, _) = health_report_app("pods", root.clone());
+    let mut fresh = root;
+    fresh["metadata"]["managedFields"] = json!([{
+        "manager":"kubelet","operation":"Update","apiVersion":"v1",
+        "fieldsType":"FieldsV1","fieldsV1":{"f:status":{"f:phase":{}}}
+    }]);
+    responses
+        .lock()
+        .unwrap()
+        .insert("/api/v1/namespaces/default/pods/web".into(), (200, fresh));
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    let lines = app.detail.lines.clone();
+    let scroll = app.detail.scroll;
+    assert!(lines.iter().any(|line| line.contains("managedFields: []")));
+
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    app.handle_msg(take_resource_refresh(&mut rx).await);
+
+    assert!(app.refresh_task.is_some());
+    assert_eq!(app.detail.lines, lines);
+    assert_eq!(app.detail.scroll, scroll);
+    assert!(
+        app.document_source
+            .as_ref()
+            .unwrap()
+            .object
+            .metadata
+            .managed_fields
+            .as_ref()
+            .unwrap()
+            .is_empty()
+    );
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+}
+
+#[tokio::test]
 async fn yaml_refresh_uses_the_original_resource_api_and_context() {
     for (plural, api_version, kind, namespace, path) in [
         (
