@@ -9995,29 +9995,91 @@ async fn command_with_unlisted_namespace_is_freeform() {
 }
 
 #[tokio::test]
-async fn ns_command_stays_on_current_view() {
-    let (mut app, _rx) = test_app();
-    app.switch_kind("deployments");
-    app.handle_key(press(KeyCode::Char(':'))).unwrap();
-    for c in "namespaces social".chars() {
-        app.handle_key(press(KeyCode::Char(c))).unwrap();
+async fn ns_command_preserves_resource_and_normalizes_namespace() {
+    for resource in ["deployments", "nodes", "namespaces"] {
+        for alias in ["ns", "namespace", "namespaces"] {
+            for (name, expected) in [("social", "social"), ("all", ""), ("*", "")] {
+                let (mut app, _rx) = test_app();
+                app.cluster
+                    .add_aliases(&HashMap::from([("ns".into(), "namespaces".into())]));
+                palette(&mut app, resource);
+                palette(&mut app, &format!("{alias} {name}"));
+                let expected_resource = if resource == "namespaces" {
+                    "pods"
+                } else {
+                    resource
+                };
+                assert_eq!(
+                    app.kind_plural, expected_resource,
+                    "{resource}: {alias} {name}"
+                );
+                assert_eq!(app.namespace, expected, "{resource}: {alias} {name}");
+                assert_eq!(app.mode, Mode::Table);
+                if resource == "nodes" {
+                    palette(&mut app, "pods");
+                    assert_eq!(app.namespace, expected);
+                }
+            }
+        }
     }
-    app.handle_key(press(KeyCode::Enter)).unwrap();
-    assert_eq!(app.kind_plural, "deployments");
-    assert_eq!(app.namespace, "social");
 }
 
 #[tokio::test]
-async fn ns_command_from_namespaces_list_falls_back_to_pods() {
-    let (mut app, _rx) = test_app();
-    app.switch_kind("namespaces");
-    app.handle_key(press(KeyCode::Char(':'))).unwrap();
-    for c in "namespaces social".chars() {
-        app.handle_key(press(KeyCode::Char(c))).unwrap();
+async fn ns_command_without_argument_opens_namespaces() {
+    for alias in ["ns", "namespace", "namespaces"] {
+        let (mut app, _rx) = test_app();
+        app.cluster
+            .add_aliases(&HashMap::from([("ns".into(), "namespaces".into())]));
+        palette(&mut app, "deployments social");
+        palette(&mut app, alias);
+        assert_eq!(app.kind_plural, "namespaces");
+        assert_eq!(app.namespace, "social");
+        assert_eq!(app.mode, Mode::Table);
     }
-    app.handle_key(press(KeyCode::Enter)).unwrap();
-    assert_eq!(app.kind_plural, "pods");
-    assert_eq!(app.namespace, "social");
+}
+
+#[tokio::test]
+async fn ns_command_matches_picker_for_filters_and_owner_scope() {
+    for return_from_list in [false, true] {
+        for name in ["social", "all", "*"] {
+            let (mut app, _rx) = test_app();
+            app.cluster
+                .add_aliases(&HashMap::from([("ns".into(), "namespaces".into())]));
+            palette(&mut app, "jobs");
+            app.filter = "backup -l app=backup".into();
+            app.owner = Some(OwnerScope {
+                kind: "CronJob".into(),
+                name: "backup".into(),
+                uid: Some("old-owner".into()),
+            });
+            app.scope_label = Some("cronjob/backup".into());
+            if return_from_list {
+                app.push_frame();
+                app.kind = app.cluster.resolve("namespaces");
+                app.kind_plural = "namespaces".into();
+                app.filter.clear();
+                app.owner = None;
+                app.scope_label = None;
+            }
+            palette(&mut app, &format!("ns {name}"));
+            assert_eq!(app.kind_plural, "jobs");
+            assert_eq!(app.namespace, if name == "social" { "social" } else { "" });
+            assert_eq!(app.filter, "backup -l app=backup");
+            assert_eq!(app.owner, None);
+            assert_eq!(app.scope_label, None);
+            assert!(app.stack.is_empty());
+            assert_eq!(app.mode, Mode::Table);
+            apply(
+                &mut app,
+                json!({
+                    "apiVersion": "batch/v1", "kind": "Job",
+                    "metadata": {"name": "backup-new", "namespace": "social", "labels": {"app": "backup"}},
+                    "spec": {}
+                }),
+            );
+            assert_eq!(row_names(&app), ["backup-new"]);
+        }
+    }
 }
 
 #[tokio::test]

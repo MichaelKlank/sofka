@@ -34,6 +34,14 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   extension API server is down, or it sends an `apiVersion` that is not `v1`.
   Sofka does not load that group. It shows a warning at startup and a flash
   on the first screen. `:info` shows the group and the reason.
+- **Namespace commands**: `:ns <name>` changes namespace and keeps the current
+  resource view, as the namespace switcher does. `:namespace` and `:namespaces`
+  accept the same argument; `all` and `*` select all namespaces. From the
+  Namespaces list, the command returns to the previous view, or opens Pods if
+  there is no previous view. Other cluster-scoped views stay open; the namespace
+  selection applies to the next namespaced resource view. Filters follow the
+  namespace switcher's rules, and resource ownership scope is cleared.
+  Without an argument, `:ns` opens the Namespaces list.
 - **Live watch** of any kind through `kube::runtime::watcher`, streamed into an
   in-memory store. Watch requests use uncompressed responses to avoid gzip
   stream errors. List requests retain gzip compression.
