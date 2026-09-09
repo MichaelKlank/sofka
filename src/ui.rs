@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, Gauge, HighlightSpacing, List, ListItem, ListState,
-    Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Shadow,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -4483,6 +4483,10 @@ fn draw_border_scrollbar(
             Rect::new(area.right() - 1, area.y + 1, 1, area.height - 2),
         )
     };
+    let track = track.intersection(frame.area());
+    if track.is_empty() {
+        return;
+    }
     // Ratatui uses content_length - 1 as the maximum position, then adds
     // the viewport length to calculate the thumb size.
     let mut state = ScrollbarState::new(max_offset.saturating_add(1))
@@ -4524,6 +4528,9 @@ fn draw_document_scrollbars(frame: &mut Frame, view: &crate::app::Scrollable, ar
 /// to the terminal default; with the skin background enabled that would punch a
 /// transparent hole through the fill, so repaint `base` over the cleared cells.
 fn clear_region(frame: &mut Frame, area: Rect) {
+    let shadow =
+        Shadow::overlay().style(Style::default().fg(theme::overlay1()).bg(theme::surface0()));
+    frame.render_widget(&shadow, area);
     frame.render_widget(Clear, area);
     if let Some(bg) = theme::background() {
         frame.buffer_mut().set_style(area, Style::default().bg(bg));

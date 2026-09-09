@@ -4,6 +4,10 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 
 ## Core navigation
 
+- **Popup shadows** use the active skin colors to separate confirmation boxes,
+  the command palette, and pickers from the content below. Shadows stay within
+  the terminal bounds and disappear when the popup closes.
+
 - **Scroll position** appears on the borders of long resource tables, document
   views, logs, and pickers. Tables and unwrapped documents also show horizontal
   position. Wrapped views use display rows. Scrollbars disappear when content
