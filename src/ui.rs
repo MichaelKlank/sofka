@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, Gauge, HighlightSpacing, List, ListItem, ListState,
-    Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Shadow, Sparkline,
+    Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Sparkline,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -98,6 +98,7 @@ pub fn resize<B: ratatui::backend::Backend>(
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    let show_scrollbars = app.scrollbars_visible();
     // Fill the whole frame with the skin's background first (when enabled), so
     // every view that only sets foreground colors sits on it. Widgets that set
     // their own background (the selection bar, gauges, search highlights) still
@@ -178,19 +179,43 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     match app.mode {
-        Mode::Detail => draw_scrollable(frame, &mut app.detail, chunks[1], theme::sky()),
-        Mode::Diff => draw_diff(frame, &mut app.detail, chunks[1]),
-        Mode::Events => draw_scrollable(frame, &mut app.detail, chunks[1], theme::peach()),
+        Mode::Detail => draw_scrollable(
+            frame,
+            show_scrollbars,
+            &mut app.detail,
+            chunks[1],
+            theme::sky(),
+        ),
+        Mode::Diff => draw_diff(frame, show_scrollbars, &mut app.detail, chunks[1]),
+        Mode::Events => draw_scrollable(
+            frame,
+            show_scrollbars,
+            &mut app.detail,
+            chunks[1],
+            theme::peach(),
+        ),
         Mode::Logs | Mode::LogFilter => draw_logs(frame, app, chunks[1]),
         // The lookback prompt opens from the logs view — keep it underneath.
         Mode::Prompt if app.prompt_over_logs() => draw_logs(frame, app, chunks[1]),
         // While typing a doc search, keep drawing the view it was opened from
         // so the matches narrow live under the prompt.
         Mode::DocFilter => match app.doc_filter_return {
-            Mode::Diff => draw_diff(frame, &mut app.detail, chunks[1]),
-            Mode::Events => draw_scrollable(frame, &mut app.detail, chunks[1], theme::peach()),
+            Mode::Diff => draw_diff(frame, show_scrollbars, &mut app.detail, chunks[1]),
+            Mode::Events => draw_scrollable(
+                frame,
+                show_scrollbars,
+                &mut app.detail,
+                chunks[1],
+                theme::peach(),
+            ),
             Mode::Help => draw_help(frame, app, chunks[1]),
-            _ => draw_scrollable(frame, &mut app.detail, chunks[1], theme::sky()),
+            _ => draw_scrollable(
+                frame,
+                show_scrollbars,
+                &mut app.detail,
+                chunks[1],
+                theme::sky(),
+            ),
         },
         Mode::Help => draw_help(frame, app, chunks[1]),
         Mode::Pulse => draw_pulse(frame, app, chunks[1]),
@@ -213,9 +238,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         // While the palette is open, keep drawing the view it was opened
         // from, so a global `:` never flashes the table underneath it.
         Mode::Command => match app.palette_return {
-            Mode::Diff => draw_diff(frame, &mut app.detail, chunks[1]),
-            Mode::Events => draw_scrollable(frame, &mut app.detail, chunks[1], theme::peach()),
-            Mode::Detail => draw_scrollable(frame, &mut app.detail, chunks[1], theme::sky()),
+            Mode::Diff => draw_diff(frame, show_scrollbars, &mut app.detail, chunks[1]),
+            Mode::Events => draw_scrollable(
+                frame,
+                show_scrollbars,
+                &mut app.detail,
+                chunks[1],
+                theme::peach(),
+            ),
+            Mode::Detail => draw_scrollable(
+                frame,
+                show_scrollbars,
+                &mut app.detail,
+                chunks[1],
+                theme::sky(),
+            ),
             Mode::Logs => draw_logs(frame, app, chunks[1]),
             Mode::Help => draw_help(frame, app, chunks[1]),
             Mode::Pulse => draw_pulse(frame, app, chunks[1]),
@@ -872,6 +909,7 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
 }
 
 fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     let show_ns = app.show_namespace_column();
     let headers = app.display_headers();
     let sort_col = app.sort_column;
@@ -1262,6 +1300,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     draw_border_scrollbar(
         frame,
+        show_scrollbars,
         Rect {
             y: area.y.saturating_add(1),
             height: area.height.saturating_sub(1),
@@ -1274,6 +1313,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     draw_border_scrollbar(
         frame,
+        show_scrollbars,
         area,
         col_offset,
         app.col_scroll_max,
@@ -1580,6 +1620,7 @@ fn render_name_cell(app: &App, name: &str, base: Color, forwarded: bool) -> Rend
 
 fn draw_scrollable(
     frame: &mut Frame,
+    show_scrollbars: bool,
     view: &mut crate::app::Scrollable,
     area: Rect,
     accent: ratatui::style::Color,
@@ -1617,7 +1658,7 @@ fn draw_scrollable(
         p.scroll((0, view.hscroll.min(u16::MAX as usize) as u16))
     };
     frame.render_widget(p, area);
-    draw_document_scrollbars(frame, view, area);
+    draw_document_scrollbars(frame, show_scrollbars, view, area);
 }
 
 fn visible_wrapped_rows(
@@ -1645,6 +1686,7 @@ fn visible_wrapped_rows(
 /// not a full restyle; and the display-row offset is a `usize`, immune to the
 /// `u16` ceiling of `Paragraph::scroll`.
 fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     // Fullscreen drops the borders (side glyphs would end up in every
     // terminal-selection copy); the title still takes the top row.
     let fullscreen = app.logs.fullscreen;
@@ -1784,7 +1826,15 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     frame.render_widget(Paragraph::new(rows).block(block), area);
     if !fullscreen {
-        draw_border_scrollbar(frame, area, scroll, max_scroll, inner_h, false);
+        draw_border_scrollbar(
+            frame,
+            show_scrollbars,
+            area,
+            scroll,
+            max_scroll,
+            inner_h,
+            false,
+        );
     }
 }
 
@@ -2286,7 +2336,12 @@ fn klog_level(l: &str, level: char) -> bool {
 }
 
 /// Unified-diff view with +/- line coloring.
-fn draw_diff(frame: &mut Frame, view: &mut crate::app::Scrollable, area: Rect) {
+fn draw_diff(
+    frame: &mut Frame,
+    show_scrollbars: bool,
+    view: &mut crate::app::Scrollable,
+    area: Rect,
+) {
     let inner_w = area.width.saturating_sub(2) as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
     view.set_viewport(inner_w, inner_h);
@@ -2324,7 +2379,7 @@ fn draw_diff(frame: &mut Frame, view: &mut crate::app::Scrollable, area: Rect) {
         p.scroll((0, view.hscroll.min(u16::MAX as usize) as u16))
     };
     frame.render_widget(p, area);
-    draw_document_scrollbars(frame, view, area);
+    draw_document_scrollbars(frame, show_scrollbars, view, area);
 }
 
 /// Doc-view title, extended with the active search query and the current
@@ -2781,6 +2836,7 @@ fn help_cache_key(app: &App, width: usize) -> u64 {
 }
 
 fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     let width = usize::from(area.width.saturating_sub(2)).max(1);
     let key = help_cache_key(app, width);
     if app.help_cache.as_ref().is_none_or(|cache| cache.key != key) {
@@ -2826,6 +2882,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     draw_border_scrollbar(
         frame,
+        show_scrollbars,
         area,
         usize::from(scroll),
         usize::from(max_scroll),
@@ -2835,6 +2892,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_namespaces(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     let names = app.filtered_namespaces();
     let browsing = app.ns_filter.is_empty();
     let items: Vec<ListItem> = names
@@ -2879,9 +2937,9 @@ fn draw_namespaces(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     render_popup_list(
         frame,
+        show_scrollbars,
         area,
-        40,
-        60,
+        (40, 60),
         items,
         Span::styled(title, theme::title()),
         &mut app.ns_state,
@@ -2889,6 +2947,7 @@ fn draw_namespaces(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_contexts(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     let current = app.cluster.context.clone();
     let items: Vec<ListItem> = app
         .filtered_contexts()
@@ -2925,9 +2984,9 @@ fn draw_contexts(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     render_popup_list(
         frame,
+        show_scrollbars,
         area,
-        50,
-        60,
+        (50, 60),
         items,
         Span::styled(title, theme::title()),
         &mut app.ctx_state,
@@ -2938,6 +2997,7 @@ fn draw_contexts(frame: &mut Frame, app: &mut App, area: Rect) {
 /// displayed columns in table order (so it doubles as a column reference).
 /// The active sort is marked with its direction arrow in the sorter color.
 fn draw_sort_picker(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     let active = app.sort_column.and_then(|i| {
         app.display_headers()
             .get(i)
@@ -2968,9 +3028,9 @@ fn draw_sort_picker(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     render_popup_list(
         frame,
+        show_scrollbars,
         area,
-        40,
-        60,
+        (40, 60),
         items,
         Span::styled(title, theme::title()),
         &mut app.sort_picker_state,
@@ -2981,6 +3041,7 @@ fn draw_sort_picker(frame: &mut Frame, app: &mut App, area: Rect) {
 /// its full value; ⏎ copies the value to the clipboard. Headers are padded
 /// to a common width so the values read as a column.
 fn draw_copy_picker(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     let entries = app.filtered_copy_entries();
     let pad = entries
         .iter()
@@ -3004,9 +3065,9 @@ fn draw_copy_picker(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     render_popup_list(
         frame,
+        show_scrollbars,
         area,
-        60,
-        60,
+        (60, 60),
         items,
         Span::styled(title, theme::title()),
         &mut app.copy_picker_state,
@@ -3017,6 +3078,7 @@ fn draw_copy_picker(frame: &mut Frame, app: &mut App, area: Rect) {
 /// menu rather than a single-key toggle, so acting on a live resource always
 /// takes an explicit, visible choice.
 fn draw_flux_menu(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     let count = app.marked.len().max(1);
     let target = if count == 1 {
         "current selection".to_string()
@@ -3044,9 +3106,9 @@ fn draw_flux_menu(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     render_popup_list(
         frame,
+        show_scrollbars,
         area,
-        36,
-        24,
+        (36, 24),
         items,
         Span::styled(format!(" {subject}: {target} "), theme::title()),
         &mut app.flux_menu_state,
@@ -3056,6 +3118,7 @@ fn draw_flux_menu(frame: &mut Frame, app: &mut App, area: Rect) {
 /// Port-forward picker (`f` on a pod/service): lists the object's declared
 /// ports for single-select, plus a "Custom…" entry for manual input.
 fn draw_port_forward_picker(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     let target = app
         .pf_picker_target
         .as_ref()
@@ -3075,9 +3138,9 @@ fn draw_port_forward_picker(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     render_popup_list(
         frame,
+        show_scrollbars,
         area,
-        40,
-        24,
+        (40, 24),
         items,
         Span::styled(format!(" Port-forward {target} "), theme::title()),
         &mut app.pf_picker_state,
@@ -3087,6 +3150,7 @@ fn draw_port_forward_picker(frame: &mut Frame, app: &mut App, area: Rect) {
 /// Pod file-transfer menu (`t` on a pod): download from or upload to the pod
 /// via `kubectl cp`, then two prompts for the source and destination paths.
 fn draw_transfer_menu(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     let target = match &app.transfer_target {
         Some((_, pod, Some(c))) => format!("{pod}:{c}"),
         Some((_, pod, None)) => pod.clone(),
@@ -3105,9 +3169,9 @@ fn draw_transfer_menu(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     render_popup_list(
         frame,
+        show_scrollbars,
         area,
-        36,
-        24,
+        (36, 24),
         items,
         Span::styled(format!(" Transfer: {target} "), theme::title()),
         &mut app.transfer_menu_state,
@@ -3117,6 +3181,7 @@ fn draw_transfer_menu(frame: &mut Frame, app: &mut App, area: Rect) {
 /// Background port-forwards (`:pf`). A full-width view, not a popup — closing
 /// it (`esc`) does not stop the forwards; only `x`/`s` on a row does.
 fn draw_port_forwards(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     // Running forwards first, then the saved-but-stopped [[forwards]]
     // entries — one keystroke away instead of retyped.
     let mut items: Vec<ListItem> = app
@@ -3152,6 +3217,7 @@ fn draw_port_forwards(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = format!(" Port-forwards [{}] ", app.port_forwards.len());
     render_framed_list(
         frame,
+        show_scrollbars,
         area,
         items,
         Span::styled(title, theme::title()),
@@ -3160,6 +3226,7 @@ fn draw_port_forwards(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_find(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     let items: Vec<ListItem> = app
         .find_items
         .iter()
@@ -3178,6 +3245,7 @@ fn draw_find(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = format!(" Find '{}' [{}] ", app.find_query, app.find_items.len());
     render_framed_list(
         frame,
+        show_scrollbars,
         area,
         items,
         Span::styled(title, theme::title()),
@@ -3186,6 +3254,7 @@ fn draw_find(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_adjacent(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     let status = [
         app.child_status.clone(),
         app.adjacent_warning
@@ -3277,6 +3346,7 @@ fn draw_adjacent(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     render_framed_list(
         frame,
+        show_scrollbars,
         area,
         items,
         Span::styled(title, theme::title()),
@@ -3285,6 +3355,7 @@ fn draw_adjacent(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_skins(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     let items: Vec<ListItem> = app
         .skin_list
         .iter()
@@ -3297,9 +3368,9 @@ fn draw_skins(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     render_popup_list(
         frame,
+        show_scrollbars,
         area,
-        42,
-        58,
+        (42, 58),
         items,
         Span::styled(" Skins ", theme::title()),
         &mut app.skin_state,
@@ -3307,6 +3378,7 @@ fn draw_skins(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_snapshots(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     let items: Vec<ListItem> = app
         .snapshot_list
         .iter()
@@ -3319,9 +3391,9 @@ fn draw_snapshots(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     render_popup_list(
         frame,
+        show_scrollbars,
         area,
-        70,
-        70,
+        (70, 70),
         items,
         Span::styled(" Snapshots ", theme::title()),
         &mut app.snapshot_state,
@@ -3374,6 +3446,7 @@ const C_GAP: usize = 2;
 use crate::text::ellipsize as truncate_cols;
 
 fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     let gap = " ".repeat(C_GAP);
     // Keep the name column readable but bounded so long names can't push the
     // numeric columns off the right edge; anything longer is ellipsized.
@@ -3529,6 +3602,7 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(list, list_area, &mut app.container_state);
     draw_border_scrollbar(
         frame,
+        show_scrollbars,
         Rect {
             y: list_area.y.saturating_sub(1),
             height: list_area.height.saturating_add(2),
@@ -3619,6 +3693,7 @@ fn draw_prompt_popup(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_set_image(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     let items: Vec<ListItem> = app
         .container_list
         .iter()
@@ -3634,9 +3709,9 @@ fn draw_set_image(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     render_popup_list(
         frame,
+        show_scrollbars,
         area,
-        70,
-        60,
+        (70, 60),
         items,
         Span::styled(" Set Image ", theme::title()),
         &mut app.container_state,
@@ -3672,6 +3747,7 @@ fn draw_confirm(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Command-palette suggestion list, anchored bottom-left over the table.
 fn draw_palette(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     if app.cmd_suggestions.is_empty() {
         return;
     }
@@ -3739,6 +3815,7 @@ fn draw_palette(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     render_framed_list(
         frame,
+        show_scrollbars,
         rect,
         items,
         Span::styled(hint, theme::title()),
@@ -3748,6 +3825,7 @@ fn draw_palette(frame: &mut Frame, app: &mut App, area: Rect) {
 
 /// Xray hierarchical tree (owner → children → containers).
 fn draw_xray(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     let glyph = |kind: &str| match kind {
         "deployment" => ("◈", theme::blue()),
         "replicaset" => ("◇", theme::sapphire()),
@@ -3782,6 +3860,7 @@ fn draw_xray(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = format!(" Xray [{}] ", app.xray_items.len());
     render_framed_list(
         frame,
+        show_scrollbars,
         area,
         items,
         Span::styled(title, theme::title()),
@@ -3790,6 +3869,7 @@ fn draw_xray(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_fleet(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     use crate::fleet::FleetStatus;
     let items: Vec<ListItem> = app
         .fleet_rows
@@ -3866,6 +3946,7 @@ fn draw_fleet(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = format!(" Fleet [{}] ", app.fleet_rows.len());
     render_framed_list(
         frame,
+        show_scrollbars,
         area,
         items,
         Span::styled(title, theme::title()),
@@ -3880,6 +3961,7 @@ fn draw_fleet(frame: &mut Frame, app: &mut App, area: Rect) {
 /// a jump target. Shows `empty_msg` while the findings are still gathering.
 fn draw_findings(
     frame: &mut Frame,
+    show_scrollbars: bool,
     area: Rect,
     title: String,
     findings: &[crate::explain::Finding],
@@ -3924,6 +4006,7 @@ fn draw_findings(
 
     render_framed_list(
         frame,
+        show_scrollbars,
         area,
         items,
         Span::styled(title, theme::title()),
@@ -3932,6 +4015,7 @@ fn draw_findings(
 }
 
 fn draw_explain(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     let title = if app.explain_items.is_empty() {
         format!(" {} ", app.explain_title)
     } else {
@@ -3943,6 +4027,7 @@ fn draw_explain(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     draw_findings(
         frame,
+        show_scrollbars,
         area,
         title,
         &app.explain_items,
@@ -3952,9 +4037,11 @@ fn draw_explain(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_gitops(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     let title = format!(" {} ", app.gitops_title);
     draw_findings(
         frame,
+        show_scrollbars,
         area,
         title,
         &app.gitops_items,
@@ -4153,6 +4240,7 @@ fn clip_to_width(s: &str, max: usize) -> String {
 /// Session-local timeline: the state changes observed for one object while
 /// sofka has been watching, oldest first.
 fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
+    let show_scrollbars = app.scrollbars_visible();
     use crate::timeline::Level;
     let color = |level: Level| match level {
         Level::Info => theme::text(),
@@ -4188,6 +4276,7 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = format!(" {target} — timeline  ({count} events · session-local) ");
     render_framed_list(
         frame,
+        show_scrollbars,
         area,
         items,
         Span::styled(title, theme::title()),
@@ -4564,13 +4653,14 @@ fn confirm_action_hint(app: &App, allows_force: bool) -> String {
 
 fn draw_border_scrollbar(
     frame: &mut Frame,
+    show_scrollbars: bool,
     area: Rect,
     position: usize,
     max_offset: usize,
     visible: usize,
     horizontal: bool,
 ) {
-    if max_offset == 0 || visible == 0 || area.width < 3 || area.height < 3 {
+    if !show_scrollbars || max_offset == 0 || visible == 0 || area.width < 3 || area.height < 3 {
         return;
     }
     let (orientation, track) = if horizontal {
@@ -4594,19 +4684,27 @@ fn draw_border_scrollbar(
         .position(position.min(max_offset))
         .viewport_content_length(visible);
     let scrollbar = Scrollbar::new(orientation)
+        .thumb_symbol(if horizontal { "─" } else { "│" })
+        .track_symbol(Some(if horizontal { "─" } else { "│" }))
         .begin_symbol(None)
         .end_symbol(None)
-        .thumb_style(theme::border_focused())
+        .thumb_style(Style::default().fg(theme::text()))
         .track_style(theme::dim());
     frame.render_stateful_widget(scrollbar, track, &mut state);
 }
 
-fn draw_document_scrollbars(frame: &mut Frame, view: &crate::app::Scrollable, area: Rect) {
+fn draw_document_scrollbars(
+    frame: &mut Frame,
+    show_scrollbars: bool,
+    view: &crate::app::Scrollable,
+    area: Rect,
+) {
     let (rows, widest) = view.scroll_dimensions();
     let height = usize::from(area.height.saturating_sub(2));
     let width = usize::from(area.width.saturating_sub(2));
     draw_border_scrollbar(
         frame,
+        show_scrollbars,
         area,
         view.scroll,
         rows.saturating_sub(height),
@@ -4616,6 +4714,7 @@ fn draw_document_scrollbars(frame: &mut Frame, view: &crate::app::Scrollable, ar
     if !view.wrap && (widest > width || view.hscroll > 0) {
         draw_border_scrollbar(
             frame,
+            show_scrollbars,
             area,
             view.hscroll,
             widest.saturating_sub(1),
@@ -4629,9 +4728,6 @@ fn draw_document_scrollbars(frame: &mut Frame, view: &crate::app::Scrollable, ar
 /// to the terminal default; with the skin background enabled that would punch a
 /// transparent hole through the fill, so repaint `base` over the cleared cells.
 fn clear_region(frame: &mut Frame, area: Rect) {
-    let shadow =
-        Shadow::overlay().style(Style::default().fg(theme::overlay1()).bg(theme::surface0()));
-    frame.render_widget(&shadow, area);
     frame.render_widget(Clear, area);
     if let Some(bg) = theme::background() {
         frame.buffer_mut().set_style(area, Style::default().bg(bg));
@@ -4640,22 +4736,23 @@ fn clear_region(frame: &mut Frame, area: Rect) {
 
 fn render_popup_list<'a, T>(
     frame: &mut Frame,
+    show_scrollbars: bool,
     area: Rect,
-    percent_x: u16,
-    percent_y: u16,
+    percent: (u16, u16),
     items: Vec<ListItem<'a>>,
     title: T,
     state: &mut ListState,
 ) where
     T: Into<Line<'a>>,
 {
-    let popup = centered_rect_with_min(percent_x, percent_y, 32, 8, area);
+    let popup = centered_rect_with_min(percent.0, percent.1, 32, 8, area);
     clear_region(frame, popup);
-    render_framed_list(frame, popup, items, title, state);
+    render_framed_list(frame, show_scrollbars, popup, items, title, state);
 }
 
 fn render_framed_list<'a, T>(
     frame: &mut Frame,
+    show_scrollbars: bool,
     area: Rect,
     items: Vec<ListItem<'a>>,
     title: T,
@@ -4681,6 +4778,7 @@ fn render_framed_list<'a, T>(
     let position = heights.iter().take(state.offset()).sum();
     draw_border_scrollbar(
         frame,
+        show_scrollbars,
         area,
         position,
         total.saturating_sub(visible),

@@ -1707,6 +1707,7 @@ pub struct App {
     pub command: String,
     pub cmd_suggestions: Vec<Suggestion>,
     pub cmd_sel: usize,
+    pub scrollbar_activity: Option<std::time::Instant>,
     pub flash: String,
     pub flash_err: bool,
     /// Last flash text observed by [`App::expire_flash`], so a change can be
@@ -2148,6 +2149,7 @@ impl App {
             // Pre-seeded so the first tick sees no change and leaves the
             // welcome hint's sticky flag alone.
             flash_seen: WELCOME_FLASH.into(),
+            scrollbar_activity: None,
             flash_since: std::time::Instant::now(),
             flash_sticky: true,
             next_status_claim: 0,
