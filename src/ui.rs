@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, Gauge, HighlightSpacing, List, ListItem, ListState,
-    Paragraph,
+    Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -1260,6 +1260,26 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
         },
         inner,
     );
+    draw_border_scrollbar(
+        frame,
+        Rect {
+            y: area.y.saturating_add(1),
+            height: area.height.saturating_sub(1),
+            ..area
+        },
+        offset,
+        count.saturating_sub(visible_rows),
+        visible_rows,
+        false,
+    );
+    draw_border_scrollbar(
+        frame,
+        area,
+        col_offset,
+        app.col_scroll_max,
+        usize::from(inner.width),
+        true,
+    );
 }
 
 /// Positions in the full table, measured from the selection marker.
@@ -1597,6 +1617,7 @@ fn draw_scrollable(
         p.scroll((0, view.hscroll.min(u16::MAX as usize) as u16))
     };
     frame.render_widget(p, area);
+    draw_document_scrollbars(frame, view, area);
 }
 
 fn visible_wrapped_rows(
@@ -1762,6 +1783,9 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
             .title(Span::styled(title, theme::title()))
     };
     frame.render_widget(Paragraph::new(rows).block(block), area);
+    if !fullscreen {
+        draw_border_scrollbar(frame, area, scroll, max_scroll, inner_h, false);
+    }
 }
 
 /// Display rows `raw` occupies when char-wrapped to `width` columns: ANSI
@@ -2300,6 +2324,7 @@ fn draw_diff(frame: &mut Frame, view: &mut crate::app::Scrollable, area: Rect) {
         p.scroll((0, view.hscroll.min(u16::MAX as usize) as u16))
     };
     frame.render_widget(p, area);
+    draw_document_scrollbars(frame, view, area);
 }
 
 /// Doc-view title, extended with the active search query and the current
@@ -2745,6 +2770,14 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
                 .title(Span::styled(title, theme::title())),
         ),
         area,
+    );
+    draw_border_scrollbar(
+        frame,
+        area,
+        usize::from(scroll),
+        usize::from(max_scroll),
+        usize::from(inner_h),
+        false,
     );
 }
 
@@ -3431,6 +3464,20 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol("▌ ")
         .highlight_spacing(HighlightSpacing::Always);
     frame.render_stateful_widget(list, list_area, &mut app.container_state);
+    draw_border_scrollbar(
+        frame,
+        Rect {
+            y: popup.y.saturating_add(1),
+            height: popup.height.saturating_sub(1),
+            ..popup
+        },
+        app.container_state.offset(),
+        app.container_list
+            .len()
+            .saturating_sub(usize::from(list_area.height)),
+        usize::from(list_area.height),
+        false,
+    );
 }
 
 fn draw_prompt_popup(frame: &mut Frame, app: &App, area: Rect) {
@@ -4414,6 +4461,65 @@ fn confirm_action_hint(app: &App, allows_force: bool) -> String {
     key_hint(app, "confirm", &actions)
 }
 
+fn draw_border_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    position: usize,
+    max_offset: usize,
+    visible: usize,
+    horizontal: bool,
+) {
+    if max_offset == 0 || visible == 0 || area.width < 3 || area.height < 3 {
+        return;
+    }
+    let (orientation, track) = if horizontal {
+        (
+            ScrollbarOrientation::HorizontalBottom,
+            Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1),
+        )
+    } else {
+        (
+            ScrollbarOrientation::VerticalRight,
+            Rect::new(area.right() - 1, area.y + 1, 1, area.height - 2),
+        )
+    };
+    // Ratatui uses content_length - 1 as the maximum position, then adds
+    // the viewport length to calculate the thumb size.
+    let mut state = ScrollbarState::new(max_offset.saturating_add(1))
+        .position(position.min(max_offset))
+        .viewport_content_length(visible);
+    let scrollbar = Scrollbar::new(orientation)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .thumb_style(theme::border_focused())
+        .track_style(theme::dim());
+    frame.render_stateful_widget(scrollbar, track, &mut state);
+}
+
+fn draw_document_scrollbars(frame: &mut Frame, view: &crate::app::Scrollable, area: Rect) {
+    let (rows, widest) = view.scroll_dimensions();
+    let height = usize::from(area.height.saturating_sub(2));
+    let width = usize::from(area.width.saturating_sub(2));
+    draw_border_scrollbar(
+        frame,
+        area,
+        view.scroll,
+        rows.saturating_sub(height),
+        height,
+        false,
+    );
+    if !view.wrap && (widest > width || view.hscroll > 0) {
+        draw_border_scrollbar(
+            frame,
+            area,
+            view.hscroll,
+            widest.saturating_sub(1),
+            width,
+            true,
+        );
+    }
+}
+
 /// Clear a popup region before drawing on top of it. `Clear` resets the cells
 /// to the terminal default; with the skin background enabled that would punch a
 /// transparent hole through the fill, so repaint `base` over the cleared cells.
@@ -4449,6 +4555,8 @@ fn render_framed_list<'a, T>(
 ) where
     T: Into<Line<'a>>,
 {
+    let heights: Vec<_> = items.iter().map(ListItem::height).collect();
+    let total: usize = heights.iter().sum();
     let list = List::new(items)
         .highlight_style(theme::selected_row())
         .highlight_symbol("▌ ")
@@ -4461,6 +4569,16 @@ fn render_framed_list<'a, T>(
                 .title(title.into()),
         );
     frame.render_stateful_widget(list, area, state);
+    let visible = usize::from(area.height.saturating_sub(2));
+    let position = heights.iter().take(state.offset()).sum();
+    draw_border_scrollbar(
+        frame,
+        area,
+        position,
+        total.saturating_sub(visible),
+        visible,
+        false,
+    );
 }
 
 /// Center a fixed-size rectangle within `r`, clamped to `r`'s bounds. Used by
