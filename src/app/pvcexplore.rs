@@ -565,15 +565,13 @@ impl App {
     fn pvc_list_argv(&self, path: &str) -> Option<(Vec<String>, String)> {
         let mount = self.pvc.mount.as_ref()?;
         let probe = pvc::list_probe(&mount.path);
-        let mut argv = self.kubectl_base();
+        let mut argv = self.exec_prefix(
+            &self.pvc.namespace,
+            &mount.pod,
+            Some(mount.container.as_str()),
+            false,
+        );
         argv.extend([
-            "exec".into(),
-            "-n".into(),
-            self.pvc.namespace.clone(),
-            mount.pod.clone(),
-            "-c".into(),
-            mount.container.clone(),
-            "--".into(),
             "sh".into(),
             "-c".into(),
             probe.script,

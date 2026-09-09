@@ -28,8 +28,10 @@ adjacent.rs  Which objects connect to which: built-in and configured reference
 timeline.rs  Session-local per-object state-change history diffed from the
              watch stream (pure transition logic, unit-tested).
 pvcexplore.rs PVC browsing: which pod already mounts a claim, the helper pod
-             for one nothing mounts, and the `ls` parser, all pure and
-             unit-tested. `app/pvcexplore.rs` drives it.
+             for one nothing mounts, the `ls` parser, and the size probes and
+             progress-bar arithmetic behind a running copy, all pure and
+             unit-tested. `app/pvcexplore.rs` drives it, `app/transfer.rs`
+             samples a `kubectl cp` in flight.
 ui.rs        All ratatui rendering: header, table, scrollable views, popups,
              status bar.
 theme.rs     Palette + semantic styles, skin resolution.

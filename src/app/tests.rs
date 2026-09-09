@@ -16720,7 +16720,9 @@ fn pvc_entry(
     crate::pvcexplore::Entry {
         name: name.into(),
         kind,
-        size: Some(size),
+        // Like both listings: a directory's own inode size is not its tree's,
+        // so neither parser reports one.
+        size: (kind != crate::pvcexplore::EntryKind::Dir).then_some(size),
         link_target: String::new(),
     }
 }
@@ -16884,6 +16886,622 @@ async fn uploading_into_a_read_only_mount_is_refused() {
     app.handle_key(press(KeyCode::Tab)).unwrap();
     app.handle_key(press(KeyCode::Char('c'))).unwrap();
     assert!(app.flash.contains("read-only"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn a_copy_fills_a_bar_where_the_size_was_and_takes_it_away_after() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("big.tar", EntryKind::File, 5_000)],
+    );
+
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    let claim = app.transfers[0].claim;
+    // Nothing is drawn before a total lands: a bar against a total nobody
+    // knows would be an animation, not a report.
+    assert!(app.pane_transfers(Pane::Remote, "/srv").is_empty());
+
+    app.handle_msg(Msg::TransferProgress {
+        generation: app.generation,
+        claim,
+        done: 2_500,
+        total: Some(5_000),
+    });
+    assert_eq!(
+        app.pane_transfers(Pane::Remote, "/srv"),
+        vec![("big.tar", 2_500, 5_000)]
+    );
+    assert!(app.flash.contains("(50%)…"), "{}", app.flash);
+    // The row it came from, not the pane it is going into.
+    assert!(app.pane_transfers(Pane::Local, "/srv").is_empty());
+    // And not a same-named row in a directory the browser has moved to.
+    assert!(app.pane_transfers(Pane::Remote, "/srv/logs").is_empty());
+
+    app.handle_msg(Msg::TransferDone {
+        generation: app.generation,
+        claim,
+        result: Ok("copied big.tar".into()),
+    });
+    assert!(app.transfers.is_empty(), "the bar outlived the copy");
+    assert_eq!(app.flash, "copied big.tar");
+}
+
+#[tokio::test]
+async fn a_copy_of_a_folder_measures_the_whole_tree() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    // A directory has no size in a listing — `ls -l` reports the directory
+    // entry, not what is under it — so the total is `du`'s, and the bar is
+    // the sum rather than one file at a time.
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("cache", EntryKind::Dir, 0)],
+    );
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    let claim = app.transfers[0].claim;
+
+    // A directory's total can only come from `du`, so it arrives with the
+    // first sample rather than from the listing — and it is the whole tree,
+    // not the 4 KiB the directory entry itself measures.
+    app.handle_msg(Msg::TransferProgress {
+        generation: app.generation,
+        claim,
+        done: 3 * 1024 * 1024 * 1024,
+        total: Some(4 * 1024 * 1024 * 1024),
+    });
+    assert_eq!(
+        app.pane_transfers(Pane::Remote, "/srv"),
+        vec![("cache", 3 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024)]
+    );
+    assert!(app.flash.contains("(75%)…"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn an_upload_puts_its_bar_on_the_local_row_it_came_from() {
+    use crate::pvcexplore::EntryKind;
+    let dir = std::env::temp_dir().join(format!("sofka-pvc-up-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    app.pvc.local_path = dir.clone();
+    app.pvc.local = vec![pvc_entry("notes.txt", EntryKind::File, 12)];
+    app.pvc.local_state.select(Some(0));
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+
+    let claim = app.transfers[0].claim;
+    app.handle_msg(Msg::TransferProgress {
+        generation: app.generation,
+        claim,
+        done: 3,
+        total: Some(12),
+    });
+    let shown = dir.to_string_lossy().into_owned();
+    assert_eq!(
+        app.pane_transfers(Pane::Local, &shown),
+        vec![("notes.txt", 3, 12)]
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn a_transfer_with_no_row_still_reports_that_it_is_moving() {
+    // `t` on a pod takes typed paths, so there is no row to draw on — and a
+    // copy with no measurable total has no share of it to report either. The
+    // bytes that have landed are still the difference between a slow copy
+    // and a stalled one.
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Pod",
+               "metadata": {"name": "p", "namespace": "default"}}),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('t'))).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    app.prompt_input = "/var/log/app.log".into();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+
+    let claim = app.transfers[0].claim;
+    assert_eq!(app.transfers[0].anchor, None);
+    app.handle_msg(Msg::TransferProgress {
+        generation: app.generation,
+        claim,
+        done: 5 * 1024 * 1024,
+        total: None,
+    });
+    assert!(app.flash.contains("(5.0M)…"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn a_copy_that_outlived_its_generation_still_frees_its_row() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("big.tar", EntryKind::File, 5_000)],
+    );
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    let claim = app.transfers[0].claim;
+
+    // A context switch, a dashboard, a restarted watch: the result is
+    // discarded, but the row it registered is not somebody else's to keep.
+    app.handle_msg(Msg::TransferDone {
+        generation: app.generation - 1,
+        claim,
+        result: Ok("copied big.tar".into()),
+    });
+    assert!(app.transfers.is_empty());
+    assert_ne!(app.flash, "copied big.tar");
+}
+
+#[tokio::test]
+async fn the_watcher_exec_asks_for_stdin_and_the_listing_does_not() {
+    // Load-bearing, not cosmetic: the watcher's loop in the container ends
+    // when its stdin closes, and with no stdin stream it would be killed
+    // before its first sample. The listing has nothing to wait for.
+    let (app, _rx) = test_app();
+    let watch = app.exec_prefix("default", "p", Some("c"), true);
+    assert_eq!(&watch[..5], ["kubectl", "--context", "test", "exec", "-i"]);
+    let once = app.exec_prefix("default", "p", Some("c"), false);
+    assert!(!once.contains(&"-i".to_string()), "{once:?}");
+    // Both still address the same container and end ready for a script.
+    for argv in [&watch, &once] {
+        let c = argv.iter().position(|a| a == "-c").unwrap();
+        assert_eq!(argv[c + 1], "c");
+        assert_eq!(argv.last().unwrap(), "--");
+    }
+}
+
+#[tokio::test]
+async fn a_bar_belongs_to_the_cluster_its_copy_started_in() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("big.tar", EntryKind::File, 5_000)],
+    );
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    let claim = app.transfers[0].claim;
+    app.handle_msg(Msg::TransferProgress {
+        generation: app.generation,
+        claim,
+        done: 2_500,
+        total: Some(5_000),
+    });
+    assert_eq!(app.pane_transfers(Pane::Remote, "/srv").len(), 1);
+
+    // A context switch bumps the generation. The copy keeps running — nothing
+    // can stop it — but another cluster's claim that happens to mount at
+    // /srv and hold a big.tar is not the row it was drawn on.
+    app.generation += 1;
+    assert!(
+        app.pane_transfers(Pane::Remote, "/srv").is_empty(),
+        "a stale bar followed the browser into another cluster"
+    );
+}
+
+#[tokio::test]
+async fn a_borrowed_status_is_not_wiped_by_the_next_progress_sample() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("big.tar", EntryKind::File, 5_000)],
+    );
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    let claim = app.transfers[0].claim;
+
+    // Something else borrows the bar mid-copy — a watch note, a failed state
+    // write, a notification. It keeps this copy's claim, so the copy still
+    // reports when it lands, but four samples a second must not wipe a
+    // message the user has had a quarter of a second to read.
+    // A sample first, so the claim is mid-flight when the borrow lands —
+    // the order a real copy sees.
+    app.handle_msg(Msg::TransferProgress {
+        generation: app.generation,
+        claim,
+        done: 1_000,
+        total: Some(5_000),
+    });
+    assert!(app.flash.contains("(20%)…"), "{}", app.flash);
+    app.borrow_status("session state was not saved", false);
+    app.handle_msg(Msg::TransferProgress {
+        generation: app.generation,
+        claim,
+        done: 2_500,
+        total: Some(5_000),
+    });
+    assert_eq!(app.flash, "session state was not saved");
+    // The bar still moved; only the text was left alone.
+    assert_eq!(
+        app.pane_transfers(Pane::Remote, "/srv"),
+        vec![("big.tar", 2_500, 5_000)]
+    );
+
+    // Once the borrowed message has had its time, the copy has the bar back.
+    app.flash_since = std::time::Instant::now() - std::time::Duration::from_secs(9);
+    app.expire_flash();
+    app.handle_msg(Msg::TransferProgress {
+        generation: app.generation,
+        claim,
+        done: 4_000,
+        total: Some(5_000),
+    });
+    assert!(app.flash.contains("(80%)…"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn the_percentage_keeps_up_with_the_copy() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("big.tar", EntryKind::File, 4_000)],
+    );
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    let claim = app.transfers[0].claim;
+
+    // Sample after sample, not just the first: the refresh only writes the
+    // bar while the text on it is still this copy's own, so a copy that
+    // forgot what it had written would freeze at its first percentage.
+    for (done, want) in [(1_000, "(25%)…"), (3_200, "(80%)…"), (4_000, "(100%)…")] {
+        app.handle_msg(Msg::TransferProgress {
+            generation: app.generation,
+            claim,
+            done,
+            total: Some(4_000),
+        });
+        assert!(app.flash.contains(want), "{}", app.flash);
+    }
+}
+
+#[tokio::test]
+async fn a_transfer_job_carries_the_direction_into_every_part_of_itself() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![
+            pvc_entry("big.tar", EntryKind::File, 5_000),
+            pvc_entry("cache", EntryKind::Dir, 0),
+        ],
+    );
+
+    let down = app.begin_transfer(
+        "ns".into(),
+        "api-0".into(),
+        Some("app".into()),
+        false,
+        "/srv/big.tar".into(),
+        "/tmp/big.tar".into(),
+    );
+    // Downloads read the volume once; nothing waits on their stdin.
+    assert!(!down.exec.contains(&"-i".to_string()), "{:?}", down.exec);
+    assert_eq!(down.cp[down.cp.len() - 2], "api-0:/srv/big.tar");
+    assert_eq!(down.cp[down.cp.len() - 1], "/tmp/big.tar");
+    // The listing already knew this file's size, so no `du` need run.
+    assert_eq!(down.known, Some(5_000));
+    assert_eq!(down.generation, app.generation);
+
+    // A directory has no size in a listing, so its total can only come from
+    // `du` — the job says so by carrying none.
+    let dir = app.begin_transfer(
+        "ns".into(),
+        "api-0".into(),
+        Some("app".into()),
+        false,
+        "/srv/cache".into(),
+        "/tmp/cache".into(),
+    );
+    assert_eq!(dir.known, None);
+
+    // An upload from somewhere other than the local pane gets no row, the
+    // same way: `t` takes typed paths too.
+    let stray = app.begin_transfer(
+        "ns".into(),
+        "api-0".into(),
+        Some("app".into()),
+        true,
+        "/somewhere/else/notes.txt".into(),
+        "/srv/notes.txt".into(),
+    );
+    assert_eq!(stray.known, None);
+    assert_eq!(app.transfers.last().and_then(|t| t.anchor.clone()), None);
+
+    // A path the browser is not showing gets no row: `t` transfers any path
+    // the user types, and a bar on the row that happens to share its name
+    // would point at the wrong file.
+    let elsewhere = app.begin_transfer(
+        "ns".into(),
+        "api-0".into(),
+        Some("app".into()),
+        false,
+        "/elsewhere/big.tar".into(),
+        "/tmp/big.tar".into(),
+    );
+    assert_eq!(elsewhere.known, None);
+    assert_eq!(
+        app.transfers
+            .last()
+            .and_then(|t| t.anchor.as_ref())
+            .map(|a| a.name.clone()),
+        None
+    );
+    assert!(app.pane_transfers(Pane::Remote, "/srv").is_empty());
+
+    let up = app.begin_transfer(
+        "ns".into(),
+        "api-0".into(),
+        Some("app".into()),
+        true,
+        "/tmp/notes.txt".into(),
+        "/srv/notes.txt".into(),
+    );
+    // The upload's watcher lives until its stdin closes, so it must have one.
+    assert!(up.exec.contains(&"-i".to_string()), "{:?}", up.exec);
+    // And its size comes from a `stat` in the task, not from the local
+    // listing: that listing is a snapshot, and the file is on this disk.
+    assert_eq!(up.known, None);
+    assert_eq!(up.cp[up.cp.len() - 2], "/tmp/notes.txt");
+    assert_eq!(up.cp[up.cp.len() - 1], "api-0:/srv/notes.txt");
+}
+
+#[tokio::test]
+async fn two_copies_at_once_draw_two_bars_and_leave_together() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![
+            pvc_entry("one.tar", EntryKind::File, 1_000),
+            pvc_entry("two.tar", EntryKind::File, 2_000),
+        ],
+    );
+
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    let (first, second) = (app.transfers[0].claim, app.transfers[1].claim);
+    assert_ne!(first, second);
+
+    for (claim, done, total) in [(first, 500, 1_000), (second, 1_500, 2_000)] {
+        app.handle_msg(Msg::TransferProgress {
+            generation: app.generation,
+            claim,
+            done,
+            total: Some(total),
+        });
+    }
+    let bars = app.pane_transfers(Pane::Remote, "/srv");
+    assert_eq!(bars.len(), 2, "{bars:?}");
+    assert!(bars.contains(&("one.tar", 500, 1_000)), "{bars:?}");
+    assert!(bars.contains(&("two.tar", 1_500, 2_000)), "{bars:?}");
+
+    // Each leaves on its own result, and the other stays.
+    app.handle_msg(Msg::TransferDone {
+        generation: app.generation,
+        claim: first,
+        result: Ok("copied one.tar".into()),
+    });
+    assert_eq!(
+        app.pane_transfers(Pane::Remote, "/srv"),
+        vec![("two.tar", 1_500, 2_000)]
+    );
+    app.handle_msg(Msg::TransferDone {
+        generation: app.generation,
+        claim: second,
+        result: Ok("copied two.tar".into()),
+    });
+    assert!(app.transfers.is_empty());
+}
+
+#[tokio::test]
+async fn a_copy_whose_task_never_reported_does_not_keep_its_row_forever() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("big.tar", EntryKind::File, 5_000)],
+    );
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert_eq!(app.transfers.len(), 1);
+
+    // Its task died without a result — a panic, a runtime shutdown — so
+    // nothing will ever end it. The next copy in a new generation clears it:
+    // nothing that old can be drawn any more.
+    app.generation += 1;
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert_eq!(app.transfers.len(), 1, "the abandoned row was kept");
+    // And the one that remains is the live one: a progress message for the
+    // current generation finds it.
+    let claim = app.transfers[0].claim;
+    app.handle_msg(Msg::TransferProgress {
+        generation: app.generation,
+        claim,
+        done: 2_500,
+        total: Some(5_000),
+    });
+    assert_eq!(
+        app.pane_transfers(Pane::Remote, "/srv"),
+        vec![("big.tar", 2_500, 5_000)]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_copy_takes_its_bar_with_it_and_says_why() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("big.tar", EntryKind::File, 5_000)],
+    );
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    let claim = app.transfers[0].claim;
+    app.handle_msg(Msg::TransferProgress {
+        generation: app.generation,
+        claim,
+        done: 2_500,
+        total: Some(5_000),
+    });
+    assert_eq!(app.pane_transfers(Pane::Remote, "/srv").len(), 1);
+
+    app.handle_msg(Msg::TransferDone {
+        generation: app.generation,
+        claim,
+        result: Err("tar: /srv/big.tar: Permission denied".into()),
+    });
+    assert!(app.transfers.is_empty(), "a failed copy kept its bar");
+    assert!(app.flash.contains("Permission denied"), "{}", app.flash);
+    assert!(app.flash_err);
+}
+
+#[tokio::test]
+async fn progress_from_a_cluster_the_browser_has_left_is_ignored() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("big.tar", EntryKind::File, 5_000)],
+    );
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    let claim = app.transfers[0].claim;
+
+    // A copy still running in the cluster the user switched away from. Its
+    // samples must not write the status bar the new context owns.
+    let stale = app.generation;
+    app.generation += 1;
+    app.handle_msg(Msg::TransferProgress {
+        generation: stale,
+        claim,
+        done: 2_500,
+        total: Some(5_000),
+    });
+    // Not merely invisible: the copy's own record is untouched, so nothing
+    // it reports can reach the bar the new context owns.
+    assert_eq!(app.transfers[0].done, 0);
+    assert_eq!(app.transfers[0].total, None);
+}
+
+#[tokio::test]
+async fn a_mount_path_written_with_a_slash_still_gets_its_bar() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    // A pod spec is free to write `mountPath: /srv/`, and the browser shows
+    // it as it found it. The row's bar is looked up by that same string, so
+    // anything deriving a second spelling of it silently never matches.
+    let mount = crate::pvcexplore::Mount {
+        path: "/srv/".into(),
+        ..pvc_mount()
+    };
+    resolve_pvc(&mut app, Ok(Some(mount)));
+    list_pvc(
+        &mut app,
+        "/srv/",
+        vec![pvc_entry("big.tar", EntryKind::File, 5_000)],
+    );
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    let claim = app.transfers[0].claim;
+    app.handle_msg(Msg::TransferProgress {
+        generation: app.generation,
+        claim,
+        done: 2_500,
+        total: Some(5_000),
+    });
+    assert_eq!(
+        app.pane_transfers(Pane::Remote, app.pvc.current_dir()),
+        vec![("big.tar", 2_500, 5_000)]
+    );
+
+    // And it survives ordinary navigation: `parent_path` hands back `/srv`
+    // where the mount was shown as `/srv/`, so an anchor holding either
+    // spelling would lose its row on the way back up.
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    list_pvc(&mut app, "/srv/logs", vec![]);
+    app.handle_key(press(KeyCode::Backspace)).unwrap();
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("big.tar", EntryKind::File, 5_000)],
+    );
+    assert_eq!(
+        app.pane_transfers(Pane::Remote, app.pvc.current_dir()),
+        vec![("big.tar", 2_500, 5_000)],
+        "the bar was lost by walking into a directory and back out"
+    );
+}
+
+#[tokio::test]
+async fn a_bar_belongs_to_the_volume_its_copy_came_from() {
+    use crate::pvcexplore::EntryKind;
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    list_pvc(
+        &mut app,
+        "/srv",
+        vec![pvc_entry("big.tar", EntryKind::File, 5_000)],
+    );
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    let claim = app.transfers[0].claim;
+    app.handle_msg(Msg::TransferProgress {
+        generation: app.generation,
+        claim,
+        done: 2_500,
+        total: Some(5_000),
+    });
+    assert_eq!(app.pane_transfers(Pane::Remote, "/srv").len(), 1);
+
+    // The user leaves and opens another claim, served by another pod, that
+    // mounts at the same path and happens to hold a file of the same name.
+    // `/data` and `/srv` are common enough that this is not exotic, and the
+    // copy still running has nothing to do with what is on screen now.
+    app.pvc.claim = "other".into();
+    app.pvc.remote = vec![pvc_entry("big.tar", EntryKind::File, 77)];
+    assert!(
+        app.pane_transfers(Pane::Remote, "/srv").is_empty(),
+        "a copy out of one volume drew its bar on another's row"
+    );
 }
 
 #[tokio::test]

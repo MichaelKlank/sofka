@@ -4075,17 +4075,23 @@ fn draw_pvc_explore(frame: &mut Frame, app: &mut App, area: Rect) {
         remote_title.push_str("· loading… ");
     }
 
+    // A copy in flight replaces its row's size with a bar. Looked up per
+    // pane *and* directory, so a copy out of a directory the browser has
+    // since left does not leave a bar on a same-named row here.
+    let local_dir = app.pvc.local_path.to_string_lossy().into_owned();
     let local_items = pvc_pane_items(
         &app.pvc.local,
         app.pvc.local_error.as_deref(),
         cols[0].width,
         app.pvc.local_truncated,
+        &app.pane_transfers(Pane::Local, &local_dir),
     );
     let remote_items = pvc_pane_items(
         &app.pvc.remote,
         app.pvc.remote_error.as_deref(),
         cols[1].width,
         app.pvc.truncated,
+        &app.pane_transfers(Pane::Remote, app.pvc.current_dir()),
     );
     let focus = app.pvc.focus;
 
@@ -4148,6 +4154,7 @@ fn pvc_pane_items(
     error: Option<&str>,
     width: u16,
     truncated: bool,
+    copying: &[(&str, u64, u64)],
 ) -> Vec<ListItem<'static>> {
     use crate::pvcexplore::EntryKind;
 
@@ -4190,13 +4197,29 @@ fn pvc_pane_items(
                 // Nothing could stat it — not the same as an empty file.
                 (_, None) => "?".to_string(),
             };
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{label}{:pad$}", "", pad = pad),
-                    Style::default().fg(color),
-                ),
-                Span::styled(format!(" {size:>size_width$}"), theme::dim()),
-            ]))
+            let name = Span::styled(
+                format!("{label}{:pad$}", "", pad = pad),
+                Style::default().fg(color),
+            );
+            // A copy of this entry is running: the size is what the bar
+            // measures against, so the bar goes where the size was. Both
+            // halves together are exactly `size_width` columns, so the rows
+            // around it stay aligned.
+            match copying.iter().find(|(n, _, _)| *n == e.name) {
+                Some(&(_, done, total)) => {
+                    let (fill, track) = crate::pvcexplore::progress_bar(done, total, size_width);
+                    ListItem::new(Line::from(vec![
+                        name,
+                        Span::raw(" "),
+                        Span::styled(fill, Style::default().fg(theme::peach())),
+                        Span::styled(track, Style::default().fg(theme::surface1())),
+                    ]))
+                }
+                None => ListItem::new(Line::from(vec![
+                    name,
+                    Span::styled(format!(" {size:>size_width$}"), theme::dim()),
+                ])),
+            }
         })
         .collect();
     if truncated {
@@ -5095,6 +5118,133 @@ mod tests {
         );
 
         theme::set_background(false); // don't leak global state to other tests
+    }
+
+    #[tokio::test]
+    async fn a_running_copy_draws_its_bar_in_the_size_column() {
+        use crate::app::{TransferAnchor, TransferProgress};
+        use crate::k8s::Cluster;
+        use crate::pvcexplore::{Entry, EntryKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut app = App::new(Cluster::fake(), tx);
+        let entry = |name: &str, size| Entry {
+            name: name.into(),
+            kind: EntryKind::File,
+            size: Some(size),
+            link_target: String::new(),
+        };
+        app.mode = Mode::PvcExplore;
+        app.pvc.active = true;
+        app.pvc.claim = "data".into();
+        app.pvc.namespace = "default".into();
+        app.pvc.remote_path = "/srv".into();
+        app.pvc.remote = vec![entry("big.tar", 5_368_709_120), entry("small.txt", 12)];
+        app.pvc.remote_state.select(Some(0));
+        app.transfers.push(TransferProgress::fake(
+            app.generation,
+            TransferAnchor {
+                pane: crate::app::Pane::Remote,
+                claim: "default/data".into(),
+                dir: "/srv".into(),
+                name: "big.tar".into(),
+            },
+            5_368_709_120 / 2,
+            5_368_709_120,
+        ));
+
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = term.backend().buffer().clone();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        // The volume pane is the right half; find the two rows in it.
+        let copying = (0..buffer.area.height)
+            .map(row)
+            .find(|line| line.contains("big.tar"))
+            .unwrap_or_default();
+        let idle = (0..buffer.area.height)
+            .map(row)
+            .find(|line| line.contains("small.txt"))
+            .unwrap_or_default();
+
+        // Half of a 5 GB copy: four filled cells and four of track, in the
+        // eight columns the size would have occupied.
+        assert!(
+            copying.contains("\u{2588}\u{2588}\u{2588}\u{2588}\u{2591}\u{2591}\u{2591}\u{2591}"),
+            "{copying:?}"
+        );
+        assert!(!copying.contains("5.0G"), "the bar replaces the size");
+        // And the row next to it is untouched, so the column still lines up.
+        assert!(idle.contains("12B"), "{idle:?}");
+        // Char columns, not byte offsets: a box-drawing cell is three bytes.
+        let column = |line: &str, needle: &str| {
+            line.find(needle)
+                .map(|at| line[..at].chars().count())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            column(&copying, "\u{2588}\u{2588}\u{2588}\u{2588}"),
+            column(&idle, "     12B"),
+            "the bar starts where the size column does"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_row_wears_its_bar_too() {
+        // The two panes are looked up by different strings — the volume's
+        // directory and the local path — so a renderer that asked for one
+        // when it meant the other would lose every upload's bar.
+        use crate::app::{TransferAnchor, TransferProgress};
+        use crate::k8s::Cluster;
+        use crate::pvcexplore::{Entry, EntryKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut app = App::new(Cluster::fake(), tx);
+        app.mode = Mode::PvcExplore;
+        app.pvc.active = true;
+        app.pvc.claim = "data".into();
+        app.pvc.namespace = "default".into();
+        app.pvc.remote_path = "/srv".into();
+        app.pvc.local_path = std::path::PathBuf::from("/tmp/here");
+        app.pvc.local = vec![Entry {
+            name: "notes.txt".into(),
+            kind: EntryKind::File,
+            size: Some(4_000),
+            link_target: String::new(),
+        }];
+        app.transfers.push(TransferProgress::fake(
+            app.generation,
+            TransferAnchor {
+                pane: crate::app::Pane::Local,
+                claim: "default/data".into(),
+                dir: "/tmp/here".into(),
+                name: "notes.txt".into(),
+            },
+            2_000,
+            4_000,
+        ));
+
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = term.backend().buffer().clone();
+        let row = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("notes.txt"))
+            .unwrap_or_default();
+        assert!(
+            row.contains("\u{2588}\u{2588}\u{2588}\u{2588}\u{2591}\u{2591}\u{2591}\u{2591}"),
+            "{row:?}"
+        );
     }
 
     #[test]
