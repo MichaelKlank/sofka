@@ -1,6 +1,19 @@
 use super::*;
 
 impl App {
+    pub fn scrollbars_visible(&self) -> bool {
+        self.scrollbar_activity
+            .is_some_and(|time| time.elapsed() < std::time::Duration::from_millis(700))
+    }
+
+    pub fn expire_scrollbars(&mut self) -> bool {
+        if self.scrollbar_activity.is_some() && !self.scrollbars_visible() {
+            self.scrollbar_activity = None;
+            return true;
+        }
+        false
+    }
+
     // ----- key handling --------------------------------------------------
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -23,7 +36,30 @@ impl App {
             other => other,
         };
         let run = self.plugin_run;
+        let input_mode = self.mode;
+        let scroll_action = matches!(
+            key.action,
+            Some(
+                Action::Up
+                    | Action::Down
+                    | Action::Left
+                    | Action::Right
+                    | Action::First
+                    | Action::Last
+                    | Action::PageUp
+                    | Action::PageDown
+                    | Action::RangeUp
+                    | Action::RangeDown
+                    | Action::NextMatch
+                    | Action::PreviousMatch
+            )
+        );
         let result = self.handle_key_inner(key);
+        if self.mode != input_mode {
+            self.scrollbar_activity = None;
+        } else if scroll_action {
+            self.scrollbar_activity = Some(std::time::Instant::now());
+        }
         self.check_resource_refresh();
         self.sync_container_history();
         if self.should_quit || self.mode != Mode::Adjacent {

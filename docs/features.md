@@ -13,14 +13,11 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   It uses the existing metrics polls and is not saved between sessions.
   The table keeps the current values; the charts show their history.
 
-- **Popup shadows** use the active skin colors to separate confirmation boxes,
-  the command palette, and pickers from the content below. Shadows stay within
-  the terminal bounds and disappear when the popup closes.
-
 - **Scroll position** appears on the borders of long resource tables, document
   views, logs, and pickers. Tables and unwrapped documents also show horizontal
-  position. Wrapped views use display rows. Scrollbars disappear when content
-  fits. Fullscreen logs keep their borderless layout for text selection.
+  position. Wrapped views use display rows. Scrollbars use thin lines. They
+  appear during keyboard or mouse scrolling and hide after 700 ms without
+  scrolling. They stay hidden when content fits. Fullscreen logs keep their borderless layout for text selection.
 
 - **Terminal title** shows `sofka: <context>/<namespace>` and follows navigation.
   The namespace is `all` when all namespaces are selected. Set

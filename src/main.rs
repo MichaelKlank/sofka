@@ -1043,9 +1043,12 @@ async fn run(
                 take_suspend(terminal, app, captured);
                 dirty = true;
             }
-            _ = frame.tick(), if dirty => {
-                terminal.draw(|f| ui::draw(f, app))?;
-                dirty = false;
+            _ = frame.tick(), if dirty || app.scrollbar_activity.is_some() => {
+                let expired = app.expire_scrollbars();
+                if dirty || expired {
+                    terminal.draw(|f| ui::draw(f, app))?;
+                    dirty = false;
+                }
             }
             _ = tick.tick() => {
                 app.reap_port_forwards(); // age columns + drop dead forwards

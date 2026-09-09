@@ -23719,7 +23719,7 @@ async fn container_trends_follow_keys_and_reject_stale_samples() {
 }
 
 #[tokio::test]
-async fn popup_shadows_follow_open_close_and_resize() {
+async fn popups_preserve_surrounding_cells_on_open_close_and_resize() {
     use ratatui::{Terminal, backend::TestBackend};
     let (mut app, _rx) = test_app();
     app.compact = true;
@@ -23739,9 +23739,15 @@ async fn popup_shadows_follow_open_close_and_resize() {
         let corner = (1..23)
             .find_map(|y| (1..99).find_map(|x| (buffer[(x, y)].symbol() == "╮").then_some((x, y))))
             .unwrap();
-        let shadow = &buffer[(corner.0 + 1, corner.1 + 1)];
-        assert_eq!(shadow.bg, crate::theme::surface0());
-        assert_eq!(shadow.fg, crate::theme::overlay1());
+        let bottom = (corner.1 + 1..24)
+            .find(|&y| buffer[(corner.0, y)].symbol() == "╯")
+            .unwrap();
+        for y in corner.1..=bottom + 1 {
+            assert_eq!(buffer[(corner.0 + 1, y)], original[(corner.0 + 1, y)]);
+        }
+        for x in 0..=corner.0 + 1 {
+            assert_eq!(buffer[(x, bottom + 1)], original[(x, bottom + 1)]);
+        }
         app.handle_key(press(KeyCode::Esc)).unwrap();
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
         assert_eq!(terminal.backend().buffer(), &original);
@@ -23763,7 +23769,10 @@ async fn scrollbars_follow_keys_and_disappear_when_content_fits() {
     let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
     let thumb_rows = |terminal: &Terminal<TestBackend>| -> Vec<u16> {
         (0..16)
-            .filter(|&y| terminal.backend().buffer()[(59, y)].symbol() == "█")
+            .filter(|&y| {
+                terminal.backend().buffer()[(59, y)].symbol() == "│"
+                    && terminal.backend().buffer()[(59, y)].fg == crate::theme::text()
+            })
             .collect()
     };
     for i in 0..80 {
@@ -23818,7 +23827,10 @@ async fn scrollbars_follow_keys_and_disappear_when_content_fits() {
     app.handle_key(press(KeyCode::Right)).unwrap();
     terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
     assert!(app.detail.hscroll > 0);
-    assert!((1..59).any(|x| terminal.backend().buffer()[(x, 15)].symbol() == "█"));
+    assert!(
+        (1..59).any(|x| terminal.backend().buffer()[(x, 15)].symbol() == "─"
+            && terminal.backend().buffer()[(x, 15)].fg == crate::theme::text())
+    );
     app.detail = Scrollable {
         lines: VecDeque::from(["x".repeat(4000)]),
         wrap: true,
@@ -23848,7 +23860,10 @@ async fn document_scrollbar_thumb_matches_visible_fraction() {
     terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
     let thumb_rows = |terminal: &Terminal<TestBackend>| -> Vec<u16> {
         (0..16)
-            .filter(|&y| terminal.backend().buffer()[(59, y)].symbol() == "█")
+            .filter(|&y| {
+                terminal.backend().buffer()[(59, y)].symbol() == "│"
+                    && terminal.backend().buffer()[(59, y)].fg == crate::theme::text()
+            })
             .collect()
     };
     let top = thumb_rows(&terminal);
@@ -23875,7 +23890,10 @@ async fn document_horizontal_scroll_uses_terminal_columns() {
         app.handle_key(press(KeyCode::Home)).unwrap();
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
         assert_eq!(app.detail.scroll_dimensions(), (1, width));
-        let has_thumb = (1..59).any(|x| terminal.backend().buffer()[(x, 15)].symbol() == "█");
+        let has_thumb = (1..59).any(|x| {
+            terminal.backend().buffer()[(x, 15)].symbol() == "─"
+                && terminal.backend().buffer()[(x, 15)].fg == crate::theme::text()
+        });
         assert_eq!(has_thumb, width > 58);
         for _ in 0..100 {
             app.handle_key(press(KeyCode::Right)).unwrap();
@@ -23883,4 +23901,47 @@ async fn document_horizontal_scroll_uses_terminal_columns() {
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
         assert_eq!(app.detail.hscroll, width - 1);
     }
+}
+
+#[tokio::test]
+async fn scrollbars_hide_when_idle_and_return_on_keyboard_and_wheel_input() {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.compact = true;
+    app.mode = Mode::Detail;
+    app.detail.lines = (0..80)
+        .map(|i| format!("line {i} {}", "x".repeat(100)))
+        .collect();
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    let has_thumb = |terminal: &Terminal<TestBackend>| {
+        (1..15).any(|y| terminal.backend().buffer()[(59, y)].fg == crate::theme::text())
+            || (1..59).any(|x| terminal.backend().buffer()[(x, 15)].fg == crate::theme::text())
+    };
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert!(!has_thumb(&terminal));
+    for key in [KeyCode::Down, KeyCode::PageDown, KeyCode::Right] {
+        app.handle_key(press(key)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(has_thumb(&terminal));
+        assert!(!app.expire_scrollbars());
+        app.scrollbar_activity =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(701));
+        app.handle_key(press(KeyCode::F(12))).unwrap();
+        assert!(app.expire_scrollbars());
+        assert!(!app.expire_scrollbars());
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(!has_thumb(&terminal));
+    }
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 10,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    })
+    .unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert!(has_thumb(&terminal));
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert!(!app.scrollbars_visible());
 }
