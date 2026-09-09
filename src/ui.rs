@@ -6,8 +6,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, Clear, Gauge, HighlightSpacing, LineGauge, List, ListItem,
-    ListState, Paragraph, Row, Sparkline, Table,
+    Block, BorderType, Borders, Clear, Gauge, HighlightSpacing, LineGauge, List, ListItem,
+    ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Sparkline,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -15,6 +15,37 @@ use crate::app::{App, DEFAULT_SORT_LABEL, Mode, Pane, SuggestKind, TRANSFER_MENU
 use crate::{columns, theme};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+struct RenderCell<'a> {
+    content: Text<'a>,
+    style: Style,
+}
+
+impl<'a, T: Into<Text<'a>>> From<T> for RenderCell<'a> {
+    fn from(content: T) -> Self {
+        Self {
+            content: content.into(),
+            style: Style::default(),
+        }
+    }
+}
+
+impl RenderCell<'_> {
+    fn style(mut self, style: Style) -> Self {
+        self.style = style;
+        self
+    }
+
+    fn render(&self, area: Rect, buf: &mut ratatui::buffer::Buffer, row: Style, selected: bool) {
+        use ratatui::widgets::Widget;
+        buf.set_style(area, row);
+        buf.set_style(area, self.style);
+        (&self.content).render(area, buf);
+        if selected {
+            buf.set_style(area, theme::selected_row());
+        }
+    }
+}
 
 enum TableCellText<'a> {
     Borrowed(&'a str),
@@ -29,21 +60,21 @@ impl<'a> TableCellText<'a> {
         }
     }
 
-    fn into_cell(self) -> Cell<'a> {
+    fn into_cell(self) -> RenderCell<'a> {
         match self {
-            TableCellText::Borrowed(value) => Cell::from(value),
-            TableCellText::Owned(value) => Cell::from(value),
+            TableCellText::Borrowed(value) => RenderCell::from(value),
+            TableCellText::Owned(value) => RenderCell::from(value),
         }
     }
 
     /// Like [`Self::into_cell`], honoring a custom column's alignment.
-    fn into_cell_aligned(self, align: Option<Alignment>) -> Cell<'a> {
+    fn into_cell_aligned(self, align: Option<Alignment>) -> RenderCell<'a> {
         let Some(align) = align else {
             return self.into_cell();
         };
         match self {
-            TableCellText::Borrowed(value) => Cell::from(Text::from(value).alignment(align)),
-            TableCellText::Owned(value) => Cell::from(Text::from(value).alignment(align)),
+            TableCellText::Borrowed(value) => RenderCell::from(Text::from(value).alignment(align)),
+            TableCellText::Owned(value) => RenderCell::from(Text::from(value).alignment(align)),
         }
     }
 }
@@ -883,11 +914,11 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                 if let Some(a) = align_of(i) {
                     line = line.alignment(a);
                 }
-                Cell::from(line)
+                RenderCell::from(line)
             } else {
                 match align_of(i) {
-                    Some(a) => Cell::from(Text::from(h.clone()).alignment(a)),
-                    None => Cell::from(h.clone()),
+                    Some(a) => RenderCell::from(Text::from(h.clone()).alignment(a)),
+                    None => RenderCell::from(h.clone()),
                 }
             }
         })
@@ -1043,7 +1074,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     app.ensure_table_cell_cache_at(&visible_objects, now);
     let cell_cache = app.table_cell_cache();
 
-    let rows: Vec<Vec<Cell>> = visible_objects
+    let rows: Vec<Vec<RenderCell>> = visible_objects
         .iter()
         .map(|obj| {
             let row_key = crate::store::row_key(obj);
@@ -1098,7 +1129,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             let row_color = theme::row_color(status_key);
             let status_badge = theme::status_color(status_key);
-            let render_cells: Vec<Cell> = cells
+            let render_cells: Vec<RenderCell> = cells
                 .into_iter()
                 .enumerate()
                 .map(|(i, c)| {
@@ -1229,6 +1260,26 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
         },
         inner,
     );
+    draw_border_scrollbar(
+        frame,
+        Rect {
+            y: area.y.saturating_add(1),
+            height: area.height.saturating_sub(1),
+            ..area
+        },
+        offset,
+        count.saturating_sub(visible_rows),
+        visible_rows,
+        false,
+    );
+    draw_border_scrollbar(
+        frame,
+        area,
+        col_offset,
+        app.col_scroll_max,
+        usize::from(inner.width),
+        true,
+    );
 }
 
 /// Positions in the full table, measured from the selection marker.
@@ -1294,8 +1345,8 @@ impl TableViewport {
 }
 
 struct ScrollingTable<'a> {
-    header: Vec<Cell<'a>>,
-    rows: Vec<Vec<Cell<'a>>>,
+    header: Vec<RenderCell<'a>>,
+    rows: Vec<Vec<RenderCell<'a>>>,
     widths: Vec<u16>,
     viewport: TableViewport,
     offset: usize,
@@ -1304,8 +1355,6 @@ struct ScrollingTable<'a> {
 
 impl ratatui::widgets::Widget for ScrollingTable<'_> {
     fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
-        use ratatui::widgets::StatefulWidget;
-
         let ranges = self.viewport.ranges(self.offset);
         let max_width = ranges
             .iter()
@@ -1338,14 +1387,7 @@ impl ratatui::widgets::Widget for ScrollingTable<'_> {
                     source.set_style(source.area, Style::default().bg(bg));
                 }
                 let cell_area = Rect::new(0, 0, self.widths[index], 1);
-                let mut state = ratatui::widgets::TableState::default();
-                state.select(selected.then_some(0));
-                let table = Table::new(
-                    [Row::new([cells[index].clone()]).style(style)],
-                    [Constraint::Length(self.widths[index])],
-                )
-                .row_highlight_style(theme::selected_row());
-                StatefulWidget::render(table, cell_area, &mut source, &mut state);
+                cells[index].render(cell_area, &mut source, style, selected);
                 let source_end = source_start + (end - start);
                 let mut x = 0;
                 while x < source_end {
@@ -1498,7 +1540,7 @@ fn pod_readiness_blocked(obj: &kube::core::DynamicObject) -> bool {
 /// fuzzy row filter (bold yellow) so a scan across many filtered results is
 /// faster — every visible row already matched, this just shows *where*.
 /// Falls back to a flat `base`-colored cell when there's no active filter.
-fn render_name_cell(app: &App, name: &str, base: Color, forwarded: bool) -> Cell<'static> {
+fn render_name_cell(app: &App, name: &str, base: Color, forwarded: bool) -> RenderCell<'static> {
     // A teal ● prepended when a port-forward is active for this row.
     let marker = if forwarded {
         vec![Span::styled("● ", Style::default().fg(theme::teal()))]
@@ -1508,7 +1550,7 @@ fn render_name_cell(app: &App, name: &str, base: Color, forwarded: bool) -> Cell
     let Some(matched) = app.filter_match_indices(name).filter(|idx| !idx.is_empty()) else {
         let mut spans = marker;
         spans.push(Span::styled(name.to_string(), Style::default().fg(base)));
-        return Cell::from(Line::from(spans));
+        return RenderCell::from(Line::from(spans));
     };
     let matched: std::collections::HashSet<usize> = matched.iter().copied().collect();
     let plain = Style::default().fg(base);
@@ -1533,7 +1575,7 @@ fn render_name_cell(app: &App, name: &str, base: Color, forwarded: bool) -> Cell
     if !run.is_empty() {
         spans.push(Span::styled(run, if run_matched { hl } else { plain }));
     }
-    Cell::from(Line::from(spans))
+    RenderCell::from(Line::from(spans))
 }
 
 fn draw_scrollable(
@@ -1575,6 +1617,7 @@ fn draw_scrollable(
         p.scroll((0, view.hscroll.min(u16::MAX as usize) as u16))
     };
     frame.render_widget(p, area);
+    draw_document_scrollbars(frame, view, area);
 }
 
 fn visible_wrapped_rows(
@@ -1740,6 +1783,9 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
             .title(Span::styled(title, theme::title()))
     };
     frame.render_widget(Paragraph::new(rows).block(block), area);
+    if !fullscreen {
+        draw_border_scrollbar(frame, area, scroll, max_scroll, inner_h, false);
+    }
 }
 
 /// Display rows `raw` occupies when char-wrapped to `width` columns: ANSI
@@ -2278,6 +2324,7 @@ fn draw_diff(frame: &mut Frame, view: &mut crate::app::Scrollable, area: Rect) {
         p.scroll((0, view.hscroll.min(u16::MAX as usize) as u16))
     };
     frame.render_widget(p, area);
+    draw_document_scrollbars(frame, view, area);
 }
 
 /// Doc-view title, extended with the active search query and the current
@@ -2723,6 +2770,14 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
                 .title(Span::styled(title, theme::title())),
         ),
         area,
+    );
+    draw_border_scrollbar(
+        frame,
+        area,
+        usize::from(scroll),
+        usize::from(max_scroll),
+        usize::from(inner_h),
+        false,
     );
 }
 
@@ -3425,6 +3480,20 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol("▌ ")
         .highlight_spacing(HighlightSpacing::Always);
     frame.render_stateful_widget(list, list_area, &mut app.container_state);
+    draw_border_scrollbar(
+        frame,
+        Rect {
+            y: list_area.y.saturating_sub(1),
+            height: list_area.height.saturating_add(2),
+            ..popup
+        },
+        app.container_state.offset(),
+        app.container_list
+            .len()
+            .saturating_sub(usize::from(list_area.height)),
+        usize::from(list_area.height),
+        false,
+    );
     if gauge_height > 0 {
         draw_container_gauges(frame, app, gauge_area);
     }
@@ -4520,6 +4589,65 @@ fn confirm_action_hint(app: &App, allows_force: bool) -> String {
     key_hint(app, "confirm", &actions)
 }
 
+fn draw_border_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    position: usize,
+    max_offset: usize,
+    visible: usize,
+    horizontal: bool,
+) {
+    if max_offset == 0 || visible == 0 || area.width < 3 || area.height < 3 {
+        return;
+    }
+    let (orientation, track) = if horizontal {
+        (
+            ScrollbarOrientation::HorizontalBottom,
+            Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1),
+        )
+    } else {
+        (
+            ScrollbarOrientation::VerticalRight,
+            Rect::new(area.right() - 1, area.y + 1, 1, area.height - 2),
+        )
+    };
+    // Ratatui uses content_length - 1 as the maximum position, then adds
+    // the viewport length to calculate the thumb size.
+    let mut state = ScrollbarState::new(max_offset.saturating_add(1))
+        .position(position.min(max_offset))
+        .viewport_content_length(visible);
+    let scrollbar = Scrollbar::new(orientation)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .thumb_style(theme::border_focused())
+        .track_style(theme::dim());
+    frame.render_stateful_widget(scrollbar, track, &mut state);
+}
+
+fn draw_document_scrollbars(frame: &mut Frame, view: &crate::app::Scrollable, area: Rect) {
+    let (rows, widest) = view.scroll_dimensions();
+    let height = usize::from(area.height.saturating_sub(2));
+    let width = usize::from(area.width.saturating_sub(2));
+    draw_border_scrollbar(
+        frame,
+        area,
+        view.scroll,
+        rows.saturating_sub(height),
+        height,
+        false,
+    );
+    if !view.wrap && (widest > width || view.hscroll > 0) {
+        draw_border_scrollbar(
+            frame,
+            area,
+            view.hscroll,
+            widest.saturating_sub(1),
+            width,
+            true,
+        );
+    }
+}
+
 /// Clear a popup region before drawing on top of it. `Clear` resets the cells
 /// to the terminal default; with the skin background enabled that would punch a
 /// transparent hole through the fill, so repaint `base` over the cleared cells.
@@ -4555,6 +4683,8 @@ fn render_framed_list<'a, T>(
 ) where
     T: Into<Line<'a>>,
 {
+    let heights: Vec<_> = items.iter().map(ListItem::height).collect();
+    let total: usize = heights.iter().sum();
     let list = List::new(items)
         .highlight_style(theme::selected_row())
         .highlight_symbol("▌ ")
@@ -4567,6 +4697,16 @@ fn render_framed_list<'a, T>(
                 .title(title.into()),
         );
     frame.render_stateful_widget(list, area, state);
+    let visible = usize::from(area.height.saturating_sub(2));
+    let position = heights.iter().take(state.offset()).sum();
+    draw_border_scrollbar(
+        frame,
+        area,
+        position,
+        total.saturating_sub(visible),
+        visible,
+        false,
+    );
 }
 
 /// Center a fixed-size rectangle within `r`, clamped to `r`'s bounds. Used by
@@ -4623,6 +4763,60 @@ mod tests {
         assert!(clipped.ends_with('…'));
         // No room even for the ellipsis.
         assert_eq!(clip_to_width("abc", 0), "");
+    }
+
+    #[test]
+    fn direct_cells_match_table_rendering() {
+        use ratatui::buffer::Buffer;
+        use ratatui::widgets::{Cell, Row, StatefulWidget, Table, TableState};
+        for width in [0, 1, 2, 5, 20] {
+            for alignment in [Alignment::Left, Alignment::Center, Alignment::Right] {
+                for selected in [false, true] {
+                    for value in [
+                        "",
+                        "plain",
+                        "界e\u{301}界",
+                        "first\nsecond",
+                        "a long clipped value",
+                    ] {
+                        let text = Text::from(Line::from(vec![
+                            Span::styled(value, Style::default().fg(Color::Red)),
+                            Span::styled("!", Style::default().add_modifier(Modifier::BOLD)),
+                        ]))
+                        .alignment(alignment);
+                        let area = Rect::new(0, 0, width, 1);
+                        let mut expected = Buffer::empty(area);
+                        let mut actual = Buffer::empty(area);
+                        let row = theme::header_row();
+                        let cell_style = Style::default().bg(Color::Blue);
+                        let mut state = TableState::default().with_selected(selected.then_some(0));
+                        StatefulWidget::render(
+                            Table::new(
+                                [
+                                    Row::new([Cell::from(text.clone()).style(cell_style)])
+                                        .style(row),
+                                ],
+                                [Constraint::Length(width)],
+                            )
+                            .row_highlight_style(theme::selected_row()),
+                            area,
+                            &mut expected,
+                            &mut state,
+                        );
+                        RenderCell::from(text).style(cell_style).render(
+                            area,
+                            &mut actual,
+                            row,
+                            selected,
+                        );
+                        assert_eq!(
+                            actual, expected,
+                            "{width} {alignment:?} {selected} {value:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// A describe/YAML/diff document is a snapshot — the status bar must not

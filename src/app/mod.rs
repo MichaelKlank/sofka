@@ -28,6 +28,7 @@ use ratatui::widgets::{ListState, TableState};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
+use unicode_width::UnicodeWidthStr;
 
 use crate::k8s::{Cluster, Kind};
 use crate::store::{Msg, Pulse, RowKey, StatusClaim, Store, StoreMutation, XrayItem, row_key};
@@ -535,6 +536,7 @@ struct MatchCache {
 }
 
 struct DocumentViewport {
+    widest: usize,
     width: usize,
     height: usize,
     wrap: bool,
@@ -781,11 +783,13 @@ impl Scrollable {
                 || viewport.line_count != self.lines.len()
         });
         if stale {
+            let mut widest = 0usize;
             let mut rows = 0usize;
             let ends = self
                 .lines
                 .iter()
                 .map(|line| {
+                    widest = widest.max(line.as_str().width());
                     let line_rows = if self.wrap {
                         crate::ui::wrapped_height(line, width)
                     } else {
@@ -796,6 +800,7 @@ impl Scrollable {
                 })
                 .collect();
             self.viewport = Some(DocumentViewport {
+                widest,
                 width,
                 height,
                 wrap: self.wrap,
@@ -829,6 +834,12 @@ impl Scrollable {
         (start, end, row_offset)
     }
 
+    pub(crate) fn scroll_dimensions(&self) -> (usize, usize) {
+        self.viewport
+            .as_ref()
+            .map_or((self.lines.len(), 0), |v| (v.total_rows(), v.widest))
+    }
+
     fn max_scroll(&self) -> usize {
         self.viewport.as_ref().map_or_else(
             || self.lines.len().saturating_sub(1),
@@ -859,7 +870,7 @@ impl Scrollable {
         let widest = self
             .lines
             .iter()
-            .map(|l| l.chars().count())
+            .map(|line| line.as_str().width())
             .max()
             .unwrap_or(0);
         let max = widest.saturating_sub(1) as i64;
