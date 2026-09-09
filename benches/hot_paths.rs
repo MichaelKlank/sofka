@@ -648,8 +648,37 @@ fn table_frames(c: &mut Criterion) {
     group.finish();
 }
 
+fn help_frames(c: &mut Criterion) {
+    let mut group = c.benchmark_group("help_frames");
+    for width in [80, 160] {
+        for filter in ["", "namespace"] {
+            let (mut app, _rx) = bs::pods_app(1);
+            app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('?'),
+                crossterm::event::KeyModifiers::NONE,
+            ))
+            .unwrap();
+            app.help_filter = filter.into();
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 40)).unwrap();
+            terminal
+                .draw(|frame| sofka::ui::draw(frame, &mut app))
+                .unwrap();
+            group.bench_function(format!("{width}/{filter}"), |b| {
+                b.iter(|| {
+                    terminal
+                        .draw(|frame| sofka::ui::draw(frame, &mut app))
+                        .unwrap();
+                })
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    help_frames,
     table_frames,
     rows_cache,
     filter,

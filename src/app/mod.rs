@@ -1729,6 +1729,7 @@ pub struct App {
     /// Search query for the help view (`?`), which has no backing
     /// [`Scrollable`] — its lines are built at render time.
     pub help_filter: String,
+    pub(crate) help_cache: Option<crate::ui::HelpCache>,
     /// Which view help was opened from, so closing it returns to that view.
     pub help_return: Mode,
     /// First visible line of the help view (`?`).
@@ -2149,6 +2150,7 @@ impl App {
             explain_refresh_source: None,
             explain_task: None,
             help_filter: String::new(),
+            help_cache: None,
             help_return: Mode::Table,
             help_scroll: 0,
             help_max_scroll: 0,
