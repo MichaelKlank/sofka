@@ -7167,6 +7167,110 @@ async fn sorted_order_updates_when_an_object_changes() {
 }
 
 #[tokio::test]
+async fn age_sort_new_pod_not_lost_among_stale_cached_keys() {
+    // AGE sort keys are cached by (header, resourceVersion), but depend on
+    // `now`. A new pod triggers a rebuild at a later `now`; unchanged pods
+    // reuse stale keys with a smaller age, so the new pod sorts after them.
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let age_idx = app
+        .display_headers()
+        .to_vec()
+        .iter()
+        .position(|h| h == "AGE")
+        .unwrap();
+
+    let pod = |name: &str, created: &str, rv: &str| {
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {
+                "name": name, "namespace": "default",
+                "resourceVersion": rv, "creationTimestamp": created
+            },
+            "status": {"phase": "Running"}
+        })
+    };
+
+    // Two pods created years ago.
+    apply(&mut app, pod("old-a", "2020-01-01T00:00:00Z", "1"));
+    apply(&mut app, pod("old-b", "2021-01-01T00:00:00Z", "1"));
+    app.sort_column = Some(age_idx);
+    app.invalidate_rows();
+    assert_eq!(row_names(&app), ["old-b", "old-a"]);
+
+    // Inject stale sort keys: simulate a cache built at an earlier `now`.
+    {
+        let mut cache = app.rows_cache.borrow_mut();
+        cache.sort_keys.insert(
+            Rc::from("default/old-a"),
+            SortKeyEntry {
+                header: "AGE".into(),
+                resource_version: Some("1".into()),
+                key: SortKey::Num(10.0),
+            },
+        );
+        cache.sort_keys.insert(
+            Rc::from("default/old-b"),
+            SortKeyEntry {
+                header: "AGE".into(),
+                resource_version: Some("1".into()),
+                key: SortKey::Num(10.0),
+            },
+        );
+    }
+
+    // A new pod created 30 s ago: its fresh age (30) is larger than the stale
+    // cached age (10), so with the bug it sorts after the old pods.
+    let now = Timestamp::now().as_second();
+    let created = Timestamp::from_second(now - 30).unwrap().to_string();
+    apply(&mut app, pod("new-pod", &created, "1"));
+
+    // Correct ascending order: new-pod (30 s) before old-b (5 y) before
+    // old-a (6 y).
+    assert_eq!(row_names(&app), ["new-pod", "old-b", "old-a"]);
+}
+
+#[tokio::test]
+async fn age_sort_rebuilds_periodically_without_watch_events() {
+    // AGE sort keys change every second without a watch event; the cache
+    // must rebuild once per second to keep them fresh.
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Pod",
+               "metadata": {"name": "p", "namespace": "default",
+                            "creationTimestamp": "2020-01-01T00:00:00Z"}}),
+    );
+    let age_idx = app
+        .display_headers()
+        .to_vec()
+        .iter()
+        .position(|h| h == "AGE")
+        .unwrap();
+    app.sort_column = Some(age_idx);
+    app.invalidate_rows();
+    let _ = row_names(&app);
+
+    // Simulate one second passing without a watch event.
+    let stale;
+    {
+        let mut cache = app.rows_cache.borrow_mut();
+        cache.filter_second -= 1;
+        stale = cache.filter_second;
+        assert!(!cache.dirty);
+    }
+
+    let _ = row_names(&app);
+
+    assert_ne!(
+        app.rows_cache.borrow().filter_second,
+        stale,
+        "AGE sort should rebuild once per second"
+    );
+}
+
+#[tokio::test]
 async fn sort_picker_picks_toggles_and_clears() {
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");

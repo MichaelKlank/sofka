@@ -467,23 +467,29 @@ impl App {
             return;
         }
         let parsed = self.parsed_filter();
+        let headers = self.display_headers();
+        let sort_header = self
+            .sort_column
+            .and_then(|i| headers.get(i).map(String::as_str));
+        // AGE and other time-dependent sort keys move without a new
+        // resourceVersion, so they can never be cached and the cache must
+        // rebuild once per second even without a watch event.
+        let time_dependent_sort =
+            sort_header.is_some_and(|h| self.spec.is_time_sort(h, &self.kind_plural));
         cache.time_sensitive = match &*parsed {
             crate::filter::ParsedFilter::Structured(s) => {
                 s.terms.iter().any(crate::filter::Term::time_sensitive)
             }
             _ => false,
-        };
+        } || time_dependent_sort;
         cache.filter_second = now;
         cache.column_widths = None;
 
-        let headers = self.display_headers();
-        let sort_header = self
-            .sort_column
-            .and_then(|i| headers.get(i).map(String::as_str));
         // CPU/MEM (and the node capacity percentages and pod counts) sort by
         // live poll snapshots, which move without a new resourceVersion, so
         // those keys can never be cached.
-        let volatile_sort = sort_header.is_some_and(|h| self.spec.metric(h).is_some());
+        let volatile_sort =
+            sort_header.is_some_and(|h| self.spec.metric(h).is_some()) || time_dependent_sort;
         // The aggregated Helm release list (`helm list` semantics) shows only
         // the latest revision per release; `helmhistory` (one release's full
         // history) shows every revision, so it skips this.
