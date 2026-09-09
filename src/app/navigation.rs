@@ -381,11 +381,6 @@ impl App {
     }
 
     pub(super) fn set_namespace_and_return(&mut self, name: &str) {
-        let ns = if name == "<all>" {
-            String::new()
-        } else {
-            name.to_string()
-        };
         // Return to the view we came from if there is one; otherwise (a `:ns`
         // root switch clears the stack) drop into pods scoped to the chosen
         // namespace — namespaces aren't namespaced, so staying on the list would
@@ -403,11 +398,6 @@ impl App {
             self.reset_sort();
             self.table_state.select(Some(0));
         }
-        self.namespace = ns;
-        self.note_recent_namespace(name);
-        self.remember_namespace();
-        self.set_flash(format!("namespace: {}", self.namespace_label()));
-        self.record_history();
-        self.start_watch();
+        self.set_namespace(name.to_string());
     }
 }

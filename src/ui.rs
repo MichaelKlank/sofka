@@ -2474,6 +2474,10 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         "switch kind and namespace at once (all/* = all namespaces)",
     ));
     lines.push(bind(
+        ":ns <name>",
+        "change namespace, keep resource (all/* = all); from Namespaces, return or open Pods",
+    ));
+    lines.push(bind(
         ":ctx · :pulse",
         "switch context · cluster-health dashboard",
     ));

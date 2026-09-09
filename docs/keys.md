@@ -25,6 +25,7 @@ for the grammar and selector persistence rules.
 | `:resource @context [namespace]`              | switch context and resource; context names fuzzy-complete                                                                                                           |
 | `:<resource>`                                 | command palette - fuzzy over kinds and built-in commands                                                                                                            |
 | `:<resource> <ns>`                            | switch kind and namespace at once (`:deploy social`; `all`/`*` = all namespaces; the namespace tab-completes)                                                       |
+| `:ns <name>`                                  | change namespace and keep the resource view; from Namespaces, return to the previous view or Pods (`all`/`*` = all namespaces)                                      |
 | `[` / `]`                                     | view history - back / forward through visited kind+namespace views                                                                                                  |
 | `Tab` / `shift-Tab`                           | next / previous common resource in the current namespace; cycle workspace views when one is open                                                                    |
 | `enter`                                       | drill down (workload/svc → pods, machinedeployment → machines, cronjob → jobs, node → pods, pod → containers, ns → re-scope, CRD → resources, or [views](views.md)) |
