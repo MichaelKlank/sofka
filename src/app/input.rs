@@ -24,7 +24,7 @@ impl App {
         };
         let run = self.plugin_run;
         let result = self.handle_key_inner(key);
-        self.check_describe_refresh();
+        self.check_resource_refresh();
         if self.should_quit || self.mode != Mode::Adjacent {
             self.cancel_children();
         }
@@ -40,8 +40,11 @@ impl App {
                 | Mode::SortPicker
                 | Mode::CopyPicker
         );
-        if before == Mode::Detail && self.mode != Mode::Detail && !overlay {
-            self.describe_source = None;
+        if matches!(before, Mode::Detail | Mode::Diff)
+            && !matches!(self.mode, Mode::Detail | Mode::Diff)
+            && !overlay
+        {
+            self.clear_document_source();
         }
         if self.should_quit || (self.plugin_run == run && self.mode != before && !overlay) {
             self.stop_plugins();
@@ -1058,8 +1061,8 @@ impl App {
                 } else if self.mode == Mode::Events {
                     self.stop_event_stream();
                 }
-                self.stop_describe_refresh();
-                self.describe_source = None;
+                self.stop_resource_refresh();
+                self.clear_document_source();
                 self.mode = self.return_mode;
                 if self.return_mode == Mode::Table {
                     self.restore_selection();
@@ -1076,8 +1079,11 @@ impl App {
             // when no search is active.
             (Some(Action::NextMatch), _) if detail => target.step_match(true),
             (Some(Action::PreviousMatch), _) if detail => target.step_match(false),
-            (Some(Action::AutoRefresh), _) if self.mode == Mode::Detail => {
-                self.toggle_describe_refresh()
+            (Some(Action::AutoRefresh), _) if matches!(self.mode, Mode::Detail | Mode::Diff) => {
+                self.toggle_resource_refresh()
+            }
+            (Some(Action::ResetBaseline), _) if self.mode == Mode::Diff => {
+                self.reset_diff_baseline();
             }
             // Copy the document to the clipboard (k9s `c`), same as the logs
             // view: an active search copies only the matching lines.
@@ -1087,7 +1093,10 @@ impl App {
             // `x` decodes the secret's data from inside its describe/YAML
             // view too — no need to back out to the table first.
             (Some(Action::DecodeSecret), _)
-                if self.mode == Mode::Detail && self.kind_plural == "secrets" =>
+                if self.mode == Mode::Detail
+                    && self.document_source.as_ref().is_some_and(|source| {
+                        source.kind.ar.group.is_empty() && source.kind.ar.kind == "Secret"
+                    }) =>
             {
                 self.show_decoded_secret();
             }

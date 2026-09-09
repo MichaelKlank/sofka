@@ -1720,8 +1720,12 @@ pub struct App {
 
     pub detail: Scrollable,
     pub(super) describe_source: Option<(crate::store::StatusClaim, Vec<String>)>,
-    pub describe_refresh_task: Option<tokio::task::JoinHandle<()>>,
-    pub(super) describe_refresh_generation: u64,
+    pub refresh_task: Option<tokio::task::JoinHandle<()>>,
+    pub(super) refresh_generation: u64,
+    document_source: Option<refresh::RefreshSource>,
+    describe_task: Option<JoinHandle<()>>,
+    explain_refresh_source: Option<refresh::RefreshSource>,
+    explain_task: Option<JoinHandle<()>>,
     /// Search query for the help view (`?`), which has no backing
     /// [`Scrollable`] — its lines are built at render time.
     pub help_filter: String,
@@ -1962,6 +1966,7 @@ pub struct App {
     /// (used to jump to the evidence behind a line).
     pub explain_items: Vec<crate::explain::Finding>,
     pub explain_state: ListState,
+    explain_selection_lost: bool,
     pub explain_title: String,
     /// The object the explain view is investigating, kept so `r` can re-gather.
     pub explain_source: Option<DynamicObject>,
@@ -2137,8 +2142,12 @@ impl App {
             last_action_error: None,
             detail: Scrollable::empty(),
             describe_source: None,
-            describe_refresh_task: None,
-            describe_refresh_generation: 0,
+            refresh_task: None,
+            refresh_generation: 0,
+            document_source: None,
+            describe_task: None,
+            explain_refresh_source: None,
+            explain_task: None,
             help_filter: String::new(),
             help_return: Mode::Table,
             help_scroll: 0,
@@ -2244,6 +2253,7 @@ impl App {
             xray_state: ListState::default(),
             explain_items: Vec::new(),
             explain_state: ListState::default(),
+            explain_selection_lost: false,
             explain_title: String::new(),
             explain_source: None,
             explain_request: 0,
@@ -2386,6 +2396,7 @@ mod overlays;
 mod pickers;
 mod plugins;
 mod pvcexplore;
+mod refresh;
 mod rightsize;
 mod rows;
 mod snapshot;

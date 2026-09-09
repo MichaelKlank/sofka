@@ -3464,11 +3464,14 @@ async fn adjacent_d_describes_the_row_and_returns_here() {
     app.handle_key(press(KeyCode::Char('d'))).unwrap();
     assert_eq!(
         app.mode,
-        Mode::Adjacent,
-        "describe runs off-thread; the view stays"
+        Mode::Detail,
+        "the loading view allows the describe request to be canceled"
     );
     assert_eq!(app.return_mode, Mode::Adjacent);
     assert!(app.flash.contains("describing data-db-0"), "{}", app.flash);
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    assert_eq!(app.mode, Mode::Adjacent);
+    assert!(app.describe_task.is_none());
 }
 
 #[tokio::test]
@@ -3602,6 +3605,7 @@ async fn adjacent_owner_actions_keep_the_api_group() {
         argv.windows(3)
             .any(|args| args == ["describe", "clusters.postgresql.cnpg.io", "db"])
     );
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
     app.cluster.client = Cluster::fake().client;
     app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.kind.as_ref().unwrap().ar.group, "postgresql.cnpg.io");
@@ -5797,7 +5801,7 @@ async fn can_i_overview_displays_rule_evaluation_errors() {
         let reply = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let reply = rx.recv().await.expect("rules review must return a message");
-                if matches!(reply, Msg::Detail { .. }) {
+                if matches!(reply, Msg::Detail { .. } | Msg::DescribeReady { .. }) {
                     break reply;
                 }
             }
@@ -12702,7 +12706,7 @@ async fn rightsize_command_report(plural: &str, name: &str) -> (App, Vec<String>
     app.handle_key(press(KeyCode::Enter)).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(message) = rx.recv().await {
-            if matches!(message, Msg::Detail { .. }) {
+            if matches!(message, Msg::Detail { .. } | Msg::DescribeReady { .. }) {
                 app.handle_msg(message);
                 return;
             }
@@ -20741,14 +20745,16 @@ async fn namespace_view_navigation_settings_fall_back_separately() {
 }
 
 fn describe_refresh_app() -> (App, Receiver<Msg>) {
-    let (mut app, rx) = test_app();
-    apply(
-        &mut app,
-        json!({"apiVersion":"v1", "kind":"Pod",
-        "metadata":{"name":"web", "namespace":"default"}}),
-    );
-    app.handle_key(press(KeyCode::Char('y'))).unwrap();
-    let claim = app.claim_status("describing web");
+    let root = json!({"apiVersion":"v1", "kind":"Pod",
+        "metadata":{"name":"web", "namespace":"default", "uid":"web-uid"}});
+    let (mut app, rx, responses, _) = health_report_app("pods", root.clone());
+    responses
+        .lock()
+        .unwrap()
+        .insert("/api/v1/namespaces/default/pods/web".into(), (200, root));
+    app.handle_key(press(KeyCode::Char('d'))).unwrap();
+    app.describe_task.take().unwrap().abort();
+    let claim = app.describe_source.as_ref().unwrap().0;
     app.describe_source = Some((
         claim,
         vec![
@@ -20757,7 +20763,11 @@ fn describe_refresh_app() -> (App, Receiver<Msg>) {
             "printf 'Events:\nnew event\n'".into(),
         ],
     ));
-    app.handle_msg(Msg::Detail {
+    if let Some(source) = app.document_source.as_mut() {
+        source.view =
+            refresh::RefreshView::Describe(app.describe_source.as_ref().unwrap().1.clone());
+    }
+    app.handle_msg(Msg::DescribeReady {
         generation: app.generation,
         claim,
         title: "web describe".into(),
@@ -20770,7 +20780,7 @@ fn describe_refresh_app() -> (App, Receiver<Msg>) {
 #[tokio::test]
 async fn describe_refresh_toggle_updates_and_rejects_stopped_results() {
     let (mut app, mut rx) = describe_refresh_app();
-    assert!(app.describe_refresh_task.is_none());
+    assert!(app.refresh_task.is_none());
     app.handle_key(press(KeyCode::Char('/'))).unwrap();
     for c in "event".chars() {
         app.handle_key(press(KeyCode::Char(c))).unwrap();
@@ -20779,27 +20789,24 @@ async fn describe_refresh_toggle_updates_and_rejects_stopped_results() {
     app.handle_key(press(KeyCode::Char('j'))).unwrap();
     let scroll = app.detail.scroll;
     app.handle_key(press(KeyCode::Char('r'))).unwrap();
-    assert!(app.describe_refresh_task.is_some());
-    let generation = app.describe_refresh_generation;
-    let msg = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    assert!(app.refresh_task.is_some());
+    let generation = app.refresh_generation;
+    let msg = take_resource_refresh(&mut rx).await;
     app.handle_msg(msg);
     assert_eq!(app.detail.lines[1], "new event");
     assert_eq!(app.detail.filter, "event");
     assert_eq!(app.detail.scroll, scroll);
     app.handle_key(press(KeyCode::Char('r'))).unwrap();
-    assert!(app.describe_refresh_task.is_none());
-    app.handle_msg(Msg::DescribeRefresh {
+    assert!(app.refresh_task.is_none());
+    app.handle_msg(Msg::ResourceRefresh {
         generation,
-        result: Ok(vec!["late".into()]),
+        result: Ok(refreshed_document(&app, vec!["late".into()])),
     });
     assert_eq!(app.detail.lines[1], "new event");
     app.handle_key(press(KeyCode::Char('r'))).unwrap();
     app.handle_key(press(KeyCode::Char('q'))).unwrap();
     assert_eq!(app.mode, Mode::Table);
-    assert!(app.describe_refresh_task.is_none());
+    assert!(app.refresh_task.is_none());
     assert!(app.describe_source.is_none());
 }
 
@@ -20807,41 +20814,45 @@ async fn describe_refresh_toggle_updates_and_rejects_stopped_results() {
 async fn describe_refresh_failure_keeps_document_and_search_accepts_updates() {
     let (mut app, _rx) = describe_refresh_app();
     app.handle_key(press(KeyCode::Char('r'))).unwrap();
-    let generation = app.describe_refresh_generation;
+    let generation = app.refresh_generation;
     app.handle_key(press(KeyCode::Char('/'))).unwrap();
-    app.handle_msg(Msg::DescribeRefresh {
+    app.handle_msg(Msg::ResourceRefresh {
         generation,
-        result: Ok(vec!["updated".into()]),
+        result: Ok(refreshed_document(&app, vec!["updated".into()])),
     });
     assert_eq!(app.mode, Mode::DocFilter);
     assert_eq!(app.detail.lines[0], "updated");
-    app.handle_msg(Msg::DescribeRefresh {
+    app.handle_msg(Msg::ResourceRefresh {
         generation,
         result: Err("request failed".into()),
     });
     assert_eq!(app.detail.lines[0], "updated");
-    assert!(app.describe_refresh_task.is_none());
+    assert!(app.refresh_task.is_none());
     assert!(app.flash.contains("request failed"));
 }
 
 #[tokio::test]
-async fn describe_refresh_is_unavailable_in_yaml_and_stops_on_palette_navigation() {
+async fn resource_refresh_stops_on_palette_navigation_and_yaml_can_refresh() {
     let (mut app, _rx) = describe_refresh_app();
     app.handle_key(press(KeyCode::Char('r'))).unwrap();
     app.handle_key(press(KeyCode::Char(':'))).unwrap();
-    assert!(app.describe_refresh_task.is_none());
+    assert!(app.refresh_task.is_none());
     app.handle_key(press(KeyCode::Esc)).unwrap();
     app.handle_key(press(KeyCode::Char('q'))).unwrap();
     app.handle_key(press(KeyCode::Char('y'))).unwrap();
     app.handle_key(press(KeyCode::Char('r'))).unwrap();
     assert!(app.describe_source.is_none());
-    assert!(app.describe_refresh_task.is_none());
+    assert!(app.refresh_task.is_some());
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
 }
 
 #[tokio::test]
 async fn describe_refresh_repeats_for_the_original_resource() {
     let (mut app, mut rx) = describe_refresh_app();
-    let (_, argv) = app.describe_source.as_mut().unwrap();
+    let refresh::RefreshView::Describe(argv) = &mut app.document_source.as_mut().unwrap().view
+    else {
+        panic!("expected describe source")
+    };
     *argv = vec![
         "/bin/sh".into(),
         "-c".into(),
@@ -20861,10 +20872,7 @@ async fn describe_refresh_repeats_for_the_original_resource() {
     );
     app.handle_key(press(KeyCode::Char('r'))).unwrap();
     for _ in 0..2 {
-        let msg = tokio::time::timeout(Duration::from_secs(8), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let msg = take_resource_refresh(&mut rx).await;
         app.handle_msg(msg);
         assert_eq!(app.detail.lines[0], "web");
     }
@@ -20872,10 +20880,10 @@ async fn describe_refresh_repeats_for_the_original_resource() {
 }
 
 #[tokio::test]
-async fn describe_refresh_does_not_replace_plugin_output_or_yaml_fallback() {
+async fn describe_refresh_does_not_replace_plugin_output_and_fallback_refreshes_yaml() {
     let (mut app, _rx) = describe_refresh_app();
     app.handle_key(press(KeyCode::Char('r'))).unwrap();
-    let generation = app.describe_refresh_generation;
+    let generation = app.refresh_generation;
     let claim = app.claim_status("plugin");
     app.handle_msg(Msg::PluginOutput {
         run: app.plugin_run,
@@ -20885,18 +20893,18 @@ async fn describe_refresh_does_not_replace_plugin_output_or_yaml_fallback() {
         lines: vec!["report".into()],
         warn: None,
     });
-    app.handle_msg(Msg::DescribeRefresh {
+    app.handle_msg(Msg::ResourceRefresh {
         generation,
-        result: Ok(vec!["late".into()]),
+        result: Ok(refreshed_document(&app, vec!["late".into()])),
     });
     app.handle_key(press(KeyCode::Char('r'))).unwrap();
     assert_eq!(app.detail.lines[0], "report");
-    assert!(app.describe_refresh_task.is_none());
+    assert!(app.refresh_task.is_none());
     assert!(app.describe_source.is_none());
 
     let (mut app, _rx) = describe_refresh_app();
     let claim = app.describe_source.as_ref().unwrap().0;
-    app.handle_msg(Msg::Detail {
+    app.handle_msg(Msg::DescribeReady {
         generation: app.generation,
         claim,
         title: "web YAML".into(),
@@ -20904,9 +20912,13 @@ async fn describe_refresh_does_not_replace_plugin_output_or_yaml_fallback() {
         warn: Some("describe failed".into()),
     });
     app.handle_key(press(KeyCode::Char('r'))).unwrap();
-    assert!(app.describe_refresh_task.is_none());
-    assert!(app.describe_source.is_none());
+    assert!(app.refresh_task.is_some());
+    assert!(matches!(
+        app.document_source.as_ref().unwrap().view,
+        refresh::RefreshView::Yaml
+    ));
     assert_eq!(app.detail.lines[0], "fallback");
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
 }
 
 #[tokio::test]
@@ -20919,23 +20931,23 @@ async fn describe_refresh_clamps_horizontal_scroll_when_content_shrinks() {
         app.handle_key(press(KeyCode::Right)).unwrap();
         assert_eq!(app.detail.hscroll, 5);
         app.handle_key(press(KeyCode::Char('r'))).unwrap();
-        let generation = app.describe_refresh_generation;
+        let generation = app.refresh_generation;
 
-        app.handle_msg(Msg::DescribeRefresh {
+        app.handle_msg(Msg::ResourceRefresh {
             generation,
-            result: Ok(vec!["another wide event".into()]),
+            result: Ok(refreshed_document(&app, vec!["another wide event".into()])),
         });
         assert_eq!(app.detail.hscroll, 5);
 
-        app.handle_msg(Msg::DescribeRefresh {
+        app.handle_msg(Msg::ResourceRefresh {
             generation,
-            result: Ok(vec!["ok".into()]),
+            result: Ok(refreshed_document(&app, vec!["ok".into()])),
         });
         assert_eq!(app.detail.hscroll, 1);
 
-        app.handle_msg(Msg::DescribeRefresh {
+        app.handle_msg(Msg::ResourceRefresh {
             generation,
-            result: Ok(vec![]),
+            result: Ok(refreshed_document(&app, vec![])),
         });
         assert_eq!(app.detail.hscroll, 0);
         app.handle_key(press(KeyCode::Char('q'))).unwrap();
@@ -22997,4 +23009,629 @@ async fn favorite_namespace_shortcuts_follow_key_configuration_in_picker_and_hel
         "{text}"
     );
     assert!(text.contains("f1"), "{text}");
+}
+
+fn refreshed_document(app: &App, lines: Vec<String>) -> crate::store::RefreshContent {
+    crate::store::RefreshContent::Document {
+        source: Box::new(
+            app.document_source
+                .as_ref()
+                .map(|source| source.object.clone())
+                .unwrap_or_else(|| serde_json::from_value(json!({})).unwrap()),
+        ),
+        lines,
+    }
+}
+
+async fn take_resource_refresh(rx: &mut Receiver<Msg>) -> Msg {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let message = rx.recv().await.expect("refresh channel closed");
+            if matches!(message, Msg::ResourceRefresh { .. }) {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("resource refresh did not finish")
+}
+
+#[tokio::test]
+async fn yaml_refresh_uses_the_original_resource_api_and_context() {
+    for (plural, api_version, kind, namespace, path) in [
+        (
+            "pods",
+            "v1",
+            "Pod",
+            Some("default"),
+            "/api/v1/namespaces/default/pods/web",
+        ),
+        ("nodes", "v1", "Node", None, "/api/v1/nodes/web"),
+        (
+            "kustomizations",
+            "kustomize.toolkit.fluxcd.io/v1",
+            "Kustomization",
+            Some("default"),
+            "/apis/kustomize.toolkit.fluxcd.io/v1/namespaces/default/kustomizations/web",
+        ),
+    ] {
+        let root = json!({"apiVersion":api_version,"kind":kind,
+            "metadata":{"name":"web","namespace":namespace,"uid":"original"},
+            "status":{"state":"old"}});
+        let (mut app, mut rx, responses, requests) = health_report_app(plural, root.clone());
+        app.handle_key(press(KeyCode::Char('y'))).unwrap();
+        assert!(app.resource_refresh_available());
+        assert!(app.refresh_task.is_none());
+        app.handle_key(press(KeyCode::Char('/'))).unwrap();
+        for c in "state".chars() {
+            app.handle_key(press(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        app.handle_key(press(KeyCode::Char('j'))).unwrap();
+        let scroll = app.detail.scroll;
+        let mut another = root.clone();
+        another["metadata"]["name"] = json!("aaa");
+        another["metadata"]["uid"] = json!("another");
+        apply(&mut app, another);
+        app.table_state.select(Some(0));
+        let mut fresh = root;
+        fresh["status"]["state"] = json!("new");
+        responses.lock().unwrap().insert(path.into(), (200, fresh));
+        // A different client must not affect the source captured by the view.
+        app.cluster.client = Cluster::fake().client;
+        app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        app.handle_msg(take_resource_refresh(&mut rx).await);
+        assert!(
+            app.detail
+                .lines
+                .iter()
+                .any(|line| line.contains("state: new"))
+        );
+        assert!(
+            app.detail
+                .lines
+                .iter()
+                .any(|line| line.contains("name: web"))
+        );
+        assert_eq!(app.detail.filter, "state");
+        assert_eq!(app.detail.scroll, scroll);
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request == path)
+        );
+        app.handle_key(press(KeyCode::Char('q'))).unwrap();
+        assert!(app.refresh_task.is_none());
+    }
+}
+
+#[tokio::test]
+async fn decoded_secret_refresh_tracks_rotation_and_removed_data() {
+    let root = json!({"apiVersion":"v1","kind":"Secret",
+        "metadata":{"name":"web","namespace":"default","uid":"original"},
+        "data":{"password":"b2xk"}});
+    let path = "/api/v1/namespaces/default/secrets/web";
+    let (mut app, mut rx, responses, _) = health_report_app("secrets", root.clone());
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    let mut another = root.clone();
+    another["metadata"]["name"] = json!("aaa");
+    another["data"]["password"] = json!("d3Jvbmc=");
+    apply(&mut app, another);
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    assert_eq!(app.detail.lines[0], "password: old");
+    assert!(app.refresh_task.is_none());
+    let mut fresh = root.clone();
+    fresh["data"]["password"] = json!("bmV3");
+    responses.lock().unwrap().insert(path.into(), (200, fresh));
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    app.handle_msg(take_resource_refresh(&mut rx).await);
+    assert_eq!(app.detail.lines[0], "password: new");
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    let mut empty = root;
+    empty["data"] = json!({});
+    responses.lock().unwrap().insert(path.into(), (200, empty));
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    app.handle_msg(take_resource_refresh(&mut rx).await);
+    assert_eq!(app.detail.lines[0], "secret has no data");
+    assert!(app.refresh_task.is_some());
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+}
+
+#[tokio::test]
+async fn document_refresh_failures_keep_the_last_content_and_stop() {
+    for view in ['y', 'x', 'D'] {
+        let root = json!({"apiVersion":"v1","kind":"Secret",
+            "metadata":{"name":"web","namespace":"default","uid":"original","resourceVersion":"1"},
+            "data":{"password":"b2xk"}});
+        let path = "/api/v1/namespaces/default/secrets/web";
+        for (code, reason) in [
+            (404, "resource is gone"),
+            (403, "access denied"),
+            (200, "was replaced"),
+        ] {
+            let (mut app, mut rx, responses, _) = health_report_app("secrets", root.clone());
+            if view == 'D' {
+                let mut changed = root.clone();
+                changed["metadata"]["resourceVersion"] = json!("2");
+                changed["data"]["password"] = json!("bmV3");
+                apply(&mut app, changed);
+                palette(&mut app, "diff");
+            } else {
+                app.handle_key(press(KeyCode::Char(view))).unwrap();
+            }
+            let before = app.detail.lines.clone();
+            let response = if code == 200 {
+                let mut replacement = root.clone();
+                replacement["metadata"]["uid"] = json!("replacement");
+                replacement
+            } else {
+                json!({"kind":"Status","apiVersion":"v1","status":"Failure","code":code,"reason":"Failed","message":reason})
+            };
+            responses
+                .lock()
+                .unwrap()
+                .insert(path.into(), (code, response));
+            app.handle_key(press(KeyCode::Char('r'))).unwrap();
+            app.handle_msg(take_resource_refresh(&mut rx).await);
+            assert_eq!(app.detail.lines.clone(), before);
+            assert!(app.refresh_task.is_none());
+            assert!(app.flash_err);
+            assert!(app.flash.contains(reason), "{}", app.flash);
+            app.handle_key(press(KeyCode::Char('q'))).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn diff_refresh_keeps_its_baseline_until_reset_and_rejects_old_results() {
+    let mut root = expression_workload(true);
+    root["metadata"]["resourceVersion"] = json!("1");
+    root["spec"]["replicas"] = json!(1);
+    let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+    let path = "/apis/apps/v1/namespaces/default/deployments/web";
+    root["metadata"]["resourceVersion"] = json!("2");
+    root["spec"]["replicas"] = json!(2);
+    apply(&mut app, root.clone());
+    palette(&mut app, "diff");
+    assert_eq!(app.mode, Mode::Diff);
+    assert!(app.refresh_task.is_none());
+    root["spec"]["replicas"] = json!(3);
+    root["metadata"]["annotations"] =
+        json!({"kubectl.kubernetes.io/last-applied-configuration":"{\"spec\":{\"replicas\":99}}"});
+    responses
+        .lock()
+        .unwrap()
+        .insert(path.into(), (200, root.clone()));
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "replicas".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_msg(take_resource_refresh(&mut rx).await);
+    assert_eq!(app.mode, Mode::DocFilter);
+    assert!(
+        app.detail
+            .lines
+            .iter()
+            .any(|line| line.starts_with('-') && line.contains("replicas: 1"))
+    );
+    assert!(
+        app.detail
+            .lines
+            .iter()
+            .any(|line| line.starts_with('+') && line.contains("replicas: 3"))
+    );
+    assert!(
+        !app.detail
+            .lines
+            .iter()
+            .any(|line| line.contains("replicas: 99"))
+    );
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let generation = app.refresh_generation;
+    let stale = Msg::ResourceRefresh {
+        generation,
+        result: Ok(refreshed_document(&app, vec!["stale".into()])),
+    };
+    app.handle_key(press(KeyCode::Char('R'))).unwrap();
+    assert!(app.detail.lines.iter().all(|line| line.starts_with(' ')));
+    assert_eq!(app.detail.filter, "replicas");
+    assert!(app.refresh_task.is_some());
+    app.handle_msg(stale);
+    assert!(!app.detail.lines.iter().any(|line| line == "stale"));
+    root["spec"]["replicas"] = json!(4);
+    responses.lock().unwrap().insert(path.into(), (200, root));
+    app.handle_msg(take_resource_refresh(&mut rx).await);
+    assert!(
+        app.detail
+            .lines
+            .iter()
+            .any(|line| line.starts_with('-') && line.contains("replicas: 3"))
+    );
+    assert!(
+        app.detail
+            .lines
+            .iter()
+            .any(|line| line.starts_with('+') && line.contains("replicas: 4"))
+    );
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    assert!(app.refresh_task.is_none());
+}
+
+#[tokio::test]
+async fn unchanged_diff_can_open_and_start_refresh() {
+    let root = json!({"apiVersion":"v1","kind":"Pod", "metadata":{"name":"web","namespace":"default","uid":"original","annotations":{}},"spec":{"nodeName":"worker"}});
+    let (mut app, mut rx, responses, _) = health_report_app("pods", root.clone());
+    let mut annotated = root.clone();
+    annotated["metadata"]["annotations"] =
+        json!({"kubectl.kubernetes.io/last-applied-configuration":root.to_string()});
+    apply(&mut app, annotated.clone());
+    palette(&mut app, "diff");
+    assert_eq!(app.mode, Mode::Diff);
+    assert!(app.detail.lines.iter().all(|line| line.starts_with(' ')));
+    annotated["spec"]["nodeName"] = json!("new-worker");
+    responses.lock().unwrap().insert(
+        "/api/v1/namespaces/default/pods/web".into(),
+        (200, annotated),
+    );
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    app.handle_msg(take_resource_refresh(&mut rx).await);
+    assert!(
+        app.detail
+            .lines
+            .iter()
+            .any(|line| line.starts_with('+') && line.contains("new-worker"))
+    );
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+}
+
+#[tokio::test]
+async fn explain_auto_refresh_preserves_selection_and_manual_refresh_is_immediate() {
+    let root = expression_workload(true);
+    let (mut app, mut rx, responses, requests) = health_report_app("deployments", root.clone());
+    let path = "/apis/apps/v1/namespaces/default/deployments/web";
+    responses
+        .lock()
+        .unwrap()
+        .insert(path.into(), (200, root.clone()));
+    app.handle_key(press(KeyCode::Char('X'))).unwrap();
+    receive_health_report(&mut app, &mut rx, false).await;
+    assert!(app.refresh_task.is_none());
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    let selected = app.explain_state.selected();
+    app.handle_key(press(KeyCode::Char('R'))).unwrap();
+    app.handle_msg(take_resource_refresh(&mut rx).await);
+    assert_eq!(app.explain_state.selected(), selected);
+    let mut fresh = root;
+    fresh["status"]["readyReplicas"] = json!(0);
+    responses.lock().unwrap().insert(path.into(), (200, fresh));
+    let generation = app.refresh_generation;
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert_ne!(app.refresh_generation, generation);
+    app.handle_msg(take_resource_refresh(&mut rx).await);
+    assert!(
+        app.explain_items
+            .iter()
+            .any(|finding| finding.text.contains("is unavailable"))
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| *request == path)
+            .count(),
+        3
+    );
+    app.handle_key(press(KeyCode::Char('R'))).unwrap();
+    assert!(app.refresh_task.is_none());
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    receive_health_report(&mut app, &mut rx, false).await;
+    assert!(app.refresh_task.is_none());
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+}
+
+#[tokio::test]
+async fn explain_auto_refresh_failures_keep_findings_and_stop() {
+    for failure in ["missing", "replacement", "events"] {
+        let root = expression_workload(true);
+        let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+        let path = "/apis/apps/v1/namespaces/default/deployments/web";
+        responses
+            .lock()
+            .unwrap()
+            .insert(path.into(), (200, root.clone()));
+        app.handle_key(press(KeyCode::Char('X'))).unwrap();
+        receive_health_report(&mut app, &mut rx, false).await;
+        let before: Vec<_> = app
+            .explain_items
+            .iter()
+            .map(|finding| finding.text.clone())
+            .collect();
+        match failure {
+            "replacement" => {
+                let mut replacement = root;
+                replacement["metadata"]["uid"] = json!("replacement");
+                responses
+                    .lock()
+                    .unwrap()
+                    .insert(path.into(), (200, replacement));
+            }
+            _ => {
+                let path = if failure == "events" {
+                    "/api/v1/namespaces/default/events"
+                } else {
+                    path
+                };
+                responses.lock().unwrap().insert(path.into(), (404, json!({"kind":"Status","apiVersion":"v1","status":"Failure","code":404,"reason":"NotFound","message":"resource is gone"})));
+            }
+        }
+        app.handle_key(press(KeyCode::Char('R'))).unwrap();
+        app.handle_msg(take_resource_refresh(&mut rx).await);
+        assert_eq!(
+            app.explain_items
+                .iter()
+                .map(|finding| finding.text.clone())
+                .collect::<Vec<_>>(),
+            before
+        );
+        assert!(app.flash_err);
+        assert!(app.refresh_task.is_none());
+        app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn refresh_navigation_cancels_work_and_rejects_queued_results() {
+    for destination in ["nodes", "ctx", "info", "journal"] {
+        let (mut app, mut rx) = describe_refresh_app();
+        app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        let task = app.refresh_task.as_ref().unwrap().abort_handle();
+        let reply = take_resource_refresh(&mut rx).await;
+        palette(&mut app, destination);
+        let mode = app.mode;
+        let content = app.detail.lines.clone();
+        app.handle_msg(reply);
+        assert_eq!(app.mode, mode);
+        assert_eq!(app.detail.lines.clone(), content);
+        assert!(app.refresh_task.is_none());
+        assert!(!app.resource_refresh_available());
+        tokio::task::yield_now().await;
+        assert!(task.is_finished());
+    }
+}
+
+#[tokio::test]
+async fn describe_initial_request_can_be_closed_without_late_content() {
+    let (mut app, _rx) = app_with_pod();
+    app.handle_key(press(KeyCode::Char('d'))).unwrap();
+    assert_eq!(app.mode, Mode::Detail);
+    let task = app.describe_task.as_ref().unwrap().abort_handle();
+    let claim = app.describe_source.as_ref().unwrap().0;
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    app.handle_msg(Msg::DescribeReady {
+        generation: app.generation,
+        claim,
+        title: "late describe".into(),
+        lines: vec!["late".into()],
+        warn: None,
+    });
+    assert_eq!(app.mode, Mode::Table);
+    assert_ne!(app.detail.title, "late describe");
+    tokio::task::yield_now().await;
+    assert!(task.is_finished());
+}
+
+#[tokio::test]
+async fn refresh_indicator_distinguishes_running_stopped_and_static_views() {
+    use ratatui::{Terminal, backend::TestBackend};
+    for compact in [false, true] {
+        let (mut app, _rx) = app_with_pod();
+        if compact {
+            app.handle_key(ctrl(KeyCode::Char('e'))).unwrap();
+        }
+        assert_eq!(app.compact, compact);
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        let mut render = |app: &mut App| {
+            terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        app.handle_key(press(KeyCode::Char('y'))).unwrap();
+        assert!(render(&mut app).contains("○ stopped"));
+        app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        assert!(render(&mut app).contains("● refresh"));
+        app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        assert!(render(&mut app).contains("○ stopped"));
+        palette(&mut app, "info");
+        assert!(render(&mut app).contains("○ static"));
+        app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        assert!(app.refresh_task.is_none());
+        assert!(app.flash.contains("unavailable"));
+    }
+}
+
+#[tokio::test]
+async fn explain_refresh_rejects_old_manual_results_and_stops_in_evidence_views() {
+    let root = expression_workload(true);
+    let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+    responses.lock().unwrap().insert(
+        "/apis/apps/v1/namespaces/default/deployments/web".into(),
+        (200, root.clone()),
+    );
+    app.handle_key(press(KeyCode::Char('X'))).unwrap();
+    let old_manual = take_health_report(&mut rx, false).await;
+    app.handle_key(press(KeyCode::Char('R'))).unwrap();
+    app.handle_msg(take_resource_refresh(&mut rx).await);
+    let selected = app.explain_state.selected();
+    let before: Vec<_> = app
+        .explain_items
+        .iter()
+        .map(|finding| finding.text.clone())
+        .collect();
+    app.handle_msg(old_manual);
+    assert_eq!(app.explain_state.selected(), selected);
+    assert_eq!(
+        app.explain_items
+            .iter()
+            .map(|finding| finding.text.clone())
+            .collect::<Vec<_>>(),
+        before
+    );
+    let generation = app.refresh_generation;
+    app.handle_key(press(KeyCode::Char('E'))).unwrap();
+    assert_eq!(app.mode, Mode::Events);
+    assert!(app.refresh_task.is_none());
+    app.handle_msg(Msg::ResourceRefresh {
+        generation,
+        result: Ok(crate::store::RefreshContent::Explain {
+            source: Box::new(obj(root)),
+            findings: vec![],
+        }),
+    });
+    assert_eq!(app.mode, Mode::Events);
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    assert_eq!(app.mode, Mode::Explain);
+    assert!(app.resource_refresh_available());
+    assert!(app.refresh_task.is_none());
+    assert_eq!(
+        app.explain_items
+            .iter()
+            .map(|finding| finding.text.clone())
+            .collect::<Vec<_>>(),
+        before
+    );
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+}
+
+fn explain_blocking_pod(name: &str, reason: &str) -> Value {
+    json!({"apiVersion":"v1", "kind":"Pod",
+        "metadata":{"name":name,"namespace":"default","uid":format!("{name}-uid"),"labels":{"app":"web"}},
+        "spec":{"containers":[{"name":"app","image":"example"}]},
+        "status":{"phase":"Pending","containerStatuses":[{"name":"app","ready":false,"restartCount":0,"state":{"waiting":{"reason":reason}}}]}})
+}
+
+async fn explain_with_selected_blocker() -> (App, Receiver<Msg>, HealthResponses) {
+    let root = expression_workload(true);
+    let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(
+            "/apis/apps/v1/namespaces/default/deployments/web".into(),
+            (200, root),
+        );
+        replies.insert(
+            "/api/v1/namespaces/default/pods".into(),
+            (
+                200,
+                json!({"apiVersion":"v1","kind":"PodList","items":[
+                    explain_blocking_pod("web-a", "ImagePullBackOff"),
+                    explain_blocking_pod("web-b", "ImagePullBackOff")
+                ]}),
+            ),
+        );
+    }
+    app.handle_key(press(KeyCode::Char('X'))).unwrap();
+    receive_health_report(&mut app, &mut rx, false).await;
+    let index = app
+        .explain_items
+        .iter()
+        .position(|finding| {
+            finding
+                .target
+                .as_ref()
+                .is_some_and(|target| target.name == "web-b")
+        })
+        .unwrap();
+    app.handle_key(press(KeyCode::Char('g'))).unwrap();
+    for _ in 0..index {
+        app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    }
+    assert_eq!(app.explain_state.selected(), Some(index));
+    (app, rx, responses)
+}
+
+#[tokio::test]
+async fn explain_refresh_keeps_the_selected_pod_when_findings_shift_and_text_changes() {
+    for insert in [false, true] {
+        for action in [KeyCode::Enter, KeyCode::Char('E'), KeyCode::Char('l')] {
+            let (mut app, mut rx, responses) = explain_with_selected_blocker().await;
+            let previous = app.explain_state.selected().unwrap();
+            let previous_text = app.explain_items[previous].text.clone();
+            let mut pods = vec![explain_blocking_pod("web-b", "CrashLoopBackOff")];
+            if insert {
+                pods.push(explain_blocking_pod("web-a", "ImagePullBackOff"));
+                pods.push(explain_blocking_pod("web-0", "ImagePullBackOff"));
+            }
+            responses.lock().unwrap().insert(
+                "/api/v1/namespaces/default/pods".into(),
+                (
+                    200,
+                    json!({"apiVersion":"v1","kind":"PodList","items":pods}),
+                ),
+            );
+            app.handle_key(press(KeyCode::Char('R'))).unwrap();
+            app.handle_msg(take_resource_refresh(&mut rx).await);
+            let selected = app.explain_state.selected().unwrap();
+            assert_ne!(selected, previous);
+            assert_ne!(app.explain_items[selected].text, previous_text);
+            assert_eq!(
+                app.explain_items[selected].target.as_ref().unwrap().name,
+                "web-b"
+            );
+            app.handle_key(press(action)).unwrap();
+            match action {
+                KeyCode::Enter => {
+                    assert_eq!(app.mode, Mode::Table);
+                    assert_eq!(app.fields.as_deref(), Some("metadata.name=web-b"));
+                    assert_eq!(app.namespace, "default");
+                }
+                KeyCode::Char('E') => {
+                    assert_eq!(app.mode, Mode::Events);
+                    assert!(app.detail.title.starts_with("web-b"));
+                }
+                _ => {
+                    assert_eq!(app.mode, Mode::Logs);
+                    assert!(
+                        matches!(&app.logs.source, Some(LogSource::Pod { ns, name, .. }) if ns == "default" && name == "web-b")
+                    );
+                }
+            }
+            app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn explain_refresh_clears_a_removed_selection_and_blocks_implicit_root_actions() {
+    let (mut app, mut rx, responses) = explain_with_selected_blocker().await;
+    responses.lock().unwrap().insert("/api/v1/namespaces/default/pods".into(), (200, json!({"apiVersion":"v1","kind":"PodList","items":[explain_blocking_pod("web-a", "ImagePullBackOff")]})));
+    app.handle_key(press(KeyCode::Char('R'))).unwrap();
+    app.handle_msg(take_resource_refresh(&mut rx).await);
+    assert!(app.explain_state.selected().is_none());
+    assert!(app.flash.contains("no longer available"));
+    for action in [KeyCode::Enter, KeyCode::Char('E'), KeyCode::Char('l')] {
+        app.handle_key(press(action)).unwrap();
+        assert_eq!(app.mode, Mode::Explain);
+        assert!(app.flash.contains("select a finding"));
+    }
+    // Another refresh must not silently choose a new target.
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    app.handle_msg(take_resource_refresh(&mut rx).await);
+    assert!(app.explain_state.selected().is_none());
+    app.handle_key(press(KeyCode::Char('E'))).unwrap();
+    assert_eq!(app.mode, Mode::Explain);
+    app.handle_key(press(KeyCode::Char('g'))).unwrap();
+    app.handle_key(press(KeyCode::Char('E'))).unwrap();
+    assert_eq!(app.mode, Mode::Events);
+    assert!(app.detail.title.starts_with("web"));
+    app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
 }

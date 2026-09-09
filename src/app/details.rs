@@ -6,8 +6,8 @@ impl App {
     /// Remember which view a transient sub-view (logs/detail/diff) was opened
     /// from, so `esc` returns there (e.g. back to the xray tree, not the table).
     pub(super) fn set_return_mode(&mut self) {
-        self.stop_describe_refresh();
-        self.describe_source = None;
+        self.stop_resource_refresh();
+        self.clear_document_source();
         self.stop_plugins();
         // A transient sub-view (logs/detail/events) opened from a list-style
         // view returns to that view, not the table underneath it.
@@ -60,6 +60,9 @@ impl App {
     /// The YAML view of one object — the selected row, or a row of a list
     /// view that already holds the object.
     pub(super) fn show_yaml(&mut self, obj: &DynamicObject) {
+        self.stop_resource_refresh();
+        self.clear_document_source();
+        self.document_source = self.resource_source(obj, refresh::RefreshView::Yaml);
         let title = obj.metadata.name.clone().unwrap_or_else(|| "object".into());
         self.detail = Scrollable {
             title: format!("{title} — YAML"),
@@ -81,27 +84,28 @@ impl App {
     /// in-document `x` binding lands here, so esc still returns to wherever
     /// the describe/YAML view was opened from.
     pub(super) fn show_decoded_secret(&mut self) {
-        self.stop_describe_refresh();
-        self.describe_source = None;
-        let Some(obj) = self.selected_ref() else {
-            return;
-        };
-        let Some(data) = obj.data.get("data").and_then(Value::as_object) else {
-            self.flash_warn("secret has no data");
-            return;
-        };
-        if data.is_empty() {
+        let obj = self
+            .document_source
+            .as_ref()
+            .map(|source| source.object.clone())
+            .or_else(|| self.selected());
+        let Some(obj) = obj else { return };
+        if obj
+            .data
+            .get("data")
+            .and_then(Value::as_object)
+            .is_none_or(|data| data.is_empty())
+        {
             self.flash_warn("secret has no data");
             return;
         }
-        let mut lines: Vec<String> = Vec::new();
-        for (key, value) in data {
-            lines.extend(decoded_secret_entry(key, value));
-        }
-        let title = obj.metadata.name.clone().unwrap_or_else(|| "secret".into());
+        self.stop_resource_refresh();
+        self.clear_document_source();
+        self.document_source = self.resource_source(&obj, refresh::RefreshView::DecodedSecret);
+        let title = obj.metadata.name.as_deref().unwrap_or("secret");
         self.detail = Scrollable {
-            title: format!("{title} — decoded"),
-            lines: lines.into(),
+            title: format!("{title} - decoded"),
+            lines: decoded_secret_lines(&obj).into(),
             ..Default::default()
         };
         self.mode = Mode::Detail;
@@ -109,7 +113,7 @@ impl App {
 
     /// Describe the selection via `kubectl describe`, off-thread so the UI loop
     /// keeps rendering. Falls back to the object's YAML if kubectl is missing
-    /// or fails. The result arrives as `Msg::Detail`.
+    /// or fails. The result arrives as `Msg::DescribeReady`.
     pub(super) fn describe(&mut self) {
         self.set_return_mode();
         let Some(obj) = self.selected_ref() else {
@@ -143,7 +147,7 @@ impl App {
     }
 
     /// Describe one object with its qualified resource name. If kubectl fails,
-    /// return the object's YAML through `Msg::Detail`.
+    /// return the object's YAML through `Msg::DescribeReady`.
     pub(super) fn describe_object(&mut self, resource: String, obj: &DynamicObject) {
         let name = obj.metadata.name.clone().unwrap_or_default();
         let ns = obj.metadata.namespace.clone();
@@ -162,14 +166,25 @@ impl App {
             argv.push(ns.clone());
         }
         let claim = self.claim_status(format!("describing {name}…"));
+        self.stop_resource_refresh();
+        self.clear_document_source();
+        self.document_source =
+            self.resource_source(obj, refresh::RefreshView::Describe(argv.clone()));
         self.describe_source = Some((claim, argv.clone()));
-        tokio::spawn(async move {
+        self.detail = Scrollable {
+            title: format!("{name} - describe"),
+            lines: vec!["loading describe...".into()].into(),
+            ..Default::default()
+        };
+        self.mode = Mode::Detail;
+        self.describe_task = Some(tokio::spawn(async move {
             let msg = match tokio::process::Command::new(&argv[0])
                 .args(&argv[1..])
+                .kill_on_drop(true)
                 .output()
                 .await
             {
-                Ok(out) if out.status.success() => Msg::Detail {
+                Ok(out) if out.status.success() => Msg::DescribeReady {
                     generation: genr,
                     claim,
                     title: format!("{name} — describe"),
@@ -181,7 +196,7 @@ impl App {
                 },
                 Ok(out) => {
                     let err = String::from_utf8_lossy(&out.stderr);
-                    Msg::Detail {
+                    Msg::DescribeReady {
                         generation: genr,
                         claim,
                         title: yaml_title,
@@ -192,7 +207,7 @@ impl App {
                         )),
                     }
                 }
-                Err(_) => Msg::Detail {
+                Err(_) => Msg::DescribeReady {
                     generation: genr,
                     claim,
                     title: yaml_title,
@@ -201,71 +216,7 @@ impl App {
                 },
             };
             let _ = tx.send(msg).await;
-        });
-    }
-
-    pub(super) fn stop_describe_refresh(&mut self) {
-        self.describe_refresh_generation += 1;
-        if let Some(task) = self.describe_refresh_task.take() {
-            task.abort();
-        }
-    }
-
-    pub(super) fn check_describe_refresh(&mut self) {
-        if self.should_quit
-            || (self.mode != Mode::Detail
-                && !(self.mode == Mode::DocFilter && self.doc_filter_return == Mode::Detail))
-        {
-            self.stop_describe_refresh();
-        }
-    }
-
-    pub(super) fn toggle_describe_refresh(&mut self) {
-        if self.describe_refresh_task.is_some() {
-            self.stop_describe_refresh();
-            self.flash = "describe refresh: off".into();
-            self.flash_err = false;
-            return;
-        }
-        let Some((_, argv)) = &self.describe_source else {
-            return;
-        };
-        let argv = argv.clone();
-        let tx = self.tx.clone();
-        let generation = self.describe_refresh_generation;
-        self.describe_refresh_task = Some(tokio::spawn(async move {
-            loop {
-                let result = match tokio::process::Command::new(&argv[0])
-                    .args(&argv[1..])
-                    .kill_on_drop(true)
-                    .output()
-                    .await
-                {
-                    Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout)
-                        .lines()
-                        .map(String::from)
-                        .collect()),
-                    Ok(out) => Err(format!(
-                        "describe refresh failed: {}",
-                        String::from_utf8_lossy(&out.stderr)
-                            .lines()
-                            .next()
-                            .unwrap_or("error")
-                    )),
-                    Err(e) => Err(format!("describe refresh failed: {e}")),
-                };
-                if tx
-                    .send(Msg::DescribeRefresh { generation, result })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
         }));
-        self.flash = "describe refresh: on (5s)".into();
-        self.flash_err = false;
     }
 
     /// Render an object as YAML lines, stamping its type if missing.
@@ -325,18 +276,24 @@ impl App {
             }
         };
 
+        let source = self.resource_source(
+            &obj,
+            refresh::RefreshView::Diff {
+                baseline: baseline_yaml.clone(),
+            },
+        );
         let live_yaml = diffable_yaml(obj);
         let lines = diff_lines(&baseline_yaml, &live_yaml);
         if lines.iter().all(|l| l.starts_with(' ')) {
             self.flash = format!("no diff: live matches {baseline_label}");
             self.flash_err = false;
-            return; // nothing to show — stay on the current view
         }
         self.detail = Scrollable {
             title: format!("{name} — diff ({baseline_label} → live)"),
             lines: lines.into(),
             ..Default::default()
         };
+        self.document_source = source;
         self.mode = Mode::Diff;
     }
 
@@ -455,7 +412,7 @@ impl App {
 /// Render an object as YAML cleaned for a readable side-by-side: no
 /// managedFields, no last-applied annotation (it *is* one of the sides), and
 /// no resourceVersion (it differs on every change — pure noise in a diff).
-fn diffable_yaml(mut obj: DynamicObject) -> String {
+pub(super) fn diffable_yaml(mut obj: DynamicObject) -> String {
     if let Some(ann) = obj.metadata.annotations.as_mut() {
         ann.remove("kubectl.kubernetes.io/last-applied-configuration");
     }
@@ -465,7 +422,7 @@ fn diffable_yaml(mut obj: DynamicObject) -> String {
 }
 
 /// Unified-diff lines (`-`/`+`/` ` prefixed) between two documents.
-fn diff_lines(before: &str, after: &str) -> Vec<String> {
+pub(super) fn diff_lines(before: &str, after: &str) -> Vec<String> {
     use similar::{ChangeTag, TextDiff};
     let diff = TextDiff::from_lines(before, after);
     diff.iter_all_changes()
@@ -506,4 +463,18 @@ fn decoded_secret_entry(key: &str, value: &Value) -> Vec<String> {
     } else {
         vec![format!("{key}: {text}")]
     }
+}
+
+pub(super) fn decoded_secret_lines(obj: &DynamicObject) -> Vec<String> {
+    let Some(data) = obj
+        .data
+        .get("data")
+        .and_then(Value::as_object)
+        .filter(|data| !data.is_empty())
+    else {
+        return vec!["secret has no data".into()];
+    };
+    data.iter()
+        .flat_map(|(key, value)| decoded_secret_entry(key, value))
+        .collect()
 }

@@ -441,8 +441,10 @@ fn draw_compact_header(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
-    let (synced, sync_color) = if app.describe_refresh_task.is_some() {
+    let (synced, sync_color) = if app.refresh_task.is_some() {
         ("● refresh", theme::sky())
+    } else if app.resource_refresh_available() {
+        ("○ stopped", theme::overlay1())
     } else {
         sync_indicator(app.mode, app.doc_filter_return, app.store.synced)
     };
@@ -2453,6 +2455,10 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         let description = if scope == "table" && action == Action::Logs {
             "logs (marked pods, or current row)"
+        } else if action == Action::AutoRefresh && scope == "detail" {
+            "toggle refresh (YAML, decoded Secret, describe)"
+        } else if action == Action::AutoRefresh && scope == "diff" {
+            "toggle refresh (keep the comparison baseline)"
         } else {
             action.description()
         };
@@ -4320,13 +4326,11 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-/// Status-bar sync indicator. The table (and the views rebuilt from its
-/// store) is watch-backed, so it's honestly "live"/"syncing" — but a
-/// describe/YAML/diff document is a point-in-time snapshot that never
-/// updates, so label it "static" instead of claiming it's live.
+/// Status indicator for views without an active resource refresh source.
+/// Document content is static; table data follows the watch.
 fn sync_indicator(mode: Mode, doc_filter_return: Mode, synced: bool) -> (&'static str, Color) {
     let static_doc = match mode {
-        Mode::Detail | Mode::Diff => true,
+        Mode::Detail | Mode::Diff | Mode::Explain => true,
         // A directory listing is fetched once by exec, not watched — `r`
         // re-reads it. Calling it live would be a lie.
         Mode::PvcExplore => true,
@@ -4349,8 +4353,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Style::default().fg(theme::subtext0())
     };
-    let (synced, sync_color) = if app.describe_refresh_task.is_some() {
+    let (synced, sync_color) = if app.refresh_task.is_some() {
         ("● refresh", theme::sky())
+    } else if app.resource_refresh_available() {
+        ("○ stopped", theme::overlay1())
     } else {
         sync_indicator(app.mode, app.doc_filter_return, app.store.synced)
     };

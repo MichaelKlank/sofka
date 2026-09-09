@@ -25,7 +25,15 @@ impl App {
         self.explain_title = format!("{name} — explain");
         self.explain_items.clear();
         self.explain_state.select(None);
+        self.explain_selection_lost = false;
         self.cancel_gitops_request();
+        self.explain_refresh_source = self.resource_source(
+            &obj,
+            refresh::RefreshView::Explain {
+                pods: self.cluster.resolve("pods").map(Box::new),
+                events: self.cluster.resolve("events").map(Box::new),
+            },
+        );
         self.explain_source = Some(obj);
         self.mode = Mode::Explain;
         self.spawn_explain();
@@ -33,7 +41,10 @@ impl App {
 
     /// `r` in the explain view — re-gather the evidence for the same object.
     pub(super) fn refresh_explain(&mut self) {
-        if self.explain_source.is_some() {
+        if self.refresh_task.is_some() {
+            self.stop_resource_refresh();
+            self.toggle_resource_refresh();
+        } else if self.explain_source.is_some() {
             self.spawn_explain();
         }
     }
@@ -41,21 +52,11 @@ impl App {
     /// Gather owned pods and recent events for [`Self::explain_source`], run the
     /// deterministic analysis, and hand the findings back via [`Msg::Explain`].
     fn spawn_explain(&mut self) {
-        let Some(obj) = self.explain_source.clone() else {
+        let Some(source) = self.explain_refresh_source.clone() else {
             return;
         };
-        let Some(kind) = self.kind.clone() else {
-            return;
-        };
-        let plural = self.kind_plural.clone();
-        let kind_name = kind.ar.kind.clone();
-        let ns = obj.metadata.namespace.clone().unwrap_or_default();
         let title = self.explain_title.clone();
-
-        let pods_kind = self.cluster.resolve("pods").map(|k| (k.ar, k.namespaced));
-        let events_kind = self.cluster.resolve("events").map(|k| (k.ar, k.namespaced));
-
-        let client = self.cluster.client.clone();
+        let obj = &source.object;
         let tx = self.tx.clone();
         let genr = self.generation;
         let claim = self.claim_status(format!(
@@ -63,51 +64,22 @@ impl App {
             obj.metadata.name.clone().unwrap_or_default()
         ));
 
+        if let Some(task) = self.explain_task.take() {
+            task.abort();
+        }
         self.explain_claim = Some(claim);
         self.explain_request = self.explain_request.wrapping_add(1);
         let request = self.explain_request;
-        tokio::spawn(async move {
-            let gathered: Result<_, String> = async {
-                let obj = report_source(&client, &kind.ar, kind.namespaced, &obj).await?;
-                // A workload's pods are found by its own pod selector; a pod explains
-                // itself; everything else has no owned pods to correlate.
-                let selector = match plural.as_str() {
-                    "deployments" | "statefulsets" | "daemonsets" | "replicasets" => {
-                        label_selector(&obj, "matchLabels")
-                    }
-                    _ => None,
-                };
-                let mut warn = None;
-                let pods: Vec<DynamicObject> = if plural == "pods" {
-                    vec![obj.clone()]
-                } else if let (Some((ar, nsd)), Some(sel)) = (&pods_kind, &selector) {
-                    list_selected(&client, ar, *nsd, &ns, sel, &mut warn).await
-                } else {
-                    Vec::new()
-                };
-
-                let (events, events_v1) = match &events_kind {
-                    Some((ar, nsd)) => {
-                        let v1 = ar.group == "events.k8s.io";
-                        let all = list_or_warn(&client, ar, *nsd, &ns, &mut warn).await;
-                        (filter_events(&all, &obj, &pods, v1), v1)
-                    }
-                    None => (Vec::new(), false),
-                };
-
-                let evidence = crate::explain::Evidence {
-                    kind: &kind_name,
-                    plural: &plural,
-                    obj: &obj,
-                    pods: &pods,
-                    events: &events,
-                    events_v1,
-                };
-                let mut findings = crate::explain::explain(&evidence);
-                prepend_warn_finding(&mut findings, warn);
-                Ok((obj, findings))
-            }
-            .await;
+        self.explain_task = Some(tokio::spawn(async move {
+            let refresh::RefreshView::Explain { pods, events } = &source.view else {
+                return;
+            };
+            let gathered = gather_explain(&source, pods.as_deref(), events.as_deref())
+                .await
+                .map(|(source, mut findings, warning)| {
+                    prepend_warn_finding(&mut findings, warning);
+                    (source, findings)
+                });
             let (source, findings) = report_result(gathered);
             let _ = tx
                 .send(Msg::Explain {
@@ -119,10 +91,13 @@ impl App {
                     findings,
                 })
                 .await;
-        });
+        }));
     }
 
     pub(super) fn cancel_explain_request(&mut self) {
+        if let Some(task) = self.explain_task.take() {
+            task.abort();
+        }
         self.explain_request = self.explain_request.wrapping_add(1);
         if let Some(claim) = self.explain_claim.take() {
             self.clear_claimed_status(claim);
@@ -130,6 +105,16 @@ impl App {
     }
 
     pub(super) fn key_explain(&mut self, key: KeyInput) {
+        if self.explain_selection_lost
+            && self.explain_state.selected().is_none()
+            && matches!(
+                key.action,
+                Some(Action::Accept | Action::Events | Action::Logs)
+            )
+        {
+            self.flash_warn("select a finding before opening its resource, events, or logs");
+            return;
+        }
         let len = self.explain_items.len();
         match (key.action, key.code) {
             (Some(Action::Back), _) | (Some(Action::Close), _) => {
@@ -153,6 +138,7 @@ impl App {
                 }
             }
             (Some(Action::Refresh), _) => self.refresh_explain(),
+            (Some(Action::AutoRefresh), _) => self.toggle_resource_refresh(),
             // Direct evidence navigation: jump to the resource behind the
             // selected finding (⏎), or open its events (E) / logs (l). With no
             // target on the current line, E/l fall back to the object being
@@ -282,4 +268,53 @@ pub(super) fn filter_events(
         })
         .cloned()
         .collect()
+}
+
+pub(super) async fn gather_explain(
+    source: &refresh::RefreshSource,
+    pods_kind: Option<&Kind>,
+    events_kind: Option<&Kind>,
+) -> Result<(DynamicObject, Vec<crate::explain::Finding>, Option<String>), String> {
+    let obj = source.read().await?;
+    let client = &source.client;
+    let ns = obj.metadata.namespace.as_deref().unwrap_or_default();
+    let plural = source.kind.ar.plural.as_str();
+    let selector = match plural {
+        "deployments" | "statefulsets" | "daemonsets" | "replicasets" => {
+            label_selector(&obj, "matchLabels")
+        }
+        _ => None,
+    };
+    let mut warning = None;
+    let pods = if plural == "pods" {
+        vec![obj.clone()]
+    } else if let (Some(kind), Some(selector)) = (pods_kind, selector.as_ref()) {
+        list_selected(
+            client,
+            &kind.ar,
+            kind.namespaced,
+            ns,
+            selector,
+            &mut warning,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
+    let (events, events_v1) = if let Some(kind) = events_kind {
+        let v1 = kind.ar.group == "events.k8s.io";
+        let all = list_or_warn(client, &kind.ar, kind.namespaced, ns, &mut warning).await;
+        (filter_events(&all, &obj, &pods, v1), v1)
+    } else {
+        (Vec::new(), false)
+    };
+    let findings = crate::explain::explain(&crate::explain::Evidence {
+        kind: &source.kind.ar.kind,
+        plural,
+        obj: &obj,
+        pods: &pods,
+        events: &events,
+        events_v1,
+    });
+    Ok((obj, findings, warning))
 }
