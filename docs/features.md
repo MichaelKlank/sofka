@@ -8,6 +8,11 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   the command palette, and pickers from the content below. Shadows stay within
   the terminal bounds and disappear when the popup closes.
 
+- **Scroll position** appears on the borders of long resource tables, document
+  views, logs, and pickers. Tables and unwrapped documents also show horizontal
+  position. Wrapped views use display rows. Scrollbars disappear when content
+  fits. Fullscreen logs keep their borderless layout for text selection.
+
 - **Terminal title** shows `sofka: <context>/<namespace>` and follows navigation.
   The namespace is `all` when all namespaces are selected. Set
   `terminal_title = false` to disable title changes. Sofka clears the title on exit.

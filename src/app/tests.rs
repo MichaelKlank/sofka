@@ -23672,3 +23672,133 @@ async fn popup_shadows_follow_open_close_and_resize() {
     app.handle_key(press(KeyCode::Esc)).unwrap();
     assert_eq!(app.mode, Mode::Table);
 }
+
+#[tokio::test]
+async fn scrollbars_follow_keys_and_disappear_when_content_fits() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.compact = true;
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    let thumb_rows = |terminal: &Terminal<TestBackend>| -> Vec<u16> {
+        (0..16)
+            .filter(|&y| terminal.backend().buffer()[(59, y)].symbol() == "█")
+            .collect()
+    };
+    for i in 0..80 {
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1", "kind":"Pod",
+            "metadata":{"name":format!("pod-{i:03}"), "namespace":"default"}}),
+        );
+    }
+    for mode in [
+        Mode::Table,
+        Mode::Detail,
+        Mode::Diff,
+        Mode::Logs,
+        Mode::Help,
+    ] {
+        app.mode = mode;
+        app.detail = Scrollable {
+            lines: (0..80).map(|i| format!("line {i}")).collect(),
+            ..Default::default()
+        };
+        app.logs.view = Scrollable {
+            lines: (0..80).map(|i| format!("line {i}")).collect(),
+            ..Default::default()
+        };
+        app.logs.follow = false;
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.handle_key(press(KeyCode::Home)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let top = thumb_rows(&terminal);
+        assert!(!top.is_empty(), "{mode:?}");
+        app.handle_key(press(KeyCode::End)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let bottom = thumb_rows(&terminal);
+        assert!(bottom[0] > top[0], "{mode:?}: {top:?} -> {bottom:?}");
+    }
+    app.mode = Mode::Detail;
+    for lines in [VecDeque::new(), VecDeque::from(["short".into()])] {
+        app.detail = Scrollable {
+            lines,
+            ..Default::default()
+        };
+        app.handle_key(press(KeyCode::Home)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(thumb_rows(&terminal).is_empty());
+    }
+    app.detail = Scrollable {
+        lines: VecDeque::from(["x".repeat(4000)]),
+        ..Default::default()
+    };
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    app.handle_key(press(KeyCode::Right)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert!(app.detail.hscroll > 0);
+    assert!((1..59).any(|x| terminal.backend().buffer()[(x, 15)].symbol() == "█"));
+    app.detail = Scrollable {
+        lines: VecDeque::from(["x".repeat(4000)]),
+        wrap: true,
+        ..Default::default()
+    };
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    app.handle_key(press(KeyCode::End)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert!(thumb_rows(&terminal)[0] > 2);
+    for width in [1, 2, 3, 120] {
+        terminal.backend_mut().resize(width, 16);
+        crate::ui::resize(&mut terminal, &mut app).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn document_scrollbar_thumb_matches_visible_fraction() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.compact = true;
+    app.mode = Mode::Detail;
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let height = app.detail.viewport.as_ref().unwrap().height;
+    app.detail.lines = (0..height * 2).map(|i| format!("line {i}")).collect();
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let thumb_rows = |terminal: &Terminal<TestBackend>| -> Vec<u16> {
+        (0..16)
+            .filter(|&y| terminal.backend().buffer()[(59, y)].symbol() == "█")
+            .collect()
+    };
+    let top = thumb_rows(&terminal);
+    assert_eq!(top.len(), height.div_ceil(2));
+    app.handle_key(press(KeyCode::End)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let bottom = thumb_rows(&terminal);
+    assert_eq!(bottom.len(), top.len());
+    assert_eq!(usize::from(bottom.last().unwrap() - top[0]) + 1, height);
+}
+
+#[tokio::test]
+async fn document_horizontal_scroll_uses_terminal_columns() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.compact = true;
+    app.mode = Mode::Detail;
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    for (line, width) in [("界".repeat(40), 80), ("e\u{301}".repeat(40), 40)] {
+        app.detail = Scrollable {
+            lines: VecDeque::from([line]),
+            ..Default::default()
+        };
+        app.handle_key(press(KeyCode::Home)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.detail.scroll_dimensions(), (1, width));
+        let has_thumb = (1..59).any(|x| terminal.backend().buffer()[(x, 15)].symbol() == "█");
+        assert_eq!(has_thumb, width > 58);
+        for _ in 0..100 {
+            app.handle_key(press(KeyCode::Right)).unwrap();
+        }
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.detail.hscroll, width - 1);
+    }
+}
