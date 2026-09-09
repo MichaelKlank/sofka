@@ -455,6 +455,7 @@ fn custom_columns(c: &mut Criterion) {
         width: None,
         align: None,
         condition_field: None,
+        condition_match: sofka::views::ConditionMatch::Type,
     };
     let now = columns::now_secs();
 
@@ -627,8 +628,29 @@ fn dependencies(c: &mut Criterion) {
     g.finish();
 }
 
+fn table_frames(c: &mut Criterion) {
+    let mut group = c.benchmark_group("table_frames");
+    for (width, height, count) in [(80, 24, 500), (160, 48, 2000)] {
+        let (mut app, _rx) = bs::pods_app(count);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| sofka::ui::draw(frame, &mut app))
+            .unwrap();
+        group.bench_function(format!("{width}x{height}/{count}"), |b| {
+            b.iter(|| {
+                terminal
+                    .draw(|frame| sofka::ui::draw(frame, &mut app))
+                    .unwrap();
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    table_frames,
     rows_cache,
     filter,
     filter_cmp,

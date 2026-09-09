@@ -23714,3 +23714,54 @@ async fn scrollbars_follow_keys_and_disappear_when_content_fits() {
         crate::ui::resize(&mut terminal, &mut app).unwrap();
     }
 }
+
+#[tokio::test]
+async fn document_scrollbar_thumb_matches_visible_fraction() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.compact = true;
+    app.mode = Mode::Detail;
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let height = app.detail.viewport.as_ref().unwrap().height;
+    app.detail.lines = (0..height * 2).map(|i| format!("line {i}")).collect();
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let thumb_rows = |terminal: &Terminal<TestBackend>| -> Vec<u16> {
+        (0..16)
+            .filter(|&y| terminal.backend().buffer()[(59, y)].symbol() == "█")
+            .collect()
+    };
+    let top = thumb_rows(&terminal);
+    assert_eq!(top.len(), height.div_ceil(2));
+    app.handle_key(press(KeyCode::End)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let bottom = thumb_rows(&terminal);
+    assert_eq!(bottom.len(), top.len());
+    assert_eq!(usize::from(bottom.last().unwrap() - top[0]) + 1, height);
+}
+
+#[tokio::test]
+async fn document_horizontal_scroll_uses_terminal_columns() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.compact = true;
+    app.mode = Mode::Detail;
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    for (line, width) in [("界".repeat(40), 80), ("e\u{301}".repeat(40), 40)] {
+        app.detail = Scrollable {
+            lines: VecDeque::from([line]),
+            ..Default::default()
+        };
+        app.handle_key(press(KeyCode::Home)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.detail.scroll_dimensions(), (1, width));
+        let has_thumb = (1..59).any(|x| terminal.backend().buffer()[(x, 15)].symbol() == "█");
+        assert_eq!(has_thumb, width > 58);
+        for _ in 0..100 {
+            app.handle_key(press(KeyCode::Right)).unwrap();
+        }
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.detail.hscroll, width - 1);
+    }
+}
