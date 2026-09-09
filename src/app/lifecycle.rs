@@ -850,8 +850,10 @@ impl App {
     }
 
     pub(super) fn bump_generation(&mut self) {
-        self.stop_describe_refresh();
-        self.describe_source = None;
+        self.stop_resource_refresh();
+        self.clear_document_source();
+        self.cancel_explain_request();
+        self.explain_refresh_source = None;
         self.stop_event_stream();
         self.clear_progress_flash();
         self.stop_plugins();
@@ -870,7 +872,7 @@ impl App {
     /// being involved at all.
     pub fn handle_msg(&mut self, msg: Msg) {
         self.handle_msg_inner(msg);
-        self.check_describe_refresh();
+        self.check_resource_refresh();
         if self.mode != Mode::Adjacent {
             self.cancel_children();
         }
@@ -1135,7 +1137,11 @@ impl App {
                 findings,
             } if generation == self.generation && request == self.explain_request => {
                 self.explain_claim = None;
+                self.explain_task = None;
                 if let Some(source) = source {
+                    if let Some(report) = self.explain_refresh_source.as_mut() {
+                        report.object = *source.clone();
+                    }
                     self.explain_source = Some(*source);
                 }
                 self.explain_items = findings;
@@ -1232,8 +1238,8 @@ impl App {
                 lines,
                 warn,
             } if generation == self.generation && run == self.plugin_run => {
-                self.stop_describe_refresh();
-                self.describe_source = None;
+                self.stop_resource_refresh();
+                self.clear_document_source();
                 self.plugin_task = None;
                 self.plugin_claim = None;
                 self.detail = Scrollable {
@@ -1349,6 +1355,31 @@ impl App {
                     self.set_claimed_status(claim, format!("snapshot save failed: {e}"), true)
                 }
             },
+            Msg::DescribeReady {
+                generation,
+                claim,
+                title,
+                lines,
+                warn,
+            } if generation == self.generation
+                && self
+                    .describe_source
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == claim) =>
+            {
+                self.describe_task = None;
+                if warn.is_some()
+                    && let Some(source) = self.document_source.as_mut()
+                {
+                    source.view = refresh::RefreshView::Yaml;
+                }
+                self.detail.title = title;
+                self.detail.replace_lines(lines.into());
+                match warn {
+                    Some(warning) => self.set_claimed_status(claim, warning, true),
+                    None => self.clear_claimed_status(claim),
+                }
+            }
             Msg::Detail {
                 generation,
                 claim,
@@ -1356,15 +1387,8 @@ impl App {
                 lines,
                 warn,
             } if generation == self.generation => {
-                self.stop_describe_refresh();
-                if warn.is_some()
-                    || self
-                        .describe_source
-                        .as_ref()
-                        .is_none_or(|(id, _)| *id != claim)
-                {
-                    self.describe_source = None;
-                }
+                self.stop_resource_refresh();
+                self.clear_document_source();
                 self.detail = Scrollable {
                     title,
                     lines: lines.into(),
@@ -1378,18 +1402,16 @@ impl App {
                     None => self.clear_claimed_status(claim),
                 }
             }
-            Msg::DescribeRefresh { generation, result }
-                if generation == self.describe_refresh_generation
-                    && self.describe_refresh_task.is_some()
-                    && (self.mode == Mode::Detail
-                        || (self.mode == Mode::DocFilter
-                            && self.doc_filter_return == Mode::Detail)) =>
+            Msg::ResourceRefresh { generation, result }
+                if generation == self.refresh_generation
+                    && self.refresh_task.is_some()
+                    && self.resource_refresh_available() =>
             {
                 match result {
-                    Ok(lines) => self.detail.replace_lines(lines.into()),
+                    Ok(content) => self.apply_resource_refresh(content),
                     Err(error) => {
-                        self.stop_describe_refresh();
-                        self.flash_warn(&error);
+                        self.stop_resource_refresh();
+                        self.flash_warn(&format!("refresh stopped: {error}"));
                     }
                 }
             }

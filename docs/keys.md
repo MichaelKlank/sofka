@@ -121,11 +121,36 @@ viewport.
 highlighted. `n` / `N` go to the next or previous match. `w` wraps. `c` copies
 the document. `esc` backs out - the first press clears an active search.
 
-In the describe view, `r` turns automatic refresh on or off. Refresh is off
-when the view opens. When on, it runs `kubectl describe` immediately and then
-5 seconds after each result. This updates the full document, including events.
-The resource, scroll position, and search stay the same. Refresh stops when
-you leave the view or a request fails. A failed request keeps the last result.
+Automatic refresh is available in these resource views:
+
+| View                           | Automatic refresh           | Other refresh controls                            |
+| ------------------------------ | --------------------------- | ------------------------------------------------- |
+| YAML, decoded Secret, describe | `r` turns refresh on or off | None                                              |
+| Diff                           | `r` turns refresh on or off | `R` resets the baseline to the displayed resource |
+| Explain                        | `R` turns refresh on or off | `r` refreshes immediately                         |
+
+Automatic refresh is off when a view opens. It reads immediately, then waits
+5 seconds after each result before the next read. Describe runs `kubectl describe`
+and updates the full document, including events. The other views read the
+resource through the Kubernetes API. YAML also supports custom resources.
+
+Refresh keeps the original resource and context. It preserves document search,
+scroll position where possible, and the selected Explain finding position.
+A shorter document can reduce the scroll position. The status indicator shows
+`refresh` while automatic refresh is on and `stopped` when it is off. Documents
+without refresh support, such as saved snapshots and Helm manifests, show `static`.
+
+Automatic refresh stops when you leave the view, open help or the command
+palette, or a request fails. Document search keeps refresh active. A failed
+request keeps the last result and shows the reason. A deleted resource, or a
+resource recreated with the same name and a different UID, also stops refresh.
+Opening events or logs from Explain stops its automatic refresh; returning does
+not restart it. Its existing manual evidence request can still finish.
+
+Diff keeps the baseline chosen when the view opens, even if the last-applied
+annotation or session history changes. `R` makes the currently displayed object
+the new baseline. A Diff view can stay open when both sides match, so automatic
+refresh can show later changes. This does not add change highlighting to YAML.
 
 ## Help panel (`?`)
 

@@ -15,6 +15,19 @@ pub struct StatusClaim(pub(crate) u64);
 /// every time it is written out.
 pub type PvcListingResult = Result<(crate::pvcexplore::Listing, Option<String>), String>;
 
+/// Content returned by a resource view refresh.
+#[derive(Debug)]
+pub enum RefreshContent {
+    Document {
+        source: Box<DynamicObject>,
+        lines: Vec<String>,
+    },
+    Explain {
+        source: Box<DynamicObject>,
+        findings: Vec<crate::explain::Finding>,
+    },
+}
+
 /// Messages flowing from watch tasks to the UI loop. Tagged with a
 /// `generation` so messages from a superseded watch can be discarded.
 pub enum Msg {
@@ -139,18 +152,25 @@ pub enum Msg {
         ok: usize,
         failed: Vec<String>,
     },
-    /// Result of an off-thread `kubectl describe` (or its YAML fallback).
+    /// A command result shown as a document.
     Detail {
         generation: u64,
         claim: StatusClaim,
         title: String,
         lines: Vec<String>,
-        /// Set when describe failed and we fell back to YAML.
         warn: Option<String>,
     },
-    DescribeRefresh {
+    ResourceRefresh {
         generation: u64,
-        result: Result<Vec<String>, String>,
+        result: Result<RefreshContent, String>,
+    },
+    /// The initial describe result, tied to the request that opened the view.
+    DescribeReady {
+        generation: u64,
+        claim: StatusClaim,
+        title: String,
+        lines: Vec<String>,
+        warn: Option<String>,
     },
     /// Live Event rows for the selected object.
     Events {
