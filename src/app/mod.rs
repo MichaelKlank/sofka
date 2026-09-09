@@ -1966,6 +1966,7 @@ pub struct App {
     /// (used to jump to the evidence behind a line).
     pub explain_items: Vec<crate::explain::Finding>,
     pub explain_state: ListState,
+    explain_selection_lost: bool,
     pub explain_title: String,
     /// The object the explain view is investigating, kept so `r` can re-gather.
     pub explain_source: Option<DynamicObject>,
@@ -2252,6 +2253,7 @@ impl App {
             xray_state: ListState::default(),
             explain_items: Vec::new(),
             explain_state: ListState::default(),
+            explain_selection_lost: false,
             explain_title: String::new(),
             explain_source: None,
             explain_request: 0,

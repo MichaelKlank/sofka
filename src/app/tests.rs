@@ -23509,3 +23509,127 @@ async fn explain_refresh_rejects_old_manual_results_and_stops_in_evidence_views(
     );
     app.handle_key(press(KeyCode::Char('q'))).unwrap();
 }
+
+fn explain_blocking_pod(name: &str, reason: &str) -> Value {
+    json!({"apiVersion":"v1", "kind":"Pod",
+        "metadata":{"name":name,"namespace":"default","uid":format!("{name}-uid"),"labels":{"app":"web"}},
+        "spec":{"containers":[{"name":"app","image":"example"}]},
+        "status":{"phase":"Pending","containerStatuses":[{"name":"app","ready":false,"restartCount":0,"state":{"waiting":{"reason":reason}}}]}})
+}
+
+async fn explain_with_selected_blocker() -> (App, Receiver<Msg>, HealthResponses) {
+    let root = expression_workload(true);
+    let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(
+            "/apis/apps/v1/namespaces/default/deployments/web".into(),
+            (200, root),
+        );
+        replies.insert(
+            "/api/v1/namespaces/default/pods".into(),
+            (
+                200,
+                json!({"apiVersion":"v1","kind":"PodList","items":[
+                    explain_blocking_pod("web-a", "ImagePullBackOff"),
+                    explain_blocking_pod("web-b", "ImagePullBackOff")
+                ]}),
+            ),
+        );
+    }
+    app.handle_key(press(KeyCode::Char('X'))).unwrap();
+    receive_health_report(&mut app, &mut rx, false).await;
+    let index = app
+        .explain_items
+        .iter()
+        .position(|finding| {
+            finding
+                .target
+                .as_ref()
+                .is_some_and(|target| target.name == "web-b")
+        })
+        .unwrap();
+    app.handle_key(press(KeyCode::Char('g'))).unwrap();
+    for _ in 0..index {
+        app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    }
+    assert_eq!(app.explain_state.selected(), Some(index));
+    (app, rx, responses)
+}
+
+#[tokio::test]
+async fn explain_refresh_keeps_the_selected_pod_when_findings_shift_and_text_changes() {
+    for insert in [false, true] {
+        for action in [KeyCode::Enter, KeyCode::Char('E'), KeyCode::Char('l')] {
+            let (mut app, mut rx, responses) = explain_with_selected_blocker().await;
+            let previous = app.explain_state.selected().unwrap();
+            let previous_text = app.explain_items[previous].text.clone();
+            let mut pods = vec![explain_blocking_pod("web-b", "CrashLoopBackOff")];
+            if insert {
+                pods.push(explain_blocking_pod("web-a", "ImagePullBackOff"));
+                pods.push(explain_blocking_pod("web-0", "ImagePullBackOff"));
+            }
+            responses.lock().unwrap().insert(
+                "/api/v1/namespaces/default/pods".into(),
+                (
+                    200,
+                    json!({"apiVersion":"v1","kind":"PodList","items":pods}),
+                ),
+            );
+            app.handle_key(press(KeyCode::Char('R'))).unwrap();
+            app.handle_msg(take_resource_refresh(&mut rx).await);
+            let selected = app.explain_state.selected().unwrap();
+            assert_ne!(selected, previous);
+            assert_ne!(app.explain_items[selected].text, previous_text);
+            assert_eq!(
+                app.explain_items[selected].target.as_ref().unwrap().name,
+                "web-b"
+            );
+            app.handle_key(press(action)).unwrap();
+            match action {
+                KeyCode::Enter => {
+                    assert_eq!(app.mode, Mode::Table);
+                    assert_eq!(app.fields.as_deref(), Some("metadata.name=web-b"));
+                    assert_eq!(app.namespace, "default");
+                }
+                KeyCode::Char('E') => {
+                    assert_eq!(app.mode, Mode::Events);
+                    assert!(app.detail.title.starts_with("web-b"));
+                }
+                _ => {
+                    assert_eq!(app.mode, Mode::Logs);
+                    assert!(
+                        matches!(&app.logs.source, Some(LogSource::Pod { ns, name, .. }) if ns == "default" && name == "web-b")
+                    );
+                }
+            }
+            app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn explain_refresh_clears_a_removed_selection_and_blocks_implicit_root_actions() {
+    let (mut app, mut rx, responses) = explain_with_selected_blocker().await;
+    responses.lock().unwrap().insert("/api/v1/namespaces/default/pods".into(), (200, json!({"apiVersion":"v1","kind":"PodList","items":[explain_blocking_pod("web-a", "ImagePullBackOff")]})));
+    app.handle_key(press(KeyCode::Char('R'))).unwrap();
+    app.handle_msg(take_resource_refresh(&mut rx).await);
+    assert!(app.explain_state.selected().is_none());
+    assert!(app.flash.contains("no longer available"));
+    for action in [KeyCode::Enter, KeyCode::Char('E'), KeyCode::Char('l')] {
+        app.handle_key(press(action)).unwrap();
+        assert_eq!(app.mode, Mode::Explain);
+        assert!(app.flash.contains("select a finding"));
+    }
+    // Another refresh must not silently choose a new target.
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    app.handle_msg(take_resource_refresh(&mut rx).await);
+    assert!(app.explain_state.selected().is_none());
+    app.handle_key(press(KeyCode::Char('E'))).unwrap();
+    assert_eq!(app.mode, Mode::Explain);
+    app.handle_key(press(KeyCode::Char('g'))).unwrap();
+    app.handle_key(press(KeyCode::Char('E'))).unwrap();
+    assert_eq!(app.mode, Mode::Events);
+    assert!(app.detail.title.starts_with("web"));
+    app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
+}

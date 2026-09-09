@@ -1144,6 +1144,7 @@ impl App {
                     }
                     self.explain_source = Some(*source);
                 }
+                self.explain_selection_lost = false;
                 self.explain_items = findings;
                 self.explain_title = title;
                 // Land the cursor on the first navigable finding, else the top.

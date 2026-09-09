@@ -245,10 +245,32 @@ impl App {
                     report.object = *source.clone();
                 }
                 self.explain_source = Some(*source);
-                let keep = self.explain_state.selected().unwrap_or(0);
-                self.explain_state.select(
-                    (!findings.is_empty()).then_some(keep.min(findings.len().saturating_sub(1))),
-                );
+                let selected = self
+                    .explain_state
+                    .selected()
+                    .and_then(|index| self.explain_items.get(index));
+                let keep = if let Some(selected) = selected {
+                    findings.iter().position(|finding| match &selected.target {
+                        Some(target) => finding.target.as_ref() == Some(target),
+                        None => finding == selected,
+                    })
+                } else if self.explain_items.is_empty() && !self.explain_selection_lost {
+                    findings
+                        .iter()
+                        .position(|finding| finding.target.is_some())
+                        .or_else(|| (!findings.is_empty()).then_some(0))
+                } else {
+                    None
+                };
+                if selected.is_some() && keep.is_none() {
+                    self.explain_selection_lost = true;
+                    self.flash_warn(
+                        "selected finding is no longer available; select another finding",
+                    );
+                } else if keep.is_some() {
+                    self.explain_selection_lost = false;
+                }
+                self.explain_state.select(keep);
                 self.explain_items = findings;
             }
         }

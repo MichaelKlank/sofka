@@ -25,6 +25,7 @@ impl App {
         self.explain_title = format!("{name} — explain");
         self.explain_items.clear();
         self.explain_state.select(None);
+        self.explain_selection_lost = false;
         self.cancel_gitops_request();
         self.explain_refresh_source = self.resource_source(
             &obj,
@@ -104,6 +105,16 @@ impl App {
     }
 
     pub(super) fn key_explain(&mut self, key: KeyInput) {
+        if self.explain_selection_lost
+            && self.explain_state.selected().is_none()
+            && matches!(
+                key.action,
+                Some(Action::Accept | Action::Events | Action::Logs)
+            )
+        {
+            self.flash_warn("select a finding before opening its resource, events, or logs");
+            return;
+        }
         let len = self.explain_items.len();
         match (key.action, key.code) {
             (Some(Action::Back), _) | (Some(Action::Close), _) => {

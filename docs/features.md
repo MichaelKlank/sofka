@@ -372,7 +372,10 @@ and updates the full document, including events. The other views read the
 resource through the Kubernetes API. YAML also supports custom resources.
 
 Refresh keeps the original resource and context. It preserves document search,
-scroll position where possible, and the selected Explain finding position.
+scroll position where possible, and the selected Explain resource when findings
+move or its status text changes. Findings without a resource target match by
+content. If the selected finding disappears, the selection clears. Select another
+finding before opening its resource, events, or logs.
 A shorter document can reduce the scroll position. The status indicator shows
 `refresh` while automatic refresh is on and `stopped` when it is off. Documents
 without refresh support, such as saved snapshots and Helm manifests, show `static`.
