@@ -1258,6 +1258,40 @@ impl App {
             .collect()
     }
 
+    pub(super) fn extend_selection(&mut self, delta: i32) {
+        let rows: Vec<_> = self
+            .rows()
+            .iter()
+            .map(|obj| (row_key(obj), obj.metadata.uid.clone()))
+            .collect();
+        if rows.is_empty() {
+            self.range_selection = None;
+            return;
+        }
+        let current = self.table_state.selected().unwrap_or(0).min(rows.len() - 1);
+        // A changed row order ends the old range before another row is marked.
+        if self
+            .range_selection
+            .as_ref()
+            .is_none_or(|range| range.rows != rows)
+        {
+            self.range_selection = Some(RangeSelection {
+                anchor: current,
+                rows,
+                previous_marks: self.marked.clone(),
+            });
+        }
+        let range = self.range_selection.as_ref().unwrap();
+        let next = current
+            .saturating_add_signed(delta as isize)
+            .min(range.rows.len() - 1);
+        self.marked.clone_from(&range.previous_marks);
+        for (key, _) in &range.rows[range.anchor.min(next)..=range.anchor.max(next)] {
+            self.marked.insert(key.clone());
+        }
+        self.table_state.select(Some(next));
+    }
+
     pub(super) fn move_selection(&mut self, delta: i32) {
         let len = self.row_count() as i32;
         if len == 0 {

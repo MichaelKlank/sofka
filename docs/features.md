@@ -138,6 +138,9 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   rank by fuzzy score, `⏎` jumps to the object. When a kind can't be listed
   (RBAC), the result says it's incomplete instead of pretending otherwise.
 - **Multiselect** (`space`) for bulk delete/kill/suspend/resume/reconcile.
+  `Shift+ArrowUp` / `Shift+ArrowDown` extend or reduce a range from a fixed
+  starting row. Separate marks remain selected when the range contracts.
+  Range marks also work with combined pod logs.
 - **Copy to clipboard** - `c` copies the selected resource's name; `Y` opens a
   field picker over the selected row's displayed columns (full values, never
   the width-truncated cell text) - type to match a column name or its value

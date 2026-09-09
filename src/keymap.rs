@@ -84,6 +84,8 @@ actions! {
     Logs => ("logs", "logs"),
     Lookback => ("lookback", "lookback"),
     Mark => ("mark", "mark"),
+    RangeDown => ("range_down", "extend or reduce selection down"),
+    RangeUp => ("range_up", "extend or reduce selection up"),
     Namespaces => ("namespaces", "namespaces"),
     NextMatch => ("next_match", "next match"),
     NextView => ("next_view", "next view"),
@@ -464,6 +466,8 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("table", Action::Left, &["left"]),
     ("table", Action::Logs, &["l"]),
     ("table", Action::Mark, &["space"]),
+    ("table", Action::RangeDown, &["shift-down"]),
+    ("table", Action::RangeUp, &["shift-up"]),
     ("table", Action::Namespaces, &["n"]),
     ("table", Action::NextView, &["tab"]),
     ("table", Action::Node, &["o"]),
@@ -570,7 +574,7 @@ impl Default for Keymap {
                     }
                 }
                 // Raw navigation matches previously accepted Shift in these modes.
-                // Keep explicit aliases in the defaults; user chords remain exact.
+                // Table Shift+Up/Down select ranges. Other aliases stay unchanged.
                 for (&scope, actions) in &mut bindings {
                     if scope == "command" {
                         continue;
@@ -581,6 +585,9 @@ impl Default for Keymap {
                             .filter(|c| {
                                 !c.ctrl
                                     && !c.alt
+                                    && !c.shift
+                                    && !(scope == "table"
+                                        && matches!(c.code, KeyCode::Up | KeyCode::Down))
                                     && matches!(
                                         c.code,
                                         KeyCode::Up

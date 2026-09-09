@@ -351,6 +351,7 @@ impl App {
         self.container_metrics.clear();
         self.node_pods = None;
         self.marked.clear();
+        self.range_selection = None;
         self.clear_rows_cache();
         if self.table_state.selected().is_none() {
             self.table_state.select(Some(0));

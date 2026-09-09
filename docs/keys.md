@@ -34,6 +34,7 @@ for the grammar and selector persistence rules.
 | `S` / `I`                                     | sort-column picker (fuzzy; ⏎ on the active column inverts) / invert sort direction; saved per kind by default (`remember_sort = false` disables this)               |
 | `ctrl-e`                                      | compact mode: collapse the header + footer (for tiled/multiplexed panes)                                                                                            |
 | `space`                                       | mark/unmark row for bulk actions                                                                                                                                    |
+| `shift-up` / `shift-down`                     | extend or reduce the marked range from the starting row                                                                                                             |
 | `/`                                           | filter: fuzzy text · `"exact"` · `/regex/` · `!inverse` · `-l`/`-f` selectors (server-side on ⏎) · `status=X` `cpu>500m` `age<2h`                                   |
 | `Ctrl+Z`                                      | toggle faults filter in pod views; configured actions take precedence; combine with `/`; press again to turn off                                                    |
 | `n` / `0`                                     | namespace switcher / all namespaces                                                                                                                                 |
@@ -80,6 +81,11 @@ for the grammar and selector persistence rules.
 | `:q`, `ctrl-c`                                | quit                                                                                                                                                                |
 | `?`                                           | help                                                                                                                                                                |
 | _(config)_                                    | plugin / bookmark / workspace key chords — `ctrl-`/`alt-`/`shift-`/`fN`; listed in `?` help                                                                         |
+
+Shift+Arrow selects a range in the visible row order. Reversing direction reduces
+the range and keeps separate marks made with `space`. Other keys end the range
+operation. Normal movement keeps marked rows. Filtering, sorting, view changes,
+and changes to the row order reset the range before the next Shift+Arrow press.
 
 ## PVC explore (`x` on a PVC)
 
