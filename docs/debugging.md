@@ -326,6 +326,34 @@ For a certificate file, use `openssl x509 -in client.crt -noout -text`.
 flag, have the cluster administrator issue a v3 client certificate and update
 your kubeconfig. Keep the existing identity and required permissions.
 
+## HTTPS proxy exclusions
+
+If the API server must use a direct connection, include its host name or IP
+address in `NO_PROXY` or `no_proxy`. For example:
+
+```sh
+NO_PROXY=rke2-server sofka --check
+```
+
+The first nonempty value takes priority: `NO_PROXY`, then `no_proxy`. Separate
+entries with commas. A domain such as `example.com` matches that domain and its
+subdomains. A leading dot or `*.` matches subdomains only. Entries can also be IP
+addresses, CIDR ranges, or host names and IP addresses with a port. Use brackets
+for an IPv6 address with a port, such as `[2001:db8::1]:6443`. A single `*` excludes
+all servers. CIDR entries match literal server IP addresses; sofka does not
+resolve host names to test these entries.
+
+These exclusions apply to the environment proxy on startup and context changes.
+Servers without a matching exclusion keep using the proxy. An explicit
+`proxy-url` in the selected kubeconfig cluster takes priority over exclusions.
+
+To test whether the environment proxy causes a connection failure, remove its
+settings for one run:
+
+```sh
+env -u HTTPS_PROXY -u https_proxy sofka --check
+```
+
 ## Teleport local Kubernetes proxy certificates
 
 `tsh proxy kube` can serve a CA certificate as its server certificate. Some TLS
