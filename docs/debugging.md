@@ -335,7 +335,8 @@ address in `NO_PROXY` or `no_proxy`. For example:
 NO_PROXY=rke2-server sofka --check
 ```
 
-The first nonempty value takes priority: `NO_PROXY`, then `no_proxy`. Separate
+The first value with non-whitespace text takes priority: `NO_PROXY`, then
+`no_proxy`. Values that contain only whitespace are ignored. Separate
 entries with commas. A domain such as `example.com` matches that domain and its
 subdomains. A leading dot or `*.` matches subdomains only. Entries can also be IP
 addresses, CIDR ranges, or host names and IP addresses with a port. Use brackets

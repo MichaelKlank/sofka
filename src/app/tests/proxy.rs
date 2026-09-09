@@ -135,6 +135,8 @@ async fn proxy_exclusions_apply_on_startup_and_context_switch() {
         (Some("127.0.0.1"), None, false, false),
         (None, Some("127.0.0.1"), false, false),
         (Some(""), Some("127.0.0.1"), false, false),
+        (Some(" \t\n"), Some("127.0.0.1"), false, false),
+        (Some(" \t"), Some("\n "), false, true),
         (Some("unmatched.invalid"), Some("127.0.0.1"), false, true),
         (Some("*"), None, false, false),
         (Some("127.0.0.0/8"), None, false, false),

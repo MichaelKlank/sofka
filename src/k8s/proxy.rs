@@ -37,8 +37,8 @@ pub(super) fn configure(config: &mut Config, kubeconfig: &Kubeconfig, context: O
 
 fn first_nonempty(upper: Option<String>, lower: Option<String>) -> Option<String> {
     upper
-        .filter(|value| !value.is_empty())
-        .or(lower.filter(|value| !value.is_empty()))
+        .filter(|value| !value.trim().is_empty())
+        .or(lower.filter(|value| !value.trim().is_empty()))
 }
 
 fn matches(server: &Uri, exclusions: &str) -> bool {
@@ -177,10 +177,14 @@ mod tests {
         for (upper, lower, expected) in [
             (Some("upper"), Some("lower"), Some("upper")),
             (Some(""), Some("lower"), Some("lower")),
+            (Some(" \t\n"), Some("lower"), Some("lower")),
+            (Some(" upper "), Some("lower"), Some(" upper ")),
             (None, Some("lower"), Some("lower")),
             (Some("upper"), None, Some("upper")),
             (None, None, None),
             (Some(""), Some(""), None),
+            (Some(" \t"), Some("\n "), None),
+            (None, Some(" \t\n"), None),
         ] {
             assert_eq!(
                 first_nonempty(upper.map(str::to_owned), lower.map(str::to_owned)).as_deref(),
