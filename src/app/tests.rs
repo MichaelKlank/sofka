@@ -4797,6 +4797,212 @@ async fn delete_message_updates_rows() {
     assert_eq!(rows[0].metadata.name.as_deref(), Some("keep"));
 }
 
+fn range_app() -> (App, Receiver<Msg>) {
+    let (mut app, rx) = test_app();
+    app.switch_kind("pods");
+    for name in ["a", "b", "c", "d", "e"] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": name, "namespace": "default", "uid": name},
+            "spec": {"containers": [{"name": "app"}]}}),
+        );
+    }
+    (app, rx)
+}
+
+fn range_key(app: &mut App, code: KeyCode) {
+    app.handle_key(KeyEvent::new(code, KeyModifiers::SHIFT))
+        .unwrap();
+}
+
+fn assert_marks(app: &App, names: &[&str]) {
+    assert_eq!(
+        app.marked,
+        names.iter().map(|name| format!("default/{name}")).collect()
+    );
+}
+
+#[tokio::test]
+async fn range_selection_extends_contracts_and_crosses_anchor() {
+    let (mut app, _rx) = range_app();
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    for (key, names, cursor) in [
+        (KeyCode::Down, vec!["c", "d"], 3),
+        (KeyCode::Down, vec!["c", "d", "e"], 4),
+        (KeyCode::Down, vec!["c", "d", "e"], 4),
+        (KeyCode::Up, vec!["c", "d"], 3),
+        (KeyCode::Up, vec!["c"], 2),
+        (KeyCode::Up, vec!["b", "c"], 1),
+        (KeyCode::Up, vec!["a", "b", "c"], 0),
+        (KeyCode::Up, vec!["a", "b", "c"], 0),
+    ] {
+        range_key(&mut app, key);
+        assert_marks(&app, &names);
+        assert_eq!(app.table_state.selected(), Some(cursor));
+    }
+}
+
+#[tokio::test]
+async fn range_selection_keeps_separate_marks_and_space_ends_range() {
+    let (mut app, _rx) = range_app();
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    range_key(&mut app, KeyCode::Up);
+    range_key(&mut app, KeyCode::Down);
+    assert_marks(&app, &["a", "c", "d"]);
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    assert_marks(&app, &["a", "c"]);
+    assert_eq!(app.table_state.selected(), Some(4));
+    range_key(&mut app, KeyCode::Up);
+    assert_marks(&app, &["a", "c", "d", "e"]);
+    range_key(&mut app, KeyCode::Down);
+    assert_marks(&app, &["a", "c", "e"]);
+}
+
+#[tokio::test]
+async fn range_selection_navigation_and_escape_end_range() {
+    for key in [
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::Char('j'),
+        KeyCode::Char('k'),
+        KeyCode::Home,
+        KeyCode::End,
+        KeyCode::PageUp,
+        KeyCode::PageDown,
+    ] {
+        let (mut app, _rx) = range_app();
+        range_key(&mut app, KeyCode::Down);
+        app.handle_key(press(key)).unwrap();
+        assert_marks(&app, &["a", "b"]);
+        let current = app.table_state.selected().unwrap();
+        range_key(&mut app, KeyCode::Up);
+        let names = ["a", "b", "c", "d", "e"];
+        let mut expected = vec!["a", "b", names[current]];
+        expected.push(names[current.saturating_sub(1)]);
+        assert_marks(&app, &expected);
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        assert_marks(&app, &[]);
+        range_key(&mut app, KeyCode::Down);
+        assert_eq!(app.marked.len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn range_selection_handles_empty_single_and_unselected_tables() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    range_key(&mut app, KeyCode::Down);
+    assert_marks(&app, &[]);
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": "a", "namespace": "default"}}),
+    );
+    range_key(&mut app, KeyCode::Up);
+    range_key(&mut app, KeyCode::Down);
+    assert_marks(&app, &["a"]);
+    let (mut app, _rx) = range_app();
+    app.table_state.select(None);
+    range_key(&mut app, KeyCode::Down);
+    assert_marks(&app, &["a", "b"]);
+    assert_eq!(app.table_state.selected(), Some(1));
+}
+
+#[tokio::test]
+async fn range_selection_resets_after_filter_sort_and_view_changes() {
+    let (mut app, _rx) = range_app();
+    range_key(&mut app, KeyCode::Down);
+    type_filter(&mut app, "!/^a$/");
+    range_key(&mut app, KeyCode::Down);
+    assert_marks(&app, &["a", "b", "c"]);
+    range_key(&mut app, KeyCode::Up);
+    assert_marks(&app, &["a", "b"]);
+    select_sort_with_keys(&mut app, "NAME");
+    app.handle_key(press(KeyCode::Char('I'))).unwrap();
+    range_key(&mut app, KeyCode::Down);
+    assert_marks(&app, &["a", "b", "d", "e"]);
+    palette(&mut app, "services");
+    assert_marks(&app, &[]);
+    range_key(&mut app, KeyCode::Down);
+    assert_marks(&app, &[]);
+}
+
+#[tokio::test]
+async fn range_selection_resets_on_membership_or_identity_changes() {
+    for change in ["insert", "delete", "replace"] {
+        let (mut app, _rx) = range_app();
+        range_key(&mut app, KeyCode::Down);
+        range_key(&mut app, KeyCode::Down);
+        match change {
+            "insert" => apply(
+                &mut app,
+                json!({"apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": "z", "namespace": "default", "uid": "z"}}),
+            ),
+            "delete" => app.handle_msg(Msg::Deleted {
+                generation: app.generation,
+                key: "default/e".into(),
+            }),
+            _ => apply(
+                &mut app,
+                json!({"apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": "e", "namespace": "default", "uid": "replacement"}}),
+            ),
+        }
+        range_key(&mut app, KeyCode::Up);
+        assert_marks(&app, &["a", "b", "c"]);
+    }
+    let (mut app, _rx) = range_app();
+    range_key(&mut app, KeyCode::Down);
+    range_key(&mut app, KeyCode::Down);
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": "e", "namespace": "default", "uid": "e"},
+        "status": {"phase": "Running"}}),
+    );
+    range_key(&mut app, KeyCode::Up);
+    assert_marks(&app, &["a", "b"]);
+}
+
+#[tokio::test]
+async fn range_selection_uses_keymap_and_existing_bulk_actions() {
+    let (mut app, _rx) = range_app();
+    let cfg: crate::config::Config =
+        toml::from_str("[keys.table]\nrange_down = 'alt-j'\nrange_up = 'alt-k'").unwrap();
+    app.keymap = Keymap::compile(&cfg.keys).unwrap();
+    range_key(&mut app, KeyCode::Down);
+    assert_marks(&app, &[]);
+    app.handle_key(alt(KeyCode::Char('j'))).unwrap();
+    app.handle_key(alt(KeyCode::Char('j'))).unwrap();
+    app.handle_key(alt(KeyCode::Char('k'))).unwrap();
+    assert_marks(&app, &["a", "b"]);
+    app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+    let Some(ConfirmAction::Delete { targets, .. }) = &app.confirm_action else {
+        panic!("expected delete confirmation");
+    };
+    assert_eq!(
+        targets,
+        &vec![
+            ("a".into(), "default".into()),
+            ("b".into(), "default".into())
+        ]
+    );
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Char('l'))).unwrap();
+    let Some(LogSource::Pods(pods)) = &app.logs.source else {
+        panic!("expected marked pod logs");
+    };
+    assert_eq!(
+        pods.iter().map(|pod| pod.name.as_str()).collect::<Vec<_>>(),
+        vec!["a", "b"]
+    );
+}
+
 #[tokio::test]
 async fn space_marks_rows_for_bulk_delete() {
     let (mut app, _rx) = test_app();
@@ -21912,7 +22118,7 @@ fn key_action_state(app: &App) -> serde_json::Value {
             "mode": format!("{:?}", app.mode), "kind": app.kind_plural,
             "namespace": app.namespace, "selected": app.table_state.selected(),
             "quit": app.should_quit, "compact": app.compact, "wide": app.wide,
-            "marked": app.marked, "sort": app.sort_column, "desc": app.sort_desc,
+            "marked": app.marked.iter().collect::<std::collections::BTreeSet<_>>(), "sort": app.sort_column, "desc": app.sort_desc,
             "faults": app.faults_only, "flash": app.flash,
         },
         "input": {
@@ -22145,7 +22351,9 @@ async fn shifted_navigation_keeps_default_list_behavior() {
             KeyCode::Home,
             KeyCode::End,
         ] {
-            if defaults.action(scope, &press(code)).is_none() {
+            if (scope == "table" && matches!(code, KeyCode::Up | KeyCode::Down))
+                || defaults.action(scope, &press(code)).is_none()
+            {
                 continue;
             }
             let (mut plain, _rx1) = key_action_fixture(scope);
@@ -22181,14 +22389,17 @@ async fn explicit_shifted_navigation_bindings_remain_distinct() {
     let (mut app, _rx) = key_action_fixture("table");
     use_keys(
         &mut app,
-        "[keys.table]\ndown = 'down'\nup = ['up', 'shift-down']",
+        "[keys.table]\nrange_down = []\ndown = 'down'\nup = ['up', 'shift-down']",
     );
     app.handle_key(press(KeyCode::Down)).unwrap();
     assert_eq!(app.table_state.selected(), Some(5));
     app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT))
         .unwrap();
     assert_eq!(app.table_state.selected(), Some(4));
-    use_keys(&mut app, "[keys.table]\ndown = ['down', 'shift-down']");
+    use_keys(
+        &mut app,
+        "[keys.table]\nrange_down = []\ndown = ['down', 'shift-down']",
+    );
     for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
         app.handle_key(KeyEvent::new(KeyCode::Down, modifiers))
             .unwrap();

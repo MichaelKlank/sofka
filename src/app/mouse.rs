@@ -72,6 +72,7 @@ impl App {
             MouseEventKind::ScrollUp => self.wheel(KeyCode::Up),
             MouseEventKind::ScrollDown => self.wheel(KeyCode::Down),
             MouseEventKind::Down(MouseButton::Left) if self.mode == Mode::Table => {
+                self.range_selection = None;
                 self.table_click(m.column, m.row);
                 Ok(())
             }

@@ -1661,6 +1661,7 @@ pub struct App {
     /// the view is (re)watched. Bulk actions target this set if non-empty, else
     /// the current selection.
     pub marked: HashSet<String>,
+    range_selection: Option<RangeSelection>,
     /// Column index (into the displayed headers) to sort the table by, or
     /// `None` for the natural namespace/name order.
     pub sort_column: Option<usize>,
@@ -2102,6 +2103,7 @@ impl App {
             table_state: TableState::default(),
             table_page_rows: 10,
             marked: HashSet::new(),
+            range_selection: None,
             sort_column: None,
             sort_origin: SortOrigin::Unset,
             sort_desc: false,
@@ -2400,4 +2402,10 @@ mod tests;
 /// Built-ins retain ownership of their command names when loading packages.
 pub(crate) fn plugin_command_reserved(name: &str) -> bool {
     name == "plugin-cancel" || PALETTE_COMMANDS.iter().any(|c| c.names.contains(&name))
+}
+
+struct RangeSelection {
+    anchor: usize,
+    rows: Vec<(String, Option<String>)>,
+    previous_marks: HashSet<String>,
 }

@@ -9,6 +9,9 @@ impl App {
     }
 
     pub(super) fn handle_input(&mut self, key: KeyInput) -> Result<()> {
+        if !matches!(key.action, Some(Action::RangeUp | Action::RangeDown)) {
+            self.range_selection = None;
+        }
         let before = match self.mode {
             Mode::Command => self.palette_return,
             Mode::Help => self.help_return,
@@ -295,6 +298,8 @@ impl App {
                     // at root, nothing to pop
                 }
             }
+            (Some(Action::RangeDown), _) => self.extend_selection(1),
+            (Some(Action::RangeUp), _) => self.extend_selection(-1),
             (Some(Action::Down), _) => self.move_selection(1),
             (Some(Action::Up), _) => self.move_selection(-1),
             (Some(Action::First), _) => self.table_state.select(Some(0)),
