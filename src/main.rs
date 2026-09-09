@@ -306,6 +306,7 @@ async fn run_main(args: Args) -> Result<()> {
     app.sort_memory = sortmem::SortMemory::load(&sort_memory_path);
     app.sort_memory_path = Some(sort_memory_path);
     app.remember_sort = cfg.remember_sort.unwrap_or(true);
+    app.mouse_scroll_lines = cfg.mouse_scroll_lines.unwrap_or(3).max(1);
     app.hide_header = cfg.hide_header;
     app.compact = cfg.compact_mode;
     app.terminal_title = cfg.terminal_title.unwrap_or(true);

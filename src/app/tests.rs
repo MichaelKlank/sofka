@@ -14317,6 +14317,58 @@ async fn reload_applies_config_changes_live() {
 }
 
 #[tokio::test]
+async fn mouse_scroll_lines_sets_rows_per_wheel_notch() {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+
+    let dir = std::env::temp_dir().join(format!("sofka-app-wheel-{}", std::process::id()));
+    write_config(&dir, "mouse_scroll_lines = 1\n");
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    app.reload_config();
+    assert!(app.config_warnings.is_empty());
+
+    app.switch_kind("pods");
+    for name in ["a", "b", "c", "d", "e"] {
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": name, "namespace": "default"},
+                "status": {"phase": "Running"}
+            }),
+        );
+    }
+    app.table_state.select(Some(0));
+    let notch = MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    app.handle_mouse(notch).unwrap();
+    assert_eq!(app.table_state.selected(), Some(1), "one row per notch");
+
+    // `0` is clamped to one row; an unset value restores the default of three.
+    write_config(&dir, "mouse_scroll_lines = 0\n");
+    app.reload_config();
+    app.handle_mouse(notch).unwrap();
+    assert_eq!(app.table_state.selected(), Some(2));
+
+    write_config(&dir, "");
+    app.reload_config();
+    app.table_state.select(Some(0));
+    app.handle_mouse(notch).unwrap();
+    assert_eq!(
+        app.table_state.selected(),
+        Some(3),
+        "default three per notch"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
 async fn failed_reload_keeps_last_known_good_config() {
     let dir = std::env::temp_dir().join(format!("sofka-app-reload-bad-{}", std::process::id()));
     write_config(&dir, "readonly = true\n[aliases]\ndep = \"deployments\"\n");

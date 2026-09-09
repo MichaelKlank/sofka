@@ -1451,6 +1451,7 @@ impl App {
         self.user_aliases = resolved.config.aliases;
         self.namespace_favorites = resolved.config.favorite_namespaces;
         self.remember_sort = resolved.config.remember_sort.unwrap_or(true);
+        self.mouse_scroll_lines = resolved.config.mouse_scroll_lines.unwrap_or(3).max(1);
         self.hide_header = resolved.config.hide_header;
         self.terminal_title = resolved.config.terminal_title.unwrap_or(true);
         self.plugins = resolved.config.plugins;

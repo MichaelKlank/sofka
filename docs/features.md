@@ -164,7 +164,8 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   backup; managed files produce a warning and use the converted keys in memory.
   See [Configure key bindings](keybindings.md).
 - **Mouse support** - the wheel scrolls every view (one notch is three steps of
-  that view's own up/down), clicking a row selects it, clicking a column header
+  that view's own up/down; tune with `mouse_scroll_lines`), clicking a row
+  selects it, clicking a column header
   sorts by it (click again to flip). Document views (YAML/describe, diff,
   events, logs, help) release the mouse automatically so click-drag selects
   text natively; the wheel still scrolls them in terminals that translate it to

@@ -79,9 +79,10 @@ impl App {
         }
     }
 
-    /// One wheel notch = three steps, like most list UIs.
+    /// One wheel notch = `mouse_scroll_lines` steps (default three, like most
+    /// list UIs).
     fn wheel(&mut self, code: KeyCode) -> Result<()> {
-        for _ in 0..3 {
+        for _ in 0..self.mouse_scroll_lines {
             let action = self
                 .keymap
                 .wheel_action(self.key_scope(), code == KeyCode::Down);

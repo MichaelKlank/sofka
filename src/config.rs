@@ -101,6 +101,8 @@ pub struct Config {
     /// behavior (text selection) everywhere. Document views release capture
     /// on their own regardless — see [`crate::app::App::wants_mouse_capture`].
     pub mouse: Option<bool>,
+    /// Rows moved per mouse wheel notch. Defaults to 3; `0` behaves like 1.
+    pub mouse_scroll_lines: Option<u16>,
     /// Set the terminal title to the context and namespace. Defaults to true.
     pub terminal_title: Option<bool>,
     /// Save and restore sort choices per kind. Defaults to true.

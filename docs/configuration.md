@@ -23,6 +23,7 @@ hide_header = false # true hides the header and logo
 compact_mode = false # true starts with a one-line header and no footer
 mouse             = true   # false keeps the terminal's native mouse behavior
                            # (text selection) instead of scroll/click/sort
+mouse_scroll_lines = 3     # rows moved per wheel notch; 1 for line-by-line
 terminal_title = true # false disables terminal title changes
 remember_sort     = true   # save and restore sort choices per resource kind
                            # false makes sort changes temporary
@@ -54,6 +55,12 @@ namespace, context, and live status, with the footer hidden. The default is
 overrides are resolved at startup; `:reload` and subsequent context switches do
 not reset the current compact mode. With `hide_header = true`, the compact
 header is hidden too. Command and filter input still appears when needed.
+
+`mouse_scroll_lines` sets how many rows one mouse wheel notch moves in every
+view (table, logs, documents, pickers). The default is `3`. Set it to `1` if
+your terminal or trackpad already sends several wheel events per gesture and
+scrolling overshoots. `0` behaves like `1`. The option supports cluster and
+context overrides and `:reload`.
 
 `remember_sort` is enabled by default. Set it to `false` to stop saving and
 restoring sort choices from `S`, `I`, and column header clicks. Existing saved
