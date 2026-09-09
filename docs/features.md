@@ -4,6 +4,12 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 
 ## Core navigation
 
+- **Container gauges** show CPU and memory for the selected container when space
+  is available. The bars use a positive limit, or a positive request when no
+  limit is set. Labels keep the numeric usage and percentages above 100%.
+  Missing metrics and missing denominators are shown explicitly. A failed
+  metrics poll marks the retained values as stale.
+
 - **Terminal title** shows `sofka: <context>/<namespace>` and follows navigation.
   The namespace is `all` when all namespaces are selected. Set
   `terminal_title = false` to disable title changes. Sofka clears the title on exit.

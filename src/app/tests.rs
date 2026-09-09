@@ -23635,3 +23635,66 @@ async fn explain_refresh_clears_a_removed_selection_and_blocks_implicit_root_act
     assert!(app.detail.title.starts_with("web"));
     app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
 }
+
+#[tokio::test]
+async fn container_gauges_follow_selection_and_missing_metrics() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Pod",
+        "metadata":{"name":"api", "namespace":"default"},
+        "spec":{"containers":[
+            {"name":"app", "resources":{"limits":{"cpu":"100m", "memory":"64Mi"}}},
+            {"name":"sidecar", "resources":{"requests":{"cpu":"50m"}, "limits":{"cpu":"0"}}}
+        ]}}),
+    );
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::new(),
+        containers: HashMap::from([
+            ("default/api/app".into(), (250, 32 * 1024 * 1024)),
+            ("default/api/sidecar".into(), (0, 0)),
+        ]),
+    });
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Containers);
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+    let render = |terminal: &mut Terminal<TestBackend>, app: &mut App| {
+        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>()
+    };
+    let text = render(&mut terminal, &mut app);
+    assert!(text.contains("CPU 250m / limit 100m (250%)"), "{text}");
+    assert!(text.contains("(50%)"));
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    let text = render(&mut terminal, &mut app);
+    assert!(
+        text.contains("CPU 0 / request 50m (0%)") || text.contains("CPU 0m / request 50m (0%)"),
+        "{text}"
+    );
+    assert!(text.contains("no request or limit"));
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::new(),
+        containers: HashMap::new(),
+    });
+    assert!(render(&mut terminal, &mut app).contains("CPU unavailable"));
+    app.handle_msg(Msg::MetricsError {
+        generation: app.generation,
+        error: "offline".into(),
+    });
+    assert!(render(&mut terminal, &mut app).contains("[stale]"));
+    for (width, height) in [(1, 1), (20, 8), (80, 24)] {
+        terminal.backend_mut().resize(width, height);
+        crate::ui::resize(&mut terminal, &mut app).unwrap();
+    }
+}
