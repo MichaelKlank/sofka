@@ -101,7 +101,8 @@ pub struct Config {
     /// behavior (text selection) everywhere. Document views release capture
     /// on their own regardless — see [`crate::app::App::wants_mouse_capture`].
     pub mouse: Option<bool>,
-    /// Rows moved per mouse wheel notch. Defaults to 3; `0` behaves like 1.
+    /// Navigation steps per received mouse wheel event in views with mouse
+    /// capture. Defaults to 3; `0` is treated as 1 with a warning.
     pub mouse_scroll_lines: Option<u16>,
     /// Set the terminal title to the context and namespace. Defaults to true.
     pub terminal_title: Option<bool>,
@@ -1096,6 +1097,19 @@ pub struct Guardrail {
     pub max_bulk: Option<usize>,
     /// Human note shown when the guardrail blocks or confirms.
     pub reason: Option<String>,
+}
+
+/// Resolves `mouse_scroll_lines`: unset means 3, `0` is treated as 1 with a
+/// warning pushed onto `warnings`.
+pub fn mouse_scroll_lines(value: Option<u16>, warnings: &mut Vec<String>) -> u16 {
+    match value {
+        None => 3,
+        Some(0) => {
+            warnings.push("mouse_scroll_lines: 0 is not allowed — using 1".into());
+            1
+        }
+        Some(n) => n,
+    }
 }
 
 /// Validation warnings for guardrails: an unknown `confirmation` mode.

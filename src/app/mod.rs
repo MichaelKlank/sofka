@@ -1819,7 +1819,7 @@ pub struct App {
     /// view start. Persisted to `sort_memory_path` on every change.
     pub sort_memory: crate::sortmem::SortMemory,
     pub remember_sort: bool,
-    /// Rows moved per mouse wheel notch (`mouse_scroll_lines`, default 3).
+    /// Steps per received mouse wheel event (`mouse_scroll_lines`, default 3).
     pub mouse_scroll_lines: u16,
     /// Where remembered sorts persist (`<state-dir>/sort.toml`, set at
     /// startup); `None` (tests) keeps them in memory only.

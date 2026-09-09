@@ -14349,14 +14349,20 @@ async fn mouse_scroll_lines_sets_rows_per_wheel_notch() {
     app.handle_mouse(notch).unwrap();
     assert_eq!(app.table_state.selected(), Some(1), "one row per notch");
 
-    // `0` is clamped to one row; an unset value restores the default of three.
+    // `0` is treated as one row and reported as a config warning; an unset
+    // value restores the default of three and clears the warning.
     write_config(&dir, "mouse_scroll_lines = 0\n");
     app.reload_config();
+    assert_eq!(
+        app.config_warnings,
+        vec!["mouse_scroll_lines: 0 is not allowed — using 1".to_string()]
+    );
     app.handle_mouse(notch).unwrap();
     assert_eq!(app.table_state.selected(), Some(2));
 
     write_config(&dir, "");
     app.reload_config();
+    assert!(app.config_warnings.is_empty());
     app.table_state.select(Some(0));
     app.handle_mouse(notch).unwrap();
     assert_eq!(
