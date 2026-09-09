@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, Gauge, HighlightSpacing, List, ListItem, ListState,
-    Paragraph, Row, Table,
+    Paragraph, Row, Shadow, Table,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -4396,6 +4396,9 @@ fn confirm_action_hint(app: &App, allows_force: bool) -> String {
 /// to the terminal default; with the skin background enabled that would punch a
 /// transparent hole through the fill, so repaint `base` over the cleared cells.
 fn clear_region(frame: &mut Frame, area: Rect) {
+    let shadow =
+        Shadow::overlay().style(Style::default().fg(theme::overlay1()).bg(theme::surface0()));
+    frame.render_widget(&shadow, area);
     frame.render_widget(Clear, area);
     if let Some(bg) = theme::background() {
         frame.buffer_mut().set_style(area, Style::default().bg(bg));
