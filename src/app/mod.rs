@@ -535,6 +535,7 @@ struct MatchCache {
 }
 
 struct DocumentViewport {
+    widest: usize,
     width: usize,
     height: usize,
     wrap: bool,
@@ -781,11 +782,13 @@ impl Scrollable {
                 || viewport.line_count != self.lines.len()
         });
         if stale {
+            let mut widest = 0usize;
             let mut rows = 0usize;
             let ends = self
                 .lines
                 .iter()
                 .map(|line| {
+                    widest = widest.max(line.chars().count());
                     let line_rows = if self.wrap {
                         crate::ui::wrapped_height(line, width)
                     } else {
@@ -796,6 +799,7 @@ impl Scrollable {
                 })
                 .collect();
             self.viewport = Some(DocumentViewport {
+                widest,
                 width,
                 height,
                 wrap: self.wrap,
@@ -827,6 +831,12 @@ impl Scrollable {
             .saturating_add(1)
             .min(self.lines.len());
         (start, end, row_offset)
+    }
+
+    pub(crate) fn scroll_dimensions(&self) -> (usize, usize) {
+        self.viewport
+            .as_ref()
+            .map_or((self.lines.len(), 0), |v| (v.total_rows(), v.widest))
     }
 
     fn max_scroll(&self) -> usize {
