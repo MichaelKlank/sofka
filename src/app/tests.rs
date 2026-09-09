@@ -23719,6 +23719,43 @@ async fn container_trends_follow_keys_and_reject_stale_samples() {
 }
 
 #[tokio::test]
+async fn popup_shadows_follow_open_close_and_resize() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.compact = true;
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Pod",
+        "metadata":{"name":"web", "namespace":"default"}}),
+    );
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let original = terminal.backend().buffer().clone();
+    for key in [ctrl(KeyCode::Char('d')), press(KeyCode::Char('S'))] {
+        app.handle_key(key).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let corner = (1..23)
+            .find_map(|y| (1..99).find_map(|x| (buffer[(x, y)].symbol() == "╮").then_some((x, y))))
+            .unwrap();
+        let shadow = &buffer[(corner.0 + 1, corner.1 + 1)];
+        assert_eq!(shadow.bg, crate::theme::surface0());
+        assert_eq!(shadow.fg, crate::theme::overlay1());
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(terminal.backend().buffer(), &original);
+    }
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for (width, height) in [(3, 3), (20, 8), (80, 24)] {
+        terminal.backend_mut().resize(width, height);
+        crate::ui::resize(&mut terminal, &mut app).unwrap();
+    }
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+}
+
+#[tokio::test]
 async fn scrollbars_follow_keys_and_disappear_when_content_fits() {
     use ratatui::{Terminal, backend::TestBackend};
     let (mut app, _rx) = test_app();
