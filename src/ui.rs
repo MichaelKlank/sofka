@@ -2482,7 +2482,7 @@ fn wrap_help_span(span: Span<'static>, width: usize, needle: &str) -> Vec<Line<'
     rows
 }
 
-fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
+fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
     let bind = |k: &str, d: &str| {
         Line::from(vec![
             Span::styled(k.to_string(), Style::default().fg(theme::yellow())),
@@ -2668,7 +2668,6 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         app.keymap.label("help", Action::Close),
         "close help and return to the previous screen",
     ));
-    let width = usize::from(area.width.saturating_sub(2)).max(1);
     let key_width = lines
         .iter()
         .filter(|line| line.spans.len() == 2)
@@ -2742,13 +2741,61 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
                 .collect()
         })
         .collect();
+    (lines, title)
+}
+
+pub(crate) struct HelpCache {
+    key: u64,
+    lines: Vec<Line<'static>>,
+    title: String,
+}
+
+fn help_cache_key(app: &App, width: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    (
+        width,
+        &app.help_filter,
+        theme::yellow(),
+        theme::crust(),
+        theme::dim(),
+        theme::title(),
+    )
+        .hash(&mut hash);
+    for (scope, action, _) in app.keymap.entries() {
+        (scope, action.name(), app.keymap.label(scope, action)).hash(&mut hash);
+    }
+    app.plugins.len().hash(&mut hash);
+    for plugin in &app.plugins {
+        (&plugin.key, &plugin.palette, &plugin.scopes, &plugin.name).hash(&mut hash);
+    }
+    app.bookmarks.len().hash(&mut hash);
+    for bookmark in &app.bookmarks {
+        (&bookmark.key, &bookmark.name).hash(&mut hash);
+    }
+    app.workspaces.len().hash(&mut hash);
+    for workspace in &app.workspaces {
+        (&workspace.key, &workspace.name, workspace.views.len()).hash(&mut hash);
+    }
+    hash.finish()
+}
+
+fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
+    let width = usize::from(area.width.saturating_sub(2)).max(1);
+    let key = help_cache_key(app, width);
+    if app.help_cache.as_ref().is_none_or(|cache| cache.key != key) {
+        let (lines, title) = build_help(app, width);
+        app.help_cache = Some(HelpCache { key, lines, title });
+    }
+    let cache = app.help_cache.as_ref().expect("help content is ready");
     // Record the content height for paging and clamp the offset after layout changes.
     let inner_h = area.height.saturating_sub(2);
     app.help_viewport_h = inner_h;
-    let max_scroll = (lines.len() as u16).saturating_sub(inner_h);
+    let max_scroll = (cache.lines.len().min(usize::from(u16::MAX)) as u16).saturating_sub(inner_h);
     app.help_max_scroll = max_scroll;
     let scroll = app.help_scroll.min(max_scroll);
     app.help_scroll = scroll;
+    let title = &cache.title;
     let title = if max_scroll > 0 {
         format!(
             "{title} {} ",
@@ -2759,18 +2806,24 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
             )
         )
     } else {
-        title
+        title.clone()
     };
-    frame.render_widget(
-        Paragraph::new(lines).scroll((scroll, 0)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(theme::border_focused())
-                .title(Span::styled(title, theme::title())),
-        ),
-        area,
-    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme::border_focused())
+        .title(Span::styled(title, theme::title()));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    for (y, line) in cache
+        .lines
+        .iter()
+        .skip(usize::from(scroll))
+        .take(usize::from(inner.height))
+        .enumerate()
+    {
+        frame.render_widget(line, Rect::new(inner.x, inner.y + y as u16, inner.width, 1));
+    }
     draw_border_scrollbar(
         frame,
         area,
@@ -4690,6 +4743,68 @@ mod tests {
         assert!(clipped.ends_with('…'));
         // No room even for the ellipsis.
         assert_eq!(clip_to_width("abc", 0), "");
+    }
+
+    #[tokio::test]
+    async fn help_cache_tracks_inputs_and_reuses_lines_when_scrolling() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::{Terminal, backend::TestBackend};
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut app = App::new(crate::k8s::Cluster::fake(), tx);
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        app.handle_key(key(KeyCode::Char('?'))).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let initial = app.help_cache.as_ref().unwrap().lines.as_ptr();
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(initial, app.help_cache.as_ref().unwrap().lines.as_ptr());
+        for step in 0..7 {
+            match step {
+                0 => app.plugins.push(crate::config::Plugin {
+                    name: "plugin sample".into(),
+                    key: "ctrl-p".into(),
+                    ..Default::default()
+                }),
+                1 => app.bookmarks.push(crate::config::Bookmark {
+                    name: "bookmark sample".into(),
+                    ..Default::default()
+                }),
+                2 => app.workspaces.push(crate::config::Workspace {
+                    name: "workspace sample".into(),
+                    ..Default::default()
+                }),
+                3 => app.workspaces[0]
+                    .views
+                    .push(crate::config::WorkspaceView::default()),
+                4 => {
+                    let cfg: crate::config::Config =
+                        toml::from_str("[keys.table]\nlogs = [\"ctrl-l\"]").unwrap();
+                    app.keymap = crate::keymap::Keymap::compile(&cfg.keys).unwrap();
+                }
+                5 => {
+                    app.handle_key(key(KeyCode::Char('/'))).unwrap();
+                    for c in "sample".chars() {
+                        app.handle_key(key(KeyCode::Char(c))).unwrap();
+                    }
+                    app.handle_key(key(KeyCode::Enter)).unwrap();
+                }
+                _ => terminal.backend_mut().resize(60, 30),
+            }
+            let previous_key = app.help_cache.as_ref().unwrap().key;
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            let width = usize::from(terminal.backend().buffer().area.width.saturating_sub(2));
+            let cache = app.help_cache.as_ref().unwrap();
+            assert_ne!(previous_key, cache.key, "step {step}");
+            assert_eq!(
+                (cache.lines.clone(), cache.title.clone()),
+                build_help(&app, width)
+            );
+            let cached = terminal.backend().buffer().clone();
+            app.help_cache = None;
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            assert_eq!(&cached, terminal.backend().buffer());
+        }
     }
 
     #[test]
