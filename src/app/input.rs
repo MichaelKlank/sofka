@@ -1080,6 +1080,18 @@ impl App {
     }
 
     pub(super) fn key_scroll(&mut self, key: KeyInput, detail: bool) {
+        if detail && key.action == Some(Action::Fullscreen) {
+            self.document_fullscreen = !self.document_fullscreen;
+            self.set_flash(format!(
+                "fullscreen: {}",
+                if self.document_fullscreen {
+                    "on"
+                } else {
+                    "off"
+                }
+            ));
+            return;
+        }
         let target = if detail {
             &mut self.detail
         } else {

@@ -29,7 +29,15 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   views, logs, and pickers. Tables and unwrapped documents also show horizontal
   position. Wrapped views use display rows. Scrollbars use thin lines. They
   appear during keyboard or mouse scrolling and hide after 700 ms without
-  scrolling. They stay hidden when content fits. Fullscreen logs keep their borderless layout for text selection.
+  scrolling. They stay hidden when content fits. Fullscreen logs and documents
+  keep their borderless layout for text selection.
+
+- **Fullscreen documents** - `F` toggles the full terminal area for YAML, decoded
+  Secret, describe, diff, events, and plugin popup output. Borders, scrollbars,
+  the application header, status line, and key hints are hidden. The title and
+  active search or command prompt remain visible. Search, scrolling, wrapping,
+  copying, and refresh still work. The document setting is kept for the current
+  session, including new documents, and is separate from the Logs setting.
 
 - **Terminal title** shows `sofka: <context>/<namespace>` and follows navigation.
   The namespace is `all` when all namespaces are selected. Set

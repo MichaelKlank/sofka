@@ -143,6 +143,45 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         return;
     }
+    let document_mode = match app.mode {
+        Mode::DocFilter => app.doc_filter_return,
+        Mode::Command => app.palette_return,
+        mode => mode,
+    };
+    if app.document_fullscreen && matches!(document_mode, Mode::Detail | Mode::Diff | Mode::Events)
+    {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(u16::from(needs_prompt)),
+            ])
+            .split(frame.area());
+        if document_mode == Mode::Diff {
+            draw_diff(frame, show_scrollbars, true, &mut app.detail, chunks[0]);
+        } else {
+            let accent = if document_mode == Mode::Events {
+                theme::peach()
+            } else {
+                theme::sky()
+            };
+            draw_scrollable(
+                frame,
+                show_scrollbars,
+                true,
+                &mut app.detail,
+                chunks[0],
+                accent,
+            );
+        }
+        if app.mode == Mode::Command {
+            draw_palette(frame, app, chunks[0]);
+        }
+        if needs_prompt {
+            draw_prompt(frame, app, chunks[1]);
+        }
+        return;
+    }
     let mut constraints = vec![
         Constraint::Length(if app.hide_header {
             0
@@ -182,14 +221,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Detail => draw_scrollable(
             frame,
             show_scrollbars,
+            false,
             &mut app.detail,
             chunks[1],
             theme::sky(),
         ),
-        Mode::Diff => draw_diff(frame, show_scrollbars, &mut app.detail, chunks[1]),
+        Mode::Diff => draw_diff(frame, show_scrollbars, false, &mut app.detail, chunks[1]),
         Mode::Events => draw_scrollable(
             frame,
             show_scrollbars,
+            false,
             &mut app.detail,
             chunks[1],
             theme::peach(),
@@ -200,10 +241,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         // While typing a doc search, keep drawing the view it was opened from
         // so the matches narrow live under the prompt.
         Mode::DocFilter => match app.doc_filter_return {
-            Mode::Diff => draw_diff(frame, show_scrollbars, &mut app.detail, chunks[1]),
+            Mode::Diff => draw_diff(frame, show_scrollbars, false, &mut app.detail, chunks[1]),
             Mode::Events => draw_scrollable(
                 frame,
                 show_scrollbars,
+                false,
                 &mut app.detail,
                 chunks[1],
                 theme::peach(),
@@ -212,6 +254,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             _ => draw_scrollable(
                 frame,
                 show_scrollbars,
+                false,
                 &mut app.detail,
                 chunks[1],
                 theme::sky(),
@@ -238,10 +281,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         // While the palette is open, keep drawing the view it was opened
         // from, so a global `:` never flashes the table underneath it.
         Mode::Command => match app.palette_return {
-            Mode::Diff => draw_diff(frame, show_scrollbars, &mut app.detail, chunks[1]),
+            Mode::Diff => draw_diff(frame, show_scrollbars, false, &mut app.detail, chunks[1]),
             Mode::Events => draw_scrollable(
                 frame,
                 show_scrollbars,
+                false,
                 &mut app.detail,
                 chunks[1],
                 theme::peach(),
@@ -249,6 +293,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Mode::Detail => draw_scrollable(
                 frame,
                 show_scrollbars,
+                false,
                 &mut app.detail,
                 chunks[1],
                 theme::sky(),
@@ -1621,12 +1666,13 @@ fn render_name_cell(app: &App, name: &str, base: Color, forwarded: bool) -> Rend
 fn draw_scrollable(
     frame: &mut Frame,
     show_scrollbars: bool,
+    fullscreen: bool,
     view: &mut crate::app::Scrollable,
     area: Rect,
     accent: ratatui::style::Color,
 ) {
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let inner_h = area.height.saturating_sub(2) as usize;
+    let inner_w = area.width.saturating_sub(if fullscreen { 0 } else { 2 }) as usize;
+    let inner_h = area.height.saturating_sub(if fullscreen { 1 } else { 2 }) as usize;
     view.set_viewport(inner_w, inner_h);
     let (start, end, row_offset) = view.visible_source_window();
     let text: Vec<Line> = view
@@ -1645,7 +1691,11 @@ fn draw_scrollable(
         text
     };
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(if fullscreen {
+            Borders::NONE
+        } else {
+            Borders::ALL
+        })
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(accent))
         .title(Span::styled(doc_title(view), theme::title()));
@@ -1658,7 +1708,9 @@ fn draw_scrollable(
         p.scroll((0, view.hscroll.min(u16::MAX as usize) as u16))
     };
     frame.render_widget(p, area);
-    draw_document_scrollbars(frame, show_scrollbars, view, area);
+    if !fullscreen {
+        draw_document_scrollbars(frame, show_scrollbars, view, area);
+    }
 }
 
 fn visible_wrapped_rows(
@@ -2340,11 +2392,12 @@ fn klog_level(l: &str, level: char) -> bool {
 fn draw_diff(
     frame: &mut Frame,
     show_scrollbars: bool,
+    fullscreen: bool,
     view: &mut crate::app::Scrollable,
     area: Rect,
 ) {
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let inner_h = area.height.saturating_sub(2) as usize;
+    let inner_w = area.width.saturating_sub(if fullscreen { 0 } else { 2 }) as usize;
+    let inner_h = area.height.saturating_sub(if fullscreen { 1 } else { 2 }) as usize;
     view.set_viewport(inner_w, inner_h);
     let (start, end, row_offset) = view.visible_source_window();
     let lines: Vec<Line> = view
@@ -2369,7 +2422,11 @@ fn draw_diff(
         lines
     };
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(if fullscreen {
+            Borders::NONE
+        } else {
+            Borders::ALL
+        })
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme::peach()))
         .title(Span::styled(doc_title(view), theme::title()));
@@ -2380,7 +2437,9 @@ fn draw_diff(
         p.scroll((0, view.hscroll.min(u16::MAX as usize) as u16))
     };
     frame.render_widget(p, area);
-    draw_document_scrollbars(frame, show_scrollbars, view, area);
+    if !fullscreen {
+        draw_document_scrollbars(frame, show_scrollbars, view, area);
+    }
 }
 
 /// Doc-view title, extended with the active search query and the current
@@ -2560,6 +2619,8 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
             "logs (marked pods, or current row)"
         } else if action == Action::LogMarker {
             "add visual marker at the log tail (excluded from copy/save)"
+        } else if action == Action::Fullscreen {
+            "toggle fullscreen for text selection (no borders or scrollbars)"
         } else if action == Action::AutoRefresh && scope == "detail" {
             "toggle refresh (YAML, decoded Secret, describe)"
         } else if action == Action::AutoRefresh && scope == "diff" {
@@ -4609,6 +4670,7 @@ fn navigation_hint(app: &App, width: u16) -> String {
             Action::NextMatch,
             Action::PreviousMatch,
             Action::Wrap,
+            Action::Fullscreen,
             Action::Copy,
             Action::PageUp,
             Action::PageDown,

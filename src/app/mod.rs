@@ -780,6 +780,16 @@ impl Scrollable {
 
     pub(crate) fn set_viewport(&mut self, width: usize, height: usize) {
         let width = width.max(1);
+        let anchor = self.viewport.as_ref().and_then(|viewport| {
+            (viewport.width != width
+                && viewport.wrap == self.wrap
+                && viewport.revision == self.revision
+                && viewport.line_count == self.lines.len())
+            .then(|| {
+                let line = viewport.line_at_row(self.scroll);
+                (line, self.scroll.saturating_sub(viewport.line_start(line)))
+            })
+        });
         let stale = self.viewport.as_ref().is_none_or(|viewport| {
             viewport.width != width
                 || viewport.wrap != self.wrap
@@ -814,6 +824,13 @@ impl Scrollable {
             });
         } else if let Some(viewport) = self.viewport.as_mut() {
             viewport.height = height;
+        }
+        if let Some((line, offset)) = anchor
+            && let Some(viewport) = &self.viewport
+            && let Some(&end) = viewport.ends.get(line)
+        {
+            let start = viewport.line_start(line);
+            self.scroll = start + offset.min(end.saturating_sub(start + 1));
         }
         self.scroll = self.scroll.min(self.max_scroll());
     }
@@ -1829,6 +1846,7 @@ pub struct App {
     pub last_action_error: Option<String>,
 
     pub detail: Scrollable,
+    pub document_fullscreen: bool,
     pub(super) describe_source: Option<(crate::store::StatusClaim, Vec<String>)>,
     pub refresh_task: Option<tokio::task::JoinHandle<()>>,
     pub(super) refresh_generation: u64,
@@ -2263,6 +2281,7 @@ impl App {
             status_claim: None,
             last_action_error: None,
             detail: Scrollable::empty(),
+            document_fullscreen: false,
             describe_source: None,
             refresh_task: None,
             refresh_generation: 0,
