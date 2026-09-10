@@ -372,8 +372,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 /// Width reserved for the per-kind key-hint column inside the header box:
-/// three 13-wide cells (2-char key + space + 10-char label) with 2-space gaps.
-const HEADER_HINTS_WIDTH: u16 = 44;
+/// Three fixed columns with two spaces between columns.
+const HEADER_HINT_COLUMNS: [usize; 3] = [16, 13, 13];
+const HEADER_HINTS_WIDTH: u16 = 46;
 /// Minimum width the info cluster keeps before the hint column may appear.
 const HEADER_INFO_MIN: u16 = 44;
 
@@ -599,26 +600,17 @@ fn hint_line(app: &App, pairs: &[(Action, &str)]) -> Line<'static> {
         .fg(theme::sky())
         .add_modifier(Modifier::BOLD);
     let mut spans = Vec::new();
-    let mut width = 0;
-    for &(action, label) in pairs {
+    for (&(action, label), cell_width) in pairs.iter().zip(HEADER_HINT_COLUMNS) {
         let key = app.keymap.first_label("table", action);
-        let cell = format!("{key} {label}");
-        let cell_width = cell.chars().count().max(13);
-        if width + cell_width > usize::from(HEADER_HINTS_WIDTH) {
-            break;
-        }
-        if width > 0 {
+        if !spans.is_empty() {
             spans.push(Span::raw("  "));
         }
-        spans.push(Span::styled(key.to_owned(), key_style));
-        spans.push(Span::styled(
-            format!(
-                " {label:<width$}",
-                width = cell_width - cell.chars().count() + label.chars().count()
-            ),
-            theme::dim(),
-        ));
-        width += cell_width + 2;
+        let key = truncate_cols(key, cell_width);
+        let remaining = cell_width.saturating_sub(key.width());
+        let label = truncate_cols(&format!(" {label}"), remaining);
+        let padding = " ".repeat(remaining.saturating_sub(label.width()));
+        spans.push(Span::styled(key, key_style));
+        spans.push(Span::styled(format!("{label}{padding}"), theme::dim()));
     }
     Line::from(spans)
 }
@@ -3653,27 +3645,30 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     let desired_width = container_columns_width(&container_column_widths(app, usize::MAX)) + 4;
     let popup_w = desired_width
-        .max(82)
-        .max(footer.width() + 2)
+        .max(84)
+        .max(footer.width() + 4)
         .min(usize::from(area.width)) as u16;
     let widths = container_column_widths(app, usize::from(popup_w.saturating_sub(4)));
-    let details = container_detail_lines(app, usize::from(popup_w.saturating_sub(4)));
+    let details = container_detail_lines(app, usize::from(popup_w.saturating_sub(6)));
     let rows = app.container_list.len().max(1).min(usize::from(u16::MAX)) as u16;
-    let content_height = area.height.saturating_sub(3);
+    let section_gap = u16::from(area.height >= 16);
+    let content_height = area.height.saturating_sub(3 + section_gap);
     let min_rows = rows.min(3).min(content_height);
     let detail_height = details
         .len()
         .min(usize::from(content_height.saturating_sub(min_rows))) as u16;
-    let trend_height = if popup_w >= 80
+    let trend_height = if popup_w >= 84
         && !app.container_list.is_empty()
-        && content_height >= min_rows + detail_height + 3
+        && content_height >= min_rows + detail_height + section_gap + 3
     {
         3
     } else {
         0
     };
-    let list_height = rows.min(content_height.saturating_sub(detail_height + trend_height));
-    let popup_h = 3 + list_height + detail_height + trend_height;
+    let trend_gap = if trend_height > 0 { section_gap } else { 0 };
+    let list_height =
+        rows.min(content_height.saturating_sub(detail_height + trend_gap + trend_height));
+    let popup_h = 3 + list_height + section_gap + detail_height + trend_gap + trend_height;
     let popup = centered_rect_exact(popup_w, popup_h, area);
     clear_region(frame, popup);
     let block = Block::default()
@@ -3681,13 +3676,15 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(theme::border_focused())
         .title(Span::styled(title, theme::title()))
-        .title_bottom(Line::from(Span::styled(footer, theme::dim())).right_aligned());
+        .title_bottom(Line::from(Span::styled(format!(" {footer} "), theme::dim())).centered());
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-    let [header_area, list_area, detail_area, trend_area] = Layout::vertical([
+    let [header_area, list_area, _, detail_area, _, trend_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(list_height),
+        Constraint::Length(section_gap),
         Constraint::Length(detail_height),
+        Constraint::Length(trend_gap),
         Constraint::Length(trend_height),
     ])
     .areas(inner);
@@ -3805,12 +3802,20 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
         Paragraph::new(details).style(Style::default().fg(theme::text())),
         Rect {
             x: detail_area.x + 2,
-            width: detail_area.width.saturating_sub(2),
+            width: detail_area.width.saturating_sub(4),
             ..detail_area
         },
     );
     if trend_height > 0 {
-        draw_container_trends(frame, app, trend_area);
+        draw_container_trends(
+            frame,
+            app,
+            Rect {
+                x: trend_area.x + 2,
+                width: trend_area.width.saturating_sub(4),
+                ..trend_area
+            },
+        );
     }
 }
 

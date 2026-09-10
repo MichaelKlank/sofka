@@ -25567,7 +25567,7 @@ async fn container_trends_follow_keys_and_reject_stale_samples() {
         })
         .unwrap();
     let rows_above: String = (0..160)
-        .map(|x| buffer[(x, heading_y - 1)].symbol())
+        .map(|x| buffer[(x, heading_y - 2)].symbol())
         .collect();
     assert!(
         rows_above.contains("Probes:"),
@@ -26469,4 +26469,54 @@ async fn journal_write_failure_is_visible_after_edit_key() {
         std::process::id()
     )))
     .unwrap();
+}
+
+#[tokio::test]
+async fn pod_header_keeps_action_columns_aligned() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let position = |text: &str| {
+        (0..40)
+            .find_map(|y| {
+                let line: String = (0..160).map(|x| buffer[(x, y)].symbol()).collect();
+                line.find(text).map(|x| (line[..x].chars().count(), y))
+            })
+            .unwrap()
+    };
+    assert_eq!(position("l logs").0, position("t transfer").0);
+    assert_eq!(position("p prev logs").0, position("f port-fwd").0);
+    assert_eq!(position("p prev logs").0, position("ctrl-d delete").0);
+}
+
+#[tokio::test]
+async fn container_popup_separates_sections_and_aligns_charts() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(&mut app, container_details_pod());
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let lines = render_container_popup(&mut app, 160, 40);
+    let details = lines
+        .iter()
+        .position(|line| line.contains("Container:"))
+        .unwrap();
+    let trends = lines
+        .iter()
+        .position(|line| line.contains("Selected container:"))
+        .unwrap();
+    assert!(lines[details - 1].trim().is_empty());
+    assert!(lines[trends - 1].trim().is_empty());
+    assert_eq!(
+        lines[details].find("Container:"),
+        lines[trends].find("Selected container:")
+    );
+    assert_eq!(
+        lines[details].find("Container:"),
+        lines[trends + 1].find("CPU")
+    );
 }
