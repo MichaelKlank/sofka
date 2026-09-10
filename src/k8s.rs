@@ -25,6 +25,7 @@ use crate::store::{Msg, row_key};
 
 mod discovery;
 mod proxy;
+mod table;
 
 pub(crate) fn build_client(mut config: Config, allow_v1_client_cert: bool) -> Result<Client> {
     if let Some(exec) = &mut config.auth_info.exec {
@@ -608,6 +609,30 @@ impl Cluster {
             namespace.to_string(),
             cfg,
             Arc::clone(&self.streaming_lists),
+            generation,
+            tx,
+        )
+    }
+
+    pub fn spawn_server_table(
+        &self,
+        kind: &Kind,
+        namespace: &str,
+        labels: Option<String>,
+        fields: Option<String>,
+        generation: u64,
+        tx: Sender<Msg>,
+    ) -> JoinHandle<()> {
+        let api = watch_api(self.client.clone(), kind, namespace);
+        table::spawn(
+            self.client.clone(),
+            api.resource_url().to_string(),
+            ListParams {
+                label_selector: labels,
+                field_selector: fields,
+                ..Default::default()
+            },
+            kind.resource_key(),
             generation,
             tx,
         )

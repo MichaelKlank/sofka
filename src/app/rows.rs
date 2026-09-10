@@ -220,7 +220,9 @@ impl App {
             Entry::Occupied(e) if fresh(e.get()) => return e.into_mut(),
             slot => slot,
         };
-        let (rendered, status_idx, helm_updated) = self.spec.cells_with_helm_time(o, now);
+        let (rendered, status_idx, helm_updated) =
+            self.spec
+                .cells_with_helm_time(o, now, self.server_table.cells(o));
         let cell_masks: Vec<u64> = rendered.iter().map(|c| subseq_mask(c)).collect();
         let row_mask = cell_masks.iter().fold(0u64, |a, m| a | m);
         let built = CellCacheEntry {
@@ -287,6 +289,20 @@ impl App {
             return wanted
                 .is_finite()
                 .then(|| cmp.op.eval(actual.total_cmp(&wanted)));
+        }
+        if let Some((index, column)) = self.spec.server_column(&cmp.key) {
+            let value = self.server_table.cells(o)?.get(index)?;
+            if value.is_null() {
+                return None;
+            }
+            let ordering = match &cmp.value {
+                CmpValue::Num(want) if column.numeric() => value.as_f64()?.total_cmp(want),
+                CmpValue::Str(want) | CmpValue::Quantity { text: want, .. } => {
+                    crate::filter::cmp_folded_lower(&crate::server_table::render(Some(value)), want)
+                }
+                _ => return None,
+            };
+            return Some(cmp.op.eval(ordering));
         }
         let ordering = match &cmp.value {
             CmpValue::Cpu(want) => self.row_metrics(o, key)?.0.cmp(want),
@@ -864,7 +880,16 @@ impl App {
                 .and_then(Option::as_ref),
             self.wide,
         );
-        self.spec = spec;
+        self.spec = if self.server_table_eligible() && !self.server_table.columns.is_empty() {
+            crate::columns::build_table_spec(
+                self.kind.as_ref().map_or("", |kind| kind.ar.group.as_str()),
+                &self.kind_plural,
+                &self.server_table.columns,
+                self.wide,
+            )
+        } else {
+            spec
+        };
         self.spec_rev = self.spec_rev.wrapping_add(1);
         if let Some((h, desc)) = sort {
             self.sort_column = self.display_headers().iter().position(|x| *x == h);
@@ -1022,7 +1047,9 @@ impl App {
         // time…), and win over the curated special cases so an overlay that
         // redefines a header sorts by its own values.
         if self.spec.is_user_column(header)
-            && let Some(v) = self.spec.sort_value(o, header, now)
+            && let Some(v) =
+                self.spec
+                    .sort_value_with_table(o, header, now, self.server_table.cells(o))
         {
             return SortKey::from(v);
         }
@@ -1183,7 +1210,9 @@ impl App {
             values.push(obj.metadata.namespace.clone().unwrap_or_default());
         }
         let now = crate::columns::now_secs();
-        let (cells, _, helm_updated) = self.spec.cells_with_helm_time(obj, now);
+        let (cells, _, helm_updated) =
+            self.spec
+                .cells_with_helm_time(obj, now, self.server_table.cells(obj));
         for (i, cell) in cells.into_iter().enumerate() {
             values.push(
                 self.live_cell(obj, i)
