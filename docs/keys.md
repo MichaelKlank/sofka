@@ -134,6 +134,14 @@ visible markers.
 highlighted. `n` / `N` go to the next or previous match. `w` wraps. `c` copies
 the document. `esc` backs out - the first press clears an active search.
 
+`F` toggles fullscreen for document views and plugin popup output. Fullscreen
+uses the full terminal area without the application header, status line, key
+hints, borders, or scrollbars. The title and active search or command prompt
+remain visible. Search, scrolling, wrapping, copying, and refresh still work.
+The setting stays on across refreshes and new documents for the current session.
+It starts off in a new session and is separate from the Logs fullscreen setting.
+`F` restores the normal layout. `esc` and `q` keep their existing behavior.
+
 Automatic refresh is available in these resource views:
 
 | View                           | Automatic refresh           | Other refresh controls                            |

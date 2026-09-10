@@ -23276,6 +23276,7 @@ fn key_action_state(app: &App) -> serde_json::Value {
             "sort_picker": app.sort_picker_state.selected(), "copy_picker": app.copy_picker_state.selected(),
         },
         "document": {
+            "fullscreen": app.document_fullscreen,
             "title": app.detail.title, "scroll": app.detail.scroll,
             "horizontal": app.detail.hscroll, "wrap": app.detail.wrap,
             "filter": app.detail.filter, "match": app.detail.match_idx,
@@ -25380,4 +25381,215 @@ async fn log_marker_shortcut_handles_stopped_provider_and_replaced_buffers() {
     assert_eq!(app.mode, Mode::Logs);
     assert!(app.logs.markers.is_empty());
     assert_eq!(app.logs.refresh_index(0).total_rows(), 0);
+}
+
+#[tokio::test]
+async fn document_fullscreen_layout_and_prompts_follow_keys() {
+    use ratatui::{Terminal, backend::TestBackend};
+    for mode in [Mode::Detail, Mode::Diff, Mode::Events] {
+        let (mut app, _rx) = test_app();
+        app.mode = mode;
+        app.detail = Scrollable::doc(
+            "document title".into(),
+            (0..80)
+                .map(|i| format!("line {i:02} {}", "x".repeat(80)))
+                .collect(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        let render = |app: &mut App, terminal: &mut Terminal<TestBackend>| {
+            terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..20)
+                .map(|y| (0..60).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+        let normal = render(&mut app, &mut terminal);
+        assert!(normal[0].contains("sofka"));
+        assert!(!app.document_fullscreen);
+        app.handle_key(press(KeyCode::Char('F'))).unwrap();
+        app.handle_key(press(KeyCode::Down)).unwrap();
+        let full = render(&mut app, &mut terminal);
+        assert!(app.document_fullscreen);
+        assert!(app.scrollbars_visible());
+        assert!(full[0].contains("document title"));
+        assert!(full[1].starts_with("line 01 "));
+        assert!(full[19].starts_with("line 19 "));
+        assert_eq!(app.detail.viewport.as_ref().unwrap().width, 60);
+        assert_eq!(app.detail.viewport.as_ref().unwrap().height, 19);
+        for row in &full {
+            assert!(
+                !row.chars().any(|c| "╭╮╰╯│─".contains(c)),
+                "{mode:?}: {row}"
+            );
+        }
+        app.handle_key(press(KeyCode::Char('/'))).unwrap();
+        app.handle_key(press(KeyCode::Char('F'))).unwrap();
+        assert_eq!(app.detail.filter, "F");
+        assert!(app.document_fullscreen);
+        let search = render(&mut app, &mut terminal);
+        assert!(search[0].contains("document title"));
+        assert!(search[19].contains("F"));
+        assert_eq!(app.detail.viewport.as_ref().unwrap().height, 18);
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        assert_eq!(app.mode, mode);
+        assert!(app.detail.filter.is_empty());
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        let command = render(&mut app, &mut terminal);
+        assert_eq!(app.mode, Mode::Command);
+        assert!(command[0].contains("document title"));
+        assert!(command[19].contains(':'));
+        assert!(
+            command
+                .iter()
+                .any(|row| row.contains("commands & resources"))
+        );
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        assert_eq!(app.mode, mode);
+        assert_eq!(render(&mut app, &mut terminal), full);
+        app.handle_key(press(KeyCode::Char('F'))).unwrap();
+        assert!(!app.document_fullscreen);
+        assert!(render(&mut app, &mut terminal)[0].contains("sofka"));
+        app.handle_key(press(KeyCode::Char('F'))).unwrap();
+        app.handle_key(press(KeyCode::Char('/'))).unwrap();
+        app.handle_key(press(KeyCode::Char('x'))).unwrap();
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        assert_eq!(app.mode, mode);
+        assert!(app.detail.filter.is_empty());
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        assert_eq!(app.mode, Mode::Table);
+        assert!(render(&mut app, &mut terminal)[0].contains("sofka"));
+    }
+}
+
+#[tokio::test]
+async fn document_fullscreen_preserves_wrapped_source_on_toggle_and_resize() {
+    use ratatui::{Terminal, backend::TestBackend};
+    for mode in [Mode::Detail, Mode::Diff, Mode::Events] {
+        let (mut app, _rx) = test_app();
+        app.mode = mode;
+        app.compact = true;
+        app.detail = Scrollable::doc(
+            "wrapped document".into(),
+            (0..80)
+                .map(|i| format!("line {i:02} {}", "x".repeat(112)))
+                .collect(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        assert_eq!(app.detail.hscroll, 5);
+        app.handle_key(press(KeyCode::Char('F'))).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.detail.hscroll, 5);
+        assert_eq!(terminal.backend().buffer()[(0, 1)].symbol(), "0");
+        app.handle_key(press(KeyCode::Char('F'))).unwrap();
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.detail.hscroll, 0);
+        for _ in 0..2 {
+            app.handle_key(press(KeyCode::PageDown)).unwrap();
+        }
+        let anchor = app.detail.visible_source_window().0;
+        assert!(anchor > 0);
+        app.handle_key(press(KeyCode::Char('F'))).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.detail.visible_source_window().0, anchor);
+        for width in [28, 60, 40] {
+            terminal.backend_mut().resize(width, 16);
+            crate::ui::resize(&mut terminal, &mut app).unwrap();
+            assert_eq!(app.detail.visible_source_window().0, anchor);
+            assert_eq!(
+                app.detail.viewport.as_ref().unwrap().width,
+                usize::from(width)
+            );
+        }
+        app.handle_key(press(KeyCode::Char('F'))).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.detail.visible_source_window().0, anchor);
+        app.handle_key(press(KeyCode::Char('F'))).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.handle_key(press(KeyCode::End)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.detail.visible_source_window().1, 80);
+        assert_eq!(terminal.backend().buffer()[(39, 15)].symbol(), "x");
+        app.handle_key(press(KeyCode::Home)).unwrap();
+        app.handle_key(press(KeyCode::Char('/'))).unwrap();
+        for c in "line".chars() {
+            app.handle_key(press(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        app.handle_key(press(KeyCode::Char('n'))).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.detail.visible_source_window().0, 1);
+        app.handle_key(press(KeyCode::Char('N'))).unwrap();
+        assert_eq!(app.detail.visible_source_window().0, 0);
+        for (width, height) in [(1, 1), (2, 2), (3, 3), (60, 20)] {
+            terminal.backend_mut().resize(width, height);
+            crate::ui::resize(&mut terminal, &mut app).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn document_fullscreen_survives_plugin_and_yaml_replacement() {
+    let (mut app, mut rx) = app_with_pod();
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    assert_eq!(app.mode, Mode::Detail);
+    app.handle_key(press(KeyCode::Char('F'))).unwrap();
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    let mut plugin = named_plugin("/bin/echo", &["plugin output"]);
+    plugin.output = Some("popup".into());
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    app.handle_msg(plugin_result(&mut rx).await);
+    assert_eq!(app.mode, Mode::Detail);
+    assert_eq!(app.detail.lines[0], "plugin output");
+    assert!(app.document_fullscreen);
+    assert!(!app.logs.fullscreen);
+    app.handle_key(press(KeyCode::Char('F'))).unwrap();
+    assert!(!app.document_fullscreen);
+    app.handle_key(press(KeyCode::Char('F'))).unwrap();
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    assert_eq!(app.mode, Mode::Detail);
+    assert!(
+        app.detail
+            .lines
+            .iter()
+            .any(|line| line.contains("kind: Pod"))
+    );
+    assert!(app.document_fullscreen);
+    app.mode = Mode::Logs;
+    app.handle_key(press(KeyCode::Char('F'))).unwrap();
+    assert!(app.logs.fullscreen);
+    app.mode = Mode::Detail;
+    app.handle_key(press(KeyCode::Char('F'))).unwrap();
+    assert!(app.logs.fullscreen);
+    assert!(!app.document_fullscreen);
+    let (fresh, _rx) = test_app();
+    assert!(!fresh.document_fullscreen);
+}
+
+#[tokio::test]
+async fn document_fullscreen_survives_refresh_during_search() {
+    let (mut app, mut rx) = describe_refresh_app();
+    app.handle_key(press(KeyCode::Char('F'))).unwrap();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "event".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_msg(take_resource_refresh(&mut rx).await);
+    assert_eq!(app.detail.lines[1], "new event");
+    assert_eq!(app.detail.filter, "event");
+    assert_eq!(app.mode, Mode::DocFilter);
+    assert!(app.document_fullscreen);
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    assert!(app.refresh_task.is_none());
+    assert!(app.document_fullscreen);
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
 }
