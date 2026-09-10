@@ -1,5 +1,145 @@
 use super::*;
 
+#[derive(Default)]
+pub(super) struct LogLineMeta {
+    sort_time: Option<i128>,
+    timestamp: Option<(usize, String)>,
+}
+
+impl LogLineMeta {
+    fn parse(line: &str, fallback: Option<i128>) -> Self {
+        let start = if line.starts_with('[') {
+            line.find("] ").map_or(0, |end| end + 2)
+        } else {
+            0
+        };
+        let end = line[start..]
+            .find(' ')
+            .map_or(line.len(), |end| start + end);
+        let Ok(time) = line[start..end].parse::<k8s_openapi::jiff::Timestamp>() else {
+            return Self {
+                sort_time: Some(
+                    fallback.unwrap_or_else(|| k8s_openapi::jiff::Timestamp::now().as_nanosecond()),
+                ),
+                timestamp: None,
+            };
+        };
+        let end = (end + 1).min(line.len());
+        Self {
+            sort_time: Some(time.as_nanosecond()),
+            timestamp: Some((start, line[start..end].to_owned())),
+        }
+    }
+}
+
+impl LogsView {
+    fn push_line(&mut self, mut line: String) {
+        self.line_meta
+            .resize_with(self.view.lines.len(), LogLineMeta::default);
+        let meta = LogLineMeta::parse(&line, self.line_meta.back().and_then(|m| m.sort_time));
+        if !self.timestamps
+            && let Some((start, timestamp)) = &meta.timestamp
+        {
+            line.replace_range(*start..start + timestamp.len(), "");
+        }
+        // Equal timestamps keep their arrival order. Missing timestamps use
+        // the newest known time, or the arrival time if no time is known.
+        let index = if self
+            .line_meta
+            .back()
+            .is_none_or(|m| m.sort_time <= meta.sort_time)
+        {
+            self.view.lines.len()
+        } else {
+            self.line_meta
+                .partition_point(|m| m.sort_time <= meta.sort_time)
+        };
+        if index < self.view.lines.len() {
+            if !self.follow && self.matches(&line) {
+                self.refresh_index(self.last_wrap_width);
+                let mut marker_index = 0;
+                if let Some(shown) = self.index.shown.iter().position(|entry| match entry {
+                    Some(i) => *i as usize >= index,
+                    None => {
+                        let after = self.markers[marker_index] > self.line_offset + index;
+                        marker_index += 1;
+                        after
+                    }
+                }) && self.index.start_row(shown) <= self.view.scroll
+                {
+                    self.view.scroll += match self.last_wrap_width {
+                        0 => 1,
+                        width => crate::ui::wrapped_height(&line, width),
+                    };
+                }
+            }
+            for marker in &mut self.markers {
+                if *marker > self.line_offset + index {
+                    *marker += 1;
+                }
+            }
+            self.view.revision = self.view.revision.wrapping_add(1);
+        }
+        self.line_meta.insert(index, meta);
+        self.view.lines.insert(index, line);
+    }
+
+    pub(super) fn toggle_timestamps(&mut self) {
+        let anchor = if self.follow {
+            None
+        } else {
+            let (scroll, height) = (self.view.scroll, self.viewport_h);
+            let index = self.refresh_index(self.last_wrap_width);
+            let row = scroll.min(index.total_rows().saturating_sub(height));
+            let shown = index.first_at_row(row);
+            index.shown.get(shown).map(|line| {
+                let marker = index.shown[..shown].iter().filter(|l| l.is_none()).count();
+                (*line, marker, row - index.start_row(shown))
+            })
+        };
+        self.timestamps = !self.timestamps;
+        for (line, meta) in self.view.lines.iter_mut().zip(&self.line_meta) {
+            if let Some((start, timestamp)) = &meta.timestamp {
+                if self.timestamps {
+                    line.insert_str(*start, timestamp);
+                } else {
+                    line.replace_range(*start..start + timestamp.len(), "");
+                }
+            }
+        }
+        self.view.revision = self.view.revision.wrapping_add(1);
+        self.viewport_rows = self.refresh_index(self.last_wrap_width).total_rows();
+        if !self.follow {
+            let row = anchor.map_or(0, |(line, marker, offset)| {
+                let index = &self.index;
+                let shown = match line {
+                    Some(line) => index
+                        .shown
+                        .iter()
+                        .position(|entry| entry.is_some_and(|i| i >= line))
+                        .or_else(|| index.shown.len().checked_sub(1)),
+                    None => index
+                        .shown
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, line)| line.is_none())
+                        .nth(marker)
+                        .map(|(i, _)| i),
+                };
+                shown.map_or(0, |shown| {
+                    let offset = if index.shown[shown] == line {
+                        offset.min(index.height_at(shown).saturating_sub(1))
+                    } else {
+                        0
+                    };
+                    index.start_row(shown) + offset
+                })
+            });
+            self.view.scroll = row.min(self.viewport_rows.saturating_sub(self.viewport_h));
+        }
+    }
+}
+
 impl App {
     // ----- selection -----------------------------------------------------
 
@@ -7,22 +147,21 @@ impl App {
     where
         I: IntoIterator<Item = String>,
     {
-        // Strip carriage returns so progress output doesn't overwrite a row,
-        // and expand tabs to spaces — many loggers separate timestamp/level/body
-        // with tabs, which some terminals render awkwardly in a TUI cell.
-        // Clean lines (the vast majority) pass through without reallocating.
-        self.logs.view.lines.extend(lines.into_iter().map(|line| {
-            if !line.contains('\r') && !line.contains('\t') {
-                return line;
-            }
-            line.chars()
-                .filter_map(|c| match c {
-                    '\r' => None,
-                    '\t' => Some(' '),
-                    c => Some(c),
-                })
-                .collect()
-        }));
+        // Remove carriage returns and replace tabs with spaces for display.
+        for line in lines {
+            let line = if line.contains('\r') || line.contains('\t') {
+                line.chars()
+                    .filter_map(|c| match c {
+                        '\r' => None,
+                        '\t' => Some(' '),
+                        c => Some(c),
+                    })
+                    .collect()
+            } else {
+                line
+            };
+            self.logs.push_line(line);
+        }
 
         self.trim_log_buffer();
     }
@@ -248,8 +387,7 @@ impl App {
         self.restart_log_stream();
     }
 
-    /// Re-stream the current source (e.g. after toggling timestamps), keeping
-    /// the title, filter, and follow state.
+    /// Restart the current source and keep the title, filter, and follow state.
     pub(super) fn retail_logs(&mut self) {
         if self.logs.source.is_none() {
             return;
@@ -278,7 +416,6 @@ impl App {
 
     /// Spawn the streaming task(s) for the current `log_source`.
     pub(super) fn start_logs(&mut self) {
-        let ts = self.logs.timestamps;
         match self.logs.source.clone() {
             Some(LogSource::Pods(pods)) => {
                 for PodLogTarget {
@@ -289,18 +426,11 @@ impl App {
                 {
                     if containers.is_empty() {
                         let prefix = format!("[{ns}/{name}] ");
-                        self.spawn_one_log(ns, name, None, prefix, false, ts);
+                        self.spawn_one_log(ns, name, None, prefix, false);
                     } else {
                         for c in containers {
                             let prefix = format!("[{ns}/{name}:{c}] ");
-                            self.spawn_one_log(
-                                ns.clone(),
-                                name.clone(),
-                                Some(c),
-                                prefix,
-                                false,
-                                ts,
-                            );
+                            self.spawn_one_log(ns.clone(), name.clone(), Some(c), prefix, false);
                         }
                     }
                 }
@@ -312,7 +442,7 @@ impl App {
             }) => {
                 if containers.is_empty() {
                     // Unknown container set (e.g. from xray) — stream the default.
-                    self.spawn_one_log(ns, name, None, String::new(), false, ts);
+                    self.spawn_one_log(ns, name, None, String::new(), false);
                 } else {
                     let multi = containers.len() > 1;
                     for c in containers {
@@ -321,32 +451,26 @@ impl App {
                         } else {
                             String::new()
                         };
-                        self.spawn_one_log(ns.clone(), name.clone(), Some(c), prefix, false, ts);
+                        self.spawn_one_log(ns.clone(), name.clone(), Some(c), prefix, false);
                     }
                 }
             }
-            Some(LogSource::Selector { ns, labels }) => self.spawn_selector_logs(ns, labels, ts),
+            Some(LogSource::Selector { ns, labels }) => self.spawn_selector_logs(ns, labels),
             Some(LogSource::Single {
                 ns,
                 pod,
                 container,
                 previous,
-            }) => self.spawn_one_log(ns, pod, container, String::new(), previous, ts),
-            Some(LogSource::Provider { request }) => self.spawn_provider_logs(request, ts),
+            }) => self.spawn_one_log(ns, pod, container, String::new(), previous),
+            Some(LogSource::Provider { request }) => self.spawn_provider_logs(request),
             None => {}
         }
     }
 
-    /// Spawn the provider backfill + live tail task for `request`. Shares the
-    /// log-stream lifecycle (`log_gen`/`log_flag`), so stop/resume, timestamp
-    /// re-streams, and view exits all work unchanged. With nothing configured,
-    /// the task first autodiscovers a VictoriaLogs service in the cluster and
-    /// reports it back for caching.
-    pub(super) fn spawn_provider_logs(
-        &mut self,
-        request: crate::providers::LogRequest,
-        timestamps: bool,
-    ) {
+    /// Start the provider history query and live stream for `request`.
+    /// Use the log generation for stream restarts and view exits. If no
+    /// provider is configured, discover and cache a VictoriaLogs service.
+    pub(super) fn spawn_provider_logs(&mut self, request: crate::providers::LogRequest) {
         let provider = self.log_provider.clone().unwrap_or_default();
         let client = self.cluster.client.clone();
         let tx = self.tx.clone();
@@ -411,7 +535,7 @@ impl App {
             if !info.is_empty() && !send_log_batch(&tx, genr, &mut info).await {
                 return;
             }
-            provider_log_task(provider, request, client, tx, genr, flag, timestamps).await;
+            provider_log_task(provider, request, client, tx, genr, flag).await;
         });
         self.log_tasks.push(handle);
     }
@@ -423,7 +547,6 @@ impl App {
         container: Option<String>,
         prefix: String,
         previous: bool,
-        timestamps: bool,
     ) {
         let client = self.cluster.client.clone();
         let tx = self.tx.clone();
@@ -443,7 +566,8 @@ impl App {
                 follow: !previous,
                 previous,
                 container,
-                timestamps,
+                // Keep timestamps for sorting, even when their text is hidden.
+                timestamps: true,
                 tail_lines,
                 since_seconds,
                 ..Default::default()
@@ -504,7 +628,7 @@ impl App {
         }
     }
 
-    pub(super) fn spawn_selector_logs(&mut self, ns: String, labels: String, timestamps: bool) {
+    pub(super) fn spawn_selector_logs(&mut self, ns: String, labels: String) {
         let client = self.cluster.client.clone();
         let tx = self.tx.clone();
         let genr = self.log_gen;
@@ -562,7 +686,7 @@ impl App {
                         let lp = LogParams {
                             follow: true,
                             container: Some(c),
-                            timestamps,
+                            timestamps: true,
                             tail_lines: Some(per_pod_tail),
                             since_seconds: since,
                             ..Default::default()
@@ -592,7 +716,6 @@ async fn provider_log_task(
     tx: Sender<Msg>,
     generation: u64,
     flag: Arc<AtomicU64>,
-    timestamps: bool,
 ) {
     use crate::providers::{LogRequest, LogScope, Prefix};
 
@@ -653,7 +776,7 @@ async fn provider_log_task(
                 if let Some(n) = e.nanos {
                     backfill_max = backfill_max.max(n);
                 }
-                lines.extend(e.lines(prefix, timestamps));
+                lines.extend(e.lines(prefix, true));
             }
             if lines.is_empty() {
                 lines.push(format!("(no logs in the last {})", provider.lookback_label));
@@ -698,7 +821,7 @@ async fn provider_log_task(
                     // Skip anything the backfill already showed (the tail may
                     // replay a little history at the seam).
                     if e.nanos.is_none_or(|n| n > backfill_max) {
-                        batch.extend(e.lines(prefix, timestamps));
+                        batch.extend(e.lines(prefix, true));
                     }
                     if batch.len() >= LOG_BATCH_LINES
                         && !send_log_batch(&tx, generation, &mut batch).await

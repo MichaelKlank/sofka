@@ -1223,17 +1223,14 @@ impl App {
                 }
                 return;
             }
-            // k9s: `t` toggles timestamps (re-streams).
+            // Show or hide timestamps in the current buffer.
             (Some(Action::Timestamps), _) => {
-                self.logs.timestamps = !self.logs.timestamps;
+                self.logs.toggle_timestamps();
                 self.flash = format!(
                     "timestamps: {}",
                     if self.logs.timestamps { "on" } else { "off" }
                 );
                 self.flash_err = false;
-                if !self.logs.stopped {
-                    self.retail_logs();
-                }
                 return;
             }
             // Stop / resume the live stream.

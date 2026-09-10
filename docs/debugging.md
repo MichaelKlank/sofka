@@ -82,7 +82,12 @@ table are included. With no marks, `l` opens logs for the current row.
 
 The pod set is fixed when the view opens, including when timestamps or time
 anchors change, or streaming resumes. New pods are not added automatically.
-Lines appear in arrival order, without a guarantee of timestamp order. A source
+Lines with timestamps are sorted by time, even when timestamp text is hidden.
+Press `t` to show or hide timestamps without clearing the buffer or restarting
+the streams. A paused view keeps the same log line or marker in view, within
+the scroll limits. Lines with equal timestamps keep their arrival order. Lines
+without a valid timestamp use the newest known time for sorting. If no time is
+known, sofka uses the arrival time. A source
 error includes its prefix, and other streams continue. The existing filter and
 buffer controls apply to the combined view. `p` and `L` still use the current row.
 

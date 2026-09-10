@@ -116,6 +116,9 @@ point instead. See [PVC explore](features.md#pvc-explore).
 (VictoriaLogs views) · `esc` back. The newest line anchors to the bottom of the
 viewport.
 
+`t` shows or hides timestamps in the current buffer without restarting the
+streams. Log lines keep their timestamp order in both display settings.
+
 `m` adds a separator after the latest received log line. Repeated presses add
 separate markers. Markers stay visible through filters and are excluded from
 sofka copy/save. While paused, a marker is added at the buffer tail without
