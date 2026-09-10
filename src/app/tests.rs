@@ -5,6 +5,7 @@ use serde_json::json;
 use std::time::Instant;
 use tokio::sync::mpsc::{self, Receiver};
 
+mod label_filter;
 mod proxy;
 
 fn obj(v: serde_json::Value) -> DynamicObject {

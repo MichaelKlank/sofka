@@ -114,6 +114,14 @@ impl App {
             Term::Text { negate, pat } => {
                 Some(negate ^ self.pattern_match_row(o, pat, key, cells, now))
             }
+            Term::Label { negate, pat } => Some(
+                negate
+                    ^ o.metadata.labels.as_ref().is_some_and(|labels| {
+                        labels.iter().any(|(key, value)| {
+                            self.pattern_matches(pat, key) || self.pattern_matches(pat, value)
+                        })
+                    }),
+            ),
             Term::Cmp(cmp) => self.eval_cmp(o, key, cmp, cells, now),
             Term::All(terms) | Term::Not(terms) | Term::Any(terms) => {
                 let any = matches!(term, Term::Any(_));

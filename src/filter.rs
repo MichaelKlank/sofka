@@ -10,6 +10,7 @@
 //! - `"text"`                 literal match: contiguous, case-insensitive
 //! - `/re/`                   regular expression (case-insensitive)
 //! - `!text`                  inverse match (`!"text"` and `!/re/` too)
+//! - `label:text`             local text match against label keys and values
 //! - `-l app=api,env=prod`    Kubernetes label selector (sent server-side)
 //! - `-f spec.nodeName=n1`    Kubernetes field selector (sent server-side)
 //! - `status=CrashLoopBackOff` column equality (case-insensitive)
@@ -57,6 +58,11 @@ pub struct Structured {
 pub enum Term {
     /// One text pattern, inverted when the term was written `!pat`.
     Text {
+        negate: bool,
+        pat: Pattern,
+    },
+    /// Match each label key and value separately with the selected pattern.
+    Label {
         negate: bool,
         pat: Pattern,
     },
@@ -450,11 +456,22 @@ fn parse_tokens(tokens: &[String], depth: usize) -> Structured {
             Some(rest) => (true, rest),
             None => (false, tok),
         };
+        let label = rest.strip_prefix("label:");
+        let rest = label.unwrap_or(rest);
         if rest.is_empty() {
-            fail(&mut error, "expected text after '!'".into());
+            fail(
+                &mut error,
+                if label.is_some() {
+                    "expected pattern after 'label:'"
+                } else {
+                    "expected text after '!'"
+                }
+                .into(),
+            );
             continue;
         }
         match pattern(rest) {
+            Ok(pat) if label.is_some() => terms.push(Term::Label { negate, pat }),
             Ok(pat) => terms.push(Term::Text { negate, pat }),
             Err(e) => fail(&mut error, e),
         }
@@ -482,6 +499,7 @@ fn is_structured(input: &str) -> bool {
             || tok.starts_with('!')
             || tok.starts_with('(')
             || text.starts_with('"')
+            || text.starts_with("label:")
             || is_regex(text)
             || split_cmp(tok).is_some()
     };
@@ -504,13 +522,7 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
                 quote = None;
             }
         } else if c == '/'
-            && input[..offset]
-                .trim_end_matches('!')
-                .chars()
-                .next_back()
-                .is_none_or(|previous| {
-                    previous.is_whitespace() || matches!(previous, '(' | '&' | '|')
-                })
+            && at_pattern_start(&input[..offset])
             && let Some(end) = regex_end(&input[offset..], 1)
         {
             token.push_str(&input[offset..offset + end]);
@@ -543,13 +555,25 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
             token.push(c);
         }
     }
-    if depth != 0 || quote.is_some() && !(token.starts_with('"') || token.starts_with("!\"")) {
+    let text = token.strip_prefix('!').unwrap_or(&token);
+    let text = text.strip_prefix("label:").unwrap_or(text);
+    if depth != 0 || quote.is_some() && !text.starts_with('"') {
         return Err("unclosed quote or selector set".into());
     }
     if !token.is_empty() {
         tokens.push(token);
     }
     Ok(tokens)
+}
+
+fn at_pattern_start(input: &str) -> bool {
+    input
+        .strip_suffix("label:")
+        .unwrap_or(input)
+        .trim_end_matches('!')
+        .chars()
+        .next_back()
+        .is_none_or(|previous| previous.is_whitespace() || matches!(previous, '(' | '&' | '|'))
 }
 
 fn unquote(value: &str) -> &str {
@@ -854,6 +878,116 @@ fn parse_duration(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn label_patterns_are_local_and_do_not_supply_name_highlights() {
+        for (input, expected) in [
+            ("label:example100", Pattern::Fuzzy("example100".into())),
+            (
+                "label:\"example100\"",
+                Pattern::Literal(Literal::new("example100")),
+            ),
+            (
+                "label:/^example[0-9]+$/",
+                Pattern::Regex(Box::new(regex::Regex::new("^example[0-9]+$").unwrap())),
+            ),
+        ] {
+            for negate in [false, true] {
+                let input = format!("{}{input}", if negate { "!" } else { "" });
+                let parsed = parse(&input);
+                assert_eq!(parsed.error(), None, "{input}");
+                assert_eq!(parsed.labels(), None);
+                assert_eq!(parsed.fields(), None);
+                assert_eq!(parsed.highlight_pattern(), None);
+                assert_eq!(
+                    structured(&input).terms,
+                    [Term::Label {
+                        negate,
+                        pat: expected.clone(),
+                    }]
+                );
+            }
+        }
+        assert_eq!(
+            parse("label:example100 api").highlight_pattern(),
+            Some(&Pattern::Fuzzy("api".into()))
+        );
+    }
+
+    #[test]
+    fn label_prefix_is_reserved_only_at_the_start_of_unquoted_terms() {
+        for input in ["Label:api", "labels:api", "prefix-label:api"] {
+            assert_eq!(
+                parse(input),
+                ParsedFilter::Fuzzy(Pattern::Fuzzy(input.into()))
+            );
+        }
+        for input in ["\"label:api\"", "!\"label:api\"", "/label:api/"] {
+            assert!(matches!(structured(input).terms[0], Term::Text { .. }));
+        }
+        let s = structured("-l test -f spec.nodeName=n1 (label:api||!label:worker)");
+        assert_eq!(s.error, None);
+        assert_eq!(s.labels.as_deref(), Some("test"));
+        assert_eq!(s.fields.as_deref(), Some("spec.nodeName=n1"));
+        assert!(matches!(s.terms[0], Term::All(_)));
+    }
+
+    #[test]
+    fn label_patterns_preserve_quotes_and_regex_grammar_characters() {
+        for source in [
+            r"api (worker||canary)",
+            r"[() &|']+",
+            r"test.example.com/type",
+            r"test.example.com\/type",
+            r"[(]",
+            r"api\)worker",
+        ] {
+            let input = format!("!(label:/{source}/||label:canary)&&status=Running");
+            let s = structured(&input);
+            assert_eq!(s.error, None, "{input}");
+            assert_eq!(s.terms.len(), 2);
+            assert_eq!(
+                tokenize(&format!("label:/{source}/")).unwrap(),
+                [format!("label:/{source}/")]
+            );
+            let Term::Label {
+                pat: Pattern::Regex(re),
+                ..
+            } = &structured(&format!("label:/{source}/")).terms[0]
+            else {
+                panic!("expected a label regex: {source}");
+            };
+            assert_eq!(re.as_str(), source);
+        }
+        let s = structured("label:\"api (worker || canary)\" status=Running");
+        assert_eq!(s.error, None);
+        assert_eq!(s.terms.len(), 2);
+        assert_eq!(
+            s.terms[0],
+            Term::Label {
+                negate: false,
+                pat: Pattern::Literal(Literal::new("api (worker || canary)")),
+            }
+        );
+        assert_eq!(structured("label:\"api").error, None);
+        assert_eq!(structured("!label:\"api").error, None);
+    }
+
+    #[test]
+    fn label_patterns_report_missing_text_and_invalid_regexes() {
+        for input in [
+            "label:",
+            "!label:",
+            "label: api",
+            "label:\"\"",
+            "!label://",
+            "label:/[/",
+            "label:/(/",
+            "(label:\"api)",
+        ] {
+            assert!(parse(input).error().is_some(), "{input}");
+        }
+    }
 
     #[test]
     fn boolean_precedence_groups_and_inverse() {

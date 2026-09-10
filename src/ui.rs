@@ -2564,6 +2564,8 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
             "toggle refresh (YAML, decoded Secret, describe)"
         } else if action == Action::AutoRefresh && scope == "diff" {
             "toggle refresh (keep the comparison baseline)"
+        } else if action == Action::Filter && scope == "table" {
+            "filter rows; label:text searches label keys and values locally"
         } else {
             action.description()
         };
