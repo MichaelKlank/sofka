@@ -26,8 +26,18 @@ use crate::store::{Msg, row_key};
 mod discovery;
 mod proxy;
 
-pub(crate) fn build_client(config: Config, allow_v1_client_cert: bool) -> Result<Client> {
-    let builder = crate::legacy_tls::client_builder(config, allow_v1_client_cert)?;
+pub(crate) fn build_client(mut config: Config, allow_v1_client_cert: bool) -> Result<Client> {
+    if let Some(exec) = &mut config.auth_info.exec {
+        // Authentication commands must not read from or write to the TUI terminal.
+        exec.interactive_mode = Some(kube::config::ExecInteractiveMode::Never);
+    }
+    let builder =
+        crate::legacy_tls::client_builder(config, allow_v1_client_cert).map_err(|error| {
+            match exec_auth_message(error.as_ref()) {
+                Some(message) => anyhow::anyhow!(message),
+                None => error,
+            }
+        })?;
     let layer =
         tower::util::MapRequestLayer::new(|mut request: http::Request<kube::client::Body>| {
             let watch = request.uri().query().is_some_and(|query| {
@@ -43,7 +53,37 @@ pub(crate) fn build_client(config: Config, allow_v1_client_cert: bool) -> Result
             }
             request
         });
-    Ok(builder.with_layer(&layer).with_layer(&MeterLayer).build())
+    let auth_errors = tower::util::MapErrLayer::new(|error: tower::BoxError| -> tower::BoxError {
+        match exec_auth_message(error.as_ref()) {
+            Some(message) => std::io::Error::other(message).into(),
+            None => error,
+        }
+    });
+    Ok(builder
+        .with_layer(&layer)
+        .with_layer(&auth_errors)
+        .with_layer(&MeterLayer)
+        .build())
+}
+
+fn exec_auth_message(error: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut source = Some(error);
+    while let Some(error) = source {
+        if let Some(kube::client::AuthError::AuthExecRun { out, .. }) =
+            error.downcast_ref::<kube::client::AuthError>()
+        {
+            let stderr = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
+            return Some(if stderr.contains("sso") {
+                "Authentication failed. Run 'aws sso login' for the active AWS profile, then retry."
+                    .into()
+            } else {
+                "Authentication command failed. Log in with your credential provider, then retry."
+                    .into()
+            });
+        }
+        source = error.source();
+    }
+    None
 }
 
 /// Times every Kubernetes API request into [`crate::diagnostics`] and, at
@@ -1078,6 +1118,52 @@ impl Cluster {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_auth_failure_is_captured_for_all_interactive_modes() {
+        for mode in [None, Some("IfAvailable"), Some("Always"), Some("Never")] {
+            let mut config = kube::Config::new("https://127.0.0.1:1".parse().unwrap());
+            config.auth_info.exec = Some(
+                serde_json::from_value(serde_json::json!({
+                    "command": "sh",
+                    "args": ["-c", "case \"$KUBERNETES_EXEC_INFO\" in *'\"interactive\":false'*) echo 'SSO session expired' >&2 ;; *) echo 'unexpected interactive mode' >&2 ;; esac; exit 1"],
+                    "interactiveMode": mode
+                }))
+                .unwrap(),
+            );
+            let error = super::build_client(config, false).err().unwrap();
+            assert_eq!(
+                error.to_string(),
+                "Authentication failed. Run 'aws sso login' for the active AWS profile, then retry.",
+                "mode: {mode:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_auth_failure_has_a_login_hint() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let error = kube::runtime::watcher::Error::WatchStartFailed(kube::Error::Auth(
+            kube::client::AuthError::AuthExecRun {
+                cmd: "aws".into(),
+                status: std::process::ExitStatus::from_raw(256),
+                out: std::process::Output {
+                    status: std::process::ExitStatus::from_raw(256),
+                    stdout: vec![],
+                    stderr: b"Error loading SSO Token: Token has expired".to_vec(),
+                },
+            },
+        ));
+        assert!(
+            super::exec_auth_message(&error)
+                .unwrap()
+                .contains("aws sso login")
+        );
+        assert!(super::exec_auth_message(&std::io::Error::other("connection refused")).is_none());
+    }
+
     use super::*;
 
     fn probe_cluster(streaming: bool, status: u16, delay: Duration) -> Cluster {

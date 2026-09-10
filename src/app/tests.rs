@@ -11639,6 +11639,99 @@ async fn disconnected_start_opens_context_picker() {
     assert!(app.flash.contains("Connection refused"), "{}", app.flash);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn expired_sso_keeps_context_picker_usable() {
+    let mut config = kube::Config::new("https://127.0.0.1:1".parse().unwrap());
+    config.auth_info.exec = Some(
+        serde_json::from_value(json!({
+            "command": "sh",
+            "args": ["-c", "echo 'SSO session expired' >&2; exit 1"]
+        }))
+        .unwrap(),
+    );
+    let error = crate::k8s::build_client(config, false).err().unwrap();
+    let (mut app, _rx) = test_app();
+    app.cluster.connected = false;
+    app.start_disconnected(&error.to_string());
+    assert_eq!(app.mode, Mode::Contexts);
+    assert!(app.flash_err);
+    assert!(app.flash.contains("aws sso login"), "{}", app.flash);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    assert_eq!(app.mode, Mode::Command);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn expired_exec_credentials_show_login_instructions_in_metrics_diagnostics() {
+    for (provider_error, instruction) in [
+        ("SSO session expired", "aws sso login"),
+        (
+            "Provider session expired",
+            "Log in with your credential provider",
+        ),
+    ] {
+        let marker = std::env::temp_dir().join(format!(
+            "sofka-exec-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut config = kube::Config::new("https://127.0.0.1:1".parse().unwrap());
+        config.auth_info.exec = Some(
+            serde_json::from_value(json!({
+                "command": "sh",
+                "args": ["-c", r#"
+if test -f "$1"; then
+    cat "$1" >&2
+    exit 1
+fi
+printf '%s' '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"test-token","expirationTimestamp":"2000-01-01T00:00:00Z"}}'
+"#, "sofka-exec-refresh", marker.to_str().unwrap()]
+            }))
+            .unwrap(),
+        );
+        let client = crate::k8s::build_client(config, false).unwrap();
+        std::fs::write(
+            &marker,
+            format!("{provider_error}: private-provider-output"),
+        )
+        .unwrap();
+        let ar = kube::discovery::ApiResource::from_gvk(&kube::core::GroupVersionKind::gvk(
+            "metrics.k8s.io",
+            "v1beta1",
+            "PodMetrics",
+        ));
+        let api: kube::Api<kube::core::DynamicObject> = kube::Api::all_with(client, &ar);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            api.list(&kube::api::ListParams::default()),
+        )
+        .await;
+        std::fs::remove_file(&marker).unwrap();
+        let error = result.unwrap().unwrap_err().to_string();
+        assert!(error.contains(instruction), "{error}");
+        assert!(!error.contains("private-provider-output"), "{error}");
+
+        let (mut app, _rx) = test_app();
+        app.handle_msg(Msg::MetricsError {
+            generation: app.generation,
+            error,
+        });
+        for ch in ":info".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        let text = info_text(&app);
+        assert!(text.contains(instruction), "{text}");
+        assert!(!text.contains("private-provider-output"), "{text}");
+    }
+}
+
 #[tokio::test]
 async fn reselecting_never_connected_context_retries() {
     let (mut app, _rx) = test_app();
