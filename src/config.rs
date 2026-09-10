@@ -101,6 +101,9 @@ pub struct Config {
     /// behavior (text selection) everywhere. Document views release capture
     /// on their own regardless — see [`crate::app::App::wants_mouse_capture`].
     pub mouse: Option<bool>,
+    /// Navigation steps per received mouse wheel event in views with mouse
+    /// capture. Defaults to 3; `0` is treated as 1 with a warning.
+    pub mouse_scroll_lines: Option<u16>,
     /// Set the terminal title to the context and namespace. Defaults to true.
     pub terminal_title: Option<bool>,
     /// Save and restore sort choices per kind. Defaults to true.
@@ -1127,6 +1130,30 @@ pub struct Guardrail {
     pub max_bulk: Option<usize>,
     /// Human note shown when the guardrail blocks or confirms.
     pub reason: Option<String>,
+}
+
+/// Upper bound for `mouse_scroll_lines`; each step is a full input dispatch,
+/// so a huge value would stall the UI on a single wheel event.
+pub const MAX_MOUSE_SCROLL_LINES: u16 = 100;
+
+/// Resolves `mouse_scroll_lines`: unset means 3, `0` is treated as 1 and values
+/// above [`MAX_MOUSE_SCROLL_LINES`] are capped, each with a warning pushed onto
+/// `warnings`.
+pub fn mouse_scroll_lines(value: Option<u16>, warnings: &mut Vec<String>) -> u16 {
+    match value {
+        None => 3,
+        Some(0) => {
+            warnings.push("mouse_scroll_lines: 0 is not allowed — using 1".into());
+            1
+        }
+        Some(n) if n > MAX_MOUSE_SCROLL_LINES => {
+            warnings.push(format!(
+                "mouse_scroll_lines: {n} is above the maximum of {MAX_MOUSE_SCROLL_LINES} — using {MAX_MOUSE_SCROLL_LINES}"
+            ));
+            MAX_MOUSE_SCROLL_LINES
+        }
+        Some(n) => n,
+    }
 }
 
 /// Validation warnings for guardrails: an unknown `confirmation` mode.

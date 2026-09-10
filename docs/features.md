@@ -221,12 +221,14 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   the previous keymap. Legacy palette settings are migrated with a config
   backup; managed files produce a warning and use the converted keys in memory.
   See [Configure key bindings](keybindings.md).
-- **Mouse support** - the wheel scrolls every view (one notch is three steps of
-  that view's own up/down), clicking a row selects it, clicking a column header
+- **Mouse support** - the wheel scrolls every view (one wheel event is three
+  steps of that view's own up/down; `mouse_scroll_lines` tunes this in views
+  with mouse capture), clicking a row selects it, clicking a column header
   sorts by it (click again to flip). Document views (YAML/describe, diff,
   events, logs, help) release the mouse automatically so click-drag selects
   text natively; the wheel still scrolls them in terminals that translate it to
-  arrow keys in the alternate screen (kitty, Ghostty, iTerm2, ...). Set
+  arrow keys in the alternate screen (kitty, Ghostty, iTerm2, ...), at the
+  terminal's own speed, not `mouse_scroll_lines`. Set
   `mouse = false` to keep the terminal's native mouse behavior everywhere.
   sofka also releases the mouse while a suspended command (`kubectl exec`,
   `$EDITOR`) runs.

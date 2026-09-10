@@ -1953,6 +1953,8 @@ pub struct App {
     /// view start. Persisted to `sort_memory_path` on every change.
     pub sort_memory: crate::sortmem::SortMemory,
     pub remember_sort: bool,
+    /// Steps per received mouse wheel event (`mouse_scroll_lines`, default 3).
+    pub mouse_scroll_lines: u16,
     /// Where remembered sorts persist (`<state-dir>/sort.toml`, set at
     /// startup); `None` (tests) keeps them in memory only.
     pub sort_memory_path: Option<std::path::PathBuf>,
@@ -2335,6 +2337,7 @@ impl App {
             fleet_marks_path: None,
             sort_memory: crate::sortmem::SortMemory::default(),
             remember_sort: true,
+            mouse_scroll_lines: 3,
             sort_memory_path: None,
             namespace_memory: crate::nsmem::NamespaceMemory::default(),
             namespace_memory_path: None,

@@ -15411,6 +15411,110 @@ async fn reload_applies_config_changes_live() {
 }
 
 #[tokio::test]
+async fn mouse_scroll_lines_sets_rows_per_wheel_notch() {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+
+    let dir = std::env::temp_dir().join(format!("sofka-app-wheel-{}", std::process::id()));
+    write_config(&dir, "mouse_scroll_lines = 1\n");
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    app.reload_config();
+    assert!(app.config_warnings.is_empty());
+
+    app.switch_kind("pods");
+    for name in ["a", "b", "c", "d", "e"] {
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": name, "namespace": "default"},
+                "status": {"phase": "Running"}
+            }),
+        );
+    }
+    app.table_state.select(Some(0));
+    let notch = MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    app.handle_mouse(notch).unwrap();
+    assert_eq!(app.table_state.selected(), Some(1), "one row per notch");
+
+    // `0` is treated as one row and reported as a config warning; an unset
+    // value restores the default of three and clears the warning.
+    write_config(&dir, "mouse_scroll_lines = 0\n");
+    app.reload_config();
+    assert_eq!(
+        app.config_warnings,
+        vec!["mouse_scroll_lines: 0 is not allowed — using 1".to_string()]
+    );
+    app.handle_mouse(notch).unwrap();
+    assert_eq!(app.table_state.selected(), Some(2));
+
+    // Values above the maximum are capped so one wheel event cannot stall
+    // the UI; the list boundary still stops the selection.
+    write_config(&dir, "mouse_scroll_lines = 65535\n");
+    app.reload_config();
+    assert_eq!(
+        app.config_warnings,
+        vec!["mouse_scroll_lines: 65535 is above the maximum of 100 — using 100".to_string()]
+    );
+    assert_eq!(app.mouse_scroll_lines, 100);
+    app.handle_mouse(notch).unwrap();
+    assert_eq!(app.table_state.selected(), Some(4), "stops at the last row");
+
+    write_config(&dir, "");
+    app.reload_config();
+    assert!(app.config_warnings.is_empty());
+    app.table_state.select(Some(0));
+    app.handle_mouse(notch).unwrap();
+    assert_eq!(
+        app.table_state.selected(),
+        Some(3),
+        "default three per notch"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn wheel_that_dismisses_a_confirm_does_not_scroll_the_table_beneath() {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for name in ["a", "b", "c", "d", "e"] {
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": name, "namespace": "default"},
+                "status": {"phase": "Running"}
+            }),
+        );
+    }
+    app.table_state.select(Some(0));
+    app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+
+    // With the default of three steps, the first step cancels the confirm and
+    // the remaining two must not move the selection in the table.
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    })
+    .unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.table_state.selected(), Some(0));
+}
+
+#[tokio::test]
 async fn failed_reload_keeps_last_known_good_config() {
     let dir = std::env::temp_dir().join(format!("sofka-app-reload-bad-{}", std::process::id()));
     write_config(&dir, "readonly = true\n[aliases]\ndep = \"deployments\"\n");
@@ -24412,9 +24516,9 @@ async fn wheel_and_keyboard_arrows_cancel_default_confirmations() {
                 app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
                 assert_eq!(app.mode, Mode::Confirm);
             }
-            for _ in 0..3 {
-                keyboard.handle_key(press(code)).unwrap();
-            }
+            // One wheel event cancels the confirm and stops there, so it
+            // matches a single arrow press, not three.
+            keyboard.handle_key(press(code)).unwrap();
             wheel
                 .handle_mouse(MouseEvent {
                     kind,

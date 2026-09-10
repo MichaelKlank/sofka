@@ -840,6 +840,10 @@ impl App {
         // Tracked debuggers belong to the previous cluster/context.
         self.launched_node_debuggers.clear();
         let mut plugin_warnings = crate::config::plugin_warnings(&self.plugins);
+        self.mouse_scroll_lines = crate::config::mouse_scroll_lines(
+            resolved.config.mouse_scroll_lines,
+            &mut plugin_warnings,
+        );
         plugin_warnings.extend(crate::config::bookmark_warnings(&self.bookmarks));
         plugin_warnings.extend(crate::config::workspace_warnings(&self.workspaces));
         plugin_warnings.extend(crate::config::guardrail_warnings(&self.guardrails));
