@@ -1241,6 +1241,37 @@ impl App {
         }
     }
 
+    pub(super) fn local_forward_port_available(&mut self, ports: &str) -> bool {
+        let local = ports.split_once(':').map_or(ports, |(local, _)| local);
+        let Ok(port) = local.parse::<u16>() else {
+            return true;
+        };
+        if port == 0 {
+            return true;
+        }
+        let mut available = false;
+        let mut in_use = false;
+        let mut last_error = None;
+        for address in [
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ] {
+            match std::net::TcpListener::bind((address, port)) {
+                Ok(_listener) => available = true,
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => in_use = true,
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if !available {
+            if in_use {
+                self.flash_warn(&format!("port {port} is already in use"));
+            } else if let Some(error) = last_error {
+                self.flash_warn(&format!("cannot bind local port {port}: {error}"));
+            }
+        }
+        available
+    }
+
     pub(super) fn start_port_forward(&mut self, ns: String, target: String, ports: String) {
         self.start_port_forward_named(ns, target, ports, None);
     }
