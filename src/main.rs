@@ -288,6 +288,10 @@ async fn run_main(args: Args) -> Result<()> {
     let panic_tx = tx.clone();
     let mut app = App::new(cluster, tx);
     app.config = loader;
+    if let Err(error) = app.journal.configure(&cfg.journal) {
+        eprintln!("warning: {error}");
+        config_warnings.push(error);
+    }
     match sofka::state_writer::StateWriter::new(app.tx.clone()) {
         Ok(writer) => app.state_writer = Some(writer),
         Err(e) => {
@@ -448,6 +452,9 @@ async fn run_main(args: Args) -> Result<()> {
     // `restore()` leaves the alternate screen but never re-shows the cursor
     // that `draw` hid, so without this the user's shell prompt has no cursor.
     let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+    if let Some(error) = app.journal.shutdown() {
+        eprintln!("warning: {error}");
+    }
     sofka::log_info!("shutdown", quit = app.should_quit);
     applog::shutdown();
     result
@@ -1053,6 +1060,7 @@ async fn run(
             _ = tick.tick() => {
                 app.reap_port_forwards(); // age columns + drop dead forwards
                 app.expire_flash();
+                app.check_journal_error();
                 dirty = true;
             }
             // A held Esc was a real keypress after all, not the head of a

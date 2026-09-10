@@ -25133,3 +25133,83 @@ async fn log_marker_shortcut_handles_stopped_provider_and_replaced_buffers() {
     assert!(app.logs.markers.is_empty());
     assert_eq!(app.logs.refresh_index(0).total_rows(), 0);
 }
+
+#[tokio::test]
+async fn journal_persistence_follows_edit_key_and_appends_across_sessions() {
+    let dir = std::env::temp_dir().join(format!("sofka-journal-app-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("actions.jsonl");
+    for enabled in [false, true, true] {
+        let (mut app, _rx) = app_with_pod();
+        app.journal
+            .configure(&crate::config::JournalConfig {
+                enabled,
+                file: Some(path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        app.handle_key(press(KeyCode::Char('e'))).unwrap();
+        assert_eq!(app.journal.len(), 1);
+        assert!(app.journal.shutdown().is_none());
+        if !enabled {
+            assert!(!dir.exists());
+        }
+    }
+    let text = std::fs::read_to_string(&path).unwrap();
+    let entries: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(entries.len(), 2);
+    for entry in entries {
+        assert_eq!(entry["action"], "edit");
+        assert!(entry["context"].is_string());
+        assert!(!entry["target"].as_str().unwrap().is_empty());
+        let at = entry["at"].as_str().unwrap();
+        assert!(at.ends_with('Z'));
+        assert!(at.parse::<k8s_openapi::jiff::Timestamp>().is_ok());
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn journal_write_failure_is_visible_after_edit_key() {
+    let dir = std::env::temp_dir().join(format!("sofka-journal-fail-app-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut app, _rx) = app_with_pod();
+    app.journal
+        .configure(&crate::config::JournalConfig {
+            enabled: true,
+            file: Some(dir.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+    app.handle_key(press(KeyCode::Char('e'))).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            app.check_journal_error();
+            if app.flash.contains("journal entry not saved") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(app.flash_err);
+    assert!(
+        app.config_warnings
+            .iter()
+            .any(|w| w.contains("journal entry not saved"))
+    );
+    assert!(!app.should_quit);
+    assert_eq!(app.journal.len(), 1);
+    assert!(app.journal.shutdown().is_none());
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(dir.with_file_name(format!(
+        "sofka-journal-fail-app-{}.lock",
+        std::process::id()
+    )))
+    .unwrap();
+}

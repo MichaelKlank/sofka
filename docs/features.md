@@ -525,7 +525,8 @@ pod is rejected; browse through a pod that already mounts the claim instead.
 ## Safety
 
 - **Read-only mode**, **declarative guardrails**, **action-aware authorization**
-  (`:can-i`), and a session-local **action journal** (`:journal`). See
+  (`:can-i`), and a session-local **action journal** (`:journal`) with optional
+  [file persistence](configuration.md#action-journal-files). See
   [Safety](safety.md).
 
 ## Extensibility

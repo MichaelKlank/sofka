@@ -89,8 +89,10 @@ incomplete rule reviews. The API still enforces access when you open the kind.
 
 `:journal` (or `:audit`) is a session-local in-memory log of every mutating
 action you took - the action, the target, the context, the time - newest first.
-It records identifiers only, never secret input or decoded values, and never
-writes to disk.
+Entries record actions started, not confirmed results. They contain identifiers
+only, never secret input or decoded values. Optional [journal file
+settings](configuration.md#action-journal-files) save entries to disk. Application
+logging at `info` or above also records these actions.
 
 ## Plugin actions
 
