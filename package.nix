@@ -1,4 +1,4 @@
-{ lib, rustPlatform }:
+{ lib, rustPlatform, cmake }:
 
 let
   cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
@@ -10,6 +10,11 @@ rustPlatform.buildRustPackage {
   src = lib.cleanSource ./.;
 
   cargoLock.lockFile = ./Cargo.lock;
+
+  # aws-lc-sys (the TLS client's crypto backend) builds AWS-LC's C sources
+  # with cmake. Bindings are pregenerated for all four platforms this package
+  # targets, so no bindgen/libclang is needed here.
+  nativeBuildInputs = [ cmake ];
 
   # The test suite builds a rustls-backed kube::Client (even for the "fake"
   # test cluster), which needs native root CA certs — unavailable in Nix's

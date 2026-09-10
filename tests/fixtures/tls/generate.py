@@ -66,3 +66,13 @@ extendedKeyUsage = clientAuth
             if extensions:
                 args.extend(["-extensions", extensions])
             openssl(*args)
+
+# A P-521 client key and cert, self-signed rather than chained to the test CA:
+# the test using this fixture only exercises private-key parsing at TLS config
+# build time, not chain-of-trust verification, so self-signed is enough and
+# keeps this independent of the CA above.
+p521_key = str(DEST / "client-p521.key")
+p521_cert = str(DEST / "client-p521.pem")
+openssl("ecparam", "-name", "secp521r1", "-genkey", "-noout", "-out", p521_key)
+openssl("req", "-new", "-x509", "-key", p521_key, "-subj", "/CN=client-p521", "-sha384",
+        "-days", "36500", "-out", p521_cert)

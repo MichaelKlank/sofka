@@ -62,6 +62,7 @@
             rustfmt
             rust-analyzer
             cargo-watch
+            cmake
             kubectl
             kind
             fluxcd

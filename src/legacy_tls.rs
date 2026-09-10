@@ -272,6 +272,8 @@ mod tests {
     const SERVER: &[u8] = include_bytes!("../tests/fixtures/tls/server.pem");
     const EXPIRED: &[u8] = include_bytes!("../tests/fixtures/tls/server-expired.pem");
     const SERVER_KEY: &[u8] = include_bytes!("../tests/fixtures/tls/server.key");
+    const CLIENT_P521: &[u8] = include_bytes!("../tests/fixtures/tls/client-p521.pem");
+    const CLIENT_P521_KEY: &[u8] = include_bytes!("../tests/fixtures/tls/client-p521.key");
 
     fn config() -> Config {
         let mut config = Config::new("https://127.0.0.1:6443/prefix".parse().unwrap());
@@ -318,6 +320,14 @@ mod tests {
             config.auth_info.client_key_data = Some(STANDARD.encode(SERVER_KEY).into());
             assert!(client_builder(config, allow).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn p521_client_key_builds_like_any_other_curve() {
+        let mut config = config();
+        config.auth_info.client_certificate_data = Some(STANDARD.encode(CLIENT_P521));
+        config.auth_info.client_key_data = Some(STANDARD.encode(CLIENT_P521_KEY).into());
+        assert!(client_builder(config, false).is_ok());
     }
 
     #[tokio::test]
@@ -401,7 +411,7 @@ mod tests {
                 message,
                 &SubjectPublicKeyInfoDer::from(cert.public_key().raw),
                 signature,
-                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+                &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
             )
         }
 
@@ -614,7 +624,7 @@ esac
     #[tokio::test]
     async fn configured_ca_requires_the_server_private_key_in_tls12_and_tls13() {
         for protocol in [&rustls::version::TLS12, &rustls::version::TLS13] {
-            let provider = rustls::crypto::ring::default_provider();
+            let provider = rustls::crypto::aws_lc_rs::default_provider();
             let wrong_key = provider
                 .key_provider
                 .load_private_key(PrivateKeyDer::from_pem_slice(KEY).unwrap())

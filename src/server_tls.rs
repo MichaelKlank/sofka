@@ -187,8 +187,11 @@ mod tests {
             .iter()
             .map(|pem| CertificateDer::from_pem_slice(pem).unwrap().to_vec())
             .collect();
-        ConfiguredCaVerifier::new(&roots, Arc::new(rustls::crypto::ring::default_provider()))
-            .unwrap()
+        ConfiguredCaVerifier::new(
+            &roots,
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+        )
+        .unwrap()
     }
 
     fn verify(
