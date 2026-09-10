@@ -8780,7 +8780,7 @@ async fn marked_pod_logs_stream_all_containers_and_identify_errors() {
                     .to_string(),
                 )
             } else {
-                (200, "ready\n".to_owned())
+                (200, "2026-09-10T10:00:00Z ready\n".to_owned())
             };
             async move {
                 Ok::<_, std::convert::Infallible>(
@@ -8820,11 +8820,238 @@ async fn marked_pod_logs_stream_all_containers_and_identify_errors() {
         assert!(!uri.path().contains("gamma"));
         let query = uri.query().unwrap();
         assert!(query.contains("follow=true"));
+        assert!(query.contains("timestamps=true"));
         assert!(query.contains(&format!("tailLines={}", app.logs_cfg.tail)));
     }
     app.handle_key(press(KeyCode::Esc)).unwrap();
     assert!(app.log_tasks.is_empty());
     assert_eq!(app.marked.len(), 2);
+}
+
+#[tokio::test]
+async fn log_timestamp_requests_cover_pods_selectors_and_previous_containers() {
+    for source in ["pod", "selector", "previous"] {
+        let (mut app, mut rx) = test_app();
+        let pod = json!({"apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "default"},
+            "spec": {"containers": [{"name": "app"}, {"name": "sidecar"}]}});
+        if source == "selector" {
+            app.switch_kind("deployments");
+            apply(
+                &mut app,
+                json!({"apiVersion": "apps/v1", "kind": "Deployment",
+                "metadata": {"name": "web", "namespace": "default"},
+                "spec": {"selector": {"matchLabels": {"app": "web"}}}}),
+            );
+        } else {
+            app.switch_kind("pods");
+            apply(&mut app, pod.clone());
+        }
+        app.table_state.select(Some(0));
+        let requests = Arc::new(AtomicU64::new(0));
+        let seen = requests.clone();
+        app.cluster.client = kube::Client::new(
+            tower::service_fn(move |request: http::Request<kube::client::Body>| {
+                let body = if request.uri().path().ends_with("/log") {
+                    let query = request.uri().query().unwrap();
+                    assert!(query.contains("timestamps=true"));
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    if query.contains("container=sidecar") {
+                        "2026-09-10T10:00:00Z first\n".to_owned()
+                    } else {
+                        "2026-09-10T10:00:01Z second\n".to_owned()
+                    }
+                } else {
+                    json!({"apiVersion": "v1", "kind": "PodList",
+                        "metadata": {}, "items": [pod]})
+                    .to_string()
+                };
+                async move {
+                    Ok::<_, std::convert::Infallible>(http::Response::new(
+                        http_body_util::Full::new(hyper::body::Bytes::from(body)),
+                    ))
+                }
+            }),
+            "default",
+        );
+        let key = if source == "previous" { 'p' } else { 'l' };
+        app.handle_key(press(KeyCode::Char(key))).unwrap();
+        let count = if source == "previous" { 1 } else { 2 };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while app.logs.view.lines.len() < count {
+                app.handle_msg(rx.recv().await.unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        let hidden = app.filtered_log_text();
+        assert!(!hidden.contains("2026-09-10"));
+        if source != "previous" {
+            assert!(hidden.find("first").unwrap() < hidden.find("second").unwrap());
+        }
+        let generation = app.log_gen;
+        for _ in 0..2 {
+            app.handle_key(press(KeyCode::Char('t'))).unwrap();
+            assert!(app.filtered_log_text().contains("2026-09-10"));
+            app.handle_key(press(KeyCode::Char('t'))).unwrap();
+            assert_eq!(app.filtered_log_text(), hidden);
+        }
+        assert_eq!(app.log_gen, generation);
+        assert_eq!(requests.load(Ordering::SeqCst), count as u64);
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn log_timestamp_toggle_keeps_chronological_order_without_restarting() {
+    let (mut app, _rx) = marked_logs_app();
+    app.handle_key(press(KeyCode::Char('l'))).unwrap();
+    let generation = app.log_gen;
+    shortcut_log_lines(
+        &mut app,
+        vec![
+            "[alpha/web:app] 2026-09-10T10:00:00.100000001Z third".into(),
+            "[alpha/web:app] 2026-09-10T10:00:00.2Z fourth".into(),
+        ],
+    );
+    app.logs.refresh_index(20);
+    shortcut_log_lines(
+        &mut app,
+        vec![
+            "[beta/web:app] 2026-09-10T12:00:00+02:00 first".into(),
+            "[beta/web:app] 2026-09-10T10:00:00.1Z second".into(),
+        ],
+    );
+    let hidden = "[beta/web:app] first\n[beta/web:app] second\n[alpha/web:app] third\n[alpha/web:app] fourth";
+    assert_eq!(app.filtered_log_text(), hidden);
+    assert_index_matches_naive(&mut app.logs, 20, "sorted batches");
+    for stopped in [false, true] {
+        if stopped {
+            app.handle_key(press(KeyCode::Char('x'))).unwrap();
+        }
+        let generation = app.log_gen;
+        let tasks = app.log_tasks.len();
+        app.handle_key(press(KeyCode::Char('t'))).unwrap();
+        assert!(app.logs.timestamps);
+        assert_eq!(app.log_gen, generation);
+        assert_eq!(app.log_tasks.len(), tasks);
+        assert_eq!(
+            app.filtered_log_text(),
+            "[beta/web:app] 2026-09-10T12:00:00+02:00 first\n[beta/web:app] 2026-09-10T10:00:00.1Z second\n[alpha/web:app] 2026-09-10T10:00:00.100000001Z third\n[alpha/web:app] 2026-09-10T10:00:00.2Z fourth"
+        );
+        assert_index_matches_naive(&mut app.logs, 20, "visible timestamps");
+        app.handle_key(press(KeyCode::Char('t'))).unwrap();
+        assert_eq!(app.filtered_log_text(), hidden);
+        assert_index_matches_naive(&mut app.logs, 20, "hidden timestamps");
+    }
+    assert_eq!(app.log_gen, generation + 1);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+}
+
+#[tokio::test]
+async fn log_timestamp_order_keeps_ties_errors_and_newest_lines_within_the_cap() {
+    let (mut app, _rx) = test_app();
+    app.mode = Mode::Logs;
+    app.logs_cfg.buffer = 3;
+    shortcut_log_lines(
+        &mut app,
+        vec![
+            "[a] 2026-09-10T10:00:03Z latest".into(),
+            "[b] [error] unavailable".into(),
+            "[b] 2026-09-10T10:00:01Z oldest".into(),
+            "[b] 2026-09-10T10:00:02Z middle".into(),
+        ],
+    );
+    assert_eq!(
+        app.filtered_log_text(),
+        "[b] middle\n[a] latest\n[b] [error] unavailable"
+    );
+    app.handle_key(press(KeyCode::Char('t'))).unwrap();
+    shortcut_log_lines(
+        &mut app,
+        vec!["[c] 2026-09-10T10:00:03.000Z same time".into()],
+    );
+    assert_eq!(
+        app.filtered_log_text(),
+        "[a] 2026-09-10T10:00:03Z latest\n[b] [error] unavailable\n[c] 2026-09-10T10:00:03.000Z same time"
+    );
+    app.handle_key(press(KeyCode::Char('t'))).unwrap();
+    assert_eq!(
+        app.filtered_log_text(),
+        "[a] latest\n[b] [error] unavailable\n[c] same time"
+    );
+    app.handle_key(press(KeyCode::Char('z'))).unwrap();
+    shortcut_log_lines(
+        &mut app,
+        vec![
+            "2026-09-10T10:00:00Z 2026-09-10T09:59:59Z body timestamp".into(),
+            "[a] invalid-time plain text".into(),
+            "2026-09-10T10:00:01Z ".into(),
+        ],
+    );
+    app.handle_key(press(KeyCode::Char('t'))).unwrap();
+    assert_eq!(
+        app.filtered_log_text(),
+        "2026-09-10T10:00:00Z 2026-09-10T09:59:59Z body timestamp\n[a] invalid-time plain text\n2026-09-10T10:00:01Z "
+    );
+    app.handle_key(press(KeyCode::Char('t'))).unwrap();
+    assert_eq!(
+        app.filtered_log_text(),
+        "2026-09-10T09:59:59Z body timestamp\n[a] invalid-time plain text\n"
+    );
+}
+
+#[tokio::test]
+async fn log_timestamp_order_keeps_paused_scroll_filters_and_markers() {
+    let (mut app, _rx) = test_app();
+    app.mode = Mode::Logs;
+    shortcut_log_lines(
+        &mut app,
+        vec![
+            "[a] 2026-09-10T10:00:02Z keep second".into(),
+            "[a] 2026-09-10T10:00:03Z keep third".into(),
+        ],
+    );
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "keep".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    app.logs.last_wrap_width = 10;
+    app.logs.refresh_index(10);
+    app.logs.view.scroll = app.logs.index().start_row(1);
+    shortcut_log_lines(
+        &mut app,
+        vec![
+            "[b] 2026-09-10T10:00:00Z excluded".into(),
+            "[b] 2026-09-10T10:00:01Z keep first".into(),
+        ],
+    );
+    let index = app.logs.refresh_index(10);
+    assert_eq!(index.shown, [Some(1), Some(2), Some(3), None]);
+    assert_eq!(app.logs.view.scroll, app.logs.index().start_row(2));
+    for _ in 0..2 {
+        app.handle_key(press(KeyCode::Char('t'))).unwrap();
+        assert!(!app.logs.follow);
+        assert_eq!(app.logs.filter, "keep");
+        assert_eq!(
+            app.logs.refresh_index(10).shown,
+            [Some(1), Some(2), Some(3), None]
+        );
+    }
+    assert_eq!(
+        app.filtered_log_text(),
+        "[b] keep first\n[a] keep second\n[a] keep third"
+    );
+    app.handle_key(press(KeyCode::Char('z'))).unwrap();
+    shortcut_log_lines(&mut app, vec!["2026-09-10T10:00:03Z excluded".into()]);
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    assert_eq!(app.logs.refresh_index(10).shown, [None]);
+    shortcut_log_lines(&mut app, vec!["2026-09-10T10:00:02Z keep earlier".into()]);
+    assert_eq!(app.logs.refresh_index(10).shown, [Some(0), None]);
+    assert_eq!(app.logs.view.scroll, app.logs.index().start_row(1));
 }
 
 #[tokio::test]
@@ -8852,7 +9079,7 @@ async fn marked_pod_logs_keep_the_snapshot_and_existing_controls() {
     for key in ['t', '2'] {
         let generation = app.log_gen;
         app.handle_key(press(KeyCode::Char(key))).unwrap();
-        assert!(app.log_gen > generation);
+        assert_eq!(app.log_gen > generation, key == '2');
         assert_eq!(format!("{:?}", app.logs.source), snapshot);
         assert_eq!(app.log_tasks.len(), 5);
         assert_eq!(app.logs.filter, "ready");
@@ -24411,11 +24638,11 @@ async fn log_marker_shortcut_handles_stopped_provider_and_replaced_buffers() {
     assert_eq!(app.mode, Mode::Logs);
     app.handle_key(press(KeyCode::Char('m'))).unwrap();
     app.handle_key(press(KeyCode::Char('t'))).unwrap();
-    assert!(app.logs.markers.is_empty());
+    assert_eq!(app.logs.markers.len(), 1);
     app.handle_key(press(KeyCode::Char('x'))).unwrap();
     assert!(app.logs.stopped);
     app.handle_key(press(KeyCode::Char('m'))).unwrap();
-    assert_eq!(app.logs.markers.len(), 1);
+    assert_eq!(app.logs.markers.len(), 2);
     app.logs.source = Some(LogSource::Provider {
         request: crate::providers::LogRequest::Pod {
             ns: "default".into(),
@@ -24425,7 +24652,7 @@ async fn log_marker_shortcut_handles_stopped_provider_and_replaced_buffers() {
         },
     });
     app.handle_key(press(KeyCode::Char('m'))).unwrap();
-    assert_eq!(app.logs.markers.len(), 2);
+    assert_eq!(app.logs.markers.len(), 3);
     app.handle_key(press(KeyCode::Esc)).unwrap();
     app.handle_key(press(KeyCode::Char('l'))).unwrap();
     assert_eq!(app.mode, Mode::Logs);

@@ -410,8 +410,7 @@ struct PodLogTarget {
     containers: Vec<String>,
 }
 
-/// What the logs view is currently streaming, so it can be re-streamed when
-/// toggling timestamps (k9s `t`).
+/// The current log source, retained for stream restarts.
 #[derive(Clone, Debug)]
 enum LogSource {
     /// The marked pods captured when the log view opens.
@@ -1117,6 +1116,8 @@ impl LogIndex {
 /// the top-level `App` struct.
 pub struct LogsView {
     pub view: Scrollable,
+    /// Timestamp text and sort keys for the corresponding display lines.
+    line_meta: VecDeque<logs::LogLineMeta>,
     /// Stable position of the first retained source line.
     line_offset: usize,
     /// Each marker precedes the source line at this stable position.
@@ -1147,8 +1148,7 @@ pub struct LogsView {
     /// handler convert trimmed *lines* into the display *rows* they occupied
     /// when shifting a paused scroll anchor.
     pub last_wrap_width: usize,
-    /// What is being streamed, so it can be re-streamed (e.g. toggling
-    /// timestamps) without re-deriving the source.
+    /// The current source, retained for stream restarts.
     source: Option<LogSource>,
     /// Filter/wrap index over [`Self::view`], maintained incrementally.
     index: LogIndex,
@@ -1158,6 +1158,7 @@ impl Default for LogsView {
     fn default() -> Self {
         Self {
             view: Scrollable::empty(),
+            line_meta: VecDeque::new(),
             line_offset: 0,
             markers: VecDeque::new(),
             follow: true,
@@ -1213,6 +1214,7 @@ impl LogsView {
 
     fn clear_lines(&mut self) {
         self.view.clear_lines();
+        self.line_meta.clear();
         self.markers.clear();
         self.line_offset = 0;
         self.reset_index();
@@ -1239,6 +1241,7 @@ impl LogsView {
             self.view.scroll = self.view.scroll.saturating_sub(rows + removed_markers);
         }
         self.markers.drain(..removed_markers);
+        self.line_meta.drain(..count.min(self.line_meta.len()));
         self.view.drain_front(count);
         self.reset_index();
     }
