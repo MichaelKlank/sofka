@@ -1099,14 +1099,25 @@ pub struct Guardrail {
     pub reason: Option<String>,
 }
 
-/// Resolves `mouse_scroll_lines`: unset means 3, `0` is treated as 1 with a
-/// warning pushed onto `warnings`.
+/// Upper bound for `mouse_scroll_lines`; each step is a full input dispatch,
+/// so a huge value would stall the UI on a single wheel event.
+pub const MAX_MOUSE_SCROLL_LINES: u16 = 100;
+
+/// Resolves `mouse_scroll_lines`: unset means 3, `0` is treated as 1 and values
+/// above [`MAX_MOUSE_SCROLL_LINES`] are capped, each with a warning pushed onto
+/// `warnings`.
 pub fn mouse_scroll_lines(value: Option<u16>, warnings: &mut Vec<String>) -> u16 {
     match value {
         None => 3,
         Some(0) => {
             warnings.push("mouse_scroll_lines: 0 is not allowed — using 1".into());
             1
+        }
+        Some(n) if n > MAX_MOUSE_SCROLL_LINES => {
+            warnings.push(format!(
+                "mouse_scroll_lines: {n} is above the maximum of {MAX_MOUSE_SCROLL_LINES} — using {MAX_MOUSE_SCROLL_LINES}"
+            ));
+            MAX_MOUSE_SCROLL_LINES
         }
         Some(n) => n,
     }

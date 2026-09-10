@@ -79,13 +79,19 @@ impl App {
         }
     }
 
-    /// One wheel notch = `mouse_scroll_lines` steps (default three, like most
-    /// list UIs).
+    /// One wheel event = `mouse_scroll_lines` steps (default three, like most
+    /// list UIs). The action is resolved once and the loop stops as soon as
+    /// the mode changes, so a wheel event that dismisses an overlay does not
+    /// keep scrolling the view underneath it.
     fn wheel(&mut self, code: KeyCode) -> Result<()> {
+        let mode = self.mode;
+        let action = self
+            .keymap
+            .wheel_action(self.key_scope(), code == KeyCode::Down);
         for _ in 0..self.mouse_scroll_lines {
-            let action = self
-                .keymap
-                .wheel_action(self.key_scope(), code == KeyCode::Down);
+            if self.mode != mode {
+                break;
+            }
             self.handle_input(KeyInput::new(
                 action,
                 KeyEvent::new(KeyCode::Null, KeyModifiers::NONE),

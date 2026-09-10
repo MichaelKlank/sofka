@@ -60,7 +60,7 @@ header is hidden too. Command and filter input still appears when needed.
 event triggers in views with mouse capture enabled (tables and pickers). The
 default is `3`. Set it to `1` if your terminal or trackpad already sends several
 wheel events per gesture and scrolling overshoots. `0` is treated as `1` and
-reported as a config warning. Logs and document views release mouse capture and
+values above `100` are capped at `100`, each reported as a config warning. Logs and document views release mouse capture and
 receive terminal-generated arrow keys instead, so this setting does not control
 their scroll speed. The option supports cluster and context overrides and
 `:reload`.
