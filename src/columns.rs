@@ -642,6 +642,17 @@ impl ViewSpec {
         self.metric_at(self.header_index(header)?)
     }
 
+    pub fn formatted_quantity_column(&self, header: &str) -> Option<&crate::views::UserColumn> {
+        match &self.columns.get(self.header_index(header)?)?.source {
+            SpecSource::User(column)
+                if matches!(column.kind, crate::views::ColumnKind::QuantityFormat(_)) =>
+            {
+                Some(column)
+            }
+            _ => None,
+        }
+    }
+
     pub fn canonical_header(&self, idx: usize) -> Option<&str> {
         if self.metric_at(idx).is_some() {
             return None;

@@ -22685,6 +22685,254 @@ async fn terminal_title_removes_control_characters() {
 }
 
 #[tokio::test]
+async fn quantity_formats_render_values_and_keep_unformatted_columns() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/nodes"]
+        replace = true
+        columns = [
+            { name = "NAME", builtin = "NAME" },
+            { name = "CPU/A", path = "/status/allocatable/cpu", type = "quantity", format = "cpu" },
+            { name = "CPU/RAW", path = "/status/allocatable/cpu", type = "quantity" },
+            { name = "MEM/A", path = "/status/allocatable/memory", type = "quantity", format = "memory", wide = true },
+            { name = "MEM/RAW", path = "/status/allocatable/memory", type = "quantity", wide = true },
+        ]
+        "#,
+    );
+    palette(&mut app, "nodes");
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "CPU/A", "CPU/RAW"]);
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    let cases = [
+        (json!("4"), json!("16374956Ki"), "4000m", "15.6Gi"),
+        (json!("250m"), json!("512Mi"), "250m", "512Mi"),
+        (json!("1000000n"), json!("1Gi"), "1m", "1.0Gi"),
+        (json!("1500u"), json!("129M"), "2m", "123Mi"),
+        (json!("1e-3"), json!("1e6"), "1m", "1Mi"),
+        (json!(4), json!(1048576), "4000m", "1Mi"),
+        (json!(0), json!(0), "0m", "0Mi"),
+        (json!("0"), json!("0Ki"), "0m", "0Mi"),
+        (json!("-0"), json!("-0"), "0m", "0Mi"),
+        (json!("0.1m"), json!("0.1"), "0m", "0Mi"),
+        (json!("bad"), json!("bad"), "bad", "bad"),
+        (json!(""), json!(""), "", ""),
+        (json!("-1m"), json!("-1Mi"), "-1m", "-1Mi"),
+        (json!("NaN"), json!("NaN"), "NaN", "NaN"),
+        (json!("inf"), json!("inf"), "inf", "inf"),
+        (json!("1e30"), json!("1e30"), "1e30", "1e30"),
+        (
+            json!("9223372036854776"),
+            json!("8Ei"),
+            "9223372036854776",
+            "8Ei",
+        ),
+        (json!(true), json!(false), "true", "false"),
+        (
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            "<none>",
+            "<none>",
+        ),
+    ];
+    for (index, (cpu, memory, _, _)) in cases.iter().enumerate() {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": format!("node-{index:02}")},
+                "status": {"allocatable": {"cpu": cpu, "memory": memory}}}),
+        );
+    }
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": "missing"}}),
+    );
+    let (headers, rows) = app.snapshot_table();
+    assert_eq!(headers, ["NAME", "CPU/A", "CPU/RAW", "MEM/A", "MEM/RAW"]);
+    assert_eq!(rows.len(), cases.len() + 1);
+    assert_eq!(rows[0], ["missing", "<none>", "<none>", "<none>", "<none>"]);
+    for (row, (cpu, memory, expected_cpu, expected_memory)) in rows[1..].iter().zip(&cases) {
+        assert_eq!(row[1], *expected_cpu, "{cpu}");
+        assert_eq!(row[3], *expected_memory, "{memory}");
+        for (index, value) in [(2, cpu), (4, memory)] {
+            let raw = if value.is_null() {
+                "<none>".into()
+            } else if let Some(text) = value.as_str() {
+                text.to_string()
+            } else {
+                value.to_string()
+            };
+            assert_eq!(row[index], raw);
+        }
+    }
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    type_filter(&mut app, "cpu/a=0 mem/a=0");
+    assert_eq!(row_names(&app), ["node-06", "node-07", "node-08"]);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    type_filter(&mut app, "cpu/a=bad");
+    assert_eq!(row_names(&app), ["node-10"]);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    type_filter(&mut app, "\"15.6Gi\"");
+    assert_eq!(row_names(&app), ["node-00"]);
+}
+
+#[tokio::test]
+async fn quantity_formats_sort_and_filter_before_display_rounding() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/nodes"]
+        replace = true
+        columns = [
+            { name = "NAME", builtin = "NAME" },
+            { name = "CPU/A", path = "/status/allocatable/cpu", type = "quantity", format = "cpu" },
+            { name = "MEM/A", path = "/status/allocatable/memory", type = "quantity", format = "memory" },
+        ]
+        "#,
+    );
+    palette(&mut app, "nodes");
+    for (name, cpu, memory) in [
+        ("a-high", "1000200000n", 1073741826_u64),
+        ("z-low", "1000100000n", 1073741825),
+    ] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": name},
+            "status": {"allocatable": {"cpu": cpu, "memory": memory}}}),
+        );
+    }
+    let (_, rows) = app.snapshot_table();
+    assert!(rows.iter().all(|row| row[1..] == ["1000m", "1.0Gi"]));
+    for header in ["CPU/A", "MEM/A"] {
+        app.handle_key(press(KeyCode::Char('S'))).unwrap();
+        for key in header.chars() {
+            app.handle_key(press(KeyCode::Char(key))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(row_names(&app), ["z-low", "a-high"]);
+        app.handle_key(press(KeyCode::Char('I'))).unwrap();
+        assert_eq!(row_names(&app), ["a-high", "z-low"]);
+    }
+    for filter in [
+        "cpu/a>1.00015",
+        "CPU/A>1000150000n",
+        "mem/a>1073741825",
+        "mem/a=1073741826",
+        "(cpu/a>1000150u || mem/a<1Gi)",
+    ] {
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        type_filter(&mut app, filter);
+        assert_eq!(row_names(&app), ["a-high"], "{filter}");
+    }
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    type_filter(&mut app, "cpu/a=1000100000n mem/a>1Gi");
+    assert_eq!(row_names(&app), ["z-low"]);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    type_filter(&mut app, "mem/a>1073741825");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": "a-high", "resourceVersion": "2"},
+        "status": {"allocatable": {"cpu": "1000200000n", "memory": "1Gi"}}}),
+    );
+    assert!(row_names(&app).is_empty());
+}
+
+#[tokio::test]
+async fn quantity_formats_with_metric_headers_filter_the_source_without_rounding() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views."v1/nodes"]
+        replace = true
+        columns = [
+            { name = "NAME", builtin = "NAME" },
+            { name = "CPU", path = "/status/allocatable/cpu", type = "quantity", format = "cpu" },
+            { name = "MEM", path = "/status/allocatable/memory", type = "quantity", format = "memory" },
+        ]
+        "#,
+    );
+    palette(&mut app, "nodes");
+    for (name, cpu, memory) in [
+        ("a-high", "1000200000n", "0.2"),
+        ("z-low", "1000100000n", "0.1"),
+    ] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": name},
+            "status": {"allocatable": {"cpu": cpu, "memory": memory}}}),
+        );
+    }
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::from([
+            ("a-high".into(), (100, 100)),
+            ("z-low".into(), (10000, 10000)),
+        ]),
+        containers: HashMap::new(),
+    });
+    for filter in ["cpu>1000150000n", "cpu>1.00015", "mem>0.15", "mem=200m"] {
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        type_filter(&mut app, filter);
+        assert_eq!(row_names(&app), ["a-high"], "{filter}");
+    }
+}
+
+#[tokio::test]
+async fn quantity_formats_reject_incompatible_columns_and_keep_valid_columns() {
+    for format in ["cpu", "memory"] {
+        let (mut app, _rx) = test_app();
+        let text = format!(
+            r#"
+            [views."v1/nodes"]
+            replace = true
+            columns = [
+                {{ name = "NAME", builtin = "NAME" }},
+                {{ name = "VALID", path = "/status/allocatable/cpu", type = "quantity", format = "{format}" }},
+                {{ name = "RAW", path = "/status/allocatable/cpu", type = "quantity" }},
+                {{ name = "TAG", path = "/spec/image", format = "image-tag" }},
+                {{ name = "NO-TYPE", path = "/spec/value", format = "{format}" }},
+                {{ name = "TEXT", path = "/spec/value", type = "text", format = "{format}" }},
+                {{ name = "NUMBER", path = "/spec/value", type = "number", format = "{format}" }},
+                {{ name = "TIME", path = "/spec/value", type = "time", format = "{format}" }},
+                {{ name = "STATUS", path = "/spec/value", type = "status", format = "{format}" }},
+                {{ name = "CONDITION", path = "Ready", type = "condition", format = "{format}" }},
+                {{ name = "METRIC", metric = "cpu", format = "{format}" }},
+                {{ name = "BUILTIN", builtin = "NAME", format = "{format}" }},
+                {{ name = "BAD-PATH", path = "value", type = "quantity", format = "{format}" }},
+                {{ name = "UNKNOWN", path = "/spec/value", type = "quantity", format = "bytes" }},
+            ]
+        "#
+        );
+        let cfg: crate::config::Config = toml::from_str(&text).unwrap();
+        let (views, warnings) = crate::views::compile(&cfg.views);
+        assert_eq!(warnings.len(), 10, "{warnings:?}");
+        assert!(
+            warnings[..8]
+                .iter()
+                .all(|warning| warning.contains("format applies only to quantity path columns"))
+        );
+        assert!(warnings[8].contains("JSON Pointer"));
+        assert!(warnings[9].contains("unknown format 'bytes'"));
+        app.user_views = views;
+        app.config_warnings = warnings;
+        palette(&mut app, "nodes");
+        assert_eq!(
+            app.display_headers().to_vec(),
+            ["NAME", "VALID", "RAW", "TAG"]
+        );
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": "node"},
+            "spec": {"image": "registry:5000/app:1.2.3"}, "status": {"allocatable": {"cpu": "4"}}}),
+        );
+        let (_, rows) = app.snapshot_table();
+        assert_eq!(rows[0][1], if format == "cpu" { "4000m" } else { "0Mi" });
+        assert_eq!(rows[0][2..], ["4", "1.2.3"]);
+    }
+}
+
+#[tokio::test]
 async fn image_tag_columns_render_selected_paths_and_filter_by_tag() {
     let (mut app, _rx) = test_app();
     install_views(

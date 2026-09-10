@@ -108,7 +108,9 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   totals, and utilization percentages. Metric columns support numeric sorting,
   structured filters, and threshold colors. Custom text path columns support
   `format = "image-tag"` to show image tags, with registry ports and digests
-  handled separately. An
+  handled separately. Quantity path columns support `format = "cpu"` and
+  `format = "memory"` for millicore and Mi/Gi display. Sorting and numeric
+  filters use values before display rounding. An
   unknown custom resource picks up its CRD `additionalPrinterColumns`
   automatically. If no usable CRD columns are available, server Table columns
   can supply the view. Explicit views and built-in columns keep their priority.

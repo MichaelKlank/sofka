@@ -782,7 +782,7 @@ pub struct ViewColumnConfig {
     /// Value type: `text` (default), `status`, `number`, `quantity`, `time`.
     #[serde(rename = "type")]
     pub kind: Option<String>,
-    /// Optional text path formatter: `image-tag`.
+    /// Path display format: `image-tag` for text, `cpu` or `memory` for quantities.
     pub format: Option<String>,
     /// Only shown in wide mode.
     pub wide: bool,

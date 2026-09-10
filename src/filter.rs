@@ -76,7 +76,7 @@ impl Term {
     pub fn metrics_sensitive(&self, is_metric: &impl Fn(&str) -> bool) -> bool {
         match self {
             Self::Cmp(Cmp {
-                value: CmpValue::Cpu(_) | CmpValue::Mem(_),
+                value: CmpValue::Cpu { .. } | CmpValue::Mem { .. },
                 ..
             }) => true,
             Self::Cmp(cmp) => is_metric(&cmp.key),
@@ -254,10 +254,10 @@ pub enum CmpValue {
     Num(f64),
     /// A quantity for metric columns, with text retained for other columns.
     Quantity { value: f64, text: String },
-    /// CPU quantity in millicores (`cpu>500m`).
-    Cpu(i64),
-    /// Memory quantity in bytes (`memory>1Gi`).
-    Mem(i64),
+    /// CPU quantity in cores, with rounded millicores for metric comparisons.
+    Cpu { quantity: f64, milli: i64 },
+    /// Memory quantity in bytes, with rounded bytes for metric comparisons.
+    Mem { quantity: f64, bytes: i64 },
     /// Duration in seconds (`age<2h`).
     Duration(i64),
     /// Anything else: case-insensitive text comparison. Stored pre-folded to
@@ -781,10 +781,12 @@ pub fn cmp_folded_lower(cell: &str, want: &str) -> std::cmp::Ordering {
 fn typed_value(key: &str, raw: &str) -> Result<CmpValue, String> {
     match key.to_ascii_lowercase().as_str() {
         "cpu" => parse_cpu(raw)
-            .map(CmpValue::Cpu)
+            .zip(crate::views::parse_quantity(raw))
+            .map(|(milli, quantity)| CmpValue::Cpu { quantity, milli })
             .ok_or_else(|| format!("bad cpu quantity '{raw}'")),
         "mem" | "memory" => parse_mem(raw)
-            .map(CmpValue::Mem)
+            .zip(crate::views::parse_quantity(raw))
+            .map(|(bytes, quantity)| CmpValue::Mem { quantity, bytes })
             .ok_or_else(|| format!("bad memory quantity '{raw}'")),
         "age" => parse_duration(raw)
             .map(CmpValue::Duration)
@@ -1406,7 +1408,10 @@ mod tests {
             vec![Term::Cmp(Cmp {
                 key: "cpu".into(),
                 op: Op::Gt,
-                value: CmpValue::Cpu(500),
+                value: CmpValue::Cpu {
+                    quantity: 0.5,
+                    milli: 500
+                },
             })]
         );
 
@@ -1416,7 +1421,10 @@ mod tests {
             vec![Term::Cmp(Cmp {
                 key: "cpu".into(),
                 op: Op::Ge,
-                value: CmpValue::Cpu(1000),
+                value: CmpValue::Cpu {
+                    quantity: 1.0,
+                    milli: 1000
+                },
             })]
         );
 
@@ -1426,7 +1434,10 @@ mod tests {
             vec![Term::Cmp(Cmp {
                 key: "memory".into(),
                 op: Op::Gt,
-                value: CmpValue::Mem(1024 * 1024 * 1024),
+                value: CmpValue::Mem {
+                    quantity: 1073741824.0,
+                    bytes: 1024 * 1024 * 1024
+                },
             })]
         );
 
@@ -1436,7 +1447,10 @@ mod tests {
             vec![Term::Cmp(Cmp {
                 key: "mem".into(),
                 op: Op::Le,
-                value: CmpValue::Mem(512 * 1024 * 1024),
+                value: CmpValue::Mem {
+                    quantity: 536870912.0,
+                    bytes: 512 * 1024 * 1024
+                },
             })]
         );
 

@@ -272,10 +272,23 @@ impl App {
         now: i64,
     ) -> Option<bool> {
         use crate::filter::CmpValue;
+        if let Some(column) = self.spec.formatted_quantity_column(&cmp.key) {
+            let wanted = match &cmp.value {
+                CmpValue::Num(value) | CmpValue::Quantity { value, .. } => Some(*value),
+                CmpValue::Cpu { quantity, .. } | CmpValue::Mem { quantity, .. } => Some(*quantity),
+                _ => None,
+            };
+            if let Some(wanted) = wanted {
+                let actual = crate::views::formatted_quantity_value(o, column)?;
+                return wanted
+                    .is_finite()
+                    .then_some(cmp.op.eval(actual.partial_cmp(&wanted)?));
+            }
+        }
         if let Some(metric) = self.spec.metric(&cmp.key) {
             let actual = self.metric_value(o, metric)? as f64;
             let wanted = match &cmp.value {
-                CmpValue::Cpu(v) | CmpValue::Mem(v) => *v as f64,
+                CmpValue::Cpu { milli: v, .. } | CmpValue::Mem { bytes: v, .. } => *v as f64,
                 CmpValue::Num(v) | CmpValue::Quantity { value: v, .. } => {
                     if metric.cpu() && !metric.percentage() {
                         v * 1000.0
@@ -305,8 +318,8 @@ impl App {
             return Some(cmp.op.eval(ordering));
         }
         let ordering = match &cmp.value {
-            CmpValue::Cpu(want) => self.row_metrics(o, key)?.0.cmp(want),
-            CmpValue::Mem(want) => self.row_metrics(o, key)?.1.cmp(want),
+            CmpValue::Cpu { milli: want, .. } => self.row_metrics(o, key)?.0.cmp(want),
+            CmpValue::Mem { bytes: want, .. } => self.row_metrics(o, key)?.1.cmp(want),
             CmpValue::Duration(want) => crate::columns::age_secs(o, now)?.cmp(want),
             CmpValue::Quantity { text, .. } => {
                 let cell = self.column_cell(o, key, &cmp.key, cells, now)?;
