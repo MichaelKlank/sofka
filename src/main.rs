@@ -464,7 +464,7 @@ async fn run_main(args: Args) -> Result<()> {
     match &connect_error {
         // No cluster to watch — open the context picker over the empty table;
         // a successful pick connects and lands on the default resource.
-        Some(err) => app.start_disconnected(err),
+        Some(err) => app.start_disconnected(err, launch_namespace),
         None if context_picker => app.start_context_picker(launch_namespace),
         None => {
             app.switch_kind(&resource);

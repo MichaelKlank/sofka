@@ -534,13 +534,13 @@ impl App {
     /// Start the session in the context picker because the current context's
     /// API server was unreachable at launch (k9s behavior). The connect error
     /// stays visible in the status line while picking.
-    pub fn start_disconnected(&mut self, error: &str) {
+    pub fn start_disconnected(&mut self, error: &str, namespace: Option<String>) {
         let label = if self.cluster.context.is_empty() {
             "cannot connect".to_string()
         } else {
             format!("cannot connect to '{}'", self.cluster.context)
         };
-        self.open_contexts();
+        self.start_context_picker(namespace);
         self.flash_warn(&format!("{label}: {error} — pick another context"));
     }
 

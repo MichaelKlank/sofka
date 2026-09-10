@@ -12370,11 +12370,19 @@ async fn context_picker_launch_connects_on_enter_and_opens_default_resource() {
 
 #[tokio::test]
 async fn context_picker_launch_namespace_survives_failure_and_applies_only_once() {
-    for scope in [None, Some("payments"), Some("")] {
+    for (scope, disconnected) in [None, Some("payments"), Some("")]
+        .into_iter()
+        .flat_map(|scope| [false, true].map(|disconnected| (scope, disconnected)))
+    {
         let (mut app, _rx) = test_app();
         app.cluster.connected = false;
         app.namespace_memory.set("test", "remembered");
-        app.start_context_picker(scope.map(str::to_owned));
+        if disconnected {
+            app.start_disconnected("connection refused", scope.map(str::to_owned));
+            assert!(app.flash_err);
+        } else {
+            app.start_context_picker(scope.map(str::to_owned));
+        }
         app.handle_msg(Msg::Contexts {
             generation: app.generation,
             list: vec!["test".into()],
@@ -12426,7 +12434,7 @@ async fn disconnected_start_opens_context_picker() {
     cluster.connected = false;
     let mut app = App::new(cluster, tx);
 
-    app.start_disconnected("tcp connect error: Connection refused");
+    app.start_disconnected("tcp connect error: Connection refused", None);
     assert_eq!(app.mode, Mode::Contexts);
     assert!(app.flash_err);
     assert!(
@@ -12453,7 +12461,7 @@ async fn expired_sso_keeps_context_picker_usable() {
         .unwrap();
     let (mut app, _rx) = test_app();
     app.cluster.connected = false;
-    app.start_disconnected(&error.to_string());
+    app.start_disconnected(&error.to_string(), None);
     assert_eq!(app.mode, Mode::Contexts);
     assert!(app.flash_err);
     assert!(app.flash.contains("aws sso login"), "{}", app.flash);
