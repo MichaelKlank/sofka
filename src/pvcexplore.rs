@@ -9,6 +9,7 @@
 //! lives in `app/pvcexplore.rs`.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use kube::core::DynamicObject;
 use serde_json::{Value, json};
@@ -789,6 +790,356 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
+/// Marker every size sample is reported on, carrying the multiplier that
+/// turns `du`'s number into bytes.
+///
+/// Unlike the listing's status line this needs no nonce, because a name on the
+/// volume cannot put a line through that looks like one: `du` prints the size
+/// *and the path*, and the scripts below echo only the leading number, so the
+/// path never reaches stdout at all.
+const SIZE_MARKER: &str = "sofka-size:";
+
+/// Cap on entries walked to size a local path: past it, a cache directory of
+/// a million files is being walked in full for a number only a bar reads.
+pub const MAX_SIZE_ENTRIES: usize = 200_000;
+
+/// How many samples [`size_watch`] takes, and how many seconds it may spend
+/// taking them, before it gives up and the script exits. An upload longer
+/// than that keeps copying; only its bar stops moving. The bound is the
+/// backstop for a stdin that never closes — the ordinary end is the reader
+/// seeing end-of-input.
+///
+/// Both, because neither alone is a duration: a `du` over a large tree can
+/// take tens of seconds, so a sample count is a lower bound on the time it
+/// buys. Fifteen minutes is already a long time to leave a `du` loop in
+/// somebody's pod for a bar nobody is watching any more.
+pub const SIZE_SAMPLES: u32 = 900;
+
+/// Passes a destination may stay missing before the watcher gives up on it
+/// too. `cp` creates its destination almost at once, so a path still absent
+/// after this is one the container cannot see — a parent it may not search
+/// answers "not there" exactly like a path that is not there — and
+/// reporting zero at a bar for the length of a copy is what that would
+/// otherwise look like.
+pub const ABSENT_PASSES: u32 = 60;
+
+/// Consecutive passes whose `du` answers nothing before the watcher gives
+/// up and exits. A path that is merely not there yet answers zero and does
+/// not count; this is the container where `du` exists but cannot run — an
+/// applet that rejects the `timeout` in front of it, a permission it lacks
+/// — and streaming zeros at a bar for the length of a copy says the copy
+/// has stalled when it has not. Ending the stream instead is what tells the
+/// sampler to drop the bar.
+pub const GIVE_UP: u32 = 3;
+
+/// Passes a watcher gets when the container has no `date` to bound itself
+/// by. Much smaller, because a pass is then bounded only by its own `du`
+/// and the second it sleeps. An upload that outlasts it keeps copying;
+/// only its bar stops.
+pub const BLIND_SAMPLES: u32 = 300;
+
+/// The `du` invocation both size scripts are built from, reporting `$p`'s
+/// recursive total on one [`SIZE_MARKER`] line.
+///
+/// `du` is the only recursive sizer GNU coreutils and busybox both have, and
+/// `-b` is the one spelling of "apparent size in bytes" they agree on: GNU's
+/// shorthand for `--apparent-size --block-size=1`, and a plain option on
+/// busybox, which rejects both long forms — including in the image this
+/// browser builds its own helper pods from, so the long pair would have left
+/// the common case on the fallback. That fallback, `-k` in KiB of disk usage,
+/// is why the marker carries the multiplier that was used rather than leaving
+/// the reader to guess which `du` answered.
+///
+/// The branch is on whether a *number* came back, not on `du`'s exit status:
+/// a directory the serving pod cannot read is ordinary on a volume, and `du`
+/// prints the total it did reach and *then* exits non-zero. Keying off the
+/// status would throw that away and fall through to a fallback about to fail
+/// the same way, leaving no bar at all.
+///
+/// `set -- $(…)` is what keeps the path off stdout: it word-splits `du`'s
+/// `size<TAB>path` and takes `$1`, the number. A name containing a newline
+/// therefore cannot forge a sample, only make one unparseable. `set -f`
+/// first, because that same split would otherwise glob a destination path
+/// containing `*` against the working directory, once a second.
+fn size_sample_body() -> String {
+    format!(
+        r#"u=1
+set -- $($dl du -s -b -- "$p" 2>/dev/null)
+case "${{1:-}}" in
+''|*[!0-9]*)
+u=1024
+set -- $($dl du -s -k -- "$p" 2>/dev/null)
+;;
+esac
+case "${{1:-}}" in
+''|*[!0-9]*)
+if [ -e "$p" ]; then
+bad=$((bad+1))
+set -- ""
+else
+gone=$((gone+1))
+[ "$gone" -lt {ABSENT_PASSES} ] || bad={GIVE_UP}
+set -- 0
+fi
+;;
+*) bad=0; gone=0 ;;
+esac
+[ -z "$1" ] || printf '{SIZE_MARKER}%s:%s\n' "$u" "$1""#
+    )
+}
+
+/// One recursive byte total for `$1`, for sizing a copy's source while the
+/// copy is already running. Run as `sh -c <script> sh <path>`, like the listing: the
+/// path arrives as a positional parameter and is never spliced into the
+/// script.
+pub fn size_probe() -> String {
+    format!(
+        "p=$1\n{PASS_SETUP}\nbad=0\ngone=0\n{}\n{}",
+        du_deadline(),
+        size_sample_body()
+    )
+}
+
+/// What every sample needs and nothing changes between them, so the watcher
+/// runs it once rather than eighteen hundred times. `set -f` is for the
+/// word-splitting below: only `du`'s leading number is ever read, but
+/// without it a destination path containing a `*` would be globbed against
+/// the working directory once a second for nothing.
+const PASS_SETUP: &str = "set -f";
+
+/// A `timeout` in front of `du`, when the container has one.
+///
+/// The container's half of every bound here: killing the local `kubectl`
+/// does not reach a `du` already running in the pod, so a tree on a wedged
+/// mount would sit there long after sofka gave up on it. Empty when the
+/// container has no `timeout`, which is the one case where only the local
+/// half is bounded.
+fn du_deadline() -> String {
+    format!(
+        "dl=\"\"\ncommand -v timeout >/dev/null 2>&1 && dl=\"timeout {}\"",
+        DU_TIMEOUT
+    )
+}
+
+/// Seconds a single `du` may run inside the container.
+pub const DU_TIMEOUT: u32 = 20;
+
+/// The same total, once a second, for as long as an upload can reasonably run.
+/// One exec for the whole copy rather than one per sample — the alternative is
+/// an exec per second against somebody's production pod.
+///
+/// A destination that does not exist yet — every upload, until `cp` creates
+/// it — reports the zero that is the truth about it. A `du` that answers
+/// nothing about a path that *is* there is a different thing, counted
+/// towards [`GIVE_UP`]: nothing is printed, and after a few such passes the
+/// watcher exits, so the bar is dropped rather than pinned at zero. That zero is what gives such
+/// a copy a baseline of nothing rather than no baseline at all. A container
+/// with no `du` is the other case and a different answer: nothing can be
+/// measured there, so the script exits and the copy runs without a bar.
+///
+/// The `cat` is what ends the loop, and the arrangement is load-bearing in
+/// three ways. A `printf` into an exec stream nobody reads keeps succeeding,
+/// so the loop cannot notice its reader on its own — stdin closing is the
+/// only signal that reaches the container, which is why the watcher's exec
+/// needs `-i`. The reader must take an explicit dup of stdin, because a
+/// shell gives a background command `/dev/null` otherwise and it would read
+/// end-of-input at once. And the loop runs in the foreground with the reader
+/// behind it, each ending the other, so that neither the sample bound nor a
+/// closed stdin can leave the other half sitting in somebody's pod.
+pub fn size_watch() -> String {
+    format!(
+        r#"p=$1
+command -v du >/dev/null 2>&1 || exit 0
+{PASS_SETUP}
+bad=0
+gone=0
+{}
+n=0
+end=$(($(date +%s 2>/dev/null || echo 0)+{SIZE_SAMPLES}))
+lim={SIZE_SAMPLES}
+[ "$end" -gt {SIZE_SAMPLES} ] || lim={BLIND_SAMPLES}
+exec 3<&0
+cat <&3 > /dev/null &
+reader=$!
+while [ "$n" -lt "$lim" ]; do
+kill -0 "$reader" 2>/dev/null || break
+if [ "$end" -gt {SIZE_SAMPLES} ] && [ "$(date +%s 2>/dev/null || echo 0)" -ge "$end" ]; then
+break
+fi
+t0=$(date +%s 2>/dev/null || echo 0)
+{}
+[ "$bad" -lt {GIVE_UP} ] || break
+n=$((n+1))
+rest=$(($(date +%s 2>/dev/null || echo 0)-t0))
+[ "$rest" -gt 1 ] || rest=1
+[ "$rest" -lt 30 ] || rest=30
+sleep "$rest"
+done
+kill "$reader" 2>/dev/null
+exit 0"#,
+        du_deadline(),
+        size_sample_body()
+    )
+}
+
+/// Bytes from one [`size_probe`]/[`size_watch`] sample line, or `None` for a
+/// line that is not one — including the sample a `du` that could not read the
+/// path prints.
+///
+/// Zero is a reading like any other: it is what a destination measures
+/// before its copy has created it, and knowing that is what lets the copy be
+/// measured from zero rather than from whatever had landed by the time
+/// something first looked. Zero as a *total* is filtered where totals are
+/// decided, not here.
+pub fn parse_size_sample(line: &str) -> Option<u64> {
+    let (mult, count) = line.trim().strip_prefix(SIZE_MARKER)?.split_once(':')?;
+    mult.parse::<u64>()
+        .ok()?
+        .checked_mul(count.trim().parse::<u64>().ok()?)
+}
+
+/// The last sample in a one-shot probe's output — the last, not the first,
+/// since a run that printed a partial line has nothing to lose by it.
+pub fn parse_size(out: &str) -> Option<u64> {
+    out.lines().filter_map(parse_size_sample).next_back()
+}
+
+/// What one attempt to size a local path produced. Three answers rather
+/// than an `Option`, because the two empty ones want opposite treatment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Measure {
+    Bytes(u64),
+    /// Not there, or not readable — for a copy's destination, not yet.
+    Absent,
+    /// Past [`MAX_SIZE_ENTRIES`], and it will not come back under.
+    TooBig,
+}
+
+/// The recursive apparent size of a local path: the byte total a copy of it
+/// has to move, giving up past `cap` entries.
+///
+/// The cap is an argument rather than [`MAX_SIZE_ENTRIES`] itself so a test
+/// can reach [`Measure::TooBig`] without building a tree of 200,000 files.
+///
+/// `stop` is how a caller that has given up says so: this runs on a blocking
+/// thread that no timeout can cancel, and a thread still walking is one the
+/// runtime waits for at shutdown. Checking it bounds every case except a
+/// `read_dir` the kernel has not returned from, which nothing in userspace
+/// can bound. A stopped walk reports [`Measure::Absent`] — no reading, ask
+/// again — rather than pretending to a number.
+///
+/// Every entry's own size, directories included, which is the sum
+/// `du --apparent-size` produces on the volume side. Counting only files
+/// would measure a tree by one definition here and another one there, and a
+/// directory of 200 subdirectories would finish at half a bar.
+///
+/// Entries that cannot be read are skipped rather than fatal — a mode-000
+/// cache directory is the ordinary case on a volume, and `du` keeps its
+/// partial total for the same reason. Symlinks are counted at their own size
+/// and never followed, which is what `tar` puts on the wire and the only way
+/// a cycle terminates.
+///
+/// Two things it cannot make identical, both absorbed by the clamp: what two
+/// filesystems charge for a directory inode (4 KiB on ext4, a couple of
+/// hundred bytes on APFS), and hard links, counted once per link here and
+/// once per inode by `du`.
+pub fn local_size_capped(path: &Path, cap: usize, stop: &AtomicBool) -> Measure {
+    let Ok(root) = std::fs::symlink_metadata(path) else {
+        return Measure::Absent;
+    };
+    let mut total: u64 = root.len();
+    let mut walked: usize = 1;
+    // Only directories are stacked, and every entry is counted as it is
+    // seen: one flat directory of a few million files would otherwise sit on
+    // the stack in full, rebuilt on every sample.
+    let mut stack = if root.is_dir() {
+        vec![path.to_path_buf()]
+    } else {
+        Vec::new()
+    };
+    while let Some(next) = stack.pop() {
+        // Asked to stop — the caller timed out, or is gone. Checked per
+        // directory rather than per entry: it is the `read_dir` that is slow
+        // on the mounts this protects against, not the arithmetic.
+        if stop.load(Ordering::Relaxed) {
+            return Measure::Absent;
+        }
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            walked += 1;
+            if walked > cap {
+                return Measure::TooBig;
+            }
+            // Also mid-directory: one flat directory can hold the whole cap,
+            // and a walk nobody is waiting for should not run to the end of
+            // it before noticing.
+            if walked.is_multiple_of(4_096) && stop.load(Ordering::Relaxed) {
+                return Measure::Absent;
+            }
+            // `metadata()` on a `DirEntry` does not follow symlinks, which
+            // is what makes a link to a parent finite and a link to a
+            // sibling count once.
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            total = total.saturating_add(meta.len());
+            if meta.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Measure::Bytes(total)
+}
+
+/// Whole percent of `total` that `done` is.
+///
+/// Clamped, because a total can be an under-estimate: a `du` that could not
+/// read every subdirectory, or a local walk that skipped one, reports less
+/// than the copy then moves. (An over-estimate — the whole-block `-k`
+/// fallback — needs no clamp; it only keeps the bar short of the end.)
+pub fn progress_pct(done: u64, total: u64) -> u8 {
+    if total == 0 {
+        return 0;
+    }
+    // Floored, not rounded: a copy with 4 MB of a 1 GB file still to move is
+    // not finished, and a status bar that says 100% while the bar is still
+    // filling is the one number a reader would call a bug.
+    let pct = (done as f64 / total as f64 * 100.0).floor();
+    pct.clamp(0.0, 100.0) as u8
+}
+
+/// The two halves of a `width`-cell progress bar: the cells `done` of `total`
+/// bytes has filled, and the track behind the rest. Two pieces because they
+/// are drawn in different colors; together they are always exactly `width`
+/// columns, so a row wearing one stays aligned with the rows that are not.
+///
+/// Eighth-blocks, not whole cells: the size column is 8 wide, and a 5 GB copy
+/// that redrew once every 640 MB would look stuck.
+pub fn progress_bar(done: u64, total: u64, width: usize) -> (String, String) {
+    const PARTIALS: [&str; 8] = [
+        "", "\u{258f}", "\u{258e}", "\u{258d}", "\u{258c}", "\u{258b}", "\u{258a}", "\u{2589}",
+    ];
+    // Zero says "nothing of it has moved", which is the truthful reading of
+    // a total nobody could measure. Totals are refused before they get here,
+    // but by accident this would divide to `NaN` and render the same.
+    if total == 0 {
+        return (String::new(), "\u{2591}".repeat(width));
+    }
+    let ratio = (done as f64 / total as f64).clamp(0.0, 1.0);
+    // Floored, for the reason [`progress_pct`] floors: a bar that fills its
+    // last eighth while bytes are still moving says the copy is done.
+    let eighths = (ratio * (width * 8) as f64).floor() as usize;
+    let full = eighths / 8;
+    let partial = PARTIALS[eighths % 8];
+    let mut fill = "\u{2588}".repeat(full);
+    fill.push_str(partial);
+    let cells = full + usize::from(!partial.is_empty());
+    let track = "\u{2591}".repeat(width.saturating_sub(cells));
+    (fill, track)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1544,5 +1895,393 @@ mod tests {
             HELPER_MOUNT
         );
         assert_eq!(spec["metadata"]["generateName"], HELPER_PREFIX);
+    }
+
+    /// Run a generated script under a real `sh` with `du` shimmed.
+    #[cfg(unix)]
+    fn probe_with_du(du: &str, path: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let nth = NEXT.fetch_add(1, Ordering::Relaxed);
+        let bin = std::env::temp_dir().join(format!("sofka-du-{}-{nth}", std::process::id()));
+        std::fs::remove_dir_all(&bin).ok();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("du"), du).unwrap();
+        std::fs::set_permissions(bin.join("du"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        for tool in ["sh", "printf"] {
+            let real = ["/bin", "/usr/bin"]
+                .iter()
+                .map(|d| std::path::Path::new(d).join(tool))
+                .find(|p| p.exists());
+            if let Some(real) = real {
+                std::os::unix::fs::symlink(real, bin.join(tool)).ok();
+            }
+        }
+        let out = std::process::Command::new("env")
+            .arg(format!("PATH={}", bin.display()))
+            .args(["sh", "-c", &size_probe(), "sh", path])
+            .output()
+            .expect("running the probe");
+        std::fs::remove_dir_all(&bin).ok();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_du_without_b_falls_back_to_whole_blocks() {
+        // The branch CI never takes: GNU `du -b` always works on Linux, so
+        // without a shim the `-k` half of the unit negotiation — and the
+        // multiplier that makes it readable — is never run.
+        let blocks = "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = -b ] && exit 1; done\nprintf '4\\t%s\\n' \"$3\"\n";
+        assert_eq!(probe_with_du(blocks, "/"), "sofka-size:1024:4");
+        assert_eq!(parse_size("sofka-size:1024:4"), Some(4096));
+    }
+
+    /// Run the watcher under a real `sh` with `du` shimmed, holding its
+    /// stdin open so that only its own bounds can end it. Bounded here too:
+    /// a bound that stopped working would otherwise hang the suite instead
+    /// of failing it.
+    #[cfg(unix)]
+    fn watch_with_du(du: &str, path: &str) -> Vec<String> {
+        use std::os::unix::fs::PermissionsExt;
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let nth = NEXT.fetch_add(1, Ordering::Relaxed);
+        let bin = std::env::temp_dir().join(format!("sofka-watch-{}-{nth}", std::process::id()));
+        std::fs::remove_dir_all(&bin).ok();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("du"), du).unwrap();
+        std::fs::set_permissions(bin.join("du"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        for tool in ["sh", "printf", "sleep", "cat", "date"] {
+            if let Some(real) = ["/bin", "/usr/bin"]
+                .iter()
+                .map(|dir| std::path::Path::new(dir).join(tool))
+                .find(|tool| tool.exists())
+            {
+                std::os::unix::fs::symlink(real, bin.join(tool)).ok();
+            }
+        }
+        let mut child = std::process::Command::new("env")
+            .arg(format!("PATH={}", bin.display()))
+            .args(["sh", "-c", &size_watch(), "sh", path])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("running the watcher");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let ended = loop {
+            match child.try_wait().expect("waiting on the watcher") {
+                Some(status) => break Some(status),
+                None if std::time::Instant::now() >= deadline => {
+                    child.kill().ok();
+                    break None;
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        };
+        let out = child.wait_with_output().expect("reading the watcher");
+        std::fs::remove_dir_all(&bin).ok();
+        let status = ended.expect("the watcher never gave up on its own");
+        assert!(status.success(), "the watcher exited badly: {status}");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_watcher_whose_du_cannot_answer_gives_up_rather_than_streaming() {
+        // Driven, not grepped: the bound has to be a number of passes the
+        // loop really stops after, or a container whose `du` is present but
+        // cannot run keeps one going once a second for the whole copy.
+        let broken = "#!/bin/sh\nexit 1\n";
+        let samples = watch_with_du(broken, "/");
+        assert!(
+            samples.is_empty(),
+            "a `du` that answered nothing was reported as a size: {samples:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_du_that_answers_with_words_is_not_read_as_a_size() {
+        // Both guards, driven rather than grepped: a `du` that writes usage
+        // to *stdout* would otherwise have its first word parsed, and the
+        // fallback would inherit it.
+        let usage = "#!/bin/sh\necho 'Usage: du [-abck] [FILE]...'\nexit 1\n";
+        assert_eq!(
+            probe_with_du(usage, "/"),
+            "",
+            "usage text was read as a size"
+        );
+
+        // A `du` that answers properly is still read.
+        let real = "#!/bin/sh\nprintf '4096\\t%s\\n' \"$3\"\n";
+        assert_eq!(probe_with_du(real, "/"), "sofka-size:1:4096");
+    }
+
+    #[test]
+    fn a_size_sample_carries_the_unit_that_measured_it() {
+        // The multiplier says which `du` answered.
+        assert_eq!(
+            parse_size_sample("sofka-size:1:5368709120"),
+            Some(5_368_709_120)
+        );
+        assert_eq!(parse_size_sample("sofka-size:1024:4"), Some(4096));
+        // `du` could not read the path yet — the first second of an upload.
+        assert_eq!(parse_size_sample("sofka-size:1024:"), None);
+        assert_eq!(parse_size_sample("total 4"), None);
+        // Zero is a reading, not a non-answer: a destination that is not
+        // there yet measures zero, and a copy starting from zero is the
+        // whole point. (Zero as a *total* is refused where totals are
+        // decided — a bar against it would sit there looking finished.)
+        assert_eq!(parse_size_sample("sofka-size:1:0"), Some(0));
+        // A line cut off mid-write is not a sample.
+        assert_eq!(parse_size_sample("sofka-siz"), None);
+        // A count that cannot be multiplied is no sample: wrapping it would
+        // turn a huge number into a small and plausible one.
+        assert_eq!(
+            parse_size_sample("sofka-size:1024:18446744073709551615"),
+            None
+        );
+        // A `du` that answered with usage text rather than a number falls
+        // through to the fallback, and then to a zero — never to a sample
+        // built out of whatever word came first.
+        assert!(size_probe().contains("*[!0-9]*"), "{}", size_probe());
+        assert_eq!(parse_size("sofka-size:1:40\nsofka-size:1:"), Some(40));
+    }
+
+    #[test]
+    fn only_the_number_reaches_stdout_so_a_name_cannot_forge_a_sample() {
+        // `set -- $out` takes du's leading field and drops the path, which is
+        // the only thing on that line a volume controls.
+        assert!(size_probe().contains("set -- $($dl du -s -b"));
+        let printed = size_probe()
+            .lines()
+            .find(|l| l.starts_with("printf"))
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !printed.contains("$p"),
+            "the path must not be echoed: {printed}"
+        );
+        // A completed run's own last sample is the one that counts.
+        let output = "sofka-size:1:120\nsofka-size:1024:999999";
+        assert_eq!(parse_size(output), Some(1024 * 999_999));
+    }
+
+    #[test]
+    fn the_watcher_is_one_exec_that_stops_when_its_reader_goes_away() {
+        let script = size_watch();
+        // A pass, then at least a second's rest — and more when the `du`
+        // itself took longer, so a slow tree is not measured back to back
+        // in somebody's production pod.
+        assert!(script.contains(r#"sleep "$rest""#), "{script}");
+        assert!(
+            script.contains(r#"[ "$rest" -gt 1 ] || rest=1"#),
+            "{script}"
+        );
+        // Writes into an abandoned exec stream keep succeeding, so the only
+        // signal that reaches the container is stdin closing. The reader
+        // waits for it in the background; the loop checks each pass that the
+        // reader is still there, and kills it on the way out — so neither
+        // half can outlive the other by more than a pass.
+        // Explicitly from a dup of stdin: a background command's stdin is
+        // /dev/null unless it says otherwise, and that reads EOF at once.
+        assert!(script.contains("exec 3<&0"), "{script}");
+        assert!(script.contains("cat <&3 > /dev/null &"), "{script}");
+        assert!(
+            script.contains(r#"kill -0 "$reader" 2>/dev/null || break"#),
+            "{script}"
+        );
+        assert!(script.contains(r#"kill "$reader""#), "{script}");
+        assert!(
+            script.contains(&format!("lim={SIZE_SAMPLES}")),
+            "an unbounded watcher could outlive the copy in somebody's pod"
+        );
+        // A sample count is not a duration — one `du` over a large tree can
+        // take tens of seconds — so the loop watches the clock as well.
+        assert!(script.contains("date +%s"), "{script}");
+        // And a much shorter one when the container has no clock to bound
+        // itself by, since a pass then costs a `du` rather than a second.
+        assert!(script.contains(&format!("lim={BLIND_SAMPLES}")), "{script}");
+        // And it stops altogether when `du` is there but answers nothing:
+        // streaming zeros would pin a bar at zero for the whole copy, while
+        // ending the stream tells the sampler to drop the bar.
+        assert!(
+            script.contains(&format!(r#"[ "$bad" -lt {GIVE_UP} ] || break"#)),
+            "{script}"
+        );
+        // A destination that never appears is the same problem wearing
+        // another hat: a parent the container cannot search answers "not
+        // there" exactly like a path that is not there.
+        assert!(
+            script.contains(&format!(
+                r#"[ "$gone" -lt {ABSENT_PASSES} ] || bad={GIVE_UP}"#
+            )),
+            "{script}"
+        );
+        // A clock that steps forward mid-`du` must not park the loop.
+        assert!(
+            script.contains(r#"[ "$rest" -lt 30 ] || rest=30"#),
+            "{script}"
+        );
+        // A destination that comes back clears both counters, so a copy
+        // that is merely intermittent keeps its bar.
+        assert!(script.contains("*) bad=0; gone=0 ;;"), "{script}");
+        // And the wall clock ends it even with passes left over.
+        assert!(script.contains(r#"-ge "$end""#), "{script}");
+        // The word-splitting that reads `du`'s number must not glob a
+        // destination path containing a `*` against the working directory.
+        assert!(script.contains("set -f"), "{script}");
+        // Its ordinary end — the reader gone — is not a failure, and kubectl
+        // reports a non-zero exit as an error the copy did not have.
+        assert!(script.trim_end().ends_with("exit 0"), "{script}");
+        // A container with no `du` cannot be measured at all: no samples,
+        // and so no bar, rather than a bar pinned at zero.
+        assert!(script.contains("command -v du"), "{script}");
+        // Bounded inside the container too, where killing the local
+        // `kubectl` cannot reach: a `du` on a wedged mount would otherwise
+        // outlive the session that asked for it.
+        assert!(
+            script.contains(&format!("timeout {DU_TIMEOUT}")),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn a_progress_bar_is_always_its_full_width() {
+        use unicode_width::UnicodeWidthStr;
+        for done in [0u64, 1, 500, 2_500, 5_000] {
+            let (fill, track) = progress_bar(done, 5_000, 8);
+            assert_eq!(
+                fill.chars().count() + track.chars().count(),
+                8,
+                "{done}: {fill}|{track}"
+            );
+            // Columns, not characters: the bar sits in a column the pane
+            // measures with `unicode_width`, so a cell that counts as two
+            // would push the row through the border.
+            assert_eq!(
+                fill.width() + track.width(),
+                8,
+                "{done}: {fill}|{track} is not 8 columns wide"
+            );
+        }
+        assert_eq!(progress_bar(0, 5_000, 8).0, "");
+        assert_eq!(progress_bar(5_000, 5_000, 8).1, "");
+        // A pane too narrow for a size column is too narrow for a bar.
+        assert_eq!(progress_bar(1, 2, 0), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn a_progress_bar_moves_in_eighths_of_a_cell() {
+        // A 5 GB copy across 8 cells: whole cells alone would redraw once
+        // every 640 MB.
+        let total = 5 * 1024 * 1024 * 1024;
+        let (early, _) = progress_bar(total / 64, total, 8);
+        assert_eq!(early, "\u{258f}", "the first 80 MB already show");
+        let (eighth, _) = progress_bar(total / 8, total, 8);
+        assert_eq!(eighth, "\u{2588}", "an eighth of the way is one whole cell");
+        let (half, track) = progress_bar(total / 2, total, 8);
+        assert_eq!(half, "\u{2588}\u{2588}\u{2588}\u{2588}");
+        assert_eq!(track, "\u{2591}\u{2591}\u{2591}\u{2591}");
+    }
+
+    #[test]
+    fn an_over_estimated_total_still_reports_a_sane_percentage() {
+        // Over 100% is the under-estimated total: a subdirectory `du` could
+        // not read is missing from it, and the copy moves those bytes anyway.
+        // (The whole-block `-k` fallback errs the other way, and only ever
+        // leaves the bar short.)
+        assert_eq!(progress_pct(120, 100), 100);
+        assert_eq!(progress_pct(0, 100), 0);
+        assert_eq!(progress_pct(50, 100), 50);
+        // Floored: still moving is never 100%.
+        assert_eq!(progress_pct(999_999_999, 1_000_000_000), 99);
+        // And the bar floors with it: the last cell only becomes a whole
+        // block when the copy is actually over, so "solid to the edge" is
+        // never something a copy still moving can show.
+        let (nearly, _) = progress_bar(999_999_999, 1_000_000_000, 8);
+        assert!(
+            !nearly.ends_with('\u{2588}'),
+            "the bar filled before the copy did: {nearly}"
+        );
+        let (done, track) = progress_bar(1_000_000_000, 1_000_000_000, 8);
+        assert!(
+            done.ends_with('\u{2588}') && track.is_empty(),
+            "{done}|{track}"
+        );
+        // Nothing of nothing: a total of zero is refused where totals are
+        // decided, and claiming "complete" would be the wrong answer anyway.
+        assert_eq!(progress_pct(1, 0), 0);
+        assert_eq!(progress_bar(1, 0, 3), (String::new(), "░░░".to_string()));
+        assert_eq!(
+            progress_bar(120, 100, 4).0,
+            "\u{2588}\u{2588}\u{2588}\u{2588}"
+        );
+    }
+
+    #[test]
+    fn sizing_a_local_tree_counts_what_du_counts() {
+        let dir = std::env::temp_dir().join(format!("sofka-size-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a"), b"0123456789").unwrap();
+        std::fs::write(dir.join("sub/b"), b"012345").unwrap();
+        // Files *and* the directories' own inodes, which is what
+        // `du --apparent-size` sums on the volume side. Their size is the
+        // filesystem's business, so the expectation asks it rather than
+        // hard-coding ext4's 4096 or APFS's couple of hundred bytes.
+        let inode = |p: &std::path::Path| std::fs::symlink_metadata(p).unwrap().len();
+        let go = AtomicBool::new(false);
+        let sized = |p: &std::path::Path| local_size_capped(p, MAX_SIZE_ENTRIES, &go);
+        let dirs = inode(&dir) + inode(&dir.join("sub"));
+        assert_eq!(sized(&dir), Measure::Bytes(16 + dirs));
+        assert_eq!(sized(&dir.join("a")), Measure::Bytes(10));
+        // Not there is its own answer: a copy's destination is like this
+        // until `cp` creates it, and it is worth asking about again.
+        assert_eq!(sized(&dir.join("nope")), Measure::Absent);
+        // A symlink counts as itself and is never followed, which is what
+        // `tar` puts on the wire — and the only way to walk a cycle.
+        std::os::unix::fs::symlink(&dir, dir.join("loop")).unwrap();
+        let link = inode(&dir.join("loop"));
+        assert_eq!(sized(&dir.join("loop")), Measure::Bytes(link));
+        // And inside a tree: counted once at its own size, never followed —
+        // following it would both double-count and, here, never finish.
+        assert_eq!(
+            sized(&dir),
+            Measure::Bytes(16 + inode(&dir) + inode(&dir.join("sub")) + link),
+            "a symlink in the tree was followed"
+        );
+        std::fs::remove_file(dir.join("loop")).unwrap();
+        // And a tree past the cap is a third answer, not a size.
+        assert_eq!(local_size_capped(&dir, 2, &go), Measure::TooBig);
+        // Asked to stop, it stops — with no reading rather than a partial
+        // one, which is the answer that gets asked again.
+        let stopped = AtomicBool::new(true);
+        assert_eq!(
+            local_size_capped(&dir, MAX_SIZE_ENTRIES, &stopped),
+            Measure::Absent
+        );
+
+        // One subdirectory nobody can enter is the ordinary case on a volume,
+        // and it must not cost the whole total — `du` keeps its partial one.
+        std::fs::create_dir(dir.join("locked")).unwrap();
+        std::fs::write(dir.join("locked/c"), b"01234").unwrap();
+        let mut perms = std::fs::metadata(dir.join("locked")).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
+        std::fs::set_permissions(dir.join("locked"), perms).unwrap();
+        // Re-read: adding an entry grows the parent directory's own inode.
+        let reachable = 16 + inode(&dir) + inode(&dir.join("sub")) + inode(&dir.join("locked"));
+        assert_eq!(
+            sized(&dir),
+            Measure::Bytes(reachable),
+            "an unreadable subtree ate the total"
+        );
+        let mut perms = std::fs::metadata(dir.join("locked")).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(dir.join("locked"), perms).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -1522,19 +1522,33 @@ impl App {
                 // search-match cache behind.
                 self.detail.replace_lines(lines.into());
             }
+            Msg::TransferProgress {
+                generation,
+                claim,
+                done,
+                total,
+            } if generation == self.generation => self.update_transfer(claim, done, total),
             Msg::TransferDone {
                 generation,
                 claim,
                 result,
-            } if generation == self.generation => match result {
-                Ok(summary) => {
-                    self.set_claimed_status(claim, summary, false);
-                    // A copy made in the PVC browser changed one of the two
-                    // panes; show the file where it landed.
-                    self.refresh_pvc_panes();
+            } => {
+                // The bar is dropped whatever the generation: a copy that
+                // started before a context switch still has a row registered
+                // against it, and this is the only message that ends one.
+                self.end_transfer(claim);
+                if generation == self.generation {
+                    match result {
+                        Ok(summary) => {
+                            self.set_claimed_status(claim, summary, false);
+                            // A copy made in the PVC browser changed one of
+                            // the two panes; show the file where it landed.
+                            self.refresh_pvc_panes();
+                        }
+                        Err(e) => self.set_claimed_status(claim, format!("cp failed: {e}"), true),
+                    }
                 }
-                Err(e) => self.set_claimed_status(claim, format!("cp failed: {e}"), true),
-            },
+            }
             // Deliberately not generation-guarded: a helper pod may already
             // exist by the time this lands, and the stale branch is the only
             // thing that can clean it up.

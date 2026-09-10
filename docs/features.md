@@ -499,6 +499,43 @@ right - so a download or an upload is one keystroke rather than a hand-written
   splits its arguments on the first `:`, so a name containing one is refused
   with an explanation rather than a `filespec must match the canonical format`
   from kubectl.
+- **A copy in flight fills a bar** where the row's size was, so a 5 GB file or
+  a directory of thousands of them shows how far it has got rather than one
+  unchanging "copying" line for minutes. `kubectl cp` reports nothing while it
+  runs, so what is measured is the destination: a download's bar comes from the
+  local file (or tree) it is writing, an upload's from one `kubectl exec` that
+  prints the destination's size once a second - one exec for the whole copy,
+  not one per second. A folder is measured whole, so its bar is the recursive
+  total and not one file at a time. The status bar carries the percentage as
+  well, which is also where a copy started by `t` on a pod - with typed paths
+  and no row to draw on - reports itself.
+
+  Quitting sofka while an upload is running leaves that `du` loop in the pod
+  until it times itself out - fifteen minutes where the container has a clock,
+  and 300 passes, at least five minutes, where it has not - because the signal that stops it is the
+  connection closing, and a killed process does not send one; the copy itself
+  is left to finish either way.
+
+  Measuring the volume side is an exec of its own - `du`, alongside the `tar`
+  that `kubectl cp` already runs there - and it is gated no further than the
+  copy it belongs to; see [safety](safety.md#guardrails) for why. A copy also
+  starts a moment later than it used to, since the destination is measured
+  before it is touched.
+
+  The source's total comes from the listing for a single file and from `du`
+  for a directory, so the pod needs `du` as well as the `ls` a listing needs
+  and the `tar` a copy needs; without it the copy runs with no bar. The total
+  is an estimate either way, and a bar can finish short of the end or reach it
+  early and wait: a `du` that can only report whole disk blocks reads high, a
+  subdirectory the serving pod cannot read is missing from the total, and both
+  ends count directory entries at whatever their own filesystem charges for
+  one - 4 KiB on ext4 against a couple of hundred bytes on APFS, which on a
+  tree of many small directories is a visible fraction rather than a rounding
+  error. What is already at the destination is not counted - an overwrite
+  opens at zero rather than at yesterday's copy - but a whole folder copied
+  over a copy of itself is the case this cannot measure: almost nothing new
+  lands, so its bar ends well short even though the copy is complete.
+
 - **`s` opens a shell** at the directory the remote pane is showing (or at the
   mount point, from the PVC row directly). The exec lands in a real pod, so it
   passes the same `shell` guardrail as `s` on that pod's row - a rule that
@@ -535,7 +572,8 @@ pod is rejected; browse through a pod that already mounts the claim instead.
 ## Safety
 
 - **Read-only mode**, **declarative guardrails**, **action-aware authorization**
-  (`:can-i`), and a session-local **action journal** (`:journal`). See
+  (`:can-i`), and a session-local **action journal** (`:journal`) with optional
+  [file persistence](configuration.md#action-journal-files). See
   [Safety](safety.md).
 
 ## Extensibility

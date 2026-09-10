@@ -1752,6 +1752,32 @@ impl App {
         );
     }
 
+    /// `kubectl exec` up to and including `--`, pinned to the active context.
+    /// What a script's argv is appended to.
+    ///
+    /// `stdin` asks for `-i`, which is not a convenience: a script that has to
+    /// notice sofka went away can only do it by reading end-of-input, and
+    /// without a stdin stream it gets that immediately.
+    pub(super) fn exec_prefix(
+        &self,
+        ns: &str,
+        pod: &str,
+        container: Option<&str>,
+        stdin: bool,
+    ) -> Vec<String> {
+        let mut argv = self.kubectl_base();
+        argv.push("exec".into());
+        if stdin {
+            argv.push("-i".into());
+        }
+        argv.extend(["-n".into(), ns.to_string(), pod.to_string()]);
+        if let Some(c) = container {
+            argv.extend(["-c".into(), c.to_string()]);
+        }
+        argv.push("--".into());
+        argv
+    }
+
     /// The `kubectl cp` argv for a transfer, pinned to the active context.
     pub(super) fn cp_argv(
         &self,
@@ -1777,9 +1803,15 @@ impl App {
         argv
     }
 
-    /// Run `kubectl cp` off-thread and flash the outcome. Not a foreground
-    /// `Suspend::Shell` — cp is non-interactive (and silent on success), and
-    /// a large copy would otherwise freeze the UI for its whole duration.
+    /// Run `kubectl cp` off-thread, reporting progress and flashing the
+    /// outcome. Not a foreground `Suspend::Shell` — cp is non-interactive
+    /// (and silent on success), and a large copy would otherwise freeze the
+    /// UI for its whole duration.
+    ///
+    /// Silent for its whole duration is also why it is measured: `cp` reports
+    /// nothing between "started" and "finished", so `super::transfer` samples
+    /// the destination instead and the size column of the row it came from
+    /// fills as the bytes land.
     pub(super) fn start_transfer(
         &mut self,
         ns: String,
@@ -1789,60 +1821,51 @@ impl App {
         src: String,
         dest: String,
     ) {
+        let job = self.begin_transfer(ns, pod, container, upload, src, dest);
+        // Never under test: `kubectl cp` here would reach the developer's own
+        // current context. Everything the tests need is either in the job
+        // (which they build the same way) or in the messages the task would
+        // have sent, which they feed by hand.
+        if !cfg!(test) {
+            tokio::spawn(super::transfer::run_transfer(job));
+        }
+    }
+
+    /// Claim the status bar, register the row the bar goes on, and gather
+    /// everything the background copy needs. Separate from the spawn so a
+    /// test can check the wiring — which end is which, which exec asks for
+    /// stdin — without a cluster to run it against.
+    pub(super) fn begin_transfer(
+        &mut self,
+        ns: String,
+        pod: String,
+        container: Option<String>,
+        upload: bool,
+        src: String,
+        dest: String,
+    ) -> super::transfer::TransferJob {
         let argv = self.cp_argv(&ns, &pod, container.as_deref(), upload, &src, &dest);
-        let from = argv[argv.len() - 2].clone();
-        let to = argv[argv.len() - 1].clone();
+        let (from, to) = (&argv[argv.len() - 2], &argv[argv.len() - 1]);
+        let label = format!("copying {from} → {to}");
         self.note_action(
             if upload { "cp upload" } else { "cp download" },
             format!("{pod} in {ns}"),
         );
-        let claim = self.claim_status(format!("copying {from} → {to}…"));
-        let tx = self.tx.clone();
-        let genr = self.generation;
-        tokio::spawn(async move {
-            let out = tokio::process::Command::new(&argv[0])
-                .args(&argv[1..])
-                .output()
-                .await;
-            let result = match out {
-                Ok(o) if o.status.success() => Ok(format!("copied {from} → {to}")),
-                Ok(o) => {
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    // The actual cause (a tar/exec error) comes before
-                    // kubectl's generic "command terminated with exit code"
-                    // trailer — flash the last line that says something.
-                    let line = |skip_trailer: bool| {
-                        stderr
-                            .lines()
-                            .rev()
-                            .map(str::trim)
-                            .find(|l| {
-                                !l.is_empty()
-                                    && !(skip_trailer && l.starts_with("command terminated"))
-                            })
-                            .unwrap_or_default()
-                            .to_string()
-                    };
-                    let err = match line(true) {
-                        e if e.is_empty() => line(false),
-                        e => e,
-                    };
-                    Err(if err.is_empty() {
-                        format!("kubectl cp exited with {}", o.status)
-                    } else {
-                        err
-                    })
-                }
-                Err(e) => Err(format!("kubectl cp failed to start: {e}")),
-            };
-            let _ = tx
-                .send(Msg::TransferDone {
-                    generation: genr,
-                    claim,
-                    result,
-                })
-                .await;
-        });
+        let claim = self.claim_status(format!("{label}…"));
+        let known = self.register_transfer(claim, label, upload, &src);
+        super::transfer::TransferJob {
+            cp: argv,
+            // `-i` for an upload only: its watcher stops when stdin closes,
+            // and a download's one-shot `du` has nothing to wait for.
+            exec: self.exec_prefix(&ns, &pod, container.as_deref(), upload),
+            upload,
+            src,
+            dest,
+            known,
+            claim,
+            generation: self.generation,
+            tx: self.tx.clone(),
+        }
     }
 
     /// Open the `t` action menu (Flux suspend/resume, CronJob
@@ -2352,6 +2375,40 @@ impl App {
                 owner
             });
         }
+    }
+
+    /// Refresh a still-running operation's progress without giving up the
+    /// claim its result has to present. Unlike [`Self::set_claimed_status`]
+    /// the claim stays pending, so the operation still reports when it lands.
+    ///
+    /// `shown` is the text this operation last wrote, and it is what makes
+    /// the refresh polite. [`Self::borrow_status`] leaves the claim in place
+    /// while putting its own message on the bar — a watch error, a failed
+    /// state write, a notification — so a caller that refreshed unconditionally
+    /// would wipe that message within a sample or two of its arriving. A
+    /// borrowed *error* is never cleared by [`Self::expire_flash`], so it
+    /// holds the text for the rest of the operation — which is the intended
+    /// order of importance: the bar keeps moving, only its number stops.
+    /// Returns the text now on the bar, for the next refresh to check.
+    pub(super) fn set_claimed_progress(
+        &mut self,
+        claim: StatusClaim,
+        shown: &str,
+        msg: impl Into<String>,
+    ) -> String {
+        // An empty bar is nobody's: a borrowed message that has expired
+        // leaves one behind, and progress is welcome there again.
+        if !self.owns_status(claim) || !(self.flash.is_empty() || self.flash == shown) {
+            return shown.to_string();
+        }
+        let message = msg.into();
+        self.set_flash(message.clone());
+        self.status_claim = Some(ActiveStatusClaim {
+            claim,
+            text: message.clone(),
+            pending: true,
+        });
+        message
     }
 
     /// Temporarily show a process/watch-level message without stealing an

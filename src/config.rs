@@ -111,6 +111,7 @@ pub struct Config {
     pub keys: KeysConfig,
     /// Structured application logging — see [`LoggingConfig`].
     pub logging: LoggingConfig,
+    pub journal: JournalConfig,
 }
 
 /// Delivery for `:notify` events, besides the status-line flash.
@@ -307,6 +308,38 @@ impl Default for LogsConfig {
             since: None,
             fullscreen: false,
         }
+    }
+}
+
+/// Optional action history on disk. Changes take effect on restart.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct JournalConfig {
+    pub enabled: bool,
+    pub file: Option<PathBuf>,
+    pub max_size_mb: u64,
+}
+
+impl Default for JournalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            file: None,
+            max_size_mb: 8,
+        }
+    }
+}
+
+impl JournalConfig {
+    pub fn path(&self) -> PathBuf {
+        self.file
+            .clone()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| crate::diagnostics::state_dir().join("journal.jsonl"))
+    }
+
+    pub fn max_bytes(&self) -> u64 {
+        self.max_size_mb.saturating_mul(1024 * 1024).max(64 * 1024)
     }
 }
 
@@ -1441,6 +1474,23 @@ fn config_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_config_defaults_and_overrides() {
+        let cfg = Config::default();
+        assert!(!cfg.journal.enabled);
+        assert_eq!(
+            cfg.journal.path(),
+            crate::diagnostics::state_dir().join("journal.jsonl")
+        );
+        assert_eq!(cfg.journal.max_bytes(), 8 * 1024 * 1024);
+        let cfg: Config =
+            toml::from_str("[journal]\nenabled = true\nfile = 'actions.jsonl'\nmax_size_mb = 0")
+                .unwrap();
+        assert!(cfg.journal.enabled);
+        assert_eq!(cfg.journal.path(), PathBuf::from("actions.jsonl"));
+        assert_eq!(cfg.journal.max_bytes(), 64 * 1024);
+    }
 
     #[test]
     fn compact_mode_defaults_false_and_accepts_booleans() {
