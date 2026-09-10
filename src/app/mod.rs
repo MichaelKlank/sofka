@@ -2174,6 +2174,8 @@ pub struct App {
     /// CRD printer-column fallbacks fetched per API resource for this cluster
     /// (`None` = fetched, nothing usable). Cleared on context switch.
     crd_views: HashMap<GroupVersionResource, Option<crate::views::View>>,
+    server_table: crate::server_table::State,
+    server_table_started: bool,
     /// Wide mode (`w`): show wide-only columns.
     pub wide: bool,
     /// Compact mode (`ctrl-e`): collapse the header to one line and hide the
@@ -2427,6 +2429,8 @@ impl App {
             user_views: HashMap::new(),
             thresholds: crate::thresholds::Compiled::default(),
             crd_views: HashMap::new(),
+            server_table: crate::server_table::State::default(),
+            server_table_started: false,
             wide: false,
             compact: false,
             hide_header: false,

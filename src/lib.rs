@@ -38,6 +38,7 @@ pub mod pvcexplore;
 pub mod redact;
 pub mod rightsize;
 pub mod sanitize;
+pub mod server_table;
 mod server_tls;
 pub mod snapshot;
 pub mod sortmem;

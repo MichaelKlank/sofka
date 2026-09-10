@@ -415,6 +415,10 @@ struct SpecColumn {
 enum SpecSource {
     Curated(CellFn),
     User(crate::views::UserColumn),
+    Server {
+        index: usize,
+        column: crate::server_table::Column,
+    },
 }
 
 fn spec_curated(c: &Column) -> SpecColumn {
@@ -580,6 +584,49 @@ pub fn build_spec(
     }
 }
 
+/// Use server columns for an otherwise generic resource view.
+pub fn build_table_spec(
+    group: &str,
+    plural: &str,
+    columns: &[crate::server_table::Column],
+    wide: bool,
+) -> ViewSpec {
+    let fallback = columns_for("", "");
+    let mut resolved: Vec<SpecColumn> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, col)| wide || col.priority <= 0)
+        .map(|(index, column)| {
+            let header = column.name.to_uppercase();
+            let local = fallback.iter().find(|c| c.header == header);
+            if let Some(local) = local {
+                return spec_curated(local);
+            }
+            SpecColumn {
+                header: header.clone(),
+                original_header: header,
+                source: SpecSource::Server {
+                    index,
+                    column: column.clone(),
+                },
+                width: None,
+                align: column.numeric().then_some(crate::views::Align::Right),
+                is_status: false,
+                wide: column.priority > 0,
+            }
+        })
+        .collect();
+    if !resolved.iter().any(|col| col.header == "NAME") {
+        resolved.insert(0, spec_curated(&fallback[0]));
+    }
+    ViewSpec {
+        group: group.into(),
+        plural: plural.into(),
+        columns: resolved,
+        status_idx: None,
+    }
+}
+
 impl ViewSpec {
     pub fn metric_at(&self, idx: usize) -> Option<MetricColumn> {
         match &self.columns.get(idx)?.source {
@@ -613,6 +660,9 @@ impl ViewSpec {
         if let SpecSource::User(uc) = &self.columns[idx].source {
             return uc.kind == crate::views::ColumnKind::Time;
         }
+        if matches!(self.columns[idx].source, SpecSource::Server { .. }) {
+            return false;
+        }
         match self.canonical_header(idx) {
             Some("AGE") => true,
             Some("DURATION") if plural == "jobs" => true,
@@ -627,7 +677,7 @@ impl ViewSpec {
     /// Cells for one object, aligned with [`Self::headers`], plus the index
     /// of the status column (if any).
     pub fn cells(&self, obj: &DynamicObject, now: i64) -> (Vec<String>, Option<usize>) {
-        let (cells, status_idx, _) = self.cells_with_helm_time(obj, now);
+        let (cells, status_idx, _) = self.cells_with_helm_time(obj, now, None);
         (cells, status_idx)
     }
 
@@ -636,6 +686,7 @@ impl ViewSpec {
         &self,
         obj: &DynamicObject,
         now: i64,
+        server: Option<&[serde_json::Value]>,
     ) -> (Vec<String>, Option<usize>, Option<i64>) {
         let ctx = CellContext::new(obj, now);
         let values = self
@@ -644,6 +695,9 @@ impl ViewSpec {
             .map(|c| match &c.source {
                 SpecSource::Curated(extract) => extract(&ctx).into_owned(),
                 SpecSource::User(uc) => crate::views::render_cell(obj, uc, now),
+                SpecSource::Server { index, .. } => {
+                    crate::server_table::render(server.and_then(|cells| cells.get(*index)))
+                }
             })
             .collect();
         let helm_time = ctx
@@ -668,7 +722,7 @@ impl ViewSpec {
             SpecSource::User(uc) if uc.kind == crate::views::ColumnKind::Time => {
                 Some(crate::views::render_cell(obj, uc, now))
             }
-            SpecSource::User(_) => None,
+            SpecSource::User(_) | SpecSource::Server { .. } => None,
             SpecSource::Curated(_) => volatile_cell(obj, plural, &col.original_header, now),
         }
     }
@@ -713,6 +767,7 @@ impl ViewSpec {
         let col = self.columns.get(idx)?;
         Some(match &col.source {
             SpecSource::User(uc) => Cow::Owned(crate::views::render_cell(obj, uc, now)),
+            SpecSource::Server { .. } => Cow::Borrowed("<none>"),
             SpecSource::Curated(extract) => {
                 let ctx = CellContext::new(obj, now);
                 extract(&ctx)
@@ -723,9 +778,10 @@ impl ViewSpec {
     /// Whether `header` is a user/printer column (typed sorting applies) as
     /// opposed to a curated one.
     pub fn is_user_column(&self, header: &str) -> bool {
-        self.columns
-            .iter()
-            .any(|c| c.header == header && matches!(c.source, SpecSource::User(_)))
+        self.columns.iter().any(|c| {
+            c.header == header
+                && matches!(c.source, SpecSource::User(_) | SpecSource::Server { .. })
+        })
     }
 
     /// Comparable value of `header`'s cell for `obj`, or `None` when the
@@ -736,9 +792,22 @@ impl ViewSpec {
         header: &str,
         now: i64,
     ) -> Option<crate::views::SortValue> {
+        self.sort_value_with_table(obj, header, now, None)
+    }
+
+    pub fn sort_value_with_table(
+        &self,
+        obj: &DynamicObject,
+        header: &str,
+        now: i64,
+        server: Option<&[serde_json::Value]>,
+    ) -> Option<crate::views::SortValue> {
         let col = self.columns.iter().find(|c| c.header == header)?;
         Some(match &col.source {
             SpecSource::User(uc) => crate::views::sort_value(obj, uc, now),
+            SpecSource::Server { index, column } => {
+                column.sort_value(server.and_then(|cells| cells.get(*index)))
+            }
             SpecSource::Curated(extract) => {
                 let ctx = CellContext::new(obj, now);
                 let v = extract(&ctx);
@@ -749,6 +818,13 @@ impl ViewSpec {
                 }
             }
         })
+    }
+
+    pub fn server_column(&self, header: &str) -> Option<(usize, &crate::server_table::Column)> {
+        match &self.columns.get(self.header_index(header)?)?.source {
+            SpecSource::Server { index, column } => Some((*index, column)),
+            _ => None,
+        }
     }
 
     /// Configured fixed width for the column at `idx`, when it's a user

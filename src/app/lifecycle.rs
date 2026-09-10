@@ -340,6 +340,8 @@ impl App {
         for t in self.tasks.drain(..) {
             t.abort();
         }
+        self.server_table = crate::server_table::State::default();
+        self.server_table_started = false;
         // Stash the outgoing view's rows, then show the incoming view's
         // cached snapshot (if it was visited recently) so navigation renders
         // instantly — the fresh watch relists behind it and swaps in on sync.
@@ -448,10 +450,7 @@ impl App {
         self.view_cache_order.clear();
     }
 
-    /// For a custom resource with neither curated columns nor a user view,
-    /// fetch its CRD off-thread and read `additionalPrinterColumns` for the
-    /// watched version — a better automatic fallback than NAME/AGE. Results
-    /// (including "nothing usable") are cached per API resource for the session.
+    /// Read CRD columns first, then try server Tables if no columns are available.
     fn maybe_fetch_printer_columns(&mut self, kind: &Kind) {
         let user_has_columns = self
             .active_user_view()
@@ -459,12 +458,17 @@ impl App {
         if crate::columns::has_curated(&kind.ar.group, &self.kind_plural)
             || kind.ar.group.is_empty()
             || kind.ar.plural.to_lowercase() != self.kind_plural
-            || self.crd_views.contains_key(&kind.resource_key())
             || user_has_columns
         {
             return;
         }
+        if self.crd_views.contains_key(&kind.resource_key()) {
+            self.maybe_start_server_table();
+            return;
+        }
         let Some(crd_kind) = self.cluster.resolve("customresourcedefinitions") else {
+            self.crd_views.insert(kind.resource_key(), None);
+            self.maybe_start_server_table();
             return;
         };
         let client = self.cluster.client.clone();
@@ -475,11 +479,11 @@ impl App {
         let genr = self.generation;
         let handle = tokio::spawn(async move {
             let api: Api<DynamicObject> = Api::all_with(client, &crd_kind.ar);
-            // No CRD (aggregated API) or no permission → stay on NAME/AGE.
-            let Ok(crd) = api.get(&name).await else {
-                return;
-            };
-            let view = crate::views::printer_columns_view(&crd.data, &version);
+            let view = tokio::time::timeout(Duration::from_secs(10), api.get(&name))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|crd| crate::views::printer_columns_view(&crd.data, &version));
             let _ = tx
                 .send(Msg::PrinterColumns {
                     generation: genr,
@@ -489,6 +493,34 @@ impl App {
                 .await;
         });
         self.tasks.push(handle);
+    }
+
+    pub(super) fn server_table_eligible(&self) -> bool {
+        let Some(kind) = &self.kind else { return false };
+        !kind.ar.group.is_empty()
+            && kind.ar.plural.to_lowercase() == self.kind_plural
+            && !crate::columns::has_curated(&kind.ar.group, &self.kind_plural)
+            && self.active_user_view().is_none_or(|v| v.columns.is_empty())
+            && self
+                .crd_views
+                .get(&kind.resource_key())
+                .is_some_and(Option::is_none)
+    }
+
+    fn maybe_start_server_table(&mut self) {
+        if self.server_table_started || !self.server_table_eligible() {
+            return;
+        }
+        let Some(kind) = &self.kind else { return };
+        self.server_table_started = true;
+        self.tasks.push(self.cluster.spawn_server_table(
+            kind,
+            &self.namespace,
+            join_selectors(&self.labels, &self.applied_filter_labels),
+            join_selectors(&self.fields, &self.applied_filter_fields),
+            self.generation,
+            self.tx.clone(),
+        ));
     }
 
     /// Restart the watch when the filter's `-l`/`-f` selectors no longer
@@ -865,6 +897,8 @@ impl App {
         for t in self.tasks.drain(..) {
             t.abort();
         }
+        self.server_table = crate::server_table::State::default();
+        self.server_table_started = false;
     }
 
     /// Fold one background message into the app, then tidy up after any view
@@ -971,6 +1005,9 @@ impl App {
             }
             Msg::Deleted { generation, key } if generation == self.generation => {
                 self.timeline.observe_delete(&self.kind_plural, &key);
+                if let Some(obj) = self.store.latest(&key) {
+                    self.server_table.remove(&key, obj.metadata.uid.as_deref());
+                }
                 if self.store.remove(&key) == StoreMutation::Removed {
                     self.invalidate_row(&key);
                 }
@@ -1095,7 +1132,41 @@ impl App {
                     // resolvable now that the CRD's columns are known.
                     self.apply_remembered_sort();
                     self.apply_view_sort();
+                    self.maybe_start_server_table();
                 }
+            }
+            Msg::ServerTable {
+                generation,
+                resource,
+                update,
+            } if generation == self.generation
+                && self.server_table_started
+                && self.server_table_eligible()
+                && self
+                    .kind
+                    .as_ref()
+                    .is_some_and(|k| k.resource_key() == resource) =>
+            {
+                let (layout_changed, changed) = self.server_table.apply(update);
+                if layout_changed {
+                    self.refresh_view_spec();
+                    self.apply_remembered_sort();
+                    self.apply_view_sort();
+                } else {
+                    for key in changed {
+                        self.invalidate_row_contents(&key);
+                    }
+                }
+            }
+            Msg::ServerTableError { generation, error }
+                if generation == self.generation && self.server_table_eligible() =>
+            {
+                for key in self.server_table.clear_cells() {
+                    self.invalidate_row_contents(&key);
+                }
+                crate::log_warn!("table.error", kind = self.kind_plural, error = error);
+                self.last_error = Some(error.clone());
+                self.borrow_status(error, true);
             }
             Msg::FindResults {
                 generation,

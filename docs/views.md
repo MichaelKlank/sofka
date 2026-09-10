@@ -386,6 +386,44 @@ Other JSONPath filter
 or wildcard expressions aren't representable and those columns are skipped. So
 most custom resources get useful columns with zero configuration.
 
+### Server Table columns
+
+If a resource has no built-in columns, no explicit view columns, and no usable
+CRD printer columns, sofka requests columns from the Kubernetes Table API.
+This supports aggregated APIs such as Calico's `projectcalico.org/v3`
+`CalicoNodeStatus` resources. It also works when you can read a resource but
+cannot read its CRD. An API that does not support Tables keeps the NAME/AGE
+view. Explicit views, built-in columns, and usable CRD printer columns keep
+their current priority.
+
+Server columns keep their order. Headers are shown in uppercase. Columns with
+`priority > 0` appear in wide mode (`w`). NAME and any AGE column use resource
+metadata, so AGE continues to advance between server updates. NAME is added
+if the server does not define it.
+
+Integer and number columns support numeric sorting and structured filters,
+such as `sessions>5`. Date columns sort by their timestamps. Other columns
+use their displayed text. A string such as `2/3` stays text; a numeric filter
+does not read its leading number. Missing cells show `<none>` and do not
+match structured comparisons.
+
+sofka keeps the full resource watch for details and resource actions. Server
+cells are stored separately and shown only when their object UID and resource
+version match the watched object. A cell can show `<none>` after an object
+changes, until a matching Table update arrives.
+
+Table watches provide cell updates when the API supports them. Each Table
+watch runs for up to 30 seconds, then sofka reads a fresh Table to update
+relative time text and recover from missed changes. If Table watches are
+unsupported, sofka polls instead. A new Table list cycle starts at most once
+every five seconds, including retries. A cycle can contain multiple pages
+of up to 500 rows. Slow requests can delay updates.
+
+Table requests follow the active namespace and label and field selectors.
+They stop when the resource watch stops. A view or context change discards
+the previous Table cells. Failed Table requests show an error and clear the
+server cells while the full resource view remains available.
+
 ## Thresholds
 
 The warning and critical values behind RESTARTS/CPU/MEM cell color (and the

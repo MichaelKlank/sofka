@@ -71,6 +71,15 @@ pub enum Msg {
         resource: GroupVersionResource,
         view: Box<Option<crate::views::View>>,
     },
+    ServerTable {
+        generation: u64,
+        resource: GroupVersionResource,
+        update: crate::server_table::Update,
+    },
+    ServerTableError {
+        generation: u64,
+        error: String,
+    },
     PulseData {
         generation: u64,
         claim: StatusClaim,

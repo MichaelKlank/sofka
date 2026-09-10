@@ -6,6 +6,7 @@ use std::time::Instant;
 use tokio::sync::mpsc::{self, Receiver};
 
 mod proxy;
+mod server_table;
 
 fn obj(v: serde_json::Value) -> DynamicObject {
     serde_json::from_value(v).unwrap()
@@ -20863,7 +20864,7 @@ fn helm_updated_custom_columns_keep_their_own_type_and_clock() {
     );
     let spec = crate::columns::build_spec("", "helm", Some(view), None, false);
     let before = crate::helm::release_decode_count();
-    let (_, _, cached) = spec.cells_with_helm_time(&secret, base + 59);
+    let (_, _, cached) = spec.cells_with_helm_time(&secret, base + 59, None);
     assert_eq!(
         spec.volatile_cached(&secret, "helm", 0, base + 60, cached)
             .as_deref(),

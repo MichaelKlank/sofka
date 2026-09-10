@@ -110,7 +110,10 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   `format = "image-tag"` to show image tags, with registry ports and digests
   handled separately. An
   unknown custom resource picks up its CRD `additionalPrinterColumns`
-  automatically. `w` toggles wide-only columns (kubectl `-o wide`), including
+  automatically. If no usable CRD columns are available, server Table columns
+  can supply the view. Explicit views and built-in columns keep their priority.
+  Table cells use watch updates, periodic refresh, and a polling fallback.
+  `w` toggles wide-only columns (kubectl `-o wide`), including
   node labels. Add `@<namespace>` to a view key to select columns for one
   namespace. See
   [Views and thresholds](views.md).
