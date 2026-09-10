@@ -11639,6 +11639,30 @@ async fn disconnected_start_opens_context_picker() {
     assert!(app.flash.contains("Connection refused"), "{}", app.flash);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn expired_sso_keeps_context_picker_usable() {
+    let mut config = kube::Config::new("https://127.0.0.1:1".parse().unwrap());
+    config.auth_info.exec = Some(
+        serde_json::from_value(json!({
+            "command": "sh",
+            "args": ["-c", "echo 'SSO session expired' >&2; exit 1"]
+        }))
+        .unwrap(),
+    );
+    let error = crate::k8s::build_client(config, false).err().unwrap();
+    let (mut app, _rx) = test_app();
+    app.cluster.connected = false;
+    app.start_disconnected(&error.to_string());
+    assert_eq!(app.mode, Mode::Contexts);
+    assert!(app.flash_err);
+    assert!(app.flash.contains("aws sso login"), "{}", app.flash);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    assert_eq!(app.mode, Mode::Command);
+}
+
 #[tokio::test]
 async fn reselecting_never_connected_context_retries() {
     let (mut app, _rx) = test_app();
