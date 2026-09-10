@@ -1951,10 +1951,28 @@ async fn port_forward_picker_select_port_starts_forward() {
     assert_eq!(app.port_forwards[0].target, "svc/web");
 }
 
+fn occupy_forward_port() -> (std::net::TcpListener, Option<std::net::TcpListener>) {
+    let ipv4 = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = ipv4.local_addr().unwrap().port();
+    let ipv6 = match std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)) {
+        Ok(listener) => Some(listener),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            None
+        }
+        Err(error) => panic!("IPv6 listener failed: {error}"),
+    };
+    (ipv4, ipv6)
+}
+
 #[tokio::test]
 async fn port_forward_picker_keeps_selection_when_local_port_is_in_use() {
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let listeners = occupy_forward_port();
+    let port = listeners.0.local_addr().unwrap().port();
     let (mut app, _rx) = test_app();
     app.switch_kind("services");
     apply(
@@ -1975,7 +1993,7 @@ async fn port_forward_picker_keeps_selection_when_local_port_is_in_use() {
     assert!(app.flash_err);
     assert!(app.port_forwards.is_empty());
 
-    drop(listener);
+    drop(listeners);
     app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.mode, Mode::Table);
     assert_eq!(app.port_forwards.len(), 1);
@@ -1984,8 +2002,8 @@ async fn port_forward_picker_keeps_selection_when_local_port_is_in_use() {
 
 #[tokio::test]
 async fn port_forward_prompt_preserves_input_and_allows_correction() {
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let listeners = occupy_forward_port();
+    let port = listeners.0.local_addr().unwrap().port();
     let (mut app, _rx) = test_app();
     app.switch_kind("services");
     apply(
@@ -2032,38 +2050,38 @@ async fn port_forward_prompt_preserves_input_and_allows_correction() {
 }
 
 #[tokio::test]
-async fn port_forward_picker_rejects_occupied_ipv6_port() {
-    let listener = match std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)) {
-        Ok(listener) => listener,
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
-            ) =>
-        {
+async fn port_forward_picker_allows_one_available_loopback_family() {
+    for occupy_ipv4 in [true, false] {
+        let (ipv4, ipv6) = occupy_forward_port();
+        let Some(ipv6) = ipv6 else {
             return;
-        }
-        Err(error) => panic!("IPv6 listener failed: {error}"),
-    };
-    let port = listener.local_addr().unwrap().port();
-    let (mut app, _rx) = test_app();
-    app.switch_kind("pods");
-    apply(
-        &mut app,
-        json!({
-            "apiVersion": "v1", "kind": "Pod",
-            "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
-            "spec": {"containers": [{"name": "web", "ports": [{"containerPort": port}]}]}
-        }),
-    );
-    app.table_state.select(Some(0));
-    app.handle_key(press(KeyCode::Char('f'))).unwrap();
-    app.handle_key(press(KeyCode::Enter)).unwrap();
-    assert_eq!(app.mode, Mode::PortForwardPicker);
-    assert_eq!(app.flash, format!("port {port} is already in use"));
-    assert!(app.port_forwards.is_empty());
-    app.handle_key(press(KeyCode::Esc)).unwrap();
-    assert_eq!(app.mode, Mode::Table);
+        };
+        let port = ipv4.local_addr().unwrap().port();
+        let _occupied = if occupy_ipv4 {
+            drop(ipv6);
+            ipv4
+        } else {
+            drop(ipv4);
+            ipv6
+        };
+        let (mut app, _rx) = test_app();
+        app.switch_kind("pods");
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
+                "spec": {"containers": [{"name": "web", "ports": [{"containerPort": port}]}]}
+            }),
+        );
+        app.table_state.select(Some(0));
+        app.handle_key(press(KeyCode::Char('f'))).unwrap();
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.mode, Mode::Table);
+        assert_eq!(app.port_forwards.len(), 1);
+        assert_eq!(app.port_forwards[0].ports, format!("{port}:{port}"));
+        assert!(!app.flash_err);
+    }
 }
 
 #[tokio::test]
