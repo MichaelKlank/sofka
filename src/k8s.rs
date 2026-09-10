@@ -53,7 +53,17 @@ pub(crate) fn build_client(mut config: Config, allow_v1_client_cert: bool) -> Re
             }
             request
         });
-    Ok(builder.with_layer(&layer).with_layer(&MeterLayer).build())
+    let auth_errors = tower::util::MapErrLayer::new(|error: tower::BoxError| -> tower::BoxError {
+        match exec_auth_message(error.as_ref()) {
+            Some(message) => std::io::Error::other(message).into(),
+            None => error,
+        }
+    });
+    Ok(builder
+        .with_layer(&layer)
+        .with_layer(&auth_errors)
+        .with_layer(&MeterLayer)
+        .build())
 }
 
 fn exec_auth_message(error: &(dyn std::error::Error + 'static)) -> Option<String> {
@@ -849,7 +859,7 @@ fn spawn_watch_task(
                     crate::log_warn!("watch.error", kind = kind, error = e);
                     Msg::Error {
                         generation,
-                        error: exec_auth_message(&e).unwrap_or_else(|| e.to_string()),
+                        error: e.to_string(),
                     }
                 }
             };
