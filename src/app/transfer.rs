@@ -837,16 +837,17 @@ mod tests {
         let (seen, outcome) = drain(rx).await;
 
         assert!(outcome.starts_with("copied"), "{outcome}");
-        // Nothing is reported until something is known: the status bar
-        // already says "copying …", and rewriting it to "(0B)…" says less.
-        assert_eq!(seen[0].0, 0, "the first report claimed progress: {seen:?}");
         // The source was measured by the probe script, running here.
         let total = seen
             .iter()
             .find_map(|(_, total)| *total)
             .expect("no total: the size probe produced nothing");
         assert!(total >= 8192, "{total} is less than the source");
-        // Progress only rises.
+        // Progress only rises, and reaches what landed. Which sample lands
+        // first is a race with the copy's own first write and is not a
+        // property to assert — that a copy opens at zero is
+        // `what_was_already_at_the_destination_is_not_progress`'s to say,
+        // where the destination is pre-filled and the fixture waits.
         assert!(
             seen.windows(2).all(|w| w[1].0 >= w[0].0),
             "progress went backwards: {seen:?}"
@@ -854,6 +855,10 @@ mod tests {
         assert!(
             seen.iter().any(|(done, _)| *done >= 4096),
             "nothing was ever reported as moved: {seen:?}"
+        );
+        assert!(
+            seen.last().is_some_and(|(done, _)| *done <= total),
+            "more was reported than the source holds: {seen:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -871,8 +876,11 @@ mod tests {
         // The trailing rest is not padding: there is no closing measurement,
         // so the last sample is whatever the timer caught, and a copy that
         // ends the instant it writes leaves the last write unmeasured.
+        // The quiet at the front is what makes the first assertion below a
+        // property rather than a race: the destination is pre-filled, so a
+        // sample taken before anything is appended must read zero moved.
         let cp = format!(
-            "sleep 0.3; i=0; while [ $i -lt 4 ]; do printf '%1024s' '' >> '{}'; i=$((i+1)); sleep 0.1; done; sleep 0.4",
+            "sleep 0.6; i=0; while [ $i -lt 4 ]; do printf '%1024s' '' >> '{}'; i=$((i+1)); sleep 0.1; done; sleep 0.4",
             dest.display()
         );
         let (tx, rx) = tokio::sync::mpsc::channel(64);
