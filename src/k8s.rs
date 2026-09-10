@@ -15,7 +15,7 @@ use kube::api::{Api, ListParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::core::{DynamicObject, GroupVersionResource};
 use kube::discovery::ApiResource;
-use kube::runtime::{WatchStreamExt, watcher};
+use kube::runtime::{WatchStreamExt, utils::Backoff, watcher};
 use kube::{Client, Config, ResourceExt};
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
@@ -27,18 +27,21 @@ mod discovery;
 mod proxy;
 mod table;
 
-pub(crate) fn build_client(mut config: Config, allow_v1_client_cert: bool) -> Result<Client> {
+pub(crate) fn build_client(
+    mut config: Config,
+    allow_v1_client_cert: bool,
+    no_tls_resumption: bool,
+) -> Result<Client> {
     if let Some(exec) = &mut config.auth_info.exec {
         // Authentication commands must not read from or write to the TUI terminal.
         exec.interactive_mode = Some(kube::config::ExecInteractiveMode::Never);
     }
     let builder =
-        crate::legacy_tls::client_builder(config, allow_v1_client_cert).map_err(|error| {
-            match exec_auth_message(error.as_ref()) {
+        crate::legacy_tls::client_builder(config, allow_v1_client_cert, no_tls_resumption)
+            .map_err(|error| match exec_auth_message(error.as_ref()) {
                 Some(message) => anyhow::anyhow!(message),
                 None => error,
-            }
-        })?;
+            })?;
     let layer =
         tower::util::MapRequestLayer::new(|mut request: http::Request<kube::client::Body>| {
             let watch = request.uri().query().is_some_and(|query| {
@@ -290,6 +293,8 @@ pub struct Cluster {
     pub connected: bool,
     /// Explicit consent for v1 client certificates, retained for this run.
     pub allow_v1_client_cert: bool,
+    /// Disable TLS session resumption for all clients in this run.
+    pub no_tls_resumption: bool,
     /// Per-cluster support for Kubernetes streaming-list watch startup:
     /// unknown, supported, or unsupported. Shared by all view watches so one
     /// negotiation failure avoids retrying the extension on every switch.
@@ -317,7 +322,7 @@ fn sanitize_server_version(version: &str) -> String {
 }
 
 impl Cluster {
-    pub async fn connect(allow_v1_client_cert: bool) -> Result<Self> {
+    pub async fn connect(allow_v1_client_cert: bool, no_tls_resumption: bool) -> Result<Self> {
         let mut config = Config::infer()
             .await
             .context("loading kubeconfig (is KUBECONFIG / ~/.kube/config present?)")?;
@@ -329,11 +334,22 @@ impl Cluster {
         }
         let cli_context = kubeconfig.and_then(|config| config.current_context);
         let context = cli_context.clone().unwrap_or_else(|| "default".into());
-        Self::from_config(config, context, cli_context, allow_v1_client_cert).await
+        Self::from_config(
+            config,
+            context,
+            cli_context,
+            allow_v1_client_cert,
+            no_tls_resumption,
+        )
+        .await
     }
 
     /// Connect using a specific kubeconfig context (for the `:ctx` switcher).
-    pub async fn connect_context(name: &str, allow_v1_client_cert: bool) -> Result<Self> {
+    pub async fn connect_context(
+        name: &str,
+        allow_v1_client_cert: bool,
+        no_tls_resumption: bool,
+    ) -> Result<Self> {
         let kubeconfig = Kubeconfig::read().context("reading kubeconfig")?;
         let opts = KubeConfigOptions {
             context: Some(name.to_string()),
@@ -349,6 +365,7 @@ impl Cluster {
             name.to_string(),
             Some(name.to_string()),
             allow_v1_client_cert,
+            no_tls_resumption,
         )
         .await
     }
@@ -358,10 +375,12 @@ impl Cluster {
         context: String,
         cli_context: Option<String>,
         allow_v1_client_cert: bool,
+        no_tls_resumption: bool,
     ) -> Result<Self> {
         let cluster_url = config.cluster_url.to_string();
         let default_namespace = config.default_namespace.clone();
-        let client = build_client(config, allow_v1_client_cert).context("building kube client")?;
+        let client = build_client(config, allow_v1_client_cert, no_tls_resumption)
+            .context("building kube client")?;
         let version_client = client.clone();
 
         let cluster_name = cluster_name_for(&context).unwrap_or_default();
@@ -377,6 +396,7 @@ impl Cluster {
             catalog: Vec::new(),
             connected: true,
             allow_v1_client_cert,
+            no_tls_resumption,
             streaming_lists: Arc::new(AtomicU8::new(STREAMING_UNKNOWN)),
             child_kinds: Vec::new(),
             discovery_warnings: Vec::new(),
@@ -462,6 +482,7 @@ impl Cluster {
             catalog: Vec::new(),
             connected: false,
             allow_v1_client_cert: false,
+            no_tls_resumption: false,
             streaming_lists: Arc::new(AtomicU8::new(STREAMING_UNKNOWN)),
             child_kinds: Vec::new(),
             discovery_warnings: Vec::new(),
@@ -823,6 +844,7 @@ fn spawn_watch_task(
             return;
         }
 
+        let mut backoff = watcher::DefaultBackoff::default();
         while let Some(event) = stream.next().await {
             if using_streaming
                 && initializing
@@ -835,6 +857,15 @@ fn spawn_watch_task(
                     .boxed();
                 continue;
             }
+            // Initialisation events can repeat before each failed list request.
+            // Reset the delay only after the watch makes progress.
+            if matches!(
+                event,
+                Ok(watcher::Event::Apply(_) | watcher::Event::Delete(_) | watcher::Event::InitDone)
+            ) {
+                backoff.reset();
+            }
+            let mut retry_delay = None;
             let msg = match event {
                 Ok(watcher::Event::Apply(obj)) | Ok(watcher::Event::InitApply(obj)) => {
                     Msg::Applied {
@@ -882,6 +913,7 @@ fn spawn_watch_task(
                 }
                 Err(e) => {
                     crate::log_warn!("watch.error", kind = kind, error = e);
+                    retry_delay = Some(backoff.next().unwrap_or(Duration::from_secs(30)));
                     Msg::Error {
                         generation,
                         error: e.to_string(),
@@ -890,6 +922,12 @@ fn spawn_watch_task(
             };
             if tx.send(msg).await.is_err() {
                 break; // UI gone
+            }
+            if let Some(delay) = retry_delay {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = tx.closed() => break,
+                }
             }
         }
     })
@@ -1031,6 +1069,7 @@ impl Cluster {
             cli_context: Some("test".into()),
             connected: true,
             allow_v1_client_cert: false,
+            no_tls_resumption: false,
             registry: HashMap::new(),
             catalog: Vec::new(),
             streaming_lists: Arc::new(AtomicU8::new(STREAMING_UNKNOWN)),
@@ -1156,7 +1195,7 @@ pub(crate) mod tests {
                 }))
                 .unwrap(),
             );
-            let error = super::build_client(config, false).err().unwrap();
+            let error = super::build_client(config, false, false).err().unwrap();
             assert_eq!(
                 error.to_string(),
                 "Authentication failed. Run 'aws sso login' for the active AWS profile, then retry.",
@@ -1495,6 +1534,49 @@ clusters:
     }
 
     #[tokio::test]
+    async fn watch_retries_slow_down_after_repeated_auth_errors() {
+        for streaming in [true, false] {
+            let error = r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Unauthorized","code":401}"#.to_string();
+            let listed = r#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"10"},"items":[]}"#.to_string();
+            let bookmark = "{\"type\":\"BOOKMARK\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"resourceVersion\":\"10\",\"annotations\":{\"k8s.io/initial-events-end\":\"true\"}}}}\n".to_string();
+            let (url, requests) = mock_watch_server(vec![
+                ("401 Unauthorized", error.clone()),
+                ("401 Unauthorized", error.clone()),
+                ("401 Unauthorized", error),
+                ("200 OK", if streaming { bookmark } else { listed }),
+            ])
+            .await;
+            let cluster = watch_cluster(&url);
+            if !streaming {
+                cluster
+                    .streaming_lists
+                    .store(STREAMING_UNSUPPORTED, Ordering::Release);
+            }
+            let kind = cluster.resolve("pods").unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            let task = cluster.spawn_watch(&kind, "default", None, None, 1, tx);
+            let mut failures = Vec::new();
+            loop {
+                match tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                {
+                    Msg::Error { .. } => failures.push(Instant::now()),
+                    Msg::Synced { .. } => break,
+                    _ => {}
+                }
+            }
+            task.abort();
+            assert_eq!(failures.len(), 3);
+            assert!(failures[1].duration_since(failures[0]) >= Duration::from_millis(800));
+            assert!(failures[2].duration_since(failures[1]) >= Duration::from_millis(1600));
+            assert!(failures[2].elapsed() >= Duration::from_millis(3200));
+            assert!(requests.lock().unwrap().len() >= 4);
+        }
+    }
+
+    #[tokio::test]
     async fn streaming_watch_initializes_from_initial_events() {
         let body = concat!(
             "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"a\",\"namespace\":\"default\",\"resourceVersion\":\"10\"}}}\n",
@@ -1778,7 +1860,7 @@ clusters:
         // backoff) turns the mock's deliberate 503 into a ~4-minute stall;
         // retrying is not what these tests exercise.
         config.default_retry = false;
-        Cluster::from_config(config, "test".into(), None, false).await
+        Cluster::from_config(config, "test".into(), None, false, false).await
     }
 
     #[tokio::test]

@@ -114,7 +114,7 @@ struct Target {
 
 /// Read the request, sanitize, and write the report. Errors here are execution
 /// errors: the runner shows them and no report is produced.
-pub async fn run(allow_v1_client_cert: bool) -> Result<()> {
+pub async fn run(allow_v1_client_cert: bool, no_tls_resumption: bool) -> Result<()> {
     let request: Value = serde_json::from_reader(std::io::stdin().lock())
         .context("reading the plugin request from stdin")?;
     if request.get("schema_version").and_then(Value::as_u64) != Some(1) {
@@ -123,6 +123,7 @@ pub async fn run(allow_v1_client_cert: bool) -> Result<()> {
     let client = client_for(
         request.get("context").and_then(Value::as_str),
         allow_v1_client_cert,
+        no_tls_resumption,
     )
     .await?;
     let report = sanitize(client, &request, &guardrails_for(&request)).await?;
@@ -396,7 +397,11 @@ fn selectors(filter: Option<&str>) -> Result<(Option<String>, Option<String>)> {
 
 /// Build a client for the request's context. A null context means sofka had no
 /// explicit kubeconfig context name, so let the usual inference apply.
-async fn client_for(context: Option<&str>, allow_v1_client_cert: bool) -> Result<Client> {
+async fn client_for(
+    context: Option<&str>,
+    allow_v1_client_cert: bool,
+    no_tls_resumption: bool,
+) -> Result<Client> {
     let config = match context {
         Some(name) => {
             let options = kube::config::KubeConfigOptions {
@@ -411,7 +416,8 @@ async fn client_for(context: Option<&str>, allow_v1_client_cert: bool) -> Result
         }
         None => Config::infer().await.context("loading kubeconfig")?,
     };
-    crate::k8s::build_client(config, allow_v1_client_cert).context("building a Kubernetes client")
+    crate::k8s::build_client(config, allow_v1_client_cert, no_tls_resumption)
+        .context("building a Kubernetes client")
 }
 
 #[cfg(test)]

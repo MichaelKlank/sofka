@@ -396,7 +396,7 @@ fn mock_cluster(url: &str) -> Cluster {
     // this test is about the app's fallback, not the client's retries.
     config.default_retry = false;
     let mut cluster = Cluster::fake();
-    cluster.client = crate::k8s::build_client(config, false).expect("mock client");
+    cluster.client = crate::k8s::build_client(config, false, false).expect("mock client");
     cluster.cluster_url = url.into();
     cluster
 }
@@ -12351,7 +12351,9 @@ async fn expired_sso_keeps_context_picker_usable() {
         }))
         .unwrap(),
     );
-    let error = crate::k8s::build_client(config, false).err().unwrap();
+    let error = crate::k8s::build_client(config, false, false)
+        .err()
+        .unwrap();
     let (mut app, _rx) = test_app();
     app.cluster.connected = false;
     app.start_disconnected(&error.to_string());
@@ -12396,7 +12398,7 @@ printf '%s' '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredent
             }))
             .unwrap(),
         );
-        let client = crate::k8s::build_client(config, false).unwrap();
+        let client = crate::k8s::build_client(config, false, false).unwrap();
         std::fs::write(
             &marker,
             format!("{provider_error}: private-provider-output"),
@@ -22023,6 +22025,79 @@ async fn bundled_plugin_receives_v1_consent_only_when_enabled() {
 }
 
 #[tokio::test]
+async fn refresh_key_reports_auth_errors_without_a_retry_loop() {
+    let (mut app, mut rx) = test_app();
+    let (request_tx, mut requests) = mpsc::unbounded_channel();
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            if request
+                .uri()
+                .query()
+                .is_some_and(|query| query.contains("watch=true"))
+            {
+                let _ = request_tx.send(());
+            }
+            async {
+                Ok::<_, std::convert::Infallible>(http::Response::builder()
+                    .status(401)
+                    .body(http_body_util::Full::new(hyper::body::Bytes::from_static(
+                        br#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Unauthorized","message":"Unauthorized","code":401}"#
+                    )))
+                    .unwrap())
+            }
+        }),
+        "default",
+    );
+    app.kind = app.cluster.resolve("pods");
+    app.kind_plural = "pods".into();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let failed = matches!(&msg, Msg::Error { error, .. } if error.contains("Unauthorized"));
+        app.handle_msg(msg);
+        if failed {
+            break;
+        }
+    }
+    assert!(app.flash_err);
+    assert!(requests.try_recv().is_ok());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), requests.recv())
+            .await
+            .is_err()
+    );
+    app.handle_key(press(KeyCode::Char('q'))).unwrap();
+}
+
+#[tokio::test]
+async fn bundled_plugin_receives_tls_resumption_option_only_when_enabled() {
+    for allow in [false, true] {
+        let (mut app, _rx) = app_with_pod();
+        app.cluster.no_tls_resumption = allow;
+        app.plugins = crate::plugins::bundled()
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        plugin_command(&mut app, "sanitize");
+        let Some(ConfirmAction::Plugin { jobs, .. }) = app.confirm_action.as_ref() else {
+            panic!("expected plugin confirmation");
+        };
+        assert!(!jobs.is_empty());
+        for job in jobs {
+            assert_eq!(
+                job.argv.iter().any(|arg| arg == "--no-tls-resumption"),
+                allow
+            );
+        }
+        app.handle_key(press(KeyCode::Char('n'))).unwrap();
+        assert_eq!(app.mode, Mode::Table);
+    }
+}
+
+#[tokio::test]
 async fn refresh_key_reads_pods_through_a_configured_ca_server_certificate() {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22079,7 +22154,7 @@ async fn refresh_key_reads_pods_through_a_configured_ca_server_certificate() {
         }
     });
     let (mut app, mut rx) = test_app();
-    app.cluster.client = crate::k8s::build_client(config, false).unwrap();
+    app.cluster.client = crate::k8s::build_client(config, false, false).unwrap();
     app.kind = app.cluster.resolve("pods");
     app.kind_plural = "pods".into();
     app.handle_key(press(KeyCode::Char('r'))).unwrap();

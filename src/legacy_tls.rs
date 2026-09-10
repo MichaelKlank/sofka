@@ -17,7 +17,7 @@ use hyper_util::{
 };
 use kube::{
     Config,
-    client::{Body, ClientBuilder, ConfigExt, DynBody, retry::RetryPolicy},
+    client::{Body, ClientBuilder, ConfigExt, DynBody, middleware::AuthLayer, retry::RetryPolicy},
 };
 use rustls::{
     ClientConfig,
@@ -31,21 +31,44 @@ use x509_parser::prelude::*;
 
 type Builder = ClientBuilder<BoxService<Request<Body>, Response<Box<DynBody>>, BoxError>>;
 
-pub(crate) fn client_builder(config: Config, allow_v1: bool) -> Result<Builder> {
-    let tls = if let Some(roots) = crate::server_tls::configured_roots(&config) {
-        let mut tls = match config.rustls_client_config() {
-            Ok(tls) => tls,
-            Err(error) => v1_config(&config, allow_v1, error)?,
+pub(crate) fn client_builder(
+    config: Config,
+    allow_v1: bool,
+    no_tls_resumption: bool,
+) -> Result<Builder> {
+    let roots = crate::server_tls::configured_roots(&config);
+    if roots.is_none() && !no_tls_resumption {
+        return match ClientBuilder::try_from(config.clone()) {
+            Ok(builder) => Ok(builder),
+            Err(error) => {
+                let tls = v1_config(&config, allow_v1, error)?;
+                let auth = config.auth_layer()?;
+                connect(config, tls, auth)
+            }
         };
-        crate::server_tls::install(&mut tls, roots)?;
-        tls
-    } else {
-        match ClientBuilder::try_from(config.clone()) {
-            Ok(builder) => return Ok(builder),
-            Err(error) => v1_config(&config, allow_v1, error)?,
-        }
+    }
+    // Resolve auth before the TLS identity, as kube-rs does.
+    let auth = config.auth_layer()?;
+    let mut tls = match config.rustls_client_config() {
+        Ok(tls) => tls,
+        Err(error) => v1_config(&config, allow_v1, error)?,
     };
-    connect(config, tls)
+    if let Some(roots) = roots {
+        crate::server_tls::install(&mut tls, roots)?;
+    }
+    if no_tls_resumption {
+        tls.resumption = rustls::client::Resumption::disabled();
+    }
+    // Kube-rs exposes exec expiry only through its standard client builder.
+    // Retain that metadata when the opt-in path needs a custom transport.
+    let expiration = if config.auth_info.exec.is_some() {
+        *ClientBuilder::try_from(config.clone())?
+            .build()
+            .valid_until()
+    } else {
+        None
+    };
+    Ok(connect(config, tls, auth)?.with_valid_until(expiration))
 }
 
 fn v1_config(config: &Config, allow_v1: bool, original_error: kube::Error) -> Result<ClientConfig> {
@@ -77,17 +100,17 @@ fn v1_config(config: &Config, allow_v1: bool, original_error: kube::Error) -> Re
     legacy_config(config, chain)
 }
 
-fn connect(config: Config, tls: ClientConfig) -> Result<Builder> {
+fn connect(config: Config, tls: ClientConfig, auth: Option<AuthLayer>) -> Result<Builder> {
     let mut connector = HttpConnector::new();
     connector.enforce_http(false);
     match config.proxy_url.as_ref() {
-        None => transport(connector, config, tls),
+        None => transport(connector, config, tls, auth),
         Some(proxy) if proxy.scheme_str() == Some("socks5") => {
-            transport(SocksV5::new(proxy.clone(), connector), config, tls)
+            transport(SocksV5::new(proxy.clone(), connector), config, tls, auth)
         }
         Some(proxy) if proxy.scheme_str() == Some("http") => {
             let connector = proxy_auth(proxy, Tunnel::new(proxy.clone(), connector))?;
-            transport(connector, config, tls)
+            transport(connector, config, tls, auth)
         }
         Some(proxy) if proxy.scheme_str() == Some("https") => {
             // Use the configured trust settings for the proxy, without sending
@@ -96,7 +119,7 @@ fn connect(config: Config, tls: ClientConfig) -> Result<Builder> {
             proxy_config.tls_server_name = None;
             let connector = proxy_config.rustls_https_connector_with_connector(connector)?;
             let connector = proxy_auth(proxy, Tunnel::new(proxy.clone(), connector))?;
-            transport(connector, config, tls)
+            transport(connector, config, tls, auth)
         }
         Some(proxy) => bail!("unsupported proxy protocol: {:?}", proxy.scheme_str()),
     }
@@ -211,7 +234,12 @@ fn https<H>(connector: H, config: &Config, tls: ClientConfig) -> Result<HttpsCon
     Ok(builder.enable_http1().wrap_connector(connector))
 }
 
-fn transport<H>(connector: H, config: Config, tls: ClientConfig) -> Result<Builder>
+fn transport<H>(
+    connector: H,
+    config: Config,
+    tls: ClientConfig,
+    auth: Option<AuthLayer>,
+) -> Result<Builder>
 where
     H: 'static + Clone + Send + Sync + Service<Uri>,
     H::Response: 'static + Connection + Read + Write + Send + Unpin,
@@ -237,7 +265,7 @@ where
                 .default_retry
                 .then_some(RetryLayer::new(RetryPolicy::server_retry())),
         )
-        .option_layer(config.auth_layer()?)
+        .option_layer(auth)
         .layer(config.extra_headers_layer()?)
         .layer(TraceLayer::new_for_http())
         .map_err(BoxError::from)
@@ -291,11 +319,14 @@ mod tests {
         for insecure in [false, true] {
             let mut config = config();
             config.accept_invalid_certs = insecure;
-            let error = client_builder(config, false).err().unwrap().to_string();
+            let error = client_builder(config, false, false)
+                .err()
+                .unwrap()
+                .to_string();
             assert!(error.contains("client certificate is X.509 v1"), "{error}");
             assert!(error.contains("--allow-v1-client-cert"), "{error}");
         }
-        assert!(client_builder(config(), true).is_ok());
+        assert!(client_builder(config(), true, false).is_ok());
     }
 
     #[tokio::test]
@@ -303,11 +334,14 @@ mod tests {
         for key in [SERVER_KEY, b"invalid key"] {
             let mut config = config();
             config.auth_info.client_key_data = Some(STANDARD.encode(key).into());
-            assert!(client_builder(config, true).is_err());
+            assert!(client_builder(config, true, false).is_err());
         }
         let mut config = config();
         config.auth_info.client_key_data = Some(STANDARD.encode(SERVER_KEY).into());
-        let error = client_builder(config, true).err().unwrap().to_string();
+        let error = client_builder(config, true, false)
+            .err()
+            .unwrap()
+            .to_string();
         assert!(error.contains("does not match its private key"), "{error}");
     }
 
@@ -316,9 +350,9 @@ mod tests {
         for allow in [false, true] {
             let mut config = config();
             config.auth_info.client_certificate_data = Some(STANDARD.encode(CLIENT_V3));
-            assert!(client_builder(config.clone(), allow).is_ok());
+            assert!(client_builder(config.clone(), allow, false).is_ok());
             config.auth_info.client_key_data = Some(STANDARD.encode(SERVER_KEY).into());
-            assert!(client_builder(config, allow).is_err());
+            assert!(client_builder(config, allow, false).is_err());
         }
     }
 
@@ -330,9 +364,9 @@ mod tests {
                 config.accept_invalid_certs = insecure;
                 config.auth_info.client_certificate_data = Some(STANDARD.encode(CLIENT_P521));
                 config.auth_info.client_key_data = Some(STANDARD.encode(CLIENT_P521_KEY).into());
-                assert!(client_builder(config.clone(), allow_v1).is_ok());
+                assert!(client_builder(config.clone(), allow_v1, false).is_ok());
                 config.auth_info.client_key_data = Some(STANDARD.encode(KEY).into());
-                assert!(client_builder(config, allow_v1).is_err());
+                assert!(client_builder(config, allow_v1, false).is_err());
             }
         }
     }
@@ -349,7 +383,7 @@ mod tests {
         for cert in [pem.as_bytes(), b"invalid certificate"] {
             let mut config = config();
             config.auth_info.client_certificate_data = Some(STANDARD.encode(cert));
-            assert!(client_builder(config, true).is_err());
+            assert!(client_builder(config, true, false).is_err());
         }
     }
 
@@ -361,13 +395,13 @@ mod tests {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tls/");
         config.auth_info.client_certificate = Some(format!("{dir}client-v1.pem"));
         config.auth_info.client_key = Some(format!("{dir}client.key"));
-        assert!(client_builder(config.clone(), true).is_ok());
-        assert!(client_builder(config.clone(), false).is_err());
+        assert!(client_builder(config.clone(), true, false).is_ok());
+        assert!(client_builder(config.clone(), false, false).is_err());
         config.auth_info.client_certificate = Some("/missing/certificate".into());
         config.auth_info.client_key = Some("/missing/key".into());
         config.auth_info.client_certificate_data = Some(STANDARD.encode(CLIENT));
         config.auth_info.client_key_data = Some(STANDARD.encode(KEY).into());
-        assert!(client_builder(config, true).is_ok());
+        assert!(client_builder(config, true, false).is_ok());
     }
 
     // The test server trusts only the exact test certificates. It checks the
@@ -464,6 +498,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabling_resumption_keeps_client_auth_on_new_connections() {
+        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            for (server_pem, ca, client_pem) in [
+                (SERVER, CA, CLIENT_V3),
+                (SERVER, CA, CLIENT),
+                (PROXY, PROXY, CLIENT_V3),
+            ] {
+                for disabled in [false, true] {
+                    let tls = ServerConfig::builder_with_protocol_versions(&[version])
+                        .with_client_cert_verifier(Arc::new(PinnedClient))
+                        .with_single_cert(
+                            vec![CertificateDer::from_pem_slice(server_pem).unwrap()],
+                            PrivateKeyDer::from_pem_slice(SERVER_KEY).unwrap(),
+                        )
+                        .unwrap();
+                    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let mut config = config();
+                    config.cluster_url = format!("https://{}", listener.local_addr().unwrap())
+                        .parse()
+                        .unwrap();
+                    config.root_cert =
+                        Some(vec![CertificateDer::from_pem_slice(ca).unwrap().to_vec()]);
+                    config.auth_info.client_certificate_data = Some(STANDARD.encode(client_pem));
+                    let task = tokio::spawn(async move {
+                        let mut resumed = Vec::new();
+                        for _ in 0..3 {
+                            let (socket, _) = listener.accept().await.unwrap();
+                            let mut stream = acceptor.accept(socket).await.unwrap();
+                            let reused = stream.get_ref().1.handshake_kind()
+                                == Some(rustls::HandshakeKind::Resumed);
+                            resumed.push(reused);
+                            let mut request = Vec::new();
+                            while !request.ends_with(b"\r\n\r\n") {
+                                request.push(stream.read_u8().await.unwrap());
+                                assert!(request.len() < 16384);
+                            }
+                            // Model an endpoint that loses the client identity on resumption.
+                            let (status, body) = if reused {
+                                (
+                                    "401 Unauthorized",
+                                    r#"{"kind":"Status","status":"Failure","reason":"Unauthorized","code":401}"#,
+                                )
+                            } else {
+                                ("200 OK", "{}")
+                            };
+                            stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                            stream.shutdown().await.unwrap();
+                        }
+                        resumed
+                    });
+                    let client =
+                        crate::k8s::build_client(config, client_pem == CLIENT, disabled).unwrap();
+                    for attempt in 0..3 {
+                        let request = Request::get("/version").body(Vec::new()).unwrap();
+                        let result = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            client.request::<serde_json::Value>(request),
+                        )
+                        .await
+                        .unwrap();
+                        if disabled || attempt == 0 {
+                            assert!(result.is_ok(), "{result:?}");
+                        } else {
+                            assert!(
+                                matches!(result, Err(kube::Error::Api(status)) if status.code == 401)
+                            );
+                        }
+                    }
+                    assert_eq!(task.await.unwrap(), vec![false, !disabled, !disabled]);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn v1_and_v3_authenticate_with_tls12_and_tls13() {
         for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
             for pem in [CLIENT, CLIENT_V3] {
@@ -472,7 +582,7 @@ mod tests {
                 config.cluster_url = url;
                 config.auth_info.client_certificate_data = Some(STANDARD.encode(pem));
                 config.auth_info.impersonate = Some("test-user".into());
-                let client = crate::k8s::build_client(config, true).unwrap();
+                let client = crate::k8s::build_client(config, true, false).unwrap();
                 assert_eq!(client.default_namespace(), "test-ns");
                 let info = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
@@ -497,7 +607,7 @@ mod tests {
             config.cluster_url = url;
             config.auth_info.client_certificate_data = Some(STANDARD.encode(CLIENT_P521));
             config.auth_info.client_key_data = Some(STANDARD.encode(CLIENT_P521_KEY).into());
-            let client = crate::k8s::build_client(config, false).unwrap();
+            let client = crate::k8s::build_client(config, false, false).unwrap();
             let info = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 client.apiserver_version(),
@@ -523,7 +633,7 @@ mod tests {
                 ]);
                 config.auth_info.client_certificate_data = Some(STANDARD.encode(pem));
                 config.auth_info.client_key_data = Some(STANDARD.encode(key).into());
-                let client = crate::k8s::build_client(config, pem == CLIENT).unwrap();
+                let client = crate::k8s::build_client(config, pem == CLIENT, false).unwrap();
                 let info = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     client.apiserver_version(),
@@ -565,7 +675,7 @@ mod tests {
             let config = Config::from_custom_kubeconfig(kubeconfig, &Default::default())
                 .await
                 .unwrap();
-            let client = crate::k8s::build_client(config, false).unwrap();
+            let client = crate::k8s::build_client(config, false, false).unwrap();
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 client.apiserver_version(),
@@ -580,36 +690,37 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn exec_credentials_keep_standard_resolution_and_expiration() {
-        let (url, task) = server(SERVER, &rustls::version::TLS13).await;
-        let directory = std::env::temp_dir().join(format!(
-            "sofka-exec-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+        for disabled in [false, true] {
+            let (url, task) = server(SERVER, &rustls::version::TLS13).await;
+            let directory = std::env::temp_dir().join(format!(
+                "sofka-exec-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let counter = directory.join("count");
+            let credential = |expiration| {
+                serde_json::json!({
+                    "apiVersion": "client.authentication.k8s.io/v1", "kind": "ExecCredential",
+                    "status": {
+                        "expirationTimestamp": expiration,
+                        "clientCertificateData": std::str::from_utf8(CLIENT_V3).unwrap(),
+                        "clientKeyData": std::str::from_utf8(KEY).unwrap()
+                    }
+                })
+                .to_string()
+            };
+            let mut config = without_identity(&config());
+            config.cluster_url = url;
+            config
+                .root_cert
+                .as_mut()
                 .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        let counter = directory.join("count");
-        let credential = |expiration| {
-            serde_json::json!({
-                "apiVersion": "client.authentication.k8s.io/v1", "kind": "ExecCredential",
-                "status": {
-                    "expirationTimestamp": expiration,
-                    "clientCertificateData": std::str::from_utf8(CLIENT_V3).unwrap(),
-                    "clientKeyData": std::str::from_utf8(KEY).unwrap()
-                }
-            })
-            .to_string()
-        };
-        let mut config = without_identity(&config());
-        config.cluster_url = url;
-        config
-            .root_cert
-            .as_mut()
-            .unwrap()
-            .push(CertificateDer::from_pem_slice(PROXY).unwrap().to_vec());
-        config.auth_info.exec = Some(
+                .push(CertificateDer::from_pem_slice(PROXY).unwrap().to_vec());
+            config.auth_info.exec = Some(
             serde_json::from_value(serde_json::json!({
                 "apiVersion": "client.authentication.k8s.io/v1", "command": "sh",
                 "args": ["-c", r#"
@@ -620,7 +731,7 @@ count=$((count + 1))
 printf '%s\n' "$count" > "$1"
 case "$count" in
     1|2) printf '%s' "$SOFKA_TEST_EXEC_FIRST" ;;
-    3) printf '%s' "$SOFKA_TEST_EXEC_LAST" ;;
+    3|4|5) printf '%s' "$SOFKA_TEST_EXEC_LAST" ;;
     *) exit 1 ;;
 esac
 "#, "sofka-exec-test", counter.to_str().unwrap()],
@@ -632,25 +743,26 @@ esac
             }))
             .unwrap(),
         );
-        let result = crate::k8s::build_client(config, false);
-        let count = std::fs::read_to_string(&counter).unwrap();
-        std::fs::remove_dir_all(&directory).unwrap();
-        let client = result.unwrap();
-        // The kube builder resolves auth, TLS identity, and expiration. The
-        // configured CA must not add another credential-plugin invocation.
-        assert_eq!(count.trim(), "3");
-        assert_eq!(
-            client.valid_until().unwrap().to_string(),
-            "2098-01-01T00:00:00Z"
-        );
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client.apiserver_version(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        task.await.unwrap().unwrap();
+            let result = crate::k8s::build_client(config, false, disabled);
+            let count = std::fs::read_to_string(&counter).unwrap();
+            std::fs::remove_dir_all(&directory).unwrap();
+            let client = result.unwrap();
+            // The default path resolves auth, TLS identity, and expiry once.
+            // The opt-in path also needs the standard builder for expiry.
+            assert_eq!(count.trim(), if disabled { "5" } else { "3" });
+            assert_eq!(
+                client.valid_until().unwrap().to_string(),
+                "2098-01-01T00:00:00Z"
+            );
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.apiserver_version(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            task.await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]
@@ -682,7 +794,7 @@ esac
                     .accept(stream)
                     .await
             });
-            let client = crate::k8s::build_client(config, false).unwrap();
+            let client = crate::k8s::build_client(config, false, false).unwrap();
             let error = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 client.apiserver_version(),
@@ -697,32 +809,34 @@ esac
 
     #[tokio::test]
     async fn consent_preserves_server_trust_hostname_and_expiry_checks() {
-        for failure in ["trust", "hostname", "expiry"] {
-            let pem = if failure == "expiry" { EXPIRED } else { SERVER };
-            let (url, task) = server(pem, &rustls::version::TLS13).await;
-            let mut config = config();
-            config.cluster_url = url;
-            match failure {
-                "trust" => config.root_cert = Some(vec![]),
-                "hostname" => config.tls_server_name = Some("wrong.example".into()),
-                _ => {}
+        for disabled in [false, true] {
+            for failure in ["trust", "hostname", "expiry"] {
+                let pem = if failure == "expiry" { EXPIRED } else { SERVER };
+                let (url, task) = server(pem, &rustls::version::TLS13).await;
+                let mut config = config();
+                config.cluster_url = url;
+                match failure {
+                    "trust" => config.root_cert = Some(vec![]),
+                    "hostname" => config.tls_server_name = Some("wrong.example".into()),
+                    _ => {}
+                }
+                let client = crate::k8s::build_client(config, true, disabled).unwrap();
+                let error = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    client.apiserver_version(),
+                )
+                .await
+                .unwrap()
+                .unwrap_err();
+                let error = format!("{:#}", anyhow::Error::new(error));
+                let expected = match failure {
+                    "trust" => "UnknownIssuer",
+                    "hostname" => "not valid for name",
+                    _ => "expired",
+                };
+                assert!(error.contains(expected), "{failure}: {error}");
+                assert!(task.await.unwrap().is_err());
             }
-            let client = crate::k8s::build_client(config, true).unwrap();
-            let error = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                client.apiserver_version(),
-            )
-            .await
-            .unwrap()
-            .unwrap_err();
-            let error = format!("{:#}", anyhow::Error::new(error));
-            let expected = match failure {
-                "trust" => "UnknownIssuer",
-                "hostname" => "not valid for name",
-                _ => "expired",
-            };
-            assert!(error.contains(expected), "{failure}: {error}");
-            assert!(task.await.unwrap().is_err());
         }
     }
     #[tokio::test]
@@ -785,7 +899,7 @@ esac
                 config.root_cert = Some(vec![CertificateDer::from_pem_slice(ca).unwrap().to_vec()]);
                 config.auth_info.client_certificate_data = Some(STANDARD.encode(client_pem));
                 config.auth_info.client_key_data = Some(STANDARD.encode(client_key).into());
-                let client = crate::k8s::build_client(config, true).unwrap();
+                let client = crate::k8s::build_client(config, true, false).unwrap();
                 let version = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     client.apiserver_version(),

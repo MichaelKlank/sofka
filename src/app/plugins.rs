@@ -145,6 +145,9 @@ impl App {
                     }]
                 };
                 argv.extend(plugin.args.iter().map(|a| subst(a)));
+                if plugin.bundled && self.cluster.no_tls_resumption {
+                    argv.push("--no-tls-resumption".into());
+                }
                 if plugin.bundled && self.cluster.allow_v1_client_cert {
                     argv.push("--allow-v1-client-cert".into());
                 }
