@@ -26520,3 +26520,38 @@ async fn container_popup_separates_sections_and_aligns_charts() {
         lines[trends + 1].find("CPU")
     );
 }
+
+#[tokio::test]
+async fn container_spacing_preserves_wrapped_details_at_height_limit() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let mut pod = container_details_pod();
+    pod["spec"]["containers"][0]["image"] = json!(format!(
+        "registry.example.com/{}app:1.2.3",
+        "long-path/".repeat(40)
+    ));
+    apply(&mut app, pod);
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let spacious = render_container_popup(&mut app, 50, 80);
+    let expected: Vec<_> = spacious
+        .iter()
+        .skip_while(|line| !line.contains("Container:"))
+        .map(|line| line.trim().to_owned())
+        .collect();
+    // Reserve nine outer rows, three popup rows, and three container rows.
+    let minimum_height = 9 + 3 + 3 + expected.len() as u16;
+    for extra in [0, 1] {
+        let lines = render_container_popup(&mut app, 50, minimum_height + extra);
+        let start = lines
+            .iter()
+            .position(|line| line.contains("Container:"))
+            .unwrap();
+        let actual: Vec<_> = lines[start..]
+            .iter()
+            .map(|line| line.trim().to_owned())
+            .collect();
+        assert_eq!(actual, expected, "extra rows: {extra}");
+        assert_eq!(lines[start - 1].trim().is_empty(), extra > 0);
+    }
+}

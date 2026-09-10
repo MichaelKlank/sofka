@@ -3651,9 +3651,12 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
     let widths = container_column_widths(app, usize::from(popup_w.saturating_sub(4)));
     let details = container_detail_lines(app, usize::from(popup_w.saturating_sub(6)));
     let rows = app.container_list.len().max(1).min(usize::from(u16::MAX)) as u16;
-    let section_gap = u16::from(area.height >= 16);
-    let content_height = area.height.saturating_sub(3 + section_gap);
+    let content_height = area.height.saturating_sub(3);
     let min_rows = rows.min(3).min(content_height);
+    let section_gap = u16::from(
+        area.height >= 16 && details.len() < usize::from(content_height.saturating_sub(min_rows)),
+    );
+    let content_height = content_height.saturating_sub(section_gap);
     let detail_height = details
         .len()
         .min(usize::from(content_height.saturating_sub(min_rows))) as u16;
