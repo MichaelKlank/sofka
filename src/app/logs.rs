@@ -18,7 +18,9 @@ impl LogLineMeta {
             .map_or(line.len(), |end| start + end);
         let Ok(time) = line[start..end].parse::<k8s_openapi::jiff::Timestamp>() else {
             return Self {
-                sort_time: fallback,
+                sort_time: Some(
+                    fallback.unwrap_or_else(|| k8s_openapi::jiff::Timestamp::now().as_nanosecond()),
+                ),
                 timestamp: None,
             };
         };
@@ -40,8 +42,8 @@ impl LogsView {
         {
             line.replace_range(*start..start + timestamp.len(), "");
         }
-        // Equal timestamps keep their arrival order. Lines without a timestamp
-        // stay after the newest timestamp received so far.
+        // Equal timestamps keep their arrival order. Missing timestamps use
+        // the newest known time, or the arrival time if no time is known.
         let index = if self
             .line_meta
             .back()
@@ -83,6 +85,18 @@ impl LogsView {
     }
 
     pub(super) fn toggle_timestamps(&mut self) {
+        let anchor = if self.follow {
+            None
+        } else {
+            let (scroll, height) = (self.view.scroll, self.viewport_h);
+            let index = self.refresh_index(self.last_wrap_width);
+            let row = scroll.min(index.total_rows().saturating_sub(height));
+            let shown = index.first_at_row(row);
+            index.shown.get(shown).map(|line| {
+                let marker = index.shown[..shown].iter().filter(|l| l.is_none()).count();
+                (*line, marker, row - index.start_row(shown))
+            })
+        };
         self.timestamps = !self.timestamps;
         for (line, meta) in self.view.lines.iter_mut().zip(&self.line_meta) {
             if let Some((start, timestamp)) = &meta.timestamp {
@@ -94,7 +108,35 @@ impl LogsView {
             }
         }
         self.view.revision = self.view.revision.wrapping_add(1);
-        self.reset_index();
+        self.viewport_rows = self.refresh_index(self.last_wrap_width).total_rows();
+        if !self.follow {
+            let row = anchor.map_or(0, |(line, marker, offset)| {
+                let index = &self.index;
+                let shown = match line {
+                    Some(line) => index
+                        .shown
+                        .iter()
+                        .position(|entry| entry.is_some_and(|i| i >= line))
+                        .or_else(|| index.shown.len().checked_sub(1)),
+                    None => index
+                        .shown
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, line)| line.is_none())
+                        .nth(marker)
+                        .map(|(i, _)| i),
+                };
+                shown.map_or(0, |shown| {
+                    let offset = if index.shown[shown] == line {
+                        offset.min(index.height_at(shown).saturating_sub(1))
+                    } else {
+                        0
+                    };
+                    index.start_row(shown) + offset
+                })
+            });
+            self.view.scroll = row.min(self.viewport_rows.saturating_sub(self.viewport_h));
+        }
     }
 }
 

@@ -9002,6 +9002,101 @@ async fn log_timestamp_order_keeps_ties_errors_and_newest_lines_within_the_cap()
 }
 
 #[tokio::test]
+async fn log_timestamp_initial_status_lines_follow_older_history() {
+    use k8s_openapi::jiff::Timestamp;
+
+    let (mut app, _rx) = test_app();
+    app.mode = Mode::Logs;
+    app.logs_cfg.buffer = 3;
+    let now = Timestamp::now().as_second();
+    shortcut_log_lines(
+        &mut app,
+        vec![
+            "[provider] connected".into(),
+            "[a] [error] unavailable".into(),
+        ],
+    );
+    shortcut_log_lines(
+        &mut app,
+        (1..=3)
+            .map(|i| {
+                format!(
+                    "{} history {i}",
+                    Timestamp::from_second(now - 60 + i).unwrap()
+                )
+            })
+            .collect(),
+    );
+    assert_eq!(
+        app.filtered_log_text(),
+        "history 3\n[provider] connected\n[a] [error] unavailable"
+    );
+    app.handle_key(press(KeyCode::Char('t'))).unwrap();
+    assert!(
+        app.filtered_log_text()
+            .ends_with("history 3\n[provider] connected\n[a] [error] unavailable")
+    );
+    shortcut_log_lines(
+        &mut app,
+        (1..=3)
+            .map(|i| format!("{} live {i}", Timestamp::from_second(now + 60 + i).unwrap()))
+            .collect(),
+    );
+    app.handle_key(press(KeyCode::Char('t'))).unwrap();
+    assert_eq!(app.filtered_log_text(), "live 1\nlive 2\nlive 3");
+}
+
+#[tokio::test]
+async fn log_timestamp_toggle_preserves_paused_wrapped_line_and_marker() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for marker in [false, true] {
+        let (mut app, _rx) = test_app();
+        app.mode = Mode::Logs;
+        app.handle_key(press(KeyCode::Char('F'))).unwrap();
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        for i in 0..40 {
+            if i == 10 {
+                app.handle_key(press(KeyCode::Char('m'))).unwrap();
+                app.handle_key(press(KeyCode::Char('m'))).unwrap();
+            }
+            shortcut_log_lines(
+                &mut app,
+                vec![format!(
+                    "2026-09-10T10:00:{i:02}Z keep line {i:02} with enough text to wrap across rows"
+                )],
+            );
+        }
+        app.handle_key(press(KeyCode::Char('/'))).unwrap();
+        for c in "keep".chars() {
+            app.handle_key(press(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(28, 10)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.handle_key(press(KeyCode::Home)).unwrap();
+        let shown = if marker { 11 } else { 15 };
+        let offset = usize::from(!marker);
+        let target = app.logs.index().start_row(shown) + offset;
+        for _ in 0..target {
+            app.handle_key(press(KeyCode::Char('j'))).unwrap();
+        }
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.logs.view.scroll, target);
+        let anchor = app.logs.index().line_at(shown);
+        for _ in 0..4 {
+            app.handle_key(press(KeyCode::Char('t'))).unwrap();
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            assert!(!app.logs.follow);
+            let index = app.logs.index();
+            assert_eq!(index.first_at_row(app.logs.view.scroll), shown);
+            assert_eq!(index.line_at(shown), anchor);
+            assert_eq!(app.logs.view.scroll - index.start_row(shown), offset);
+        }
+    }
+}
+
+#[tokio::test]
 async fn log_timestamp_order_keeps_paused_scroll_filters_and_markers() {
     let (mut app, _rx) = test_app();
     app.mode = Mode::Logs;
