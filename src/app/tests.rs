@@ -12341,7 +12341,7 @@ async fn context_picker_launch_connects_on_enter_and_opens_default_resource() {
             .unwrap();
         }
         app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
-        app.open_contexts();
+        app.start_context_picker(None);
         assert_eq!(app.mode, Mode::Contexts);
         assert!(!app.flash_err);
         assert!(app.context_switch_target.is_none());
@@ -12365,6 +12365,57 @@ async fn context_picker_launch_connects_on_enter_and_opens_default_resource() {
             default.unwrap_or("pods")
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn context_picker_launch_namespace_survives_failure_and_applies_only_once() {
+    for scope in [None, Some("payments"), Some("")] {
+        let (mut app, _rx) = test_app();
+        app.cluster.connected = false;
+        app.namespace_memory.set("test", "remembered");
+        app.start_context_picker(scope.map(str::to_owned));
+        app.handle_msg(Msg::Contexts {
+            generation: app.generation,
+            list: vec!["test".into()],
+        });
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        app.handle_msg(Msg::ContextSwitched {
+            generation: app.generation,
+            name: "test".into(),
+            result: Err("connection refused".into()),
+        });
+        assert_eq!(app.mode, Mode::Contexts);
+        app.handle_msg(Msg::Contexts {
+            generation: app.generation,
+            list: vec!["test".into()],
+        });
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        app.handle_msg(Msg::ContextSwitched {
+            generation: app.generation,
+            name: "test".into(),
+            result: Ok(Box::new(Cluster::fake())),
+        });
+        assert_eq!(app.namespace, scope.unwrap_or("remembered"));
+        assert!(app.launch_namespace.is_none());
+        app.namespace_memory.set("other", "other-scope");
+        for ch in ":ctx".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        app.handle_msg(Msg::Contexts {
+            generation: app.generation,
+            list: vec!["other".into()],
+        });
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        let mut cluster = Cluster::fake();
+        cluster.context = "other".into();
+        app.handle_msg(Msg::ContextSwitched {
+            generation: app.generation,
+            name: "other".into(),
+            result: Ok(Box::new(cluster)),
+        });
+        assert_eq!(app.namespace, "other-scope");
     }
 }
 

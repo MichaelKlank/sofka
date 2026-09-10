@@ -544,8 +544,13 @@ impl App {
         self.flash_warn(&format!("{label}: {error} — pick another context"));
     }
 
-    /// Open the context picker without starting a cluster connection.
-    pub fn open_contexts(&mut self) {
+    /// Keep an explicit launch namespace until the first successful connection.
+    pub fn start_context_picker(&mut self, namespace: Option<String>) {
+        self.launch_namespace = namespace;
+        self.open_contexts();
+    }
+
+    pub(super) fn open_contexts(&mut self) {
         self.ctx_filter.clear();
         self.ctx_filtering = false;
         self.ctx_list.clear();
@@ -871,10 +876,12 @@ impl App {
         self.readonly = self.readonly_override.unwrap_or(resolved.config.readonly);
         cluster.add_aliases(&self.user_aliases);
         self.bump_generation();
-        // Where you last were in this context beats its config default.
+        // The launch scope applies once. Later switches use namespace memory,
+        // then the context default.
         self.namespace = self
-            .namespace_memory
-            .get(&cluster.context)
+            .launch_namespace
+            .take()
+            .or_else(|| self.namespace_memory.get(&cluster.context))
             .or(resolved.config.default_namespace)
             .unwrap_or_else(|| cluster.default_namespace.clone());
         self.cluster = *cluster;

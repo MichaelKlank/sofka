@@ -147,6 +147,24 @@ fn main() -> Result<()> {
 }
 
 impl Args {
+    fn launch_namespace(&self) -> Option<String> {
+        if self.all_namespaces {
+            Some(String::new())
+        } else {
+            self.namespace.clone()
+        }
+    }
+
+    fn validate_picker_context(&self, contexts: &[String]) -> Result<()> {
+        if let Some(name) = &self.context {
+            anyhow::ensure!(
+                contexts.contains(name),
+                "context '{name}' not found in kubeconfig"
+            );
+        }
+        Ok(())
+    }
+
     fn context_picker(&self) -> Result<bool> {
         let picker = matches!(self.resource.as_deref(), Some("ctx" | "contexts"));
         anyhow::ensure!(
@@ -208,6 +226,9 @@ async fn run_main(args: Args) -> Result<()> {
     // in the context picker instead (k9s behavior). Headless modes still exit
     // with the error, since there is no picker to fall back to.
     let (mut cluster, connect_error) = if context_picker {
+        if args.context.is_some() {
+            args.validate_picker_context(&Cluster::list_contexts().map_err(anyhow::Error::msg)?)?;
+        }
         (Cluster::disconnected(args.context.as_deref()), None)
     } else {
         eprintln!("Connecting to cluster…");
@@ -428,10 +449,9 @@ async fn run_main(args: Args) -> Result<()> {
     app.readonly = app.readonly_override.unwrap_or(cfg.readonly);
     // CLI flags win; then the namespace remembered for this context from the
     // last session; then the config default; then the kubeconfig's.
-    if args.all_namespaces {
-        app.namespace = String::new();
-    } else if let Some(ns) = args.namespace {
-        app.namespace = ns;
+    let launch_namespace = args.launch_namespace();
+    if let Some(ns) = &launch_namespace {
+        app.namespace = ns.clone();
     } else if let Some(ns) = app.namespace_memory.get(&app.cluster.context) {
         app.namespace = ns;
     } else if let Some(ns) = cfg.default_namespace.clone() {
@@ -445,7 +465,7 @@ async fn run_main(args: Args) -> Result<()> {
         // No cluster to watch — open the context picker over the empty table;
         // a successful pick connects and lands on the default resource.
         Some(err) => app.start_disconnected(err),
-        None if context_picker => app.open_contexts(),
+        None if context_picker => app.start_context_picker(launch_namespace),
         None => {
             app.switch_kind(&resource);
             app.start_autostart_forwards();
@@ -1111,6 +1131,35 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_picker_launch_validates_explicit_context() {
+        for alias in ["ctx", "contexts"] {
+            let args = Args::try_parse_from(["sofka", alias, "--context", "prod"]).unwrap();
+            assert!(args.validate_picker_context(&["prod".into()]).is_ok());
+            for contexts in [vec![], vec!["other".into()]] {
+                let error = args.validate_picker_context(&contexts).unwrap_err();
+                assert!(error.to_string().contains("context 'prod' not found"));
+            }
+            let args = Args::try_parse_from(["sofka", alias]).unwrap();
+            assert!(args.validate_picker_context(&["other".into()]).is_ok());
+        }
+    }
+
+    #[test]
+    fn context_picker_launch_namespace_flags() {
+        for alias in ["ctx", "contexts"] {
+            for (flags, expected) in [
+                (vec![], None),
+                (vec!["--namespace", "payments"], Some("payments")),
+                (vec!["--all-namespaces"], Some("")),
+                (vec!["-n", "payments", "-A"], Some("")),
+            ] {
+                let args = Args::try_parse_from(["sofka", alias].into_iter().chain(flags)).unwrap();
+                assert_eq!(args.launch_namespace().as_deref(), expected);
+            }
+        }
+    }
 
     #[test]
     fn context_picker_launch_aliases_and_context_flag() {
