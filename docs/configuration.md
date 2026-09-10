@@ -161,6 +161,44 @@ Each of these is documented where the feature itself is:
 | `[providers.logs]`    | VictoriaLogs backend for `L`                | [Providers](providers.md#log-provider-victorialogs)        |
 | `[fleet]`             | contexts in the cross-cluster dashboard     | [Providers](providers.md#fleet-dashboard)                  |
 
+## Action journal files
+
+The journal keeps the latest 500 entries in memory. To also save entries to disk:
+
+```toml
+[journal]
+enabled = true
+# file = "/path/to/journal.jsonl"
+max_size_mb = 8
+```
+
+`enabled` defaults to `false`. No journal file is created when it is disabled.
+`file` defaults to `<state-dir>/journal.jsonl`. An empty path uses the default.
+Relative paths start at the working directory. The file is created on the first
+recorded action. Restart sofka to apply changes to these settings.
+
+`max_size_mb` limits each file to 8 MiB by default, with a minimum of 64 KiB.
+The writer appends one JSON object per line. Before the next entry exceeds the
+limit, it rotates the file to `<file>.1` and replaces the previous backup.
+An entry larger than the limit is not saved and produces a warning.
+A `<file>.lock` file coordinates writes from multiple sessions.
+Use a separate path from the application log and other sofka state files.
+
+Each entry has `at` (full UTC timestamp), `context`, `action`, and `target`.
+Entries record actions started, not confirmed results. The journal view still
+shows only the current session. It does not load saved entries.
+
+File writes run on a background thread. Failed writes and a full queue produce
+a status warning, also kept in `:info`. Failed entries are not retried; later
+entries can still be saved. At exit, sofka waits up to 300 ms for pending writes
+and reports a warning if they do not finish. Entries can be lost on a crash or
+a stalled disk. This is local action history, not a complete audit record.
+
+Secret inputs are excluded. File output uses the same credential and IP address
+redaction as the application log. Resource names and contexts remain visible.
+Application logging at `info` or above also records actions, independently of
+`[journal]`.
+
 ## Per-cluster and per-context overrides
 
 Any option can be overridden for a specific cluster or kubeconfig context, like

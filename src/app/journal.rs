@@ -8,6 +8,15 @@ impl App {
         self.journal.record(&ctx, action, target);
     }
 
+    pub fn check_journal_error(&mut self) {
+        if let Some(error) = self.journal.take_error() {
+            self.borrow_status(error.clone(), true);
+            if !self.config_warnings.contains(&error) {
+                self.config_warnings.push(error);
+            }
+        }
+    }
+
     /// A compact "name" / "N kind" target label for a bulk-or-single action.
     pub(super) fn action_label(&self, targets: &[(String, String)]) -> String {
         match targets {

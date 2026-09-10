@@ -273,7 +273,7 @@ fn push_value(out: &mut String, raw: &str) {
 
 /// The log file and its rotation. All sessions use the same lock file.
 /// Only writer threads wait for this lock.
-struct Writer {
+pub(crate) struct Writer {
     path: PathBuf,
     max_bytes: u64,
     file: File,
@@ -282,7 +282,7 @@ struct Writer {
 }
 
 impl Writer {
-    fn open(path: &Path, max_bytes: u64) -> std::io::Result<Self> {
+    pub(crate) fn open(path: &Path, max_bytes: u64) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -303,7 +303,7 @@ impl Writer {
         })
     }
 
-    fn write(&mut self, line: &str) -> std::io::Result<()> {
+    pub(crate) fn write(&mut self, line: &str) -> std::io::Result<()> {
         // The lock file stays in place when any session rotates the log.
         self.lock.lock()?;
         let result = self.write_locked(line);
