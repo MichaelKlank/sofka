@@ -68,6 +68,9 @@ cargo install sofka                     # Cargo
 Or build from source: `cargo build --release` (see
 [Development](docs/architecture.md#development)).
 
+Use the [Home Manager module](docs/home-manager.md) to install Sofka and manage
+its configuration with Nix.
+
 ### macOS: "cannot be opened because the developer cannot be verified"
 
 The release binaries aren't signed or notarized yet, so Gatekeeper refuses a

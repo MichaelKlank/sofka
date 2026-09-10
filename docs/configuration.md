@@ -11,6 +11,9 @@ See [palette migration](keybindings.md#legacy-palette-migration).
 
 Everything below is optional. An empty config behaves exactly like no config.
 
+The [Home Manager module](home-manager.md) can manage the full configuration,
+dedicated section options, and cluster and context override files.
+
 ## Base options
 
 ```toml
