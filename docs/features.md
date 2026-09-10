@@ -372,7 +372,8 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   forwards** that show up in `:pf` even while stopped, with optional autostart.
   Pressing `f` on a pod or service opens a picker listing the manifest's
   declared ports; select one to forward immediately, or choose "Custom…" for
-  manual `LOCAL:REMOTE` input. Active forwards show a teal `●` in a dedicated
+  manual `LOCAL:REMOTE` input. If the local port is in use, the input stays open
+  and shows an error so you can choose another port. Active forwards show a teal `●` in a dedicated
   indicator column next to the row name. See [Saved forwards](plugins.md#saved-forwards).
 - **File transfer** (`t` on a pod, or `t` in the container picker for one
   container) - download from or upload to a pod via `kubectl cp`, off-thread

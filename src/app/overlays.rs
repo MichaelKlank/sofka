@@ -276,6 +276,11 @@ impl App {
             }
             (Some(Action::Accept), _) => {
                 let input = self.prompt_input.trim().to_string();
+                if matches!(self.prompt_kind, Some(PromptKind::PortForward { .. }))
+                    && !self.local_forward_port_available(&input)
+                {
+                    return;
+                }
                 self.mode = if self.prompt_over_logs() {
                     Mode::Logs
                 } else if self.prompt_over_contexts() {
@@ -428,6 +433,9 @@ impl App {
                     self.mode = Mode::Prompt;
                 } else {
                     let ports = item.split_whitespace().next().unwrap_or(&item).to_string();
+                    if !self.local_forward_port_available(&ports) {
+                        return;
+                    }
                     let target = forward_target(&self.kind_plural, &name);
                     self.start_port_forward(ns, target, ports);
                     self.mode = Mode::Table;
