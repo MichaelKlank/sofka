@@ -13,6 +13,9 @@ name, or an individual displayed column. Structured markers enable these terms:
 | `"auth"`                           | Contiguous text match, case-insensitive            |
 | `/^api/`                           | Regular expression, case-insensitive               |
 | `!canary`                          | Exclude fuzzy matches                              |
+| `label:example100`                 | Fuzzy match against label keys and values          |
+| `label:"example100"`               | Contiguous label text match, case-insensitive      |
+| `label:/^example[0-9]+$/`          | Label regex match, case-insensitive                |
 | `-l app=api,env=prod`              | Kubernetes label selector                          |
 | `-l app in (api, worker)`          | Kubernetes set selector                            |
 | `-l 'app notin (worker),env=prod'` | Quoted selector                                    |
@@ -33,6 +36,28 @@ when metrics arrive or disappear. Missing values are unknown, so they do not
 match typed comparisons, including negated comparisons; unknown is not zero.
 Age queries update as time passes without requiring a resource watch event.
 
+`label:<pattern>` searches the object's own `metadata.labels`, including labels
+that are not shown in the table. It works for built-in and custom resources.
+Each key and each value is tested separately. A match cannot cross a key/value
+boundary or combine text from different labels. Names, annotations, and pod
+template labels are outside this term's scope.
+
+Fuzzy label patterns allow gaps. An all-lowercase pattern ignores case; a pattern
+with uppercase characters is case-sensitive. Double quotes select a contiguous
+text match, not whole-value equality. Regex patterns use `/pattern/`. Quoted text
+and regex patterns ignore case, as they do in ordinary row filters.
+
+`!label:canary` keeps objects with no matching key or value. Objects without labels
+fail positive label terms and pass their negation. Empty label values remain
+valid; `label:/^$/` finds them. Separate AND terms can match different labels.
+Use `-l key=value` when an exact key/value relationship is required.
+
+Use the lowercase prefix `label:` with no space before the pattern. The pattern
+must not be empty. `"label:example100"` searches ordinary row text for that literal
+string. Label terms update locally as you type and when objects change. They use
+the current resource, namespace, and API selector scope and do not restart the
+watch. `-l test` still selects objects with the exact label key `test`.
+
 Boolean expressions use spaces or `&&` for AND, `||` for OR, and parentheses
 for grouping. AND binds more tightly than OR. `!text` excludes a fuzzy match;
 `!(expression)` negates a group. For example:
@@ -42,6 +67,8 @@ for grouping. AND binds more tightly than OR. `!text` excludes a fuzzy match;
 !(status=Running && age<2h)
 ("auth" || /^web/) && !/canary/
 -l app=api (status=Pending || restarts>=5)
+(label:api || label:worker) && !label:canary
+-l env=prod label:example100 status=Running
 ```
 
 Selectors scope the API request and must sit outside Boolean groups. To combine

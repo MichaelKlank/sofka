@@ -149,7 +149,9 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   help and returns to the previous screen.
 - **Filtering** (`/`) with matched-character highlighting: fuzzy text, `"text"`
   contiguous match, `/re/` regular expression (both case-insensitive), `!text`
-  inverse match (also `!"text"` and `!/re/`), `-l`/`-f` label and field selectors (evaluated server-side on
+  inverse match (also `!"text"` and `!/re/`), local label key and value search
+  (`label:text`, `label:"text"`, `label:/re/`, and `!label:text`),
+  `-l`/`-f` label and field selectors (evaluated server-side on
   ⏎), and typed column comparisons (`status=CrashLoopBackOff`, `cpu>500m`,
   `memory>1Gi`, `restarts>=5`, `age<2h`). Structured terms AND together with
   spaces or `&&`; `||` combines alternatives, parentheses group expressions,
