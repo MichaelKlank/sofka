@@ -19,7 +19,9 @@ async fn proxy_exclusions_apply_on_startup_and_context_switch() {
     if let Ok(phase) = std::env::var(CHILD) {
         let (mut app, mut rx) = test_app();
         if phase == "startup" {
-            app.cluster = Cluster::connect(false).await.expect("connect at startup");
+            app.cluster = Cluster::connect(false, false)
+                .await
+                .expect("connect at startup");
             app.kind = app.cluster.resolve("pods");
             app.kind_plural = "pods".into();
             app.handle_key(press(KeyCode::Char('r'))).unwrap();

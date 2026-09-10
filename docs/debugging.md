@@ -291,6 +291,56 @@ Sofka cannot skip the core API group. If it cannot read `v1`, the connection
 fails with the reason. If aggregated discovery fails, sofka shows the reason
 and reads each API group separately.
 
+## TLS session resumption and HTTP 401
+
+Some endpoints, including the AKS endpoints reported in
+[issue #479](https://github.com/nklmilojevic/sofka/issues/479), return HTTP 401
+on resumed TLS connections when authentication uses a client certificate.
+Sofka can show `watch stream failed: ApiError: Unauthorized` at startup or
+when you change context. Other requests, including metrics requests, can fail too.
+
+For an affected cluster, disable TLS session resumption for this run:
+
+```sh
+sofka --no-tls-resumption --context my-aks
+sofka --no-tls-resumption --context my-aks --check
+sofka --no-tls-resumption --context my-aks --snapshot -A pods
+```
+
+This option is off by default. When selected, it applies to all contexts used
+in the run, including fleet queries and the bundled sanitizer. Each new cluster
+TLS connection uses a full handshake. Existing connections can still be reused.
+Server certificate and hostname checks remain enabled. This option is separate
+from `--allow-v1-client-cert` and does not permit v1 certificates by itself.
+Full handshakes add work on new connections, including later reconnects.
+
+A 401 alone does not identify this problem. Expired or missing credentials can
+also cause it. To check session resumption, use OpenSSL with the certificate,
+key, and CA for the affected context. Use the API hostname for `HOST`, or its
+`tls-server-name` override, and the API address with its port for `ADDR`:
+
+```sh
+HOST=api.example.com
+ADDR=api.example.com:443
+umask 077
+printf 'GET /version HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$HOST" > req.txt
+openssl s_client -tls1_3 -connect "$ADDR" -servername "$HOST" \
+  -cert tls.crt -key tls.key -CAfile ca.crt \
+  -sess_out sess.pem -ign_eof < req.txt
+openssl s_client -tls1_3 -connect "$ADDR" -servername "$HOST" \
+  -cert tls.crt -key tls.key -CAfile ca.crt \
+  -sess_in sess.pem -ign_eof < req.txt
+```
+
+Compare `New` or `Reused` with the HTTP status. Full handshakes that return 200
+and resumed handshakes that return 401 support this diagnosis. A server can
+reject a ticket and use a full handshake, so more than one attempt can be needed.
+Keep private keys and session files private. Remove the temporary files after
+the check.
+
+Watch errors use increasing retry delays to limit repeated requests. This delay
+is always enabled and does not correct an authentication failure.
+
 ## X.509 v1 client certificates
 
 Some MicroK8s kubeconfigs contain an X.509 v1 client certificate. The standard

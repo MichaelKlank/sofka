@@ -52,6 +52,9 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 
 - **Connect** to the current kubeconfig context, including exec credential
   plugins (GKE, EKS, and friends).
+- **Optional TLS session resumption workaround** through `--no-tls-resumption`
+  for clusters that reject resumed connections with HTTP 401. The default is
+  unchanged. See [TLS session resumption](debugging.md#tls-session-resumption-and-http-401).
 - **Optional v1 client certificates** through `--allow-v1-client-cert`, disabled
   by default. See [certificate compatibility](debugging.md#x509-v1-client-certificates).
 - **Teleport local proxy certificates** work when the server certificate exactly

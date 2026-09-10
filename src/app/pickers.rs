@@ -802,8 +802,9 @@ impl App {
         let tx = self.tx.clone();
         let genr = self.generation;
         let allow_v1_client_cert = self.cluster.allow_v1_client_cert;
+        let no_tls_resumption = self.cluster.no_tls_resumption;
         tokio::spawn(async move {
-            let result = Cluster::connect_context(&name, allow_v1_client_cert)
+            let result = Cluster::connect_context(&name, allow_v1_client_cert, no_tls_resumption)
                 .await
                 .map(Box::new)
                 .map_err(|e| e.to_string());

@@ -54,6 +54,10 @@ struct Args {
     #[arg(long)]
     allow_v1_client_cert: bool,
 
+    /// Disable TLS session resumption for this run, including context changes.
+    #[arg(long)]
+    no_tls_resumption: bool,
+
     /// Disable every action that could modify the cluster (delete, edit,
     /// scale, shell, plugins, …). Overrides the config `readonly` option,
     /// including per-cluster/per-context overrides, for the whole session.
@@ -146,7 +150,9 @@ async fn run_main(args: Args) -> Result<()> {
     // never load config, connect, or touch the terminal.
     if let Some(name) = &args.plugin_adapter {
         return match name.as_str() {
-            "sanitize" => sofka::sanitize::run(args.allow_v1_client_cert).await,
+            "sanitize" => {
+                sofka::sanitize::run(args.allow_v1_client_cert, args.no_tls_resumption).await
+            }
             other => Err(anyhow::anyhow!("unknown core plugin adapter '{other}'")),
         };
     }
@@ -189,8 +195,10 @@ async fn run_main(args: Args) -> Result<()> {
     // with the error, since there is no picker to fall back to.
     eprintln!("Connecting to cluster…");
     let connect = match args.context.as_deref() {
-        Some(name) => Cluster::connect_context(name, args.allow_v1_client_cert).await,
-        None => Cluster::connect(args.allow_v1_client_cert).await,
+        Some(name) => {
+            Cluster::connect_context(name, args.allow_v1_client_cert, args.no_tls_resumption).await
+        }
+        None => Cluster::connect(args.allow_v1_client_cert, args.no_tls_resumption).await,
     };
     let (mut cluster, connect_error) = match connect {
         Ok(c) => (c, None),
@@ -208,6 +216,7 @@ async fn run_main(args: Args) -> Result<()> {
         }
     };
     cluster.allow_v1_client_cert = args.allow_v1_client_cert;
+    cluster.no_tls_resumption = args.no_tls_resumption;
     for w in cluster
         .discovery_fallback
         .iter()
@@ -703,8 +712,11 @@ async fn run_info(
     } else {
         eprintln!("Connecting to cluster…");
         match args.context.as_deref() {
-            Some(name) => Cluster::connect_context(name, args.allow_v1_client_cert).await,
-            None => Cluster::connect(args.allow_v1_client_cert).await,
+            Some(name) => {
+                Cluster::connect_context(name, args.allow_v1_client_cert, args.no_tls_resumption)
+                    .await
+            }
+            None => Cluster::connect(args.allow_v1_client_cert, args.no_tls_resumption).await,
         }
         .inspect_err(|e| {
             eprintln!(
@@ -1077,6 +1089,24 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tls_resumption_is_disabled_only_when_requested() {
+        assert!(!Args::try_parse_from(["sofka"]).unwrap().no_tls_resumption);
+        for mode in ["--check", "--snapshot", "pods"] {
+            let args = Args::try_parse_from(["sofka", mode, "--no-tls-resumption"]).unwrap();
+            assert!(args.no_tls_resumption);
+            assert!(!args.allow_v1_client_cert);
+        }
+        let args = Args::try_parse_from([
+            "sofka",
+            "--no-tls-resumption",
+            "--plugin-adapter",
+            "sanitize",
+        ])
+        .unwrap();
+        assert!(args.no_tls_resumption);
+    }
 
     #[test]
     fn v1_client_cert_requires_an_explicit_cli_flag() {
