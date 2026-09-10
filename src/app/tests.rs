@@ -12465,13 +12465,118 @@ async fn context_switch_resolves_readonly_and_cli_pin_wins() {
 }
 
 #[tokio::test]
+async fn context_picker_launch_connects_on_enter_and_opens_default_resource() {
+    for default in [None, Some("deployments")] {
+        let (mut app, _rx) = test_app();
+        app.cluster.connected = false;
+        let dir = std::env::temp_dir().join(format!(
+            "sofka-context-launch-{}-{}",
+            std::process::id(),
+            default.unwrap_or("pods")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(resource) = default {
+            std::fs::write(
+                dir.join("config.toml"),
+                format!("default_resource = \"{resource}\"\n"),
+            )
+            .unwrap();
+        }
+        app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+        app.start_context_picker(None);
+        assert_eq!(app.mode, Mode::Contexts);
+        assert!(!app.flash_err);
+        assert!(app.context_switch_target.is_none());
+        app.handle_msg(Msg::Contexts {
+            generation: app.generation,
+            list: vec!["test".into()],
+        });
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            app.context_switch_target,
+            Some((app.generation, "test".into()))
+        );
+        app.handle_msg(Msg::ContextSwitched {
+            generation: app.generation,
+            name: "test".into(),
+            result: Ok(Box::new(Cluster::fake())),
+        });
+        assert_eq!(app.mode, Mode::Table);
+        assert_eq!(
+            app.kind.as_ref().unwrap().ar.plural,
+            default.unwrap_or("pods")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn context_picker_launch_namespace_survives_failure_and_applies_only_once() {
+    for (scope, disconnected) in [None, Some("payments"), Some("")]
+        .into_iter()
+        .flat_map(|scope| [false, true].map(|disconnected| (scope, disconnected)))
+    {
+        let (mut app, _rx) = test_app();
+        app.cluster.connected = false;
+        app.namespace_memory.set("test", "remembered");
+        if disconnected {
+            app.start_disconnected("connection refused", scope.map(str::to_owned));
+            assert!(app.flash_err);
+        } else {
+            app.start_context_picker(scope.map(str::to_owned));
+        }
+        app.handle_msg(Msg::Contexts {
+            generation: app.generation,
+            list: vec!["test".into()],
+        });
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        app.handle_msg(Msg::ContextSwitched {
+            generation: app.generation,
+            name: "test".into(),
+            result: Err("connection refused".into()),
+        });
+        assert_eq!(app.mode, Mode::Contexts);
+        app.handle_msg(Msg::Contexts {
+            generation: app.generation,
+            list: vec!["test".into()],
+        });
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        app.handle_msg(Msg::ContextSwitched {
+            generation: app.generation,
+            name: "test".into(),
+            result: Ok(Box::new(Cluster::fake())),
+        });
+        assert_eq!(app.namespace, scope.unwrap_or("remembered"));
+        assert!(app.launch_namespace.is_none());
+        app.namespace_memory.set("other", "other-scope");
+        for ch in ":ctx".chars() {
+            app.handle_key(press(KeyCode::Char(ch))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        app.handle_msg(Msg::Contexts {
+            generation: app.generation,
+            list: vec!["other".into()],
+        });
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        let mut cluster = Cluster::fake();
+        cluster.context = "other".into();
+        app.handle_msg(Msg::ContextSwitched {
+            generation: app.generation,
+            name: "other".into(),
+            result: Ok(Box::new(cluster)),
+        });
+        assert_eq!(app.namespace, "other-scope");
+    }
+}
+
+#[tokio::test]
 async fn disconnected_start_opens_context_picker() {
     let (tx, _rx) = mpsc::channel(1024);
     let mut cluster = Cluster::fake();
     cluster.connected = false;
     let mut app = App::new(cluster, tx);
 
-    app.start_disconnected("tcp connect error: Connection refused");
+    app.start_disconnected("tcp connect error: Connection refused", None);
     assert_eq!(app.mode, Mode::Contexts);
     assert!(app.flash_err);
     assert!(
@@ -12498,7 +12603,7 @@ async fn expired_sso_keeps_context_picker_usable() {
         .unwrap();
     let (mut app, _rx) = test_app();
     app.cluster.connected = false;
-    app.start_disconnected(&error.to_string());
+    app.start_disconnected(&error.to_string(), None);
     assert_eq!(app.mode, Mode::Contexts);
     assert!(app.flash_err);
     assert!(app.flash.contains("aws sso login"), "{}", app.flash);

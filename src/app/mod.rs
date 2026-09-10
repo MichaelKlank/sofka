@@ -1758,6 +1758,8 @@ pub struct App {
     /// Context currently being connected to, paired with the generation that
     /// owns its eventual result.
     context_switch_target: Option<(u64, String)>,
+    /// Explicit launch scope, consumed by the first successful picker connection.
+    launch_namespace: Option<String>,
     pub tasks: Vec<JoinHandle<()>>,
     pub tx: Sender<Msg>,
     /// Ordered off-thread persistence for small UI state files. `None` keeps
@@ -2236,6 +2238,7 @@ impl App {
             generation: 0,
             gen_flag: Arc::new(AtomicU64::new(0)),
             context_switch_target: None,
+            launch_namespace: None,
             tasks: Vec::new(),
             tx,
             state_writer: None,

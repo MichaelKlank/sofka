@@ -534,14 +534,20 @@ impl App {
     /// Start the session in the context picker because the current context's
     /// API server was unreachable at launch (k9s behavior). The connect error
     /// stays visible in the status line while picking.
-    pub fn start_disconnected(&mut self, error: &str) {
+    pub fn start_disconnected(&mut self, error: &str, namespace: Option<String>) {
         let label = if self.cluster.context.is_empty() {
             "cannot connect".to_string()
         } else {
             format!("cannot connect to '{}'", self.cluster.context)
         };
-        self.open_contexts();
+        self.start_context_picker(namespace);
         self.flash_warn(&format!("{label}: {error} — pick another context"));
+    }
+
+    /// Keep an explicit launch namespace until the first successful connection.
+    pub fn start_context_picker(&mut self, namespace: Option<String>) {
+        self.launch_namespace = namespace;
+        self.open_contexts();
     }
 
     pub(super) fn open_contexts(&mut self) {
@@ -870,10 +876,12 @@ impl App {
         self.readonly = self.readonly_override.unwrap_or(resolved.config.readonly);
         cluster.add_aliases(&self.user_aliases);
         self.bump_generation();
-        // Where you last were in this context beats its config default.
+        // The launch scope applies once. Later switches use namespace memory,
+        // then the context default.
         self.namespace = self
-            .namespace_memory
-            .get(&cluster.context)
+            .launch_namespace
+            .take()
+            .or_else(|| self.namespace_memory.get(&cluster.context))
             .or(resolved.config.default_namespace)
             .unwrap_or_else(|| cluster.default_namespace.clone());
         self.cluster = *cluster;

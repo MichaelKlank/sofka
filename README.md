@@ -99,6 +99,12 @@ sofka [RESOURCE] [-n NAMESPACE] [-A] [--context NAME] [--kubeconfig PATH] [--rea
   --write           force write mode, overriding any config `readonly`
 ```
 
+Use `sofka ctx` or `sofka contexts` to open the context picker before connecting.
+Select a context to connect and open its configured default resource, or pods.
+`--context NAME` selects the initial context in the picker. An unknown name
+returns an error. `-n` and `-A` apply to the first successful selection only. These launch commands
+require interactive mode and cannot be used with `--check` or `--snapshot`.
+
 `--readonly` and `--write` set the mode for the whole session and win over the
 config `readonly` option, including per-cluster and per-context overrides, on
 every `:ctx` switch. With no flag, switching into a context whose config sets
