@@ -272,6 +272,8 @@ mod tests {
     const SERVER: &[u8] = include_bytes!("../tests/fixtures/tls/server.pem");
     const EXPIRED: &[u8] = include_bytes!("../tests/fixtures/tls/server-expired.pem");
     const SERVER_KEY: &[u8] = include_bytes!("../tests/fixtures/tls/server.key");
+    const CLIENT_P521: &[u8] = include_bytes!("../tests/fixtures/tls/client-p521.pem");
+    const CLIENT_P521_KEY: &[u8] = include_bytes!("../tests/fixtures/tls/client-p521.key");
 
     fn config() -> Config {
         let mut config = Config::new("https://127.0.0.1:6443/prefix".parse().unwrap());
@@ -317,6 +319,21 @@ mod tests {
             assert!(client_builder(config.clone(), allow).is_ok());
             config.auth_info.client_key_data = Some(STANDARD.encode(SERVER_KEY).into());
             assert!(client_builder(config, allow).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn p521_client_keys_require_a_matching_certificate_with_any_tls_flags() {
+        for insecure in [false, true] {
+            for allow_v1 in [false, true] {
+                let mut config = config();
+                config.accept_invalid_certs = insecure;
+                config.auth_info.client_certificate_data = Some(STANDARD.encode(CLIENT_P521));
+                config.auth_info.client_key_data = Some(STANDARD.encode(CLIENT_P521_KEY).into());
+                assert!(client_builder(config.clone(), allow_v1).is_ok());
+                config.auth_info.client_key_data = Some(STANDARD.encode(KEY).into());
+                assert!(client_builder(config, allow_v1).is_err());
+            }
         }
     }
 
@@ -369,7 +386,7 @@ mod tests {
             _: &[CertificateDer<'_>],
             _: UnixTime,
         ) -> Result<ClientCertVerified, rustls::Error> {
-            if [CLIENT, CLIENT_V3, PROXY]
+            if [CLIENT, CLIENT_V3, CLIENT_P521, PROXY]
                 .iter()
                 .any(|pem| CertificateDer::from_pem_slice(pem).unwrap() == *cert)
             {
@@ -401,12 +418,15 @@ mod tests {
                 message,
                 &SubjectPublicKeyInfoDer::from(cert.public_key().raw),
                 signature,
-                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+                &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
             )
         }
 
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            vec![SignatureScheme::RSA_PSS_SHA256]
+            vec![
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::ECDSA_NISTP521_SHA512,
+            ]
         }
     }
 
@@ -466,6 +486,28 @@ mod tests {
                 assert!(request.starts_with("GET /prefix/version "), "{request}");
                 assert!(request.contains("impersonate-user: test-user"), "{request}");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn p521_authenticates_with_tls12_and_tls13_without_tls_flags() {
+        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            let (url, task) = server(SERVER, version).await;
+            let mut config = config();
+            config.cluster_url = url;
+            config.auth_info.client_certificate_data = Some(STANDARD.encode(CLIENT_P521));
+            config.auth_info.client_key_data = Some(STANDARD.encode(CLIENT_P521_KEY).into());
+            let client = crate::k8s::build_client(config, false).unwrap();
+            let info = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.apiserver_version(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(info.git_version, "v1.35.0");
+            let request = task.await.unwrap().unwrap();
+            assert!(request.starts_with("GET /prefix/version "), "{request}");
         }
     }
 
@@ -614,7 +656,7 @@ esac
     #[tokio::test]
     async fn configured_ca_requires_the_server_private_key_in_tls12_and_tls13() {
         for protocol in [&rustls::version::TLS12, &rustls::version::TLS13] {
-            let provider = rustls::crypto::ring::default_provider();
+            let provider = rustls::crypto::aws_lc_rs::default_provider();
             let wrong_key = provider
                 .key_provider
                 .load_private_key(PrivateKeyDer::from_pem_slice(KEY).unwrap())

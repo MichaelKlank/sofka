@@ -66,3 +66,11 @@ extendedKeyUsage = clientAuth
             if extensions:
                 args.extend(["-extensions", extensions])
             openssl(*args)
+
+# The test server trusts the exact P-521 certificate, so it can be self-signed.
+# Tests check private key loading and the TLS handshake signature.
+p521_key = str(DEST / "client-p521.key")
+p521_cert = str(DEST / "client-p521.pem")
+openssl("ecparam", "-name", "secp521r1", "-genkey", "-noout", "-out", p521_key)
+openssl("req", "-new", "-x509", "-key", p521_key, "-subj", "/CN=client-p521", "-sha384",
+        "-days", "36500", "-out", p521_cert)
