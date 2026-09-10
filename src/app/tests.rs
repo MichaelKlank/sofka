@@ -24080,3 +24080,355 @@ async fn scrollbars_hide_when_idle_and_return_on_keyboard_and_wheel_input() {
     app.handle_key(press(KeyCode::Esc)).unwrap();
     assert!(!app.scrollbars_visible());
 }
+
+#[tokio::test]
+async fn age_shortcut_sorts_toggles_and_obeys_sort_memory() {
+    for remember in [true, false] {
+        let (mut app, _rx) = test_app();
+        app.remember_sort = remember;
+        palette(&mut app, "pods");
+        app.handle_key(press(KeyCode::Char('A'))).unwrap();
+        assert_eq!(app.display_headers()[app.sort_column.unwrap()], "AGE");
+        assert!(!app.sort_desc);
+        assert_eq!(app.mode, Mode::Table);
+        for (name, created) in [
+            ("a-old", "2020-01-01T00:00:00Z"),
+            ("z-new", "2025-01-01T00:00:00Z"),
+        ] {
+            apply(
+                &mut app,
+                json!({"apiVersion":"v1", "kind":"Pod", "metadata": {
+                    "name":name, "namespace":"default", "creationTimestamp":created
+                }}),
+            );
+        }
+        let names = |app: &App| {
+            app.rows()
+                .iter()
+                .map(|o| o.metadata.name.clone().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&app), ["z-new", "a-old"]);
+        app.handle_key(press(KeyCode::Char('A'))).unwrap();
+        assert!(app.sort_desc);
+        assert_eq!(names(&app), ["a-old", "z-new"]);
+        assert_eq!(
+            app.sort_memory.get("pods"),
+            remember.then(|| ("AGE".into(), true))
+        );
+        palette(&mut app, "deployments");
+        palette(&mut app, "pods");
+        assert_eq!(app.sort_column.is_some(), remember);
+        if remember {
+            assert!(app.sort_desc);
+            app.handle_key(press(KeyCode::Char('A'))).unwrap();
+            assert!(!app.sort_desc);
+        }
+    }
+}
+
+#[tokio::test]
+async fn age_shortcut_keeps_sort_when_age_is_absent() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [views.pods]
+        replace = true
+        columns = [{ name = "NAME", builtin = "NAME" }]
+    "#,
+    );
+    palette(&mut app, "pods");
+    select_sort_with_keys(&mut app, "NAME");
+    let sort = (app.sort_column, app.sort_desc);
+    app.handle_key(press(KeyCode::Char('A'))).unwrap();
+    assert_eq!((app.sort_column, app.sort_desc), sort);
+    assert_eq!(app.flash, "view has no AGE column");
+    assert_eq!(app.mode, Mode::Table);
+}
+
+#[tokio::test]
+async fn namespace_shortcut_uses_cursor_and_records_history() {
+    let (mut app, _rx) = test_app();
+    palette(&mut app, "pods all /pod");
+    let pod = |ns: &str| {
+        json!({"apiVersion":"v1", "kind":"Pod",
+        "metadata":{"name":"pod", "namespace":ns}})
+    };
+    apply(&mut app, pod("alpha"));
+    apply(&mut app, pod("monitoring"));
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::End)).unwrap();
+    assert_eq!(app.marked.len(), 1);
+    app.handle_key(press(KeyCode::Char('W'))).unwrap();
+    assert_eq!(app.namespace, "monitoring");
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.filter, "pod");
+    app.handle_key(press(KeyCode::Char('['))).unwrap();
+    assert_eq!(app.namespace, "");
+    app.handle_key(press(KeyCode::Char(']'))).unwrap();
+    assert_eq!(app.namespace, "monitoring");
+    apply(&mut app, pod("monitoring"));
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    let generation = app.generation;
+    app.handle_key(press(KeyCode::Char('W'))).unwrap();
+    assert_eq!(app.generation, generation);
+    assert_eq!(app.flash, "namespace: monitoring");
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert!(app.wide);
+}
+
+#[tokio::test]
+async fn namespace_shortcut_rejects_missing_selection_and_namespace() {
+    let (mut app, _rx) = test_app();
+    palette(&mut app, "nodes");
+    app.handle_key(press(KeyCode::Char('W'))).unwrap();
+    assert_eq!(app.flash, "no resource selected");
+    for namespace in [None, Some("")] {
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1", "kind":"Node",
+            "metadata":{"name":"node", "namespace":namespace}}),
+        );
+        app.handle_key(press(KeyCode::Home)).unwrap();
+        let before = (app.namespace.clone(), app.generation);
+        app.handle_key(press(KeyCode::Char('W'))).unwrap();
+        assert_eq!(app.flash, "resource has no namespace");
+        assert_eq!((app.namespace.clone(), app.generation), before);
+    }
+}
+
+#[tokio::test]
+async fn namespace_shortcut_removes_owner_scope_in_current_namespace() {
+    let (mut app, _rx) = test_app();
+    palette(&mut app, "pods default");
+    app.owner = Some(OwnerScope {
+        kind: "Job".into(),
+        name: "backup".into(),
+        uid: None,
+    });
+    app.scope_label = Some("job/backup".into());
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Pod",
+        "metadata":{"name":"backup-0", "namespace":"default"}}),
+    );
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    let generation = app.generation;
+    app.handle_key(press(KeyCode::Char('W'))).unwrap();
+    assert!(app.owner.is_none());
+    assert!(app.scope_label.is_none());
+    assert!(app.generation > generation);
+    assert_eq!(app.namespace, "default");
+}
+
+fn shortcut_log_lines(app: &mut App, lines: Vec<String>) {
+    app.handle_msg(Msg::LogLines {
+        generation: app.log_gen,
+        lines,
+    });
+}
+
+#[tokio::test]
+async fn log_marker_shortcut_keeps_order_across_appends_and_filters() {
+    let (mut app, _rx) = test_app();
+    app.mode = Mode::Logs;
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    assert_eq!(app.logs.refresh_index(0).shown, [None, None]);
+    shortcut_log_lines(&mut app, vec!["before".into()]);
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    assert_eq!(app.logs.refresh_index(0).shown, [None, None, Some(0), None]);
+    shortcut_log_lines(&mut app, vec!["after".into()]);
+    assert_eq!(
+        app.logs.refresh_index(0).shown,
+        [None, None, Some(0), None, Some(1)]
+    );
+    assert_eq!(app.logs.refresh_index(0).total_rows(), 5);
+    assert_eq!(app.logs.index().matched_lines(), 2);
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "after".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.logs.refresh_index(2).shown, [None, None, None, Some(1)]);
+    assert_eq!(app.logs.index().total_rows(), 6);
+    assert_eq!(app.logs.index().matched_lines(), 1);
+    assert_eq!(app.filtered_log_text(), "after");
+    app.handle_key(press(KeyCode::Char('z'))).unwrap();
+    assert!(app.logs.markers.is_empty());
+    assert_eq!(app.logs.refresh_index(0).total_rows(), 0);
+}
+
+#[tokio::test]
+async fn log_marker_shortcut_exports_only_source_lines() {
+    let (mut app, mut rx) = test_app();
+    app.mode = Mode::Logs;
+    app.logs.view.title = format!("marker-export-{}", std::process::id());
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    assert_eq!(app.flash, "no log lines to copy");
+    shortcut_log_lines(&mut app, vec!["before".into(), "--------".into()]);
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    shortcut_log_lines(&mut app, vec!["after".into()]);
+    assert_eq!(app.filtered_log_text(), "before\n--------\nafter");
+    app.handle_key(ctrl(KeyCode::Char('s'))).unwrap();
+    let path = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Msg::LogsSaved { result, .. } = rx.recv().await.unwrap() {
+                break result.unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "before\n--------\nafter"
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn log_marker_shortcut_is_bounded_and_tracks_trimmed_positions() {
+    let (mut app, _rx) = test_app();
+    app.mode = Mode::Logs;
+    app.logs_cfg.buffer = 2;
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    shortcut_log_lines(&mut app, vec!["old".into()]);
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    shortcut_log_lines(&mut app, vec!["keep".into(), "new".into()]);
+    assert_eq!(app.logs.refresh_index(0).shown, [None, Some(0), Some(1)]);
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    assert_eq!(
+        app.logs.refresh_index(0).shown,
+        [Some(0), Some(1), None, None]
+    );
+    for resume in ['s', 'G'] {
+        app.handle_key(press(KeyCode::Home)).unwrap();
+        for _ in 0..4 {
+            app.handle_key(press(KeyCode::Char('m'))).unwrap();
+        }
+        assert!(!app.logs.follow);
+        assert_eq!(app.logs.markers.len(), 6);
+        app.handle_key(press(KeyCode::Char(resume))).unwrap();
+        assert!(app.logs.follow);
+        assert_eq!(app.logs.markers.len(), 2);
+    }
+    app.logs_cfg.buffer = 0;
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    assert_eq!(app.logs.markers.len(), 1);
+}
+
+#[tokio::test]
+async fn log_marker_shortcut_preserves_paused_scroll_during_trim() {
+    let (mut app, _rx) = test_app();
+    app.mode = Mode::Logs;
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.logs.last_wrap_width = 10;
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    shortcut_log_lines(&mut app, vec!["a".repeat(25)]);
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    shortcut_log_lines(
+        &mut app,
+        (1..MAX_LOG_LINES_PAUSED).map(|i| format!("l{i}")).collect(),
+    );
+    app.logs.view.scroll = 500;
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    assert_eq!(app.logs.view.scroll, 500);
+    shortcut_log_lines(&mut app, vec!["new".into()]);
+    assert!(!app.logs.follow);
+    assert_eq!(app.logs.view.scroll, 496);
+    assert_eq!(app.logs.markers.len(), 2);
+    assert_eq!(app.logs.refresh_index(10).line_at(0), None);
+    assert_eq!(app.logs.index().line_at(1), Some(0));
+}
+
+#[tokio::test]
+async fn log_marker_shortcut_paused_marker_cap_preserves_scroll() {
+    let (mut app, _rx) = test_app();
+    app.mode = Mode::Logs;
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.logs.markers = std::iter::repeat_n(0, MAX_LOG_LINES_PAUSED).collect();
+    app.logs.view.scroll = 50;
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    assert_eq!(app.logs.markers.len(), MAX_LOG_LINES_PAUSED);
+    assert_eq!(app.logs.view.scroll, 49);
+}
+
+#[tokio::test]
+async fn log_marker_shortcut_renders_one_row_at_each_width() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.mode = Mode::Logs;
+    app.compact = true;
+    shortcut_log_lines(&mut app, vec!["before".into()]);
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    shortcut_log_lines(&mut app, vec!["after".into()]);
+    app.logs.view.hscroll = 20;
+    let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
+    for fullscreen in [false, true] {
+        if fullscreen {
+            app.handle_key(press(KeyCode::Char('F'))).unwrap();
+        }
+        for wrap in [true, false] {
+            app.handle_key(press(KeyCode::Char('w'))).unwrap();
+            assert_eq!(app.logs.wrap, wrap);
+            for width in [40, 28] {
+                terminal.backend_mut().resize(width, 16);
+                crate::ui::resize(&mut terminal, &mut app).unwrap();
+                terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+                let expected = if fullscreen { width } else { width - 2 } as usize;
+                let counts: Vec<_> = (0..16)
+                    .map(|y| {
+                        (0..width)
+                            .filter(|&x| terminal.backend().buffer()[(x, y)].symbol() == "-")
+                            .count()
+                    })
+                    .filter(|&count| count == expected)
+                    .collect();
+                assert_eq!(counts, [expected]);
+                assert_eq!(app.logs.viewport_rows, 3);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn log_marker_shortcut_handles_stopped_provider_and_replaced_buffers() {
+    let (mut app, _rx) = test_app();
+    palette(&mut app, "pods default");
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Pod",
+        "metadata":{"name":"web", "namespace":"default"},
+        "spec":{"containers":[{"name":"app"}]}}),
+    );
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::Char('l'))).unwrap();
+    assert_eq!(app.mode, Mode::Logs);
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    app.handle_key(press(KeyCode::Char('t'))).unwrap();
+    assert!(app.logs.markers.is_empty());
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    assert!(app.logs.stopped);
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    assert_eq!(app.logs.markers.len(), 1);
+    app.logs.source = Some(LogSource::Provider {
+        request: crate::providers::LogRequest::Pod {
+            ns: "default".into(),
+            pod: "web".into(),
+            container: None,
+            multi_container: false,
+        },
+    });
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    assert_eq!(app.logs.markers.len(), 2);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Char('l'))).unwrap();
+    assert_eq!(app.mode, Mode::Logs);
+    assert!(app.logs.markers.is_empty());
+    assert_eq!(app.logs.refresh_index(0).total_rows(), 0);
+}

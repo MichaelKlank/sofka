@@ -24,38 +24,22 @@ impl App {
                 .collect()
         }));
 
-        // While following, keep a tight tail buffer. While paused, avoid
-        // trimming so indices don't shift under the frozen view (only a huge
-        // backlog hits the larger paused cap).
-        let cap = if self.logs.follow {
+        self.trim_log_buffer();
+    }
+
+    pub(super) fn log_buffer_cap(&self) -> usize {
+        if self.logs.follow {
             self.logs_cfg.buffer.max(1)
         } else {
             MAX_LOG_LINES_PAUSED
-        };
-        let overflow = self.logs.view.lines.len().saturating_sub(cap);
-        if overflow == 0 {
-            return;
         }
+    }
 
-        // If we trim while paused, shift the anchored scroll by the display
-        // rows the dropped lines occupied on screen — filtered lines take none,
-        // wrapped lines take several — so the frozen view stays put.
-        if !self.logs.follow {
-            let rows: usize = self
-                .logs
-                .view
-                .lines
-                .iter()
-                .take(overflow)
-                .filter(|l| self.logs.matches(l))
-                .map(|l| match self.logs.last_wrap_width {
-                    0 => 1,
-                    w => crate::ui::wrapped_height(l, w),
-                })
-                .sum();
-            self.logs.view.scroll = self.logs.view.scroll.saturating_sub(rows);
-        }
-        self.logs.view.drain_front(overflow);
+    pub(super) fn trim_log_buffer(&mut self) {
+        let cap = self.log_buffer_cap();
+        self.logs.limit_markers(cap);
+        self.logs
+            .drain_front(self.logs.view.lines.len().saturating_sub(cap));
     }
 
     // ----- containers / logs --------------------------------------------
@@ -285,7 +269,7 @@ impl App {
         // A new Scrollable starts at revision 0, which can match the previous
         // buffer's revision. Do not let refresh_index mistake the replacement
         // for an append and retain stale line positions or wrapped heights.
-        self.logs.index = LogIndex::default();
+        self.logs.clear_lines();
         self.logs.follow = true;
         self.logs.set_filter(String::new());
         self.logs.stopped = false;
@@ -299,7 +283,7 @@ impl App {
         if self.logs.source.is_none() {
             return;
         }
-        self.logs.view.clear_lines();
+        self.logs.clear_lines();
         self.logs.view.scroll = 0;
         self.restart_log_stream();
     }

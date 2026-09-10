@@ -1043,8 +1043,9 @@ pub struct LogIndex {
     revision: u64,
     /// How many buffer lines have been folded in so far.
     consumed: usize,
-    /// Buffer indices that pass the filter, ascending.
-    shown: Vec<u32>,
+    /// Buffer indices in display order. None is a visual marker row.
+    shown: Vec<Option<u32>>,
+    consumed_markers: usize,
     /// Cumulative display rows *through* `shown[i]`, so the first row of
     /// `shown[i]` is `ends[i-1]` (0 for i == 0). Only maintained when
     /// wrapping; without wrap every line is exactly one row.
@@ -1061,9 +1062,13 @@ impl LogIndex {
         self.shown.len()
     }
 
-    /// Buffer index of the `i`th shown line.
+    pub fn matched_lines(&self) -> usize {
+        self.shown.len() - self.consumed_markers
+    }
+
+    /// Source index of a displayed entry. Markers return None.
     pub fn line_at(&self, i: usize) -> Option<usize> {
-        self.shown.get(i).map(|&x| x as usize)
+        self.shown.get(i).copied().flatten().map(|x| x as usize)
     }
 
     /// Display row where the `i`th shown line starts.
@@ -1101,6 +1106,7 @@ impl LogIndex {
         self.wrap_width = wrap_width;
         self.revision = revision;
         self.consumed = 0;
+        self.consumed_markers = 0;
         self.shown.clear();
         self.ends.clear();
         self.total_rows = 0;
@@ -1111,6 +1117,10 @@ impl LogIndex {
 /// the top-level `App` struct.
 pub struct LogsView {
     pub view: Scrollable,
+    /// Stable position of the first retained source line.
+    line_offset: usize,
+    /// Each marker precedes the source line at this stable position.
+    markers: VecDeque<usize>,
     pub follow: bool,
     pub filter: String,
     /// Compiled form of [`Self::filter`] (substring / regex / inverse). Rebuilt
@@ -1148,6 +1158,8 @@ impl Default for LogsView {
     fn default() -> Self {
         Self {
             view: Scrollable::empty(),
+            line_offset: 0,
+            markers: VecDeque::new(),
             follow: true,
             filter: String::new(),
             matcher: crate::logfilter::LogMatcher::default(),
@@ -1166,6 +1178,71 @@ impl Default for LogsView {
 }
 
 impl LogsView {
+    fn reset_index(&mut self) {
+        self.index
+            .reset(&self.filter, self.index.wrap_width, self.view.revision());
+    }
+
+    fn add_marker(&mut self, cap: usize) {
+        self.markers
+            .push_back(self.line_offset + self.view.lines.len());
+        self.limit_markers(cap);
+    }
+
+    fn limit_markers(&mut self, cap: usize) {
+        let overflow = self.markers.len().saturating_sub(cap.max(1));
+        if overflow == 0 {
+            return;
+        }
+        if !self.follow {
+            self.refresh_index(self.last_wrap_width);
+            let removed_before_scroll = self
+                .index
+                .shown
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| line.is_none())
+                .take(overflow)
+                .filter(|(i, _)| self.index.start_row(*i) < self.view.scroll)
+                .count();
+            self.view.scroll = self.view.scroll.saturating_sub(removed_before_scroll);
+        }
+        self.markers.drain(..overflow);
+        self.reset_index();
+    }
+
+    fn clear_lines(&mut self) {
+        self.view.clear_lines();
+        self.markers.clear();
+        self.line_offset = 0;
+        self.reset_index();
+    }
+
+    fn drain_front(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.line_offset += count;
+        let removed_markers = self.markers.partition_point(|&pos| pos < self.line_offset);
+        if !self.follow {
+            let rows: usize = self
+                .view
+                .lines
+                .iter()
+                .take(count)
+                .filter(|line| self.matches(line))
+                .map(|line| match self.last_wrap_width {
+                    0 => 1,
+                    width => crate::ui::wrapped_height(line, width),
+                })
+                .sum();
+            self.view.scroll = self.view.scroll.saturating_sub(rows + removed_markers);
+        }
+        self.markers.drain(..removed_markers);
+        self.view.drain_front(count);
+        self.reset_index();
+    }
+
     /// Replace the filter text and recompile its matcher (substring / regex /
     /// inverse) in one place, so the cached matcher never drifts.
     pub fn set_filter(&mut self, filter: String) {
@@ -1198,6 +1275,8 @@ impl LogsView {
             filter,
             matcher,
             index,
+            markers,
+            line_offset,
             ..
         } = self;
 
@@ -1211,14 +1290,25 @@ impl LogsView {
             index.reset(filter, wrap_width, revision);
         }
 
-        for i in index.consumed..len {
+        for i in index.consumed..=len {
+            while markers
+                .get(index.consumed_markers)
+                .is_some_and(|&pos| pos == *line_offset + i)
+            {
+                index.shown.push(None);
+                index.total_rows += 1;
+                if wrap_width > 0 {
+                    index.ends.push(index.total_rows as u32);
+                }
+                index.consumed_markers += 1;
+            }
             let Some(line) = view.lines.get(i) else {
                 break;
             };
             if !matcher.matches(line) {
                 continue;
             }
-            index.shown.push(i as u32);
+            index.shown.push(Some(i as u32));
             if wrap_width > 0 {
                 index.total_rows += crate::ui::wrapped_height(line, wrap_width);
                 index.ends.push(index.total_rows as u32);
