@@ -3448,87 +3448,128 @@ const C_GAP: usize = 2;
 
 use crate::text::ellipsize as truncate_cols;
 
-fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
-    let show_scrollbars = app.scrollbars_visible();
-    let gap = " ".repeat(C_GAP);
-    // Keep the name column readable but bounded so long names can't push the
-    // numeric columns off the right edge; anything longer is ellipsized.
-    let name_cap = (area.width as usize).saturating_sub(40).max(8);
-    let util_band = app.resolved_thresholds().utilization;
+fn container_columns_width(widths: &[usize; 8]) -> usize {
+    widths.iter().sum::<usize>()
+        + widths.iter().filter(|&&w| w > 0).count().saturating_sub(1) * C_GAP
+}
+
+fn container_column_widths(app: &App, available: usize) -> [usize; 8] {
     let name_width = app
         .container_list
         .iter()
-        .map(|name| name.chars().count())
+        .map(|s| s.width())
         .max()
         .unwrap_or(4)
-        .clamp(4, name_cap);
+        .clamp(8, 40);
+    let state_width = app
+        .container_details
+        .values()
+        .map(|c| c.state.width())
+        .max()
+        .unwrap_or(7)
+        .clamp(7, 32);
+    let restart_width = app
+        .container_details
+        .values()
+        .filter_map(|c| c.restarts)
+        .map(|n| n.to_string().len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
+    let mut widths = [
+        8,
+        5,
+        state_width,
+        restart_width,
+        C_CPU,
+        C_CPU_PCT,
+        C_MEM,
+        C_MEM_PCT,
+    ];
+    for indices in [&[5, 7][..], &[4, 6][..], &[1][..]] {
+        if container_columns_width(&widths) <= available {
+            break;
+        }
+        for &i in indices {
+            widths[i] = 0;
+        }
+    }
+    if container_columns_width(&widths) > available {
+        widths[2] = available
+            .saturating_sub(8 + restart_width + 2 * C_GAP)
+            .min(state_width);
+    }
+    widths[0] = 0;
+    let other_width = container_columns_width(&widths);
+    let gap = if other_width > 0 { C_GAP } else { 0 };
+    widths[0] = available.saturating_sub(other_width + gap).min(name_width);
+    widths
+}
 
-    let header = Line::from(format!(
-        "{name:<name_width$}{gap}{cpu:>C_CPU$}{gap}{cpu_pct:>C_CPU_PCT$}{gap}{mem:>C_MEM$}{gap}{mem_pct:>C_MEM_PCT$}",
-        name = "NAME",
-        cpu = "CPU",
-        cpu_pct = "%R/L",
-        mem = "MEM",
-        mem_pct = "%R/L",
-    ))
-    .style(theme::dim());
+fn container_table_line(
+    values: [&str; 8],
+    colors: [Color; 8],
+    widths: &[usize; 8],
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (i, &width) in widths.iter().enumerate().filter(|(_, w)| **w > 0) {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" ".repeat(C_GAP)));
+        }
+        let value = truncate_cols(values[i], width);
+        let padding = " ".repeat(width.saturating_sub(value.width()));
+        let text = if i >= 3 {
+            format!("{padding}{value}")
+        } else {
+            format!("{value}{padding}")
+        };
+        spans.push(Span::styled(text, Style::default().fg(colors[i])));
+    }
+    Line::from(spans)
+}
 
-    let items: Vec<ListItem> = app
-        .container_list
-        .iter()
-        .map(|container| {
-            let usage = app.selected_pod_container_metrics(container);
-            let (cpu, memory) = usage
-                .map(|(cpu, memory)| {
-                    (
-                        crate::columns::fmt_cpu(cpu),
-                        crate::columns::fmt_mem(memory),
-                    )
-                })
-                .unwrap_or_else(|| ("-".into(), "-".into()));
-            let res = app
-                .container_resources
-                .get(container)
-                .cloned()
-                .unwrap_or_default();
-            let (cpu_pct, cpu_pct_color) = util_cell(
-                usage.map(|(c, _)| c),
-                res.cpu_request,
-                res.cpu_limit,
-                util_band,
-            );
-            let (mem_pct, mem_pct_color) = util_cell(
-                usage.map(|(_, m)| m),
-                res.mem_request,
-                res.mem_limit,
-                util_band,
-            );
-            let name = truncate_cols(container, name_width);
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{name:<name_width$}"),
-                    Style::default().fg(theme::text()),
-                ),
-                Span::styled(
-                    format!("{gap}{cpu:>C_CPU$}"),
-                    Style::default().fg(theme::yellow()),
-                ),
-                Span::styled(
-                    format!("{gap}{cpu_pct:>C_CPU_PCT$}"),
-                    Style::default().fg(cpu_pct_color),
-                ),
-                Span::styled(
-                    format!("{gap}{memory:>C_MEM$}"),
-                    Style::default().fg(theme::teal()),
-                ),
-                Span::styled(
-                    format!("{gap}{mem_pct:>C_MEM_PCT$}"),
-                    Style::default().fg(mem_pct_color),
-                ),
-            ]))
-        })
-        .collect();
+fn container_detail_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let selected = app
+        .container_state
+        .selected()
+        .and_then(|i| app.container_list.get(i));
+    let Some((name, details)) =
+        selected.and_then(|name| app.container_details.get(name).map(|d| (name, d)))
+    else {
+        return vec![Line::styled(
+            if app.container_list.is_empty() {
+                "No containers available."
+            } else {
+                "Select a container to see its details."
+            },
+            theme::dim(),
+        )];
+    };
+    let [startup, readiness, liveness] = details
+        .probes
+        .map(|present| if present { "configured" } else { "absent" });
+    [
+        Line::styled(
+            format!("Container: {name} ({})", details.kind),
+            theme::title(),
+        ),
+        Line::from(format!("Image: {}", details.image)),
+        Line::from(format!("Ports: {}", details.ports)),
+        Line::from(format!(
+            "Probes: startup={startup}, readiness={readiness}, liveness={liveness}"
+        )),
+    ]
+    .into_iter()
+    .flat_map(|line| wrap_line(line, width))
+    .collect()
+}
 
+fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
+    if area.width < 4 || area.height < 4 {
+        return;
+    }
+    let show_scrollbars = app.scrollbars_visible();
+    let thresholds = app.resolved_thresholds();
     let qos = if app.container_qos.is_empty() {
         String::new()
     } else {
@@ -3547,32 +3588,31 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
             (Action::ProviderLogs, "provider"),
         ],
     );
-
-    // Size the box to its contents: header + rows + borders, and wide enough
-    // for the columns, the title, or the footer — whichever needs the most.
-    let content_w = 2 // list highlight symbol ("▌ ")
-        + name_width
-        + C_GAP + C_CPU
-        + C_GAP + C_CPU_PCT
-        + C_GAP + C_MEM
-        + C_GAP + C_MEM_PCT;
-    let inner_w = content_w
-        .max(title.chars().count())
-        .max(footer.chars().count())
-        .max(78);
-    // +2 borders, +1 so the last column doesn't touch the right border.
-    let popup_w = (inner_w as u16 + 3).min(area.width);
-    let rows = app.container_list.len() as u16;
-    let trend_height = if popup_w >= 80 && area.height >= 7 && rows > 0 {
+    let desired_width = container_columns_width(&container_column_widths(app, usize::MAX)) + 4;
+    let popup_w = desired_width
+        .max(82)
+        .max(footer.width() + 2)
+        .min(usize::from(area.width)) as u16;
+    let widths = container_column_widths(app, usize::from(popup_w.saturating_sub(4)));
+    let details = container_detail_lines(app, usize::from(popup_w.saturating_sub(4)));
+    let rows = app.container_list.len().max(1).min(usize::from(u16::MAX)) as u16;
+    let content_height = area.height.saturating_sub(3);
+    let min_rows = rows.min(3).min(content_height);
+    let detail_height = details
+        .len()
+        .min(usize::from(content_height.saturating_sub(min_rows))) as u16;
+    let trend_height = if popup_w >= 80
+        && !app.container_list.is_empty()
+        && content_height >= min_rows + detail_height + 3
+    {
         3
     } else {
         0
     };
-    let popup_h = rows.saturating_add(3 + trend_height).min(area.height);
-
+    let list_height = rows.min(content_height.saturating_sub(detail_height + trend_height));
+    let popup_h = 3 + list_height + detail_height + trend_height;
     let popup = centered_rect_exact(popup_w, popup_h, area);
     clear_region(frame, popup);
-
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -3581,15 +3621,20 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
         .title_bottom(Line::from(Span::styled(footer, theme::dim())).right_aligned());
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-
-    let [header_area, list_area, trend_area] = Layout::vertical([
+    let [header_area, list_area, detail_area, trend_area] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Min(1),
+        Constraint::Length(list_height),
+        Constraint::Length(detail_height),
         Constraint::Length(trend_height),
     ])
     .areas(inner);
-    // Indent the header past the 2-column highlight gutter so it lines up with
-    // the rows underneath it.
+    let header = container_table_line(
+        [
+            "NAME", "READY", "STATE", "RESTARTS", "CPU", "%R/L", "MEM", "%R/L",
+        ],
+        [theme::overlay1(); 8],
+        &widths,
+    );
     frame.render_widget(
         Paragraph::new(header),
         Rect {
@@ -3598,6 +3643,81 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
             ..header_area
         },
     );
+    let items: Vec<ListItem> = app
+        .container_list
+        .iter()
+        .map(|container| {
+            let details = app.container_details.get(container);
+            let ready = match details.and_then(|d| d.ready) {
+                Some(true) => "true",
+                Some(false) => "false",
+                None => "-",
+            };
+            let state = details.map(|d| d.state.as_str()).unwrap_or("Unknown");
+            let restarts = details.and_then(|d| d.restarts);
+            let restart_text = restarts
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".into());
+            let restart_color = restarts
+                .and_then(|n| i64::try_from(n).ok())
+                .and_then(|n| thresholds.restarts.severity(n))
+                .map(theme::severity_fg)
+                .unwrap_or_else(theme::text);
+            let usage = app.selected_pod_container_metrics(container);
+            let (cpu, memory) = usage
+                .map(|(cpu, memory)| {
+                    (
+                        crate::columns::fmt_cpu(cpu),
+                        crate::columns::fmt_mem(memory),
+                    )
+                })
+                .unwrap_or_else(|| ("-".into(), "-".into()));
+            let res = app
+                .container_resources
+                .get(container)
+                .cloned()
+                .unwrap_or_default();
+            let (cpu_pct, cpu_pct_color) = util_cell(
+                usage.map(|(c, _)| c),
+                res.cpu_request,
+                res.cpu_limit,
+                thresholds.utilization,
+            );
+            let (mem_pct, mem_pct_color) = util_cell(
+                usage.map(|(_, m)| m),
+                res.mem_request,
+                res.mem_limit,
+                thresholds.utilization,
+            );
+            ListItem::new(container_table_line(
+                [
+                    container,
+                    ready,
+                    state,
+                    &restart_text,
+                    &cpu,
+                    &cpu_pct,
+                    &memory,
+                    &mem_pct,
+                ],
+                [
+                    theme::text(),
+                    match ready {
+                        "true" => theme::green(),
+                        "false" => theme::yellow(),
+                        _ => theme::overlay1(),
+                    },
+                    theme::status_color(state),
+                    restart_color,
+                    theme::yellow(),
+                    cpu_pct_color,
+                    theme::teal(),
+                    mem_pct_color,
+                ],
+                &widths,
+            ))
+        })
+        .collect();
     let list = List::new(items)
         .highlight_style(theme::selected_row())
         .highlight_symbol("▌ ")
@@ -3617,6 +3737,14 @@ fn draw_containers(frame: &mut Frame, app: &mut App, area: Rect) {
             .saturating_sub(usize::from(list_area.height)),
         usize::from(list_area.height),
         false,
+    );
+    frame.render_widget(
+        Paragraph::new(details).style(Style::default().fg(theme::text())),
+        Rect {
+            x: detail_area.x + 2,
+            width: detail_area.width.saturating_sub(2),
+            ..detail_area
+        },
     );
     if trend_height > 0 {
         draw_container_trends(frame, app, trend_area);

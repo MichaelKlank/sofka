@@ -4,6 +4,18 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 
 ## Core navigation
 
+- **Container details** show readiness, state or failure reason, and restart
+  count beside the existing resource columns. The selected container's details
+  show its type, full image reference, declared ports, and configured startup,
+  readiness, and liveness probes. Images and ports wrap to fit the popup.
+  Probe labels show configuration, not the current probe result.
+  Regular, init, native sidecar, and ephemeral containers are included. Pod watch
+  updates refresh the details and keep the selected container by name. Missing
+  status values show `-` or `Unknown`. If the selected container disappears,
+  its selection clears. Name, state, and restarts have priority on narrow
+  terminals. Resource percentages hide first, then usage and readiness columns.
+  The popup uses fixed columns.
+
 - **Container trends** show CPU and memory for the selected container on wide
   screens. Each chart covers the last five minutes in five-second bins, with
   the newest sample on the right. The scale is zero to the largest visible

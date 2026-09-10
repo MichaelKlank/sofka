@@ -1978,6 +1978,7 @@ pub struct App {
     /// Declared requests/limits for the pod shown by the container picker,
     /// keyed by container name. Drives the request/limit percentage columns.
     pub container_resources: HashMap<String, crate::columns::ContainerResources>,
+    pub(crate) container_details: HashMap<String, containers::ContainerDetails>,
     /// QoS class of the pod shown by the container picker (empty if unknown).
     pub container_qos: String,
 
@@ -2319,6 +2320,7 @@ impl App {
             container_state: ListState::default(),
             container_pod: None,
             container_resources: HashMap::new(),
+            container_details: HashMap::new(),
             container_qos: String::new(),
             flux_menu_state: ListState::default(),
             transfer_menu_state: ListState::default(),
@@ -2483,6 +2485,7 @@ mod adjacent;
 mod authz;
 mod bookmarks;
 mod bundle;
+mod containers;
 mod dashboards;
 mod details;
 mod diagnostics;

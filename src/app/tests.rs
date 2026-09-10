@@ -8606,8 +8606,8 @@ async fn container_picker_populates_resources_and_qos() {
         }),
     );
 
-    let pod = app.selected().unwrap();
-    app.open_containers(&pod);
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.container_qos, "Burstable");
     assert_eq!(app.container_resources["app"].cpu_request, Some(250));
     assert_eq!(
@@ -8652,8 +8652,8 @@ async fn container_picker_renders_qos_and_utilization() {
         ]),
     });
 
-    let pod = app.selected().unwrap();
-    app.open_containers(&pod);
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
 
     let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
     term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
@@ -8684,6 +8684,383 @@ async fn container_picker_renders_qos_and_utilization() {
         screen.contains("13%/-"),
         "missing missing-limit indicator in:\n{screen}"
     );
+}
+
+fn container_details_pod() -> Value {
+    json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": "api", "namespace": "default", "uid": "original"},
+        "spec": {
+            "containers": [
+                {"name": "app", "image": "registry:5000/team/app:1.2.3@sha256:abcdef",
+                 "ports": [{"name": "http", "containerPort": 8080}, {"containerPort": 5353, "protocol": "UDP"}],
+                 "startupProbe": {"tcpSocket": {"port": 8080}},
+                 "readinessProbe": {"httpGet": {"path": "/ready", "port": "http"}},
+                 "livenessProbe": null,
+                 "resources": {"requests": {"cpu": "100m"}, "limits": {"cpu": "200m"}}},
+                {"name": "worker", "image": "worker:v2"}
+            ],
+            "initContainers": [
+                {"name": "setup", "image": "setup:v1"},
+                {"name": "sidecar", "image": "proxy:v1", "restartPolicy": "Always",
+                 "livenessProbe": {"tcpSocket": {"port": 15000}}}
+            ],
+            "ephemeralContainers": [{"name": "debug", "image": "debug:v1"}]
+        },
+        "status": {
+            "containerStatuses": [
+                {"name": "worker", "ready": true, "restartCount": 0, "state": {"running": {}}},
+                {"name": "app", "ready": false, "restartCount": 7,
+                 "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                 "lastState": {"terminated": {"reason": "OOMKilled", "exitCode": 137}}}
+            ],
+            "initContainerStatuses": [
+                {"name": "sidecar", "ready": true, "restartCount": 1, "state": {"running": {}}},
+                {"name": "setup", "ready": false, "restartCount": 3, "state": {"terminated": {"reason": "Completed", "exitCode": 0}}}
+            ],
+            "ephemeralContainerStatuses": [
+                {"name": "debug", "ready": false, "restartCount": 2, "state": {"terminated": {"reason": "OOMKilled", "exitCode": 137}}}
+            ]
+        }
+    })
+}
+
+fn render_container_popup(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let top = (0..height)
+        .find(|&y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .contains(" Containers")
+        })
+        .expect("container popup title");
+    let left = (0..width)
+        .find(|&x| buffer[(x, top)].symbol() == "╭")
+        .unwrap();
+    let right = (left..width)
+        .find(|&x| buffer[(x, top)].symbol() == "╮")
+        .unwrap();
+    (top + 1..height)
+        .take_while(|&y| buffer[(left, y)].symbol() != "╰")
+        .map(|y| (left + 1..right).map(|x| buffer[(x, y)].symbol()).collect())
+        .collect()
+}
+
+#[tokio::test]
+async fn container_details_follow_selection_and_match_status_by_name() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(&mut app, container_details_pod());
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Containers);
+    assert_eq!(
+        app.container_list,
+        ["app", "debug", "setup", "sidecar", "worker"]
+    );
+
+    for (index, name, kind, ready, state, restarts, image) in [
+        (
+            0,
+            "app",
+            "regular",
+            false,
+            "CrashLoopBackOff",
+            7,
+            "registry:5000/team/app:1.2.3@sha256:abcdef",
+        ),
+        (1, "debug", "ephemeral", false, "OOMKilled", 2, "debug:v1"),
+        (2, "setup", "init", false, "Completed", 3, "setup:v1"),
+        (3, "sidecar", "sidecar", true, "Running", 1, "proxy:v1"),
+        (4, "worker", "regular", true, "Running", 0, "worker:v2"),
+    ] {
+        if index > 0 {
+            app.handle_key(press(KeyCode::Down)).unwrap();
+        }
+        assert_eq!(app.container_state.selected(), Some(index));
+        let details = &app.container_details[name];
+        assert_eq!(details.kind, kind);
+        assert_eq!(details.ready, Some(ready));
+        assert_eq!(details.state, state);
+        assert_eq!(details.restarts, Some(restarts));
+        let lines = render_container_popup(&mut app, 160, 40);
+        let screen = lines.join("\n");
+        assert!(
+            screen.contains(&format!("Container: {name} ({kind})")),
+            "{screen}"
+        );
+        assert!(screen.contains(&format!("Image: {image}")), "{screen}");
+        let row = lines
+            .iter()
+            .find(|line| line.trim_start().starts_with("▌ "))
+            .unwrap();
+        let cells: Vec<_> = row.split_whitespace().collect();
+        assert_eq!(
+            &cells[1..5],
+            &[
+                name,
+                if ready { "true" } else { "false" },
+                state,
+                &restarts.to_string()
+            ]
+        );
+        if name == "app" {
+            assert!(
+                screen.contains("Ports: http:8080/TCP, 5353/UDP"),
+                "{screen}"
+            );
+            assert!(
+                screen.contains("startup=configured, readiness=configured, liveness=absent"),
+                "{screen}"
+            );
+        } else if name == "sidecar" {
+            assert!(screen.contains("Ports: none declared"), "{screen}");
+            assert!(
+                screen.contains("startup=absent, readiness=absent, liveness=configured"),
+                "{screen}"
+            );
+        } else {
+            assert!(screen.contains("Ports: none declared"), "{screen}");
+            assert!(
+                screen.contains("startup=absent, readiness=absent, liveness=absent"),
+                "{screen}"
+            );
+        }
+    }
+    app.handle_key(press(KeyCode::Up)).unwrap();
+    assert!(
+        render_container_popup(&mut app, 160, 40)
+            .join("\n")
+            .contains("Container: sidecar (sidecar)")
+    );
+}
+
+#[tokio::test]
+async fn container_details_refresh_without_changing_the_selected_name() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let mut pod = container_details_pod();
+    apply(&mut app, pod.clone());
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    assert_eq!(
+        app.container_list[app.container_state.selected().unwrap()],
+        "debug"
+    );
+
+    pod["spec"]["ephemeralContainers"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name": "aaa", "image": "debug:v2"}));
+    pod["spec"]["ephemeralContainers"][0]["image"] = json!("debug:v3");
+    pod["status"]["ephemeralContainerStatuses"][0]["state"] = json!({"running": {}});
+    pod["status"]["ephemeralContainerStatuses"][0]["restartCount"] = json!(4);
+    pod["spec"]["containers"][0]["resources"]["limits"]["cpu"] = json!("500m");
+    app.handle_msg(Msg::Applied {
+        generation: app.generation.wrapping_sub(1),
+        key: "default/api".into(),
+        obj: Box::new(obj(pod.clone())),
+    });
+    assert_eq!(app.container_details["debug"].state, "OOMKilled");
+    apply(&mut app, pod.clone());
+    assert_eq!(app.container_state.selected(), Some(2));
+    assert_eq!(app.container_list[2], "debug");
+    assert_eq!(app.container_details["debug"].state, "Running");
+    assert_eq!(app.container_details["debug"].restarts, Some(4));
+    assert_eq!(app.container_resources["app"].cpu_limit, Some(500));
+    let screen = render_container_popup(&mut app, 160, 40).join("\n");
+    assert!(
+        screen.contains("Container: debug (ephemeral)") && screen.contains("Image: debug:v3"),
+        "{screen}"
+    );
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    let Some(Suspend::Shell(argv)) = app.pending.take() else {
+        panic!("expected a shell command for the selected container");
+    };
+    let container_arg = argv.iter().position(|arg| arg == "-c").unwrap();
+    assert_eq!(argv[container_arg + 1], "debug");
+
+    let mut other = pod.clone();
+    other["metadata"]["namespace"] = json!("other");
+    other["status"]["ephemeralContainerStatuses"][0]["restartCount"] = json!(99);
+    apply(&mut app, other);
+    assert_eq!(app.container_details["debug"].restarts, Some(4));
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    assert_eq!(app.mode, Mode::Command);
+    pod["status"]["ephemeralContainerStatuses"][0]["restartCount"] = json!(5);
+    apply(&mut app, pod.clone());
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Containers);
+    assert_eq!(app.container_details["debug"].restarts, Some(5));
+    assert_eq!(
+        app.container_list[app.container_state.selected().unwrap()],
+        "debug"
+    );
+
+    app.handle_msg(Msg::Reset {
+        generation: app.generation,
+    });
+    pod["status"]["ephemeralContainerStatuses"][0]["restartCount"] = json!(6);
+    apply(&mut app, pod);
+    assert_eq!(app.container_details["debug"].restarts, Some(5));
+    app.handle_msg(Msg::Synced {
+        generation: app.generation,
+    });
+    assert_eq!(app.container_details["debug"].restarts, Some(6));
+    assert_eq!(
+        app.container_list[app.container_state.selected().unwrap()],
+        "debug"
+    );
+
+    app.handle_msg(Msg::Deleted {
+        generation: app.generation,
+        key: "default/api".into(),
+    });
+    assert!(app.container_list.is_empty());
+    assert!(app.container_details.is_empty());
+    assert!(app.container_state.selected().is_none());
+    assert!(
+        render_container_popup(&mut app, 160, 40)
+            .join("\n")
+            .contains("No containers available.")
+    );
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    assert!(app.pending.is_none());
+}
+
+#[tokio::test]
+async fn container_details_clear_selection_when_a_container_disappears() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let mut pod = container_details_pod();
+    apply(&mut app, pod.clone());
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    pod["spec"]["ephemeralContainers"] = json!([]);
+    apply(&mut app, pod);
+    assert!(app.container_state.selected().is_none());
+    assert!(
+        render_container_popup(&mut app, 160, 40)
+            .join("\n")
+            .contains("Select a container to see its details.")
+    );
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    assert!(app.pending.is_none());
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    assert!(app.container_state.selected().is_some());
+}
+
+#[tokio::test]
+async fn container_details_distinguish_missing_status_and_state_fallbacks() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let mut pod = container_details_pod();
+    pod["status"]["containerStatuses"] = json!([]);
+    apply(&mut app, pod.clone());
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.container_details["app"].ready, None);
+    assert_eq!(app.container_details["app"].restarts, None);
+    let lines = render_container_popup(&mut app, 160, 40);
+    let cells: Vec<_> = lines
+        .iter()
+        .find(|line| line.trim_start().starts_with("▌ "))
+        .unwrap()
+        .split_whitespace()
+        .collect();
+    assert_eq!(&cells[1..5], &["app", "-", "Unknown", "-"]);
+    for (state, expected) in [
+        (json!({"waiting": {}}), "Waiting"),
+        (json!({"terminated": {"exitCode": 42}}), "ExitCode:42"),
+        (
+            json!({"terminated": {"reason": "", "signal": 9, "exitCode": 137}}),
+            "Signal:9",
+        ),
+        (json!({"terminated": {"exitCode": 0}}), "Completed"),
+        (json!({"terminated": {}}), "Terminated"),
+        (json!({}), "Unknown"),
+    ] {
+        pod["status"]["containerStatuses"] =
+            json!([{"name": "app", "ready": false, "restartCount": 0, "state": state}]);
+        apply(&mut app, pod.clone());
+        assert_eq!(app.container_details["app"].state, expected);
+        assert_eq!(app.container_details["app"].restarts, Some(0));
+        assert!(
+            render_container_popup(&mut app, 160, 40)
+                .join("\n")
+                .contains(expected)
+        );
+    }
+}
+
+#[tokio::test]
+async fn container_details_keep_health_columns_and_wrap_long_images() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let mut pod = container_details_pod();
+    let image = format!(
+        "registry.example.com/{}/app:1.2.3@sha256:{}",
+        "long-path/".repeat(8),
+        "a".repeat(64)
+    );
+    pod["spec"]["containers"][0]["image"] = json!(image);
+    apply(&mut app, pod);
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::new(),
+        containers: HashMap::from([("default/api/app".into(), (50, 1024 * 1024))]),
+    });
+    for (width, percentages, usage, readiness) in [
+        (160, true, true, true),
+        (80, false, true, true),
+        (50, false, false, true),
+        (40, false, false, false),
+    ] {
+        let lines = render_container_popup(&mut app, width, 40);
+        let header = &lines[0];
+        assert!(
+            header.contains("NAME") && header.contains("STATE") && header.contains("RESTARTS"),
+            "{header}"
+        );
+        assert_eq!(header.contains("%R/L"), percentages, "{header}");
+        assert_eq!(
+            header.contains("CPU") && header.contains("MEM"),
+            usage,
+            "{header}"
+        );
+        assert_eq!(header.contains("READY"), readiness, "{header}");
+        let app_row = lines
+            .iter()
+            .find(|line| line.trim_start().starts_with("▌ "))
+            .unwrap();
+        assert!(
+            app_row.contains("app") && app_row.contains("CrashLoopBackOff"),
+            "{app_row}"
+        );
+        assert!(app_row.split_whitespace().any(|v| v == "7"), "{app_row}");
+        let image_rows: String = lines
+            .iter()
+            .skip_while(|line| !line.contains("Image:"))
+            .take_while(|line| !line.contains("Ports:"))
+            .map(|line| line.trim())
+            .collect();
+        assert_eq!(image_rows, format!("Image: {image}"));
+        assert!(lines.join("\n").contains("http:8080/TCP, 5353/UDP"));
+    }
+    for (width, height) in [(3, 3), (10, 6), (30, 12), (80, 12), (160, 40)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    }
 }
 
 #[tokio::test]
@@ -23823,8 +24200,8 @@ async fn container_trends_follow_keys_and_reject_stale_samples() {
         .map(|x| buffer[(x, heading_y - 1)].symbol())
         .collect();
     assert!(
-        rows_above.contains("sidecar"),
-        "the charts must follow the table without gauges or empty rows"
+        rows_above.contains("Probes:"),
+        "the charts must follow the selected container details"
     );
 
     app.handle_key(press(KeyCode::Down)).unwrap();
