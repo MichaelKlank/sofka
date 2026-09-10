@@ -6,10 +6,14 @@
     # after 26.05), this branch still covers all four platforms the release
     # workflow builds for, so a single input suffices.
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    home-manager = {
+      url = "github:nix-community/home-manager/release-26.05";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
-    { self, nixpkgs }:
+    { self, nixpkgs, home-manager }:
     let
       inherit (nixpkgs) lib;
 
@@ -36,6 +40,14 @@
     in
     {
       overlays.default = overlay;
+
+      homeManagerModules = {
+        sofka = { pkgs, lib, ... }: {
+          imports = [ ./nix/home-manager.nix ];
+          programs.sofka.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.sofka;
+        };
+        default = self.homeManagerModules.sofka;
+      };
 
       packages = forAllSystems (pkgs: {
         default = pkgs.sofka;
@@ -89,6 +101,11 @@
         self.packages.${system}
         // lib.mapAttrs' (name: drv: lib.nameValuePair "devshell-${name}" drv) self.devShells.${system}
         // {
+          home-manager = import ./nix/tests/home-manager.nix {
+            inherit pkgs home-manager;
+            module = self.homeManagerModules.default;
+            package = self.packages.${system}.sofka;
+          };
           fmt =
             pkgs.runCommand "sofka-fmt-check"
               {
