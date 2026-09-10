@@ -187,6 +187,15 @@ pub enum Msg {
         title: String,
         lines: Vec<String>,
     },
+    /// How far a background `kubectl cp` has got: bytes that have landed at
+    /// the destination, and the source's total when anything could measure
+    /// it. Sent repeatedly for one copy, and never after its `TransferDone`.
+    TransferProgress {
+        generation: u64,
+        claim: StatusClaim,
+        done: u64,
+        total: Option<u64>,
+    },
     /// Result of a background `kubectl cp` transfer (`t` on a pod): a
     /// "copied …" summary, or kubectl's error.
     TransferDone {

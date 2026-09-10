@@ -33,6 +33,22 @@ pod they reach the volume through, exactly like `s` and `t` on that pod's row -
 a rule that already blocks shells or uploads in prod is not defeated by
 reaching the same pod through a claim it mounts.
 
+Measuring a copy's progress runs `du` in the pod, and the two directions cost
+very different things. A download of a single file from the browser adds no
+exec at all - its size is already on screen, from the listing, though a `t`
+download of a typed path has no listing and so runs the probe - and a download of a directory
+adds one `du`, which carries its own `timeout` inside the container. An
+upload adds more: one long-lived exec that measures the destination once a
+second for as long as the copy runs, because nothing else can see a volume
+being written to from outside. That exec ends when sofka closes it, but a
+sofka that is killed cannot close anything, and the loop then runs on in the
+pod until its own bound expires - see [PVC explore](features.md#pvc-explore).
+
+All of it is gated no further than the copy it belongs to, and recorded as
+that one action in `:journal`, on the reasoning that a `du` reaches nothing a
+permitted copy could not already reach: `kubectl cp` has always run `tar`
+there.
+
 sofka combines the restrictions from all matching rules:
 
 - Any matching rule with `deny = true` blocks the action.

@@ -35,6 +35,11 @@ use crate::store::{Msg, Pulse, RowKey, StatusClaim, Store, StoreMutation, XrayIt
 
 pub(crate) use guardrails::ConfirmLevel;
 pub use pvcexplore::{Pane, PvcExplore, PvcIntent};
+pub(crate) use transfer::TransferProgress;
+// Only the renderer's own test names an anchor; the app builds them inside
+// `transfer` and hands out `pane_transfers`.
+#[cfg(test)]
+pub(crate) use transfer::TransferAnchor;
 
 impl App {
     pub fn terminal_title(&self) -> Option<String> {
@@ -1994,6 +1999,12 @@ pub struct App {
     pub transfer_menu_state: ListState,
     pub transfer_target: Option<(String, String, Option<String>)>,
 
+    /// Copies running in the background (`c` in the PVC browser, `t` on a
+    /// pod), and how far each has got. One entry per copy, so copies of two
+    /// different rows draw two bars; two copies of the *same* row draw the
+    /// older one's, there being one size column to draw in.
+    pub(crate) transfers: Vec<TransferProgress>,
+
     /// Split-pane PVC browser state (`x` on a PVC row, `:pvc-explore`).
     pub pvc: PvcExplore,
     /// `[pvc_explore]` helper-pod defaults.
@@ -2330,6 +2341,7 @@ impl App {
             flux_menu_state: ListState::default(),
             transfer_menu_state: ListState::default(),
             transfer_target: None,
+            transfers: Vec::new(),
             pvc: PvcExplore::default(),
             pvc_cfg: crate::config::PvcExploreConfig::default(),
             confirm_return: Mode::Table,
@@ -2519,6 +2531,7 @@ mod rightsize;
 mod rows;
 mod snapshot;
 mod timeline;
+mod transfer;
 mod workspaces;
 
 use helpers::*;
