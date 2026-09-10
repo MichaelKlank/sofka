@@ -32,6 +32,7 @@ pub enum ColumnKind {
     Number,
     /// Kubernetes quantity (`500m`, `1Gi`, `2k`) — sorted by value.
     Quantity,
+    QuantityFormat(QuantityFormat),
     /// RFC 3339 timestamp — rendered as compact elapsed time (`3d4h`, or
     /// `in 30d` for the future), sorted by the timestamp.
     Time,
@@ -39,6 +40,38 @@ pub enum ColumnKind {
     /// [`UserColumn::pointer`]. Shows `status` (`True`/`False`/`Unknown`)
     /// and controls row colors like `Status`.
     Condition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantityFormat {
+    Cpu,
+    Memory,
+}
+
+impl QuantityFormat {
+    fn display_value(self, value: f64) -> f64 {
+        match self {
+            Self::Cpu => (value * 1000.0).round(),
+            Self::Memory => value.ceil(),
+        }
+    }
+
+    fn value(self, value: &Extracted<'_>) -> Option<f64> {
+        value.quantity().filter(|value| {
+            value.is_finite() && *value >= 0.0 && self.display_value(*value) < i64::MAX as f64
+        })
+    }
+
+    fn render(self, value: &Extracted<'_>) -> String {
+        let Some(number) = self.value(value) else {
+            return value.render();
+        };
+        let sample = Some(self.display_value(number) as i64);
+        match self {
+            Self::Cpu => crate::columns::fmt_cpu_sample(sample),
+            Self::Memory => crate::columns::fmt_mem_sample(sample),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,15 +354,23 @@ pub fn compile(
                 continue;
             }
             if let Some(format) = &c.format {
-                if format != "image-tag" {
-                    warnings.push(format!("views.\"{key}\": column {header}: unknown format '{format}' (expected image-tag); column skipped"));
+                let (formatted_kind, required_type) = match format.as_str() {
+                    "image-tag" => (ColumnKind::ImageTag, "text"),
+                    "cpu" => (ColumnKind::QuantityFormat(QuantityFormat::Cpu), "quantity"),
+                    "memory" => (
+                        ColumnKind::QuantityFormat(QuantityFormat::Memory),
+                        "quantity",
+                    ),
+                    _ => {
+                        warnings.push(format!("views.\"{key}\": column {header}: unknown format '{format}' (expected image-tag/cpu/memory); column skipped"));
+                        continue;
+                    }
+                };
+                if c.path.is_empty() || c.kind.as_deref().unwrap_or("text") != required_type {
+                    warnings.push(format!("views.\"{key}\": column {header}: format applies only to {required_type} path columns; column skipped"));
                     continue;
                 }
-                if c.path.is_empty() || c.kind.as_deref().is_some_and(|kind| kind != "text") {
-                    warnings.push(format!("views.\"{key}\": column {header}: format applies only to text path columns; column skipped"));
-                    continue;
-                }
-                kind = ColumnKind::ImageTag;
+                kind = formatted_kind;
             }
             let mut pointer = c.path.trim().to_string();
             if let Some(metric) = &c.metric {
@@ -764,8 +805,16 @@ pub fn render_cell(obj: &DynamicObject, col: &UserColumn, now: i64) -> String {
     match col.kind {
         ColumnKind::Time => render_time(&v, now),
         ColumnKind::ImageTag => render_image_tag(&v),
+        ColumnKind::QuantityFormat(format) => format.render(&v),
         _ => v.render(),
     }
+}
+
+pub fn formatted_quantity_value(obj: &DynamicObject, col: &UserColumn) -> Option<f64> {
+    let ColumnKind::QuantityFormat(format) = col.kind else {
+        return None;
+    };
+    format.value(&cell_value(obj, col)?)
 }
 
 fn render_image_tag(v: &Extracted<'_>) -> String {
@@ -874,6 +923,11 @@ pub fn sort_value(obj: &DynamicObject, col: &UserColumn, now: i64) -> SortValue 
         ColumnKind::Quantity => {
             SortValue::Num(v.as_ref().and_then(Extracted::quantity).unwrap_or(f64::MAX))
         }
+        ColumnKind::QuantityFormat(format) => SortValue::Num(
+            v.as_ref()
+                .and_then(|value| format.value(value))
+                .unwrap_or(f64::MAX),
+        ),
         // Elapsed seconds, like AGE: ascending = most recent (or furthest in
         // the future) first, unknowns last.
         ColumnKind::Time => SortValue::Num(

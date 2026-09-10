@@ -132,6 +132,11 @@ Custom text path columns accept `format = "image-tag"` to show only the image
 tag. See the [image tag example](views.md#image-tags) for configuration and
 validation rules.
 
+Quantity path columns accept `format = "cpu"` or `format = "memory"` with
+`type = "quantity"`. These formats use millicores or Mi/Gi for display and
+the original values for sorting and numeric filters. See
+[quantity formats](views.md#quantity-formats).
+
 ## Other sections
 
 Each of these is documented where the feature itself is:

@@ -72,9 +72,49 @@ Empty strings and values that are not strings keep their usual display.
 Sorting and text filters use the displayed tag. If `format` is omitted, the
 column keeps its usual behavior. The default Pod columns do not change.
 
-The formatter accepts an omitted `type` or `type = "text"`. Other types,
+The image tag formatter accepts an omitted `type` or `type = "text"`. Other types,
 `metric` sources, and `builtin` sources are incompatible with `format`.
 Unsupported formats and incompatible columns are skipped with a config warning.
+
+### Quantity formats
+
+Use `format = "cpu"` or `format = "memory"` with `type = "quantity"`
+to display a path value in the same units as the metric columns:
+
+```toml
+[[views."v1/nodes".columns]]
+name = "CPU/A"
+path = "/status/allocatable/cpu"
+type = "quantity"
+format = "cpu"
+
+[[views."v1/nodes".columns]]
+name = "MEM/A"
+path = "/status/allocatable/memory"
+type = "quantity"
+format = "memory"
+```
+
+CPU values display as whole millicores: `4` becomes `4000m`.
+Memory values display as whole Mi below 1 Gi, or Gi with one decimal place:
+`16374956Ki` becomes `15.6Gi`. These formats also accept JSON numbers.
+Values without a suffix mean CPU cores or memory bytes. The format is explicit;
+sofka does not infer it from the name, path, or suffix.
+
+Without `format`, quantity columns keep their original display. Missing and null
+values show `<none>`. Invalid, negative, non-finite, and out-of-range values keep
+their original display. Zero shows `0m` or `0Mi`. Small positive values can also
+round to zero in the display.
+
+Sorting and numeric filters use the original numeric value before display
+rounding. For example, `cpu/a>=4`, `cpu/a>=4000m`, and `mem/a>1Gi` compare source
+values. Text searches match the displayed value, such as `"15.6Gi"`.
+Invalid and missing values do not match numeric comparisons and sort last in
+ascending order.
+
+Both formats require a path source and `type = "quantity"`. Other types,
+an omitted type, and `metric` or `builtin` sources are incompatible. Unsupported
+formats and incompatible columns are skipped with a config warning.
 
 ### Built-in and metric columns
 
