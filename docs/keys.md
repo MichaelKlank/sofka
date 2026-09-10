@@ -105,7 +105,8 @@ and changes to the row order reset the range before the next Shift+Arrow press.
 
 The local-port prompt contains the current value. `enter` starts the forward;
 `esc` returns to the same picker row. Invalid or unavailable ports keep the
-prompt open for correction.
+prompt open for correction. If the forward process cannot start, the prompt
+keeps the edited value so you can retry.
 
 ## PVC explore (`x` on a PVC)
 

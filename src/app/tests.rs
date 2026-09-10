@@ -2048,6 +2048,72 @@ async fn port_forward_conflict_can_be_fixed_by_editing_only_the_local_port() {
 }
 
 #[tokio::test]
+async fn port_forward_local_edit_preserves_input_after_spawn_failure() {
+    let (mut app, _rx) = test_app();
+    let successful_spawner = app.pf_spawner;
+    app.pf_spawner = |_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "kubectl missing",
+        ))
+    };
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 8080}, {"port": 9090}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('f'))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    app.handle_key(press(KeyCode::Char('e'))).unwrap();
+    let free = occupy_forward_port();
+    let local = free.0.local_addr().unwrap().port().to_string();
+    drop(free);
+    for _ in 0..app.prompt_input.len() {
+        app.handle_key(press(KeyCode::Backspace)).unwrap();
+    }
+    for ch in local.chars() {
+        app.handle_key(press(KeyCode::Char(ch))).unwrap();
+    }
+    let label = app.prompt_label.clone();
+    for _ in 0..2 {
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.mode, Mode::Prompt);
+        assert_eq!(app.prompt_input, local);
+        assert_eq!(app.prompt_label, label);
+        assert!(app.flash_err);
+        assert!(app.flash.contains("kubectl missing"));
+        assert!(app.port_forwards.is_empty());
+        assert!(matches!(&app.prompt_kind,
+            Some(PromptKind::PortForwardLocal { ns, target, remote })
+            if ns == "default" && target == "svc/web" && remote == "9090"));
+    }
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::PortForwardPicker);
+    assert_eq!(app.pf_picker_state.selected(), Some(1));
+    app.handle_key(press(KeyCode::Char('e'))).unwrap();
+    for _ in 0..app.prompt_input.len() {
+        app.handle_key(press(KeyCode::Backspace)).unwrap();
+    }
+    for ch in local.chars() {
+        app.handle_key(press(KeyCode::Char(ch))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Prompt);
+    app.pf_spawner = successful_spawner;
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.prompt_kind.is_none());
+    assert_eq!(app.port_forwards.len(), 1);
+    assert_eq!(app.port_forwards[0].ports, format!("{local}:9090"));
+    assert_eq!(app.port_forwards[0].target, "svc/web");
+}
+
+#[tokio::test]
 async fn port_forward_local_edit_validates_input_and_returns_to_selected_row() {
     let (mut app, _rx) = test_app();
     let cfg: crate::config::Config =

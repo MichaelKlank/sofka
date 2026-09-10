@@ -315,7 +315,15 @@ impl App {
                         }
                     }
                     Some(PromptKind::PortForwardLocal { ns, target, remote }) => {
-                        self.start_port_forward(ns, target, format!("{input}:{remote}"));
+                        if !self.start_port_forward(
+                            ns.clone(),
+                            target.clone(),
+                            format!("{input}:{remote}"),
+                        ) {
+                            self.prompt_kind =
+                                Some(PromptKind::PortForwardLocal { ns, target, remote });
+                            self.mode = Mode::Prompt;
+                        }
                     }
                     Some(PromptKind::SetImage {
                         ns,
