@@ -9,6 +9,10 @@ pickers keep both characters available as input.
 
 ## Table views
 
+At launch, `sofka ctx` or `sofka contexts` opens the context picker before
+connecting. Press Enter to connect to the selected context and open its default
+resource, or pods if none is set.
+
 Use `:resource -n namespace --context context /filter` to apply a complete query.
 Use `:resource @context [namespace]` for cross-context navigation. Context names
 fuzzy-complete after `@`; Tab/Shift-Tab select a suggestion and Enter opens it.

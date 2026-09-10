@@ -12323,6 +12323,52 @@ async fn context_switch_resolves_readonly_and_cli_pin_wins() {
 }
 
 #[tokio::test]
+async fn context_picker_launch_connects_on_enter_and_opens_default_resource() {
+    for default in [None, Some("deployments")] {
+        let (mut app, _rx) = test_app();
+        app.cluster.connected = false;
+        let dir = std::env::temp_dir().join(format!(
+            "sofka-context-launch-{}-{}",
+            std::process::id(),
+            default.unwrap_or("pods")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(resource) = default {
+            std::fs::write(
+                dir.join("config.toml"),
+                format!("default_resource = \"{resource}\"\n"),
+            )
+            .unwrap();
+        }
+        app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+        app.open_contexts();
+        assert_eq!(app.mode, Mode::Contexts);
+        assert!(!app.flash_err);
+        assert!(app.context_switch_target.is_none());
+        app.handle_msg(Msg::Contexts {
+            generation: app.generation,
+            list: vec!["test".into()],
+        });
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            app.context_switch_target,
+            Some((app.generation, "test".into()))
+        );
+        app.handle_msg(Msg::ContextSwitched {
+            generation: app.generation,
+            name: "test".into(),
+            result: Ok(Box::new(Cluster::fake())),
+        });
+        assert_eq!(app.mode, Mode::Table);
+        assert_eq!(
+            app.kind.as_ref().unwrap().ar.plural,
+            default.unwrap_or("pods")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[tokio::test]
 async fn disconnected_start_opens_context_picker() {
     let (tx, _rx) = mpsc::channel(1024);
     let mut cluster = Cluster::fake();

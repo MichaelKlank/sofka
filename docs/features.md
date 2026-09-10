@@ -202,6 +202,10 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 - **RBAC-aware palette browse** - the empty `:` list hides kinds you cannot
   `list`. An explicit search checks the full discovery catalog, because some
   delegated authorizers return incomplete rule reviews.
+- **Context picker at launch** - `sofka ctx` and `sofka contexts` open the picker
+  before connecting to a cluster. Enter connects to the selected context and
+  opens its configured default resource, or pods. `--context NAME` selects the
+  initial context in the picker. These commands require interactive mode.
 - **Namespace switcher** (`n`) with pinned favourites (★) and per-context
   session recents (·) above the rest, plus a context switcher (`:ctx`). In the
   resource table, `1` to `9` select the first nine configured favourites in fixed

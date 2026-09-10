@@ -544,7 +544,8 @@ impl App {
         self.flash_warn(&format!("{label}: {error} — pick another context"));
     }
 
-    pub(super) fn open_contexts(&mut self) {
+    /// Open the context picker without starting a cluster connection.
+    pub fn open_contexts(&mut self) {
         self.ctx_filter.clear();
         self.ctx_filtering = false;
         self.ctx_list.clear();

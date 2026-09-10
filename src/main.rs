@@ -30,6 +30,7 @@ struct Args {
     command: Option<Command>,
 
     /// Resource to open on launch (alias/plural/kind), e.g. pods, svc, dp.
+    /// Use ctx or contexts to choose a context before connecting.
     /// Defaults to config `default_resource`, then "pods".
     resource: Option<String>,
 
@@ -145,6 +146,17 @@ fn main() -> Result<()> {
         .block_on(run_main(args))
 }
 
+impl Args {
+    fn context_picker(&self) -> Result<bool> {
+        let picker = matches!(self.resource.as_deref(), Some("ctx" | "contexts"));
+        anyhow::ensure!(
+            !picker || !(self.check || self.snapshot),
+            "ctx and contexts require interactive mode; remove --check or --snapshot"
+        );
+        Ok(picker)
+    }
+}
+
 async fn run_main(args: Args) -> Result<()> {
     // Before anything else: an adapter run owns stdout for its report and must
     // never load config, connect, or touch the terminal.
@@ -189,30 +201,37 @@ async fn run_main(args: Args) -> Result<()> {
         return result;
     }
 
+    let context_picker = args.context_picker()?;
+
     // Connect before taking over the terminal so errors are readable. An
     // unreachable current context isn't fatal for the interactive TUI: start
     // in the context picker instead (k9s behavior). Headless modes still exit
     // with the error, since there is no picker to fall back to.
-    eprintln!("Connecting to cluster…");
-    let connect = match args.context.as_deref() {
-        Some(name) => {
-            Cluster::connect_context(name, args.allow_v1_client_cert, args.no_tls_resumption).await
-        }
-        None => Cluster::connect(args.allow_v1_client_cert, args.no_tls_resumption).await,
-    };
-    let (mut cluster, connect_error) = match connect {
-        Ok(c) => (c, None),
-        Err(e) if args.check || args.snapshot => {
-            eprintln!("\x1b[31merror:\x1b[0m {e:#}");
-            applog::shutdown();
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("\x1b[33mwarning:\x1b[0m {e:#}");
-            (
-                Cluster::disconnected(args.context.as_deref()),
-                Some(format!("{e:#}")),
-            )
+    let (mut cluster, connect_error) = if context_picker {
+        (Cluster::disconnected(args.context.as_deref()), None)
+    } else {
+        eprintln!("Connecting to cluster…");
+        let connect = match args.context.as_deref() {
+            Some(name) => {
+                Cluster::connect_context(name, args.allow_v1_client_cert, args.no_tls_resumption)
+                    .await
+            }
+            None => Cluster::connect(args.allow_v1_client_cert, args.no_tls_resumption).await,
+        };
+        match connect {
+            Ok(c) => (c, None),
+            Err(e) if args.check || args.snapshot => {
+                eprintln!("\x1b[31merror:\x1b[0m {e:#}");
+                applog::shutdown();
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("\x1b[33mwarning:\x1b[0m {e:#}");
+                (
+                    Cluster::disconnected(args.context.as_deref()),
+                    Some(format!("{e:#}")),
+                )
+            }
         }
     };
     cluster.allow_v1_client_cert = args.allow_v1_client_cert;
@@ -426,6 +445,7 @@ async fn run_main(args: Args) -> Result<()> {
         // No cluster to watch — open the context picker over the empty table;
         // a successful pick connects and lands on the default resource.
         Some(err) => app.start_disconnected(err),
+        None if context_picker => app.open_contexts(),
         None => {
             app.switch_kind(&resource);
             app.start_autostart_forwards();
@@ -1091,6 +1111,31 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_picker_launch_aliases_and_context_flag() {
+        for alias in ["ctx", "contexts"] {
+            let args = Args::try_parse_from(["sofka", alias, "--context", "prod"]).unwrap();
+            assert!(args.context_picker().unwrap());
+            assert_eq!(args.context.as_deref(), Some("prod"));
+            for flag in ["--check", "--snapshot"] {
+                let args = Args::try_parse_from(["sofka", alias, flag]).unwrap();
+                assert!(args.context_picker().is_err());
+            }
+        }
+        for argv in [
+            vec!["sofka"],
+            vec!["sofka", "dp"],
+            vec!["sofka", "--context", "prod"],
+        ] {
+            assert!(
+                !Args::try_parse_from(argv)
+                    .unwrap()
+                    .context_picker()
+                    .unwrap()
+            );
+        }
+    }
 
     #[test]
     fn tls_resumption_is_disabled_only_when_requested() {

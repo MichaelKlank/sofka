@@ -2645,7 +2645,7 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
     ));
     lines.push(bind(
         ":ctx · :pulse",
-        "switch context · cluster-health dashboard",
+        "switch context (launch: sofka ctx) · cluster-health dashboard",
     ));
     lines.push(bind(
         ":fleet",
