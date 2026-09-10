@@ -1213,7 +1213,7 @@ impl App {
         target: String,
         ports: String,
         config_name: Option<String>,
-    ) {
+    ) -> bool {
         let mut argv = self.kubectl_base();
         argv.push("port-forward".into());
         if !ns.is_empty() {
@@ -1236,8 +1236,12 @@ impl App {
                 self.flash = format!("port-forwarding {} (:pf to view/stop)", pf.label());
                 self.flash_err = false;
                 self.port_forwards.push(pf);
+                true
             }
-            Err(e) => self.flash_warn(&format!("port-forward failed to start: {e}")),
+            Err(e) => {
+                self.flash_warn(&format!("port-forward failed to start: {e}"));
+                false
+            }
         }
     }
 
@@ -1272,8 +1276,8 @@ impl App {
         available
     }
 
-    pub(super) fn start_port_forward(&mut self, ns: String, target: String, ports: String) {
-        self.start_port_forward_named(ns, target, ports, None);
+    pub(super) fn start_port_forward(&mut self, ns: String, target: String, ports: String) -> bool {
+        self.start_port_forward_named(ns, target, ports, None)
     }
 
     /// Whether the `[[forwards]]` entry named `name` has a live child.

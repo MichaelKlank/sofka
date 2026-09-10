@@ -255,7 +255,10 @@ impl App {
                 // Most prompts start at (and return to) the table; the
                 // lookback and rename-context prompts return to the view
                 // they were opened from.
-                self.mode = if self.prompt_over_logs() {
+                self.mode = if matches!(self.prompt_kind, Some(PromptKind::PortForwardLocal { .. }))
+                {
+                    Mode::PortForwardPicker
+                } else if self.prompt_over_logs() {
                     Mode::Logs
                 } else if self.prompt_over_contexts() {
                     Mode::Contexts
@@ -276,8 +279,16 @@ impl App {
             }
             (Some(Action::Accept), _) => {
                 let input = self.prompt_input.trim().to_string();
-                if matches!(self.prompt_kind, Some(PromptKind::PortForward { .. }))
-                    && !self.local_forward_port_available(&input)
+                if matches!(self.prompt_kind, Some(PromptKind::PortForwardLocal { .. }))
+                    && !input.parse::<u16>().is_ok_and(|port| port > 0)
+                {
+                    self.flash_warn("local port must be a number from 1 to 65535");
+                    return;
+                }
+                if matches!(
+                    self.prompt_kind,
+                    Some(PromptKind::PortForward { .. } | PromptKind::PortForwardLocal { .. })
+                ) && !self.local_forward_port_available(&input)
                 {
                     return;
                 }
@@ -301,6 +312,17 @@ impl App {
                         } else {
                             let target = forward_target(&self.kind_plural, &name);
                             self.start_port_forward(ns, target, input);
+                        }
+                    }
+                    Some(PromptKind::PortForwardLocal { ns, target, remote }) => {
+                        if !self.start_port_forward(
+                            ns.clone(),
+                            target.clone(),
+                            format!("{input}:{remote}"),
+                        ) {
+                            self.prompt_kind =
+                                Some(PromptKind::PortForwardLocal { ns, target, remote });
+                            self.mode = Mode::Prompt;
                         }
                     }
                     Some(PromptKind::SetImage {
@@ -415,7 +437,7 @@ impl App {
             (Some(Action::Back), _) | (Some(Action::Close), _) => self.mode = Mode::Table,
             (Some(Action::Down), _) => list_step(&mut self.pf_picker_state, len, true),
             (Some(Action::Up), _) => list_step(&mut self.pf_picker_state, len, false),
-            (Some(Action::Accept), _) => {
+            (Some(Action::Accept | Action::Edit), _) => {
                 let Some(i) = self.pf_picker_state.selected() else {
                     return;
                 };
@@ -426,6 +448,9 @@ impl App {
                     return;
                 };
                 if item == "Custom…" {
+                    if key.action == Some(Action::Edit) {
+                        return;
+                    }
                     self.prompt_label =
                         format!("Port-forward {name} (LOCAL:REMOTE, e.g. 8080:80):");
                     self.prompt_input.clear();
@@ -433,6 +458,20 @@ impl App {
                     self.mode = Mode::Prompt;
                 } else {
                     let ports = item.split_whitespace().next().unwrap_or(&item).to_string();
+                    if key.action == Some(Action::Edit) {
+                        let Some((local, remote)) = ports.split_once(':') else {
+                            return;
+                        };
+                        self.prompt_label = format!("Local port for {name}, remote {remote}:");
+                        self.prompt_input = local.to_string();
+                        self.prompt_kind = Some(PromptKind::PortForwardLocal {
+                            ns,
+                            target: forward_target(&self.kind_plural, &name),
+                            remote: remote.to_string(),
+                        });
+                        self.mode = Mode::Prompt;
+                        return;
+                    }
                     if !self.local_forward_port_available(&ports) {
                         return;
                     }
