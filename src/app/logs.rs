@@ -42,35 +42,6 @@ impl App {
             .drain_front(self.logs.view.lines.len().saturating_sub(cap));
     }
 
-    // ----- containers / logs --------------------------------------------
-
-    pub(super) fn open_containers(&mut self, obj: &DynamicObject) {
-        let mut names = container_names(obj);
-        if names.is_empty() {
-            self.flash_warn("no containers found");
-            return;
-        }
-        names.sort();
-        let ns = obj.metadata.namespace.clone().unwrap_or_default();
-        let name = obj.metadata.name.clone().unwrap_or_default();
-        self.container_pod = Some((ns, name));
-        self.container_list = names;
-        self.container_resources = container_resources_of(obj).into_iter().collect();
-        self.container_qos = qos_class(obj);
-        self.container_state.select(Some(0));
-        self.mode = Mode::Containers;
-    }
-
-    /// Latest metrics for a container in the pod currently shown by the
-    /// container picker. `None` distinguishes unavailable Metrics Server data
-    /// from a measured zero value.
-    pub fn selected_pod_container_metrics(&self, container: &str) -> Option<(i64, i64)> {
-        let (namespace, pod) = self.container_pod.as_ref()?;
-        self.container_metrics
-            .get(&format!("{namespace}/{pod}/{container}"))
-            .copied()
-    }
-
     /// Logs for marked pods or the current selection. Stream every container. For
     /// workloads/services: list matching pods and aggregate all their logs.
     pub(super) fn open_logs(&mut self) {

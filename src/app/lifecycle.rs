@@ -873,7 +873,26 @@ impl App {
     /// report, a bundle) can displace the PVC browser without a keystroke
     /// being involved at all.
     pub fn handle_msg(&mut self, msg: Msg) {
+        let refresh_containers = match &msg {
+            Msg::Applied {
+                generation, key, ..
+            }
+            | Msg::Deleted { generation, key } => {
+                *generation == self.generation
+                    && self
+                        .container_pod
+                        .as_ref()
+                        .is_some_and(|(ns, pod)| key == &format!("{ns}/{pod}"))
+            }
+            Msg::Reset { generation } | Msg::Synced { generation } => {
+                *generation == self.generation
+            }
+            _ => false,
+        };
         self.handle_msg_inner(msg);
+        if refresh_containers {
+            self.sync_container_picker();
+        }
         self.check_resource_refresh();
         if self.mode != Mode::Adjacent {
             self.cancel_children();
