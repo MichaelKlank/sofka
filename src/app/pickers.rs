@@ -302,6 +302,14 @@ impl App {
         self.sort_picker_state.select(Some(idx));
     }
 
+    pub(super) fn sort_by_age(&mut self) {
+        if !self.display_headers().iter().any(|h| h == "AGE") {
+            self.flash_warn("view has no AGE column");
+            return;
+        }
+        self.apply_sort_choice("AGE");
+    }
+
     /// Sort by a picked entry: the default entry clears the sort, a new column
     /// sorts ascending, and re-picking the active column toggles direction
     /// (the spreadsheet idiom).

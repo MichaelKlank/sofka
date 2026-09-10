@@ -56,7 +56,7 @@ not reset the current compact mode. With `hide_header = true`, the compact
 header is hidden too. Command and filter input still appears when needed.
 
 `remember_sort` is enabled by default. Set it to `false` to stop saving and
-restoring sort choices from `S`, `I`, and column header clicks. Existing saved
+restoring sort choices from `S`, `A`, `I`, and column header clicks. Existing saved
 choices stay on disk and become available again when you enable the option.
 The option supports cluster and context overrides and `:reload`. A reload
 keeps the active sort; the option controls later sort changes and view starts.
@@ -93,6 +93,19 @@ To change or disable a shortcut, use the existing key configuration:
 favorite_namespace_1 = "f1"
 favorite_namespace_2 = []
 ```
+
+The age sort, selected namespace, and log marker actions can also be changed:
+
+```toml
+[keys.table]
+sort_age = "A"
+namespace_selected = "W"
+
+[keys.logs]
+log_marker = "m"
+```
+
+Use `[]` to disable an action. Custom keys use the normal conflict checks.
 
 ## Skins
 

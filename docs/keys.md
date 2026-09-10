@@ -33,12 +33,14 @@ for the grammar and selector persistence rules.
 | `j`/`k`, `↓`/`↑`, `g`/`G`                     | navigate                                                                                                                                                            |
 | `ctrl-f` / `ctrl-b`, `PgDn` / `PgUp`          | page forward / back - one screenful at a time                                                                                                                       |
 | `S` / `I`                                     | sort-column picker (fuzzy; ⏎ on the active column inverts) / invert sort direction; saved per kind by default (`remember_sort = false` disables this)               |
+| `A`                                           | sort by `AGE`; press again to invert; uses the sort memory setting                                                                                                  |
 | `ctrl-e`                                      | compact mode: collapse the header + footer (for tiled/multiplexed panes)                                                                                            |
 | `space`                                       | mark/unmark row for bulk actions                                                                                                                                    |
 | `shift-up` / `shift-down`                     | extend or reduce the marked range from the starting row                                                                                                             |
 | `/`                                           | filter: fuzzy text · `"exact"` · `/regex/` · `!inverse` · `-l`/`-f` selectors (server-side on ⏎) · `status=X` `cpu>500m` `age<2h`                                   |
 | `Ctrl+Z`                                      | toggle faults filter in pod views; configured actions take precedence; combine with `/`; press again to turn off                                                    |
 | `n` / `0`                                     | namespace switcher / all namespaces                                                                                                                                 |
+| `W`                                           | switch to the selected resource's namespace and keep the resource kind                                                                                              |
 | `1` to `9`                                    | select a configured favourite namespace in fixed configuration order                                                                                                |
 | `shift-j`                                     | jump to owner/controller                                                                                                                                            |
 | `o`                                           | show the node the selected row names (pods built in; other kinds via `[views."…"].node`)                                                                            |
@@ -108,11 +110,19 @@ point instead. See [PVC explore](features.md#pvc-explore).
 ## Logs view
 
 `/` filter (substring · `/regex/` · `!invert`) · `s`/`f` autoscroll · `w` wrap ·
-`t` timestamps · `x` stop/resume stream · `z` clear buffer · `c` copy buffer ·
+`m` visual marker · `t` timestamps · `x` stop/resume stream · `z` clear buffer · `c` copy buffer ·
 `ctrl-s` save to file · `F` fullscreen (no chrome, clean text selection) ·
 `0`–`5` time anchors (tail · 1m · 5m · 15m · 30m · 1h) · `T` provider lookback
 (VictoriaLogs views) · `esc` back. The newest line anchors to the bottom of the
 viewport.
+
+`m` adds a separator after the latest received log line. Repeated presses add
+separate markers. Markers stay visible through filters and are excluded from
+sofka copy/save. While paused, a marker is added at the buffer tail without
+moving the viewport. Markers have no timestamp. They are removed when the
+buffer is cleared or replaced, or when their position is trimmed. Marker count
+is limited to the active log buffer cap. Manual terminal selection can include
+visible markers.
 
 ## Document views (YAML, describe, diff, events)
 

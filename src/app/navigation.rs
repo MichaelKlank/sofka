@@ -126,6 +126,22 @@ impl App {
         }
     }
 
+    pub(super) fn select_resource_namespace(&mut self) {
+        let Some(obj) = self.selected() else {
+            self.flash_warn("no resource selected");
+            return;
+        };
+        let Some(ns) = obj.metadata.namespace.filter(|ns| !ns.is_empty()) else {
+            self.flash_warn("resource has no namespace");
+            return;
+        };
+        if self.namespace == ns && self.owner.is_none() {
+            self.set_flash(format!("namespace: {ns}"));
+            return;
+        }
+        self.set_namespace(ns);
+    }
+
     pub(super) fn drill_into_cronjob_jobs(&mut self, obj: &DynamicObject) {
         let Some(jobs) = self.cluster.resolve("jobs") else {
             self.flash_warn("jobs kind unavailable");

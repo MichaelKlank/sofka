@@ -179,6 +179,11 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   Unconfigured slots do nothing. `0` selects all namespaces. The
   last namespace picked in each context is remembered across restarts
   (`<state-dir>/namespaces.toml`); `-n`/`-A` override it for a session.
+- **Selected namespace** (`W`) switches to the cursor row's namespace and
+  keeps the resource kind. It uses normal namespace history and watch behavior.
+  Rows without a namespace show a status message.
+- **Sort by age** (`A`) selects `AGE` with the same direction as the sort picker.
+  Press it again to invert. If `AGE` is absent, the current sort stays active.
 - **Default sort** - `[views."*"].sort` sets a global initial sort, with
   resource-specific overrides. Sort choices are saved per kind by default.
   Set `remember_sort = false` to make user sort changes temporary.
@@ -352,6 +357,10 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   retries until its logs are available. sofka parses ANSI color from the source app
   and maps it onto the active skin instead of printing literal escapes. See
   [Log controls](debugging.md#log-controls).
+- **Log markers** (`m` in logs) add visual separators at the buffer tail.
+  Markers stay visible through filters, do not move a paused viewport, and are
+  excluded from sofka copy/save. Clearing or replacing the buffer removes them.
+  Their storage is bounded by the active log buffer cap.
 - **VictoriaLogs integration** (`L` / `:vlogs`) - log history from a
   VictoriaLogs backend for a pod, container, workload, service, or whole
   namespace, covering restarted and deleted pods. Zero config: sofka finds the

@@ -409,12 +409,14 @@ impl App {
             (Some(Action::Drain), _) => self.request_drain(),
             // Sorting: S opens the column picker, I inverts the direction.
             (Some(Action::Sort), _) => self.open_sort_picker(),
+            (Some(Action::SortAge), _) => self.sort_by_age(),
             (Some(Action::InvertSort), _) => self.toggle_sort_dir(),
             // Wide mode: show wide-only columns (kubectl `-o wide`).
             (Some(Action::Wide), _) => self.toggle_wide(),
             // `f`/Shift-F = port-forward.
             (Some(Action::PortForward), _) => self.request_port_forward(),
             (Some(Action::Namespaces), _) => self.open_namespaces(),
+            (Some(Action::NamespaceSelected), _) => self.select_resource_namespace(),
             // Browser-style view history: [ back, ] forward.
             (Some(Action::HistoryBack), _) => self.history_back(),
             (Some(Action::HistoryForward), _) => self.history_forward(),
@@ -1160,6 +1162,11 @@ impl App {
     }
 
     pub(super) fn key_logs(&mut self, key: KeyInput) {
+        if key.action == Some(Action::LogMarker) {
+            self.logs.add_marker(self.log_buffer_cap());
+            self.set_flash("log marker added");
+            return;
+        }
         if let Some(anchor) = key.action.and_then(Action::log_anchor) {
             self.apply_log_anchor(anchor);
             return;
@@ -1174,16 +1181,7 @@ impl App {
             (Some(Action::Follow), _) => {
                 self.logs.follow = !self.logs.follow;
                 if self.logs.follow {
-                    // Resumed tailing — trim the backlog accumulated while paused.
-                    let overflow = self
-                        .logs
-                        .view
-                        .lines
-                        .len()
-                        .saturating_sub(self.logs_cfg.buffer.max(1));
-                    if overflow > 0 {
-                        self.logs.view.drain_front(overflow);
-                    }
+                    self.trim_log_buffer();
                 }
                 self.flash = format!(
                     "autoscroll: {}",
@@ -1260,7 +1258,7 @@ impl App {
             }
             // Clear the on-screen buffer (the live stream keeps appending).
             (Some(Action::Clear), _) => {
-                self.logs.view.clear_lines();
+                self.logs.clear_lines();
                 self.logs.view.scroll = 0;
                 self.flash = "log buffer cleared".into();
                 self.flash_err = false;
@@ -1311,6 +1309,7 @@ impl App {
             (Some(Action::Last), _) => {
                 // Resume autoscroll; the next draw anchors to the bottom.
                 self.logs.follow = true;
+                self.trim_log_buffer();
             }
             _ => {}
         }

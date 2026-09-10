@@ -1754,7 +1754,8 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
                 break;
             }
             let Some(buf_idx) = index.line_at(i) else {
-                break;
+                rows.push(Line::styled("-".repeat(inner_w), theme::dim()));
+                continue;
             };
             let Some(l) = app.logs.view.lines.get(buf_idx) else {
                 break;
@@ -1804,7 +1805,7 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
             " {} · /{} [{}]{} ",
             app.logs.view.title,
             filter,
-            app.logs.index().shown_len(),
+            app.logs.index().matched_lines(),
             flags
         )
     } else {
@@ -2557,6 +2558,8 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
         }
         let description = if scope == "table" && action == Action::Logs {
             "logs (marked pods, or current row)"
+        } else if action == Action::LogMarker {
+            "add visual marker at the log tail (excluded from copy/save)"
         } else if action == Action::AutoRefresh && scope == "detail" {
             "toggle refresh (YAML, decoded Secret, describe)"
         } else if action == Action::AutoRefresh && scope == "diff" {
@@ -4439,6 +4442,7 @@ fn navigation_hint(app: &App, width: u16) -> String {
             Action::Back,
             Action::Filter,
             Action::Follow,
+            Action::LogMarker,
             Action::Wrap,
             Action::Stream,
             Action::Copy,

@@ -83,11 +83,13 @@ actions! {
     Last => ("last", "last row"),
     Left => ("left", "left"),
     Logs => ("logs", "logs"),
+    LogMarker => ("log_marker", "add visual log marker"),
     Lookback => ("lookback", "lookback"),
     Mark => ("mark", "mark"),
     RangeDown => ("range_down", "extend or reduce selection down"),
     RangeUp => ("range_up", "extend or reduce selection up"),
     Namespaces => ("namespaces", "namespaces"),
+    NamespaceSelected => ("namespace_selected", "selected resource namespace"),
     NextMatch => ("next_match", "next match"),
     NextView => ("next_view", "next view"),
     Node => ("node", "node"),
@@ -111,6 +113,7 @@ actions! {
     Shell => ("shell", "shell"),
     ShellOrScale => ("shell_or_scale", "shell or scale"),
     Sort => ("sort", "sort"),
+    SortAge => ("sort_age", "sort by age; repeat to invert"),
     Start => ("start", "start"),
     Stream => ("stream", "stream"),
     SwitchPane => ("switch_pane", "switch pane"),
@@ -378,6 +381,7 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("logs", Action::Fullscreen, &["F"]),
     ("logs", Action::Last, &["G", "end"]),
     ("logs", Action::Lookback, &["T"]),
+    ("logs", Action::LogMarker, &["m"]),
     ("logs", Action::PageDown, &["pagedown", "space"]),
     ("logs", Action::PageUp, &["pageup"]),
     ("logs", Action::Save, &["ctrl-s"]),
@@ -473,6 +477,7 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("table", Action::RangeDown, &["shift-down"]),
     ("table", Action::RangeUp, &["shift-up"]),
     ("table", Action::Namespaces, &["n"]),
+    ("table", Action::NamespaceSelected, &["W"]),
     ("table", Action::NextView, &["tab"]),
     ("table", Action::Node, &["o"]),
     ("table", Action::Open, &["enter"]),
@@ -489,6 +494,7 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("table", Action::SetImage, &["i"]),
     ("table", Action::ShellOrScale, &["s"]),
     ("table", Action::Sort, &["S"]),
+    ("table", Action::SortAge, &["A"]),
     ("table", Action::Timeline, &["T"]),
     ("table", Action::Uncordon, &["U"]),
     ("table", Action::Up, &["k", "up"]),
@@ -914,6 +920,45 @@ mod tests {
             ),
             Some(Action::ClearLine)
         );
+    }
+
+    #[test]
+    fn resource_and_log_shortcuts_support_overrides_and_conflicts() {
+        for (scope, action, default, custom) in [
+            ("table", Action::SortAge, 'A', "f8"),
+            ("table", Action::NamespaceSelected, 'W', "f9"),
+            ("logs", Action::LogMarker, 'm', "f10"),
+        ] {
+            let key = KeyEvent::new(KeyCode::Char(default), KeyModifiers::NONE);
+            assert_eq!(Keymap::default().action(scope, &key), Some(action));
+            let setting = format!("[keys.{scope}]\n{} = '{custom}'", action.name());
+            let map = compile(&setting).unwrap();
+            assert_eq!(map.label(scope, action), custom);
+            assert_eq!(map.action(scope, &key), None);
+            let disabled = compile(&format!("[keys.{scope}]\n{} = []", action.name())).unwrap();
+            assert_eq!(disabled.action(scope, &key), None);
+            let conflict = format!("[keys.{scope}]\n{} = 'w'", action.name());
+            assert!(
+                compile(&conflict)
+                    .unwrap_err()
+                    .iter()
+                    .any(|e| e.contains("conflicts"))
+            );
+        }
+        let map = Keymap::default();
+        for (scope, key, action) in [
+            ("table", 'a', Action::Attach),
+            ("table", 'w', Action::Wide),
+            ("logs", 'w', Action::Wrap),
+        ] {
+            assert_eq!(
+                map.action(
+                    scope,
+                    &KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)
+                ),
+                Some(action)
+            );
+        }
     }
 
     #[test]
