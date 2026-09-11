@@ -15,6 +15,7 @@ const RECORD_SCHEMA: u32 = 1;
 /// Directories under this name are committed for deletion: whatever state an
 /// interruption left them in, recovery discards them.
 const REMOVED_PREFIX: &str = ".plugin-removed-";
+const TRASH: &str = ".plugin-trash";
 const EXPANDED_MAX_BYTES: u64 = 200 * 1024 * 1024;
 const FILE_MAX: usize = 2_000;
 /// A package may hold thousands of files; an error message may not.
@@ -194,7 +195,8 @@ impl PreparedPackage {
         if had_destination {
             // Rename first: a half-deleted backup is unidentifiable, so recovery
             // must see it under a name that means "already replaced".
-            let discarded = unique_path(config, &format!("{REMOVED_PREFIX}{}", self.id));
+            let trash = trash(config).map_err(|e| format!("{} was activated, but {e}", self.id))?;
+            let discarded = unique_path(&trash, &format!("{REMOVED_PREFIX}{}", self.id));
             std::fs::rename(&backup, &discarded).map_err(|e| {
                 format!(
                     "{} was activated, but retiring {} failed: {e}",
@@ -627,8 +629,9 @@ fn remove_below(config: &Path, ids: &[String]) -> Result<Vec<(String, PathBuf)>,
     // A failure partway through must still report what is already gone: the
     // caller cannot tell the user to re-run something that already happened.
     let mut removed = Vec::new();
+    let trash = trash(config)?;
     for (id, path, _) in checked {
-        let staged = unique_path(config, &format!("{REMOVED_PREFIX}{id}"));
+        let staged = unique_path(&trash, &format!("{REMOVED_PREFIX}{id}"));
         if let Err(e) = std::fs::rename(&path, &staged) {
             return Err(Removal {
                 removed,
@@ -972,26 +975,37 @@ fn unique_path(parent: &Path, prefix: &str) -> PathBuf {
     parent.join(format!("{prefix}-{}-{nanos:x}", std::process::id()))
 }
 
-/// Whether a name is one `unique_path` produced: the prefix, an ID, then the
-/// process and timestamp that made it unique. A staging directory proves itself
-/// with a marker file, which a half-deleted directory may no longer have; this
-/// shape survives a partial deletion and still excludes a directory a user
-/// happened to name with the same prefix.
-fn generated(name: &str, prefix: &str) -> bool {
-    let Some(rest) = name.strip_prefix(prefix) else {
-        return false;
+/// Where a removed package waits to be deleted. A removal renames into here
+/// and only then deletes, so everything inside is sofka's by construction:
+/// recovery can clear it without matching a name or reading a record, and a
+/// leftover that lost its record to an interrupted deletion is still cleaned
+/// up. Nothing a user put in the config directory can end up in it.
+fn trash(config: &Path) -> Result<PathBuf, String> {
+    let trash = config.join(TRASH);
+    ensure_directory_path(&trash)?;
+    std::fs::create_dir_all(&trash).map_err(|e| format!("creating {}: {e}", trash.display()))?;
+    ensure_directory_path(&trash)?;
+    Ok(trash)
+}
+
+fn empty_trash(trash: &Path) -> Result<(), String> {
+    let entries = match std::fs::read_dir(trash) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("reading {}: {e}", trash.display())),
     };
-    let Some((rest, nanos)) = rest.rsplit_once('-') else {
-        return false;
-    };
-    let Some((id, pid)) = rest.rsplit_once('-') else {
-        return false;
-    };
-    !id.is_empty()
-        && !pid.is_empty()
-        && !nanos.is_empty()
-        && pid.bytes().all(|b| b.is_ascii_digit())
-        && nanos.bytes().all(|b| b.is_ascii_hexdigit())
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("reading {}: {e}", trash.display()))?;
+        let path = entry.path();
+        // A symlink reports as neither: unlinked, never followed.
+        let discarded = if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        discarded.map_err(|e| format!("recovering {}: {e}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn recover(config: &Path) -> Result<(), String> {
@@ -1011,17 +1025,11 @@ fn recover(config: &Path) -> Result<(), String> {
                 std::fs::remove_dir_all(&path)
                     .map_err(|e| format!("recovering {}: {e}", path.display()))?;
             }
-        } else if name.starts_with(REMOVED_PREFIX) {
-            // The rename that created this directory committed the removal, so
-            // there is nothing left to identify and nothing to keep — but the
-            // deletion is recursive, so it takes the same care the staging
-            // branch takes with its marker: only a name this process shape
-            // could have produced is sofka's to destroy.
-            if generated(&name, REMOVED_PREFIX) && entry.file_type().is_ok_and(|kind| kind.is_dir())
-            {
-                std::fs::remove_dir_all(&path)
-                    .map_err(|e| format!("recovering {}: {e}", path.display()))?;
-            }
+        } else if name == TRASH {
+            // The rename into here committed the removal, so nothing inside is
+            // worth keeping and nothing inside can be anyone else's.
+            ensure_directory_path(&path)?;
+            empty_trash(&path)?;
         } else if name.starts_with(".plugin-backup-") {
             let record = read_record(&path).map_err(|e| {
                 format!(
@@ -1042,7 +1050,8 @@ fn recover(config: &Path) -> Result<(), String> {
                 // Rename first, for the same reason activation does: a
                 // half-deleted backup is unidentifiable, and recovery would
                 // then refuse every later operation.
-                let discarded = unique_path(config, &format!("{REMOVED_PREFIX}{}", record.id));
+                let discarded =
+                    unique_path(&trash(config)?, &format!("{REMOVED_PREFIX}{}", record.id));
                 std::fs::rename(&path, &discarded)
                     .map_err(|e| format!("retiring {}: {e}", path.display()))?;
                 std::fs::remove_dir_all(&discarded)
@@ -1094,6 +1103,22 @@ mod tests {
             builder.append_data(&mut header, name, *bytes).unwrap();
         }
         builder.into_inner().unwrap();
+    }
+
+    /// Transient state a finished operation must not leave behind. The trash
+    /// directory survives its first use; an empty one is not a leftover.
+    fn leftovers(config: &Path) -> Vec<String> {
+        std::fs::read_dir(config)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".plugin-"))
+            .filter(|name| {
+                name != TRASH
+                    || std::fs::read_dir(config.join(TRASH))
+                        .is_ok_and(|mut entries| entries.next().is_some())
+            })
+            .collect()
     }
 
     fn scratch(tag: &str) -> PathBuf {
@@ -1336,12 +1361,7 @@ mod tests {
         assert!(error.contains("local modifications"), "{error}");
 
         // No stage survives a refused batch.
-        let leftovers: Vec<_> = std::fs::read_dir(&config)
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with(".plugin-"))
-            .collect();
+        let leftovers = leftovers(&config);
         assert!(leftovers.is_empty(), "{leftovers:?}");
         let _ = std::fs::remove_dir_all(config);
     }
@@ -1604,12 +1624,7 @@ mod tests {
         assert!(!backup.exists());
         assert!(destination.join(RECORD).is_file());
         // Nothing is left behind that a later run would refuse to identify.
-        let leftovers: Vec<_> = std::fs::read_dir(&config)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with(".plugin-"))
-            .collect();
+        let leftovers = leftovers(&config);
         assert!(leftovers.is_empty(), "{leftovers:?}");
         let _ = std::fs::remove_dir_all(config);
     }
@@ -1903,7 +1918,10 @@ mod tests {
 
         // 5. Interrupted while deleting a committed removal, in any state.
         for leftover in ["with-record", "without-record"] {
-            let removed = unique_path(&config, &format!("{REMOVED_PREFIX}{leftover}"));
+            let removed = unique_path(
+                &trash(&config).unwrap(),
+                &format!("{REMOVED_PREFIX}{leftover}"),
+            );
             std::fs::create_dir(&removed).unwrap();
             if leftover == "with-record" {
                 std::fs::write(removed.join(RECORD), serde_json::to_vec(&record).unwrap()).unwrap();
@@ -2289,7 +2307,7 @@ mod tests {
         .unwrap();
         // Cleanup deletes the record before the rest of the directory, which
         // used to leave a backup nothing could identify.
-        let orphan = config.join(".plugin-removed-sample-1-1");
+        let orphan = trash(&config).unwrap().join(".plugin-removed-sample-1-1");
         std::fs::create_dir(&orphan).unwrap();
         std::fs::write(orphan.join("leftover"), "old").unwrap();
 
@@ -2326,12 +2344,7 @@ mod tests {
         .activate()
         .unwrap();
 
-        let leftovers: Vec<_> = std::fs::read_dir(&config)
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with(".plugin-"))
-            .collect();
+        let leftovers = leftovers(&config);
         assert!(leftovers.is_empty(), "{leftovers:?}");
         assert!(destination.join("new").is_file());
         let _ = std::fs::remove_dir_all(config);
@@ -2523,38 +2536,32 @@ mod tests {
     }
 
     #[test]
-    fn recovery_only_deletes_directories_it_could_have_created() {
-        assert!(generated(
-            ".plugin-removed-sample-4321-17b2c9f0",
-            REMOVED_PREFIX
-        ));
-        // An ID may contain hyphens of its own.
-        assert!(generated(
-            ".plugin-removed-resource-summary-4321-17b2c9f0",
-            REMOVED_PREFIX
-        ));
-        // Anything a user would plausibly type is not sofka's to delete.
-        for name in [
-            ".plugin-removed-notes",
-            ".plugin-removed-sample-backup",
-            ".plugin-removed-sample-4321-nothex",
-            ".plugin-removed-sample-notdigits-17b2c9f0",
-            ".plugin-removed-",
-            ".plugin-removed-a-b",
-        ] {
-            assert!(!generated(name, REMOVED_PREFIX), "{name}");
-        }
-
-        let config = scratch("removed-prefix");
+    fn recovery_clears_its_own_trash_and_nothing_else() {
+        let config = scratch("removed-ownership");
         std::fs::create_dir_all(config.join("plugins")).unwrap();
-        let mine = unique_path(&config, &format!("{REMOVED_PREFIX}sample"));
-        std::fs::create_dir(&mine).unwrap();
-        let theirs = config.join(".plugin-removed-my-own-notes");
+
+        // A removal renames into the trash and then deletes, so an interrupted
+        // one leaves a directory here — with or without its record, since
+        // deletion can take the record first.
+        let trash = trash(&config).unwrap();
+        let with_record = unique_path(&trash, &format!("{REMOVED_PREFIX}sample"));
+        std::fs::create_dir(&with_record).unwrap();
+        write_record(&with_record, &record_for("sample", "1.0.0"));
+        let without_record = unique_path(&trash, &format!("{REMOVED_PREFIX}other"));
+        std::fs::create_dir(&without_record).unwrap();
+        std::fs::write(without_record.join("leftover"), "old").unwrap();
+
+        // Nothing a user put in the config directory is sofka's to delete, and
+        // a name alone never made it so — not even one shaped like sofka's own.
+        let theirs = config.join(".plugin-removed-notes-4321-17b2c9f0");
         std::fs::create_dir(&theirs).unwrap();
         std::fs::write(theirs.join("keep.txt"), "mine").unwrap();
 
         recover(&config).unwrap();
-        assert!(!mine.exists(), "sofka's own leftover survived recovery");
+
+        assert!(!with_record.exists());
+        assert!(!without_record.exists(), "a leftover that lost its record");
+        assert!(trash.is_dir(), "the trash directory itself is kept");
         assert!(
             theirs.join("keep.txt").is_file(),
             "recovery deleted a directory it did not create"

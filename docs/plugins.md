@@ -43,7 +43,10 @@ failure does not silently fall back to cached metadata.
 
 Managed packages are installed under
 `$XDG_CONFIG_HOME/sofka/plugins/<id>`, or `~/.config/sofka/plugins/<id>`. Each
-contains a `.sofka-install.json` record with its versions and file hashes.
+contains a `.sofka-install.json` record with its versions and file hashes. A
+removal moves the package into `sofka/.plugin-trash` before deleting it, and
+the next plugin command empties that directory; sofka deletes nothing else in
+the config directory, whatever it is named.
 `list` works offline and labels manual packages and local modifications. A
 symlinked package directory is always manual: sofka runs the package behind the
 link and never takes ownership of it. Update and removal refuse modified
