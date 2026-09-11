@@ -16195,6 +16195,54 @@ async fn config_view_lists_sources_active_skin_and_warnings() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[tokio::test]
+async fn reload_applies_dropin_files_and_config_view_lists_them() {
+    let dir = std::env::temp_dir().join(format!("sofka-app-dropin-{}", std::process::id()));
+    write_config(&dir, "[aliases]\npo = \"pods\"\n");
+    let dropin_dir = dir.join("conf.d");
+    std::fs::create_dir_all(&dropin_dir).unwrap();
+    std::fs::write(
+        dropin_dir.join("10-team.yaml"),
+        "aliases:\n  dep: deployments\n",
+    )
+    .unwrap();
+    std::fs::write(dropin_dir.join("20-broken.toml"), "not valid toml [[[").unwrap();
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    app.reload_config();
+
+    assert_eq!(
+        app.user_aliases.get("dep").map(String::as_str),
+        Some("deployments")
+    );
+    assert_eq!(app.user_aliases.get("po").map(String::as_str), Some("pods"));
+    assert!(
+        app.config_warnings
+            .iter()
+            .any(|w| w.contains("20-broken.toml")),
+        "{:?}",
+        app.config_warnings
+    );
+
+    assert!(app.run_palette_command("config"));
+    let text = app
+        .detail
+        .lines
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let team = dropin_dir.join("10-team.yaml").display().to_string();
+    let broken = dropin_dir.join("20-broken.toml").display().to_string();
+    assert!(text.contains(&format!("{team} (loaded)")), "{text}");
+    assert!(
+        text.contains(&format!("{broken} (invalid - skipped)")),
+        "{text}"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 // ----- provider logs (VictoriaLogs) ------------------------------------
 
 fn install_provider(app: &mut App) {

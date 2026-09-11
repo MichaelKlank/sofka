@@ -1590,6 +1590,13 @@ impl App {
         {
             lines.push(format!("  {} (previous config kept)", path.display()));
         }
+        for path in self.config.dropin_paths() {
+            lines.push(format!(
+                "  {} ({})",
+                path.display(),
+                crate::config::dropin_state(&path)
+            ));
+        }
         for path in self
             .config
             .override_paths(&self.cluster.context, &self.cluster.cluster_name)

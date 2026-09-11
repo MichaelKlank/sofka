@@ -208,6 +208,7 @@ impl App {
             .config
             .base_path()
             .into_iter()
+            .chain(self.config.dropin_paths())
             .chain(
                 self.config
                     .override_paths(&self.cluster.context, &self.cluster.cluster_name),
