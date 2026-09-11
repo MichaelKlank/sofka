@@ -1,5 +1,5 @@
-//! User configuration loaded from `$XDG_CONFIG_HOME/sofka/config.toml`
-//! (falling back to `~/.config/sofka/config.toml`), with optional
+//! User configuration in TOML or YAML under `$XDG_CONFIG_HOME/sofka`
+//! (falling back to `~/.config/sofka`), with optional
 //! per-cluster / per-context overrides, k9s-style:
 //!
 //! ```text
@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+mod document;
 mod key_migration;
 
 #[derive(Debug, Default, Deserialize)]
@@ -1245,19 +1246,20 @@ pub struct Resolved {
     /// manual `:skin` choice still survives switches into contexts that don't
     /// pin their own skin.
     pub skin_override: Option<String>,
-    /// Problems with override files (malformed TOML, type mismatches). The
+    /// Problems with override files (syntax errors, type mismatches). The
     /// offending layer is skipped, never fatal.
     pub warnings: Vec<String>,
 }
 
-/// Holds the parsed base `config.toml` for the session and re-reads override
+/// Holds the parsed base config for the session and re-reads override
 /// files on demand, so `:ctx` switches pick up freshly edited overrides
 /// without a restart.
 #[derive(Default)]
 pub struct ConfigLoader {
-    /// Base `config.toml` as a raw TOML table (`None` when missing/invalid).
+    /// Base settings as a shared table (`None` when missing or invalid).
     base: Option<toml::Value>,
-    /// The `sofka` config directory containing `config.toml` and `clusters/`.
+    base_file: Option<PathBuf>,
+    /// The `sofka` directory that contains the base config and `clusters/`.
     dir: Option<PathBuf>,
 }
 
@@ -1269,52 +1271,71 @@ impl ConfigLoader {
         let dir = config_dir();
         let empty = Self {
             base: None,
+            base_file: None,
             dir: dir.clone(),
         };
         match empty.reload() {
             Ok(loader) => (loader, Vec::new()),
             Err(e) => {
                 eprintln!("warning: ignoring invalid {e}");
-                (Self { base: None, dir }, vec![e])
+                (
+                    Self {
+                        base: None,
+                        base_file: None,
+                        dir,
+                    },
+                    vec![e],
+                )
             }
         }
     }
 
     #[cfg(test)]
     pub(crate) fn from_dir(dir: Option<PathBuf>) -> Self {
-        let base = dir.as_ref().and_then(|d| {
-            let text = std::fs::read_to_string(d.join("config.toml")).ok()?;
-            parse_doc(&text).ok()
-        });
-        Self { base, dir }
-    }
-
-    /// Re-read the base `config.toml` from disk, validated end-to-end (TOML
-    /// syntax *and* the typed [`Config`] shape). `Ok` carries a fresh loader
-    /// ready to [`resolve`](Self::resolve); `Err` carries the precise error —
-    /// file, offending key, and what's wrong — so the caller keeps the last
-    /// known-good loader instead. A missing base file is not an error: it
-    /// loads as defaults, like at startup.
-    pub fn reload(&self) -> Result<Self, String> {
-        let dir = self.dir.clone();
-        let Some(path) = self.base_path() else {
-            return Ok(Self { base: None, dir });
-        };
-        match std::fs::read_to_string(&path) {
-            Err(_) => Ok(Self { base: None, dir }),
-            Ok(text) => match validate(&text) {
-                Ok(value) => Ok(Self {
-                    base: Some(value),
-                    dir,
-                }),
-                Err(e) => Err(format!("{}: {e}", path.display())),
-            },
+        let base_file = dir.as_ref().and_then(|d| document::select(d).ok());
+        let base = base_file
+            .as_ref()
+            .and_then(|path| read_value(path).ok().flatten());
+        Self {
+            base,
+            base_file,
+            dir,
         }
     }
 
-    /// The base `config.toml` path, when a config directory is known.
+    /// Read and validate the base config. On error, the caller keeps the last valid loader.
+    pub fn reload(&self) -> Result<Self, String> {
+        let dir = self.dir.clone();
+        let Some(directory) = &dir else {
+            return Ok(Self::default());
+        };
+        let path = document::select(directory)?;
+        let base = match std::fs::read_to_string(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+            Ok(text) => {
+                Some(validate_file(&path, &text).map_err(|e| format!("{}: {e}", path.display()))?)
+            }
+        };
+        Ok(Self {
+            base,
+            base_file: Some(path),
+            dir,
+        })
+    }
+
+    /// Path used by the cached base config, or the first candidate before loading.
     pub fn base_path(&self) -> Option<PathBuf> {
-        self.dir.as_ref().map(|d| d.join("config.toml"))
+        self.base_file
+            .clone()
+            .or_else(|| self.base_paths().into_iter().next())
+    }
+
+    pub fn base_paths(&self) -> Vec<PathBuf> {
+        self.dir
+            .as_ref()
+            .map(|d| document::paths(d))
+            .unwrap_or_default()
     }
 
     /// Whether a parsed base config is active (as opposed to a missing or
@@ -1331,9 +1352,9 @@ impl ConfigLoader {
         let mut paths = Vec::new();
         if let (Some(dir), false) = (&self.dir, cluster.is_empty()) {
             let cluster_dir = dir.join("clusters").join(sanitize(cluster));
-            paths.push(cluster_dir.join("config.toml"));
+            paths.extend(document::paths(&cluster_dir));
             if !context.is_empty() {
-                paths.push(cluster_dir.join(sanitize(context)).join("config.toml"));
+                paths.extend(document::paths(&cluster_dir.join(sanitize(context))));
             }
         }
         paths
@@ -1446,22 +1467,37 @@ fn validate(text: &str) -> Result<toml::Value, toml::de::Error> {
 
 /// Human-readable state of one config file, for the `:config` view:
 /// `loaded` (present and parseable), `absent`, or `invalid` (present but
-/// malformed TOML — it is being skipped).
+/// malformed config).
 pub fn file_state(path: &Path) -> &'static str {
     match read_value(path) {
         Ok(Some(_)) => "loaded",
         Ok(None) => "absent",
-        Err(_) => "invalid — skipped",
+        Err(_) => "invalid - skipped",
     }
 }
 
-/// Parse an override file. Missing/unreadable -> `Ok(None)` (overrides are
-/// optional); present but malformed -> `Err` so the caller can warn.
-fn read_value(path: &Path) -> Result<Option<toml::Value>, toml::de::Error> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => parse_doc(&text).map(Some),
-        Err(_) => Ok(None),
+/// Read an optional override file. Report conflicts, read errors, and parse errors.
+fn read_value(path: &Path) -> Result<Option<toml::Value>, String> {
+    if let Some(dir) = path.parent() {
+        document::select(dir)?;
     }
+    match std::fs::read_to_string(path) {
+        Ok(text) => document::parse(path, &text).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn validate_file(path: &Path, text: &str) -> Result<toml::Value, String> {
+    if !document::is_yaml(path) {
+        return validate(text).map_err(|e| e.to_string());
+    }
+    let value = document::parse(path, text)?;
+    let _: Config = value
+        .clone()
+        .try_into()
+        .map_err(|e: toml::de::Error| e.to_string())?;
+    Ok(value)
 }
 
 /// Parse a TOML *document* into a `Value::Table` (a bare `Value` parse would
@@ -1501,6 +1537,92 @@ fn config_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_config_format_combination_uses_the_same_merge_rules() {
+        let dir = std::env::temp_dir().join(format!("sofka-format-matrix-{}", std::process::id()));
+        for base in ["toml", "yaml", "yml"] {
+            for cluster in ["toml", "yaml", "yml"] {
+                for context in ["toml", "yaml", "yml"] {
+                    let cluster_dir = dir.join("clusters/prod");
+                    let context_dir = cluster_dir.join("admin");
+                    std::fs::create_dir_all(&context_dir).unwrap();
+                    for (directory, extension, text) in [
+                        (
+                            &dir,
+                            base,
+                            "readonly = true\nfavorite_namespaces = ['base']\n[aliases]\npo = 'pods'\n[skin]\nname = 'nord'\n[keys.command]\ndown = ['f7', 'f8']\n",
+                        ),
+                        (
+                            &cluster_dir,
+                            cluster,
+                            "favorite_namespaces = ['cluster']\n[aliases]\ndep = 'deployments'\n[skin]\nbackground = true\n",
+                        ),
+                        (
+                            &context_dir,
+                            context,
+                            "readonly = false\nfavorite_namespaces = []\n[keys.command]\ndown = ['f9']\n",
+                        ),
+                    ] {
+                        let text = if extension == "toml" {
+                            text.into()
+                        } else {
+                            serde_yaml::to_string(&parse_doc(text).unwrap()).unwrap()
+                        };
+                        std::fs::write(directory.join(format!("config.{extension}")), text)
+                            .unwrap();
+                    }
+                    let loader = ConfigLoader {
+                        dir: Some(dir.clone()),
+                        ..Default::default()
+                    }
+                    .reload()
+                    .unwrap();
+                    let resolved = loader.resolve("admin", "prod");
+                    assert!(resolved.warnings.is_empty(), "{:?}", resolved.warnings);
+                    assert!(!resolved.config.readonly);
+                    assert!(resolved.config.favorite_namespaces.is_empty());
+                    assert_eq!(resolved.config.aliases.len(), 2);
+                    assert_eq!(resolved.config.skin.name.as_deref(), Some("nord"));
+                    assert!(resolved.config.skin.background);
+                    assert_eq!(
+                        resolved.config.keys.0["command"]["down"]
+                            .as_array()
+                            .unwrap(),
+                        &[toml::Value::String("f9".into())]
+                    );
+                    assert_eq!(loader.base_path(), Some(dir.join(format!("config.{base}"))));
+                    std::fs::remove_dir_all(&dir).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn yaml_conflicts_and_invalid_overrides_report_the_source() {
+        let dir = std::env::temp_dir().join(format!("sofka-yaml-invalid-{}", std::process::id()));
+        let cluster_dir = dir.join("clusters/prod");
+        std::fs::create_dir_all(&cluster_dir).unwrap();
+        std::fs::write(dir.join("config.yaml"), "readonly: true\n").unwrap();
+        let loader = ConfigLoader {
+            dir: Some(dir.clone()),
+            ..Default::default()
+        }
+        .reload()
+        .unwrap();
+        for text in ["readonly: [", "readonly: 'yes'"] {
+            std::fs::write(cluster_dir.join("config.yml"), text).unwrap();
+            let resolved = loader.resolve("admin", "prod");
+            assert!(resolved.config.readonly);
+            assert!(!resolved.warnings.is_empty());
+        }
+        std::fs::write(dir.join("config.yml"), "readonly: false\n").unwrap();
+        let error = loader.reload().err().unwrap();
+        assert!(error.contains("conflicting config files"));
+        assert!(error.contains("config.yaml") && error.contains("config.yml"));
+        assert!(loader.resolve("", "").config.readonly);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn journal_config_defaults_and_overrides() {
@@ -1969,7 +2091,7 @@ mod tests {
         // Malformed TOML syntax is rejected too.
         std::fs::write(&path, "not toml [[[").unwrap();
         assert!(loader.reload().err().unwrap().contains("config.toml"));
-        assert_eq!(file_state(&path), "invalid — skipped");
+        assert_eq!(file_state(&path), "invalid - skipped");
 
         // A missing base file reloads as defaults, never an error.
         std::fs::remove_file(&path).unwrap();

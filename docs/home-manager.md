@@ -54,18 +54,18 @@ set from your flake outputs function. You can pass it to Home Manager through
 
 All options are under `programs.sofka`.
 
-| Option       | Default                      | Purpose                                                  |
-| ------------ | ---------------------------- | -------------------------------------------------------- |
-| `enable`     | `false`                      | Install Sofka and manage the selected files.             |
-| `package`    | Package from the Sofka flake | Select a package, or use `null` to skip installation.    |
-| `settings`   | `{ }`                        | Set any field in the complete Sofka TOML configuration.  |
-| `aliases`    | `{ }`                        | Merge into `settings.aliases`.                           |
-| `keys`       | `{ }`                        | Merge into `settings.keys`.                              |
-| `plugins`    | `[ ]`                        | Merge into `settings.plugins`.                           |
-| `views`      | `{ }`                        | Merge into `settings.views`.                             |
-| `skin`       | `{ }`                        | Merge into `settings.skin`.                              |
-| `configFile` | `null`                       | Use an existing TOML file instead of generated settings. |
-| `clusters`   | `{ }`                        | Manage cluster and context override files.               |
+| Option       | Default                      | Purpose                                                          |
+| ------------ | ---------------------------- | ---------------------------------------------------------------- |
+| `enable`     | `false`                      | Install Sofka and manage the selected files.                     |
+| `package`    | Package from the Sofka flake | Select a package, or use `null` to skip installation.            |
+| `settings`   | `{ }`                        | Set any field in the complete Sofka TOML configuration.          |
+| `aliases`    | `{ }`                        | Merge into `settings.aliases`.                                   |
+| `keys`       | `{ }`                        | Merge into `settings.keys`.                                      |
+| `plugins`    | `[ ]`                        | Merge into `settings.plugins`.                                   |
+| `views`      | `{ }`                        | Merge into `settings.views`.                                     |
+| `skin`       | `{ }`                        | Merge into `settings.skin`.                                      |
+| `configFile` | `null`                       | Use an existing TOML or YAML file instead of generated settings. |
+| `clusters`   | `{ }`                        | Manage cluster and context override files.                       |
 
 `settings` accepts the full [configuration](configuration.md), including
 providers, logging, guardrails, bookmarks, and new settings added to Sofka.
@@ -85,7 +85,8 @@ definitions, including values from dedicated options.
 }
 ```
 
-Sofka keeps aliases, keys, plugins, views, and skin settings in one TOML file.
+The module writes generated aliases, keys, plugins, views, and skin settings
+to one TOML file. Existing YAML files support the same settings.
 The module uses the native names `keys` and `skin`; it does not generate k9s
 hotkey or skin files.
 
@@ -100,6 +101,12 @@ programs.sofka = {
 };
 ```
 
+For an existing YAML file, use `configFile = ./sofka.yaml;` or
+`configFile = ./sofka.yml;`. The module uses the source suffix to select
+`config.yaml` or `config.yml` at that level. Generated `settings` still use
+TOML. Remove any separately managed config file at the same level to avoid
+a file conflict.
+
 `configFile` cannot be combined with nonempty `settings` or dedicated options
 for the same file. It can be combined with cluster and context overrides.
 
@@ -113,7 +120,7 @@ no files.
 
 ## Cluster and context overrides
 
-Each cluster and context accepts `settings` or `configFile`. Clusters also
+Each cluster and context accepts `settings` or a TOML or YAML `configFile`. Clusters also
 accept `contexts`:
 
 ```nix
@@ -130,7 +137,8 @@ programs.sofka.clusters = {
 ```
 
 This creates files under `sofka/clusters/<cluster>/config.toml` and
-`sofka/clusters/<cluster>/<context>/config.toml`. Empty settings create no file.
+`sofka/clusters/<cluster>/<context>/config.toml`. An existing YAML source uses
+`config.yaml` or `config.yml` instead. Empty settings create no file.
 A context file does not require a cluster file.
 
 Attribute names must be directory names after
@@ -154,7 +162,7 @@ that require a restart retain that requirement.
 Home Manager links files under `$XDG_CONFIG_HOME/sofka`, normally
 `~/.config/sofka`, on both Linux and macOS. A custom `xdg.configHome` changes
 this location. Managed files are read-only; edit the Nix settings or source
-TOML file and apply Home Manager again. Sofka keeps session state separate from
+TOML or YAML file and apply Home Manager again. Sofka keeps session state separate from
 these files.
 
 The module checks are available through

@@ -13,7 +13,7 @@ let
     configFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
-      description = "Existing TOML file to use instead of generated settings at this level.";
+      description = "Existing TOML or YAML file to use instead of generated settings at this level.";
     };
   };
 
@@ -32,13 +32,18 @@ let
     };
   }));
 
-  files = [{ path = "sofka/config.toml"; value = cfg; }]
+  fileName = value:
+    if value.configFile != null && lib.hasSuffix ".yaml" (toString value.configFile) then "config.yaml"
+    else if value.configFile != null && lib.hasSuffix ".yml" (toString value.configFile) then "config.yml"
+    else "config.toml";
+
+  files = [{ path = "sofka/${fileName cfg}"; value = cfg; }]
     ++ lib.concatLists (lib.mapAttrsToList
     (_: cluster:
-      [{ path = "sofka/clusters/${cluster.directory}/config.toml"; value = cluster; }]
+      [{ path = "sofka/clusters/${cluster.directory}/${fileName cluster}"; value = cluster; }]
         ++ lib.mapAttrsToList
         (_: context: {
-          path = "sofka/clusters/${cluster.directory}/${context.directory}/config.toml";
+          path = "sofka/clusters/${cluster.directory}/${context.directory}/${fileName context}";
           value = context;
         })
         cluster.contexts)

@@ -81,8 +81,7 @@ once:
 xattr -d com.apple.quarantine sofka
 ```
 
-(Or right-click the binary in Finder, pick Open, confirm once.) Signing and
-notarization are on the [roadmap](docs/roadmap.md).
+(Or right-click the binary in Finder, pick Open, confirm once.)
 
 ## Usage
 
@@ -148,7 +147,8 @@ The essentials. `?` in the app shows everything, or see the
 
 ## Configuration
 
-`$XDG_CONFIG_HOME/sofka/config.toml` (or `~/.config/sofka/config.toml`). All
+Use `config.toml`, `config.yaml`, or `config.yml` under `$XDG_CONFIG_HOME/sofka`
+(or `~/.config/sofka`). Keep one file at each config level. All
 optional - an empty config behaves like no config. `:reload` re-reads it live.
 
 ```toml
@@ -183,7 +183,6 @@ be read-only in a light skin while everything else stays as is. See the
 | [Providers](docs/providers.md)                 | right-sizing, VictoriaLogs, fleet dashboard                 |
 | [Debugging](docs/debugging.md)                 | explain, timeline, diff, notifications, debug pods, bundles |
 | [Architecture](docs/architecture.md)           | module layout, data flow, dev loop, release process         |
-| [Roadmap](docs/roadmap.md)                     | milestone status                                            |
 
 ## License
 

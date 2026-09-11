@@ -1562,18 +1562,33 @@ impl App {
     pub(super) fn open_config_info(&mut self) {
         self.set_return_mode();
         let mut lines: Vec<String> = vec!["Sources".into()];
-        match self.config.base_path() {
-            Some(path) => {
-                let state = if self.config.has_base() {
-                    "loaded"
-                } else if path.exists() {
-                    "invalid — using defaults"
-                } else {
-                    "absent — using defaults"
-                };
-                lines.push(format!("  {} ({state})", path.display()));
-            }
-            None => lines.push("  no config directory — using defaults".into()),
+        let base_paths = self.config.base_paths();
+        if base_paths.is_empty() {
+            lines.push("  no config directory - using defaults".into());
+        }
+        let cached_path = self.config.base_path();
+        for path in &base_paths {
+            let cached = self.config.has_base() && cached_path.as_ref() == Some(path);
+            let state = if base_paths.len() > 1 && cached {
+                "conflict - previous config kept"
+            } else if base_paths.len() > 1 {
+                "conflict - skipped"
+            } else if cached {
+                "loaded"
+            } else if self.config.has_base() {
+                "not loaded - previous config kept"
+            } else if path.exists() {
+                "invalid - using defaults"
+            } else {
+                "absent - using defaults"
+            };
+            lines.push(format!("  {} ({state})", path.display()));
+        }
+        if self.config.has_base()
+            && let Some(path) = cached_path
+            && !base_paths.contains(&path)
+        {
+            lines.push(format!("  {} (previous config kept)", path.display()));
         }
         for path in self
             .config

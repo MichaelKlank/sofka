@@ -26970,3 +26970,283 @@ async fn container_spacing_preserves_wrapped_details_at_height_limit() {
         assert_eq!(lines[start - 1].trim().is_empty(), extra > 0);
     }
 }
+
+#[tokio::test]
+async fn yaml_config_reload_keys_sources_and_errors() {
+    for extension in ["yaml", "yml"] {
+        let dir = std::env::temp_dir().join(format!(
+            "sofka-yaml-reload-{extension}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("config.{extension}"));
+        let original = "readonly: true\nhide_header: true\naliases:\n  dep: deployments\nkeys:\n  table:\n    page_down: f8\n";
+        std::fs::write(&path, original).unwrap();
+        let (mut app, _rx) = key_action_fixture("table");
+        app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+        palette(&mut app, "reload");
+        assert!(app.readonly && app.hide_header);
+        assert_eq!(
+            app.user_aliases.get("dep").map(String::as_str),
+            Some("deployments")
+        );
+        assert!(app.config_warnings.is_empty(), "{:?}", app.config_warnings);
+        app.handle_key(press(KeyCode::F(8))).unwrap();
+        assert_eq!(app.table_state.selected(), Some(7));
+        palette(&mut app, "config");
+        let text = app
+            .detail
+            .lines
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains(&format!("config.{extension} (loaded)")),
+            "{text}"
+        );
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+
+        for invalid in [
+            "readonly: 'yes'",
+            "readonly: [",
+            "readonly: null",
+            "readonly: true\nreadonly: false",
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            palette(&mut app, "reload");
+            assert!(
+                app.flash_err && app.flash.contains("previous config kept"),
+                "{}",
+                app.flash
+            );
+            assert!(app.readonly && app.hide_header);
+            assert!(
+                app.config_warnings
+                    .join("\n")
+                    .contains(&format!("config.{extension}"))
+            );
+        }
+        std::fs::write(&path, original).unwrap();
+        write_config(&dir, "readonly = false\n");
+        palette(&mut app, "reload");
+        assert!(app.flash_err && app.readonly);
+        palette(&mut app, "config");
+        let text = app
+            .detail
+            .lines
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("config.toml (conflict - skipped)"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "config.{extension} (conflict - previous config kept)"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("(loaded)"), "{text}");
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        write_config(&dir, "readonly = 'invalid'\n");
+        palette(&mut app, "reload");
+        assert!(app.flash_err && app.readonly);
+        palette(&mut app, "config");
+        let text = app
+            .detail
+            .lines
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains(&format!("config.{extension} (previous config kept)")),
+            "{text}"
+        );
+        assert!(
+            text.contains("config.toml (not loaded - previous config kept)"),
+            "{text}"
+        );
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        write_config(&dir, "readonly = false\n");
+        palette(&mut app, "reload");
+        assert!(!app.flash_err && !app.readonly && !app.hide_header);
+        assert!(app.user_aliases.is_empty());
+        std::fs::remove_file(dir.join("config.toml")).unwrap();
+        std::fs::write(&path, "# empty config\n").unwrap();
+        palette(&mut app, "reload");
+        assert!(app.config_warnings.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn yaml_migration_and_mixed_context_overrides() {
+    let dir = std::env::temp_dir().join(format!("sofka-yaml-layers-{}", std::process::id()));
+    let cluster = dir.join("clusters/test-cluster");
+    let context = cluster.join("new");
+    std::fs::create_dir_all(&context).unwrap();
+    let original =
+        "# original comment\nhide_header: true\nkeys:\n  palette_next: f7\naliases:\n  po: pods\n";
+    std::fs::write(dir.join("config.yaml"), original).unwrap();
+    write_config(&cluster, "[keys]\npalette_next = 'f8'\n");
+    std::fs::write(
+        context.join("config.yml"),
+        "keys:\n  palette_prev: f10\n  command:\n    down: f9\n",
+    )
+    .unwrap();
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    palette(&mut app, "reload");
+    assert!(app.hide_header);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("config.yaml.bak")).unwrap(),
+        original
+    );
+    let updated = std::fs::read_to_string(dir.join("config.yaml")).unwrap();
+    assert!(!updated.contains("palette_next"));
+    palette(&mut app, "reload");
+    assert!(app.config_warnings.is_empty(), "{:?}", app.config_warnings);
+    palette(&mut app, "ctx new");
+    land_context(&mut app, "new");
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for key in [KeyCode::F(7), KeyCode::F(8)] {
+        app.handle_key(press(key)).unwrap();
+        assert_eq!(app.cmd_sel, 0);
+    }
+    app.handle_key(press(KeyCode::F(9))).unwrap();
+    assert_eq!(app.cmd_sel, 1);
+    app.handle_key(press(KeyCode::F(10))).unwrap();
+    assert_eq!(app.cmd_sel, 0);
+    assert!(context.join("config.yml.bak").exists());
+    assert!(cluster.join("config.toml.bak").exists());
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    palette(&mut app, "config");
+    let text = app
+        .detail
+        .lines
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    for path in [
+        dir.join("config.yaml"),
+        cluster.join("config.toml"),
+        context.join("config.yml"),
+    ] {
+        assert!(
+            text.contains(&format!("{} (loaded)", path.display())),
+            "{text}"
+        );
+    }
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    std::fs::write(context.join("config.yaml"), "hide_header: false\n").unwrap();
+    palette(&mut app, "reload");
+    assert!(
+        app.config_warnings
+            .join("\n")
+            .contains("conflicting config files")
+    );
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    app.handle_key(press(KeyCode::F(8))).unwrap();
+    assert_eq!(app.cmd_sel, 1);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    std::fs::remove_file(context.join("config.yaml")).unwrap();
+    palette(&mut app, "ctx other");
+    land_context(&mut app, "other");
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    app.handle_key(press(KeyCode::F(8))).unwrap();
+    assert_eq!(app.cmd_sel, 1);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("config.yaml")).unwrap(),
+        updated
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn yaml_managed_config_uses_migrated_keys_without_writing() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    for mode in ["readonly", "symlink", "backup"] {
+        let dir =
+            std::env::temp_dir().join(format!("sofka-yaml-managed-{mode}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let original = "keys:\n  palette_next: ctrl-n\n";
+        std::fs::write(&path, original).unwrap();
+        match mode {
+            "readonly" => {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap()
+            }
+            "symlink" => {
+                let target = dir.join("managed.yaml");
+                std::fs::rename(&path, &target).unwrap();
+                symlink(&target, &path).unwrap();
+            }
+            _ => std::fs::write(dir.join("config.yaml.bak"), "previous backup").unwrap(),
+        }
+        let (mut app, _rx) = test_app();
+        app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+        palette(&mut app, "reload");
+        assert!(
+            app.config_warnings
+                .join("\n")
+                .contains("cannot save config migration")
+        );
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        app.handle_key(ctrl(KeyCode::Char('n'))).unwrap();
+        assert_eq!(app.cmd_sel, 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        if mode == "backup" {
+            assert_eq!(
+                std::fs::read_to_string(dir.join("config.yaml.bak")).unwrap(),
+                "previous backup"
+            );
+        } else {
+            assert!(!dir.join("config.yaml.bak").exists());
+        }
+        if mode == "readonly" {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        if mode == "symlink" {
+            assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn yaml_migration_validates_conflicts_and_empty_bindings() {
+    let dir = std::env::temp_dir().join(format!("sofka-yaml-key-errors-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.yaml");
+    for settings in [
+        "  palette_next: 5\n",
+        "  palette_next: [ctrl-n, 5]\n",
+        "  palette_next: f7\n  command:\n    down: f8\n",
+        "  palette_next: enter\n  palette_prev: enter\n",
+    ] {
+        let original = format!("hide_header: true\nkeys:\n{settings}");
+        std::fs::write(&path, &original).unwrap();
+        let (mut app, _rx) = test_app();
+        app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+        palette(&mut app, "reload");
+        assert!(app.hide_header);
+        assert!(!app.config_warnings.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(!dir.join("config.yaml.bak").exists());
+    }
+    std::fs::write(&path, "keys:\n  palette_next: []\n").unwrap();
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    palette(&mut app, "reload");
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    assert_eq!(app.cmd_sel, 0);
+    assert!(app.keymap.chords("command", Action::Down).is_empty());
+    assert!(dir.join("config.yaml.bak").exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
