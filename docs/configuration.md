@@ -21,6 +21,28 @@ converted settings in memory. See [palette migration](keybindings.md#legacy-pale
 
 Everything below is optional. An empty config behaves like no config.
 
+## Drop-in files
+
+To split the configuration, put extra files in `conf.d/` next to the base
+config. Every `*.toml`, `*.yaml`, and `*.yml` file in that directory is merged
+over the base config, in file name order. This lets a team share one file and
+keep personal settings in another:
+
+```
+~/.config/sofka/
+├── config.toml
+└── conf.d/
+    ├── 10-team.yaml       # shared, for example CRD view settings
+    └── 20-personal.toml   # applied after 10-team.yaml
+```
+
+TOML and YAML files can be mixed in `conf.d/`. Drop-in files merge before the
+cluster and context overrides, so those keep the last word. The merge rules are
+the same as for [overrides](#per-cluster-and-per-context-overrides): tables
+merge key by key, and arrays like `[[plugins]]` replace the base value. An
+invalid drop-in file is skipped with a warning. `:config` lists the drop-in
+files and `:reload` reads them again.
+
 The [Home Manager module](home-manager.md) can manage generated TOML settings
 or existing TOML and YAML files, including cluster and context overrides.
 

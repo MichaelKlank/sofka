@@ -5,6 +5,8 @@
 //! ```text
 //! sofka/
 //! ├── config.toml                  # base, applies everywhere
+//! ├── conf.d/
+//! │   └── *.toml, *.yaml, *.yml    # drop-ins merged over the base, in name order
 //! └── clusters/
 //!     └── <cluster>/               # kubeconfig *cluster* name
 //!         ├── config.toml          # every context on this cluster
@@ -1344,6 +1346,26 @@ impl ConfigLoader {
         self.base.is_some()
     }
 
+    pub fn dropin_paths(&self) -> Vec<PathBuf> {
+        let Some(dir) = &self.dir else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(dir.join("conf.d")) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| {
+                matches!(
+                    path.extension().and_then(|s| s.to_str()),
+                    Some("toml" | "yaml" | "yml")
+                ) && path.is_file()
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
+
     /// Override files consulted for the given kubeconfig cluster/context, in
     /// merge order (cluster level first, then context level). The files need
     /// not exist — this is the search path, for [`resolve`](Self::resolve)
@@ -1378,6 +1400,19 @@ impl ConfigLoader {
         }
         let base = merged.clone();
 
+        for path in self.dropin_paths() {
+            match read_dropin(&path) {
+                Ok(Some(mut v)) => {
+                    if let Some(migration) = key_migration::prepare(&mut v, &path, &mut warnings) {
+                        migrations.push(migration);
+                    }
+                    merge(&mut merged, v);
+                }
+                Ok(None) => {}
+                Err(e) => warnings.push(format!("ignoring invalid {}: {e}", path.display())),
+            }
+        }
+
         for path in self.override_paths(context, cluster) {
             match read_value(&path) {
                 Ok(Some(mut v)) => {
@@ -1397,7 +1432,7 @@ impl ConfigLoader {
         let mut valid_config = true;
         let mut config: Config = merged.try_into().unwrap_or_else(|e| {
             valid_config = false;
-            warnings.push(format!("ignoring cluster overrides: {e}"));
+            warnings.push(format!("ignoring drop-in and cluster overrides: {e}"));
             base.try_into().unwrap_or_default()
         });
         if !migrations.is_empty() {
@@ -1469,7 +1504,15 @@ fn validate(text: &str) -> Result<toml::Value, toml::de::Error> {
 /// `loaded` (present and parseable), `absent`, or `invalid` (present but
 /// malformed config).
 pub fn file_state(path: &Path) -> &'static str {
-    match read_value(path) {
+    state_of(read_value(path))
+}
+
+pub fn dropin_state(path: &Path) -> &'static str {
+    state_of(read_dropin(path))
+}
+
+fn state_of(result: Result<Option<toml::Value>, String>) -> &'static str {
+    match result {
         Ok(Some(_)) => "loaded",
         Ok(None) => "absent",
         Err(_) => "invalid - skipped",
@@ -1481,6 +1524,18 @@ fn read_value(path: &Path) -> Result<Option<toml::Value>, String> {
     if let Some(dir) = path.parent() {
         document::select(dir)?;
     }
+    read_file(path)
+}
+
+fn read_dropin(path: &Path) -> Result<Option<toml::Value>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => validate_file(path, &text).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn read_file(path: &Path) -> Result<Option<toml::Value>, String> {
     match std::fs::read_to_string(path) {
         Ok(text) => document::parse(path, &text).map(Some),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -2136,6 +2191,67 @@ mod tests {
         let r = loader.resolve("ctx", "c1");
         assert_eq!(r.warnings.len(), 1);
         assert_eq!(r.config.default_namespace.as_deref(), Some("base"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dropins_merge_in_name_order_before_cluster_overrides() {
+        let dir =
+            std::env::temp_dir().join(format!("sofka-cfg-dropin-test-{}", std::process::id()));
+        let dropin_dir = dir.join("conf.d");
+        let cluster_dir = dir.join("clusters").join("c1");
+        std::fs::create_dir_all(&dropin_dir).unwrap();
+        std::fs::create_dir_all(&cluster_dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "default_namespace = \"base\"\nreadonly = false\n[aliases]\npo = \"pods\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dropin_dir.join("20-personal.toml"),
+            "default_namespace = \"personal\"\n[aliases]\ndep = \"deployments\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dropin_dir.join("10-team.yaml"),
+            "default_namespace: team\nreadonly: true\naliases:\n  svc: services\n",
+        )
+        .unwrap();
+        std::fs::write(dropin_dir.join("30-broken.yml"), "aliases: [unclosed\n").unwrap();
+        std::fs::write(dropin_dir.join("40-typed.toml"), "readonly = \"yes\"\n").unwrap();
+        std::fs::write(dropin_dir.join("README.md"), "ignored\n").unwrap();
+        std::fs::write(cluster_dir.join("config.toml"), "readonly = false\n").unwrap();
+
+        let loader = ConfigLoader::from_dir(Some(dir.clone()));
+        assert_eq!(
+            loader.dropin_paths(),
+            vec![
+                dropin_dir.join("10-team.yaml"),
+                dropin_dir.join("20-personal.toml"),
+                dropin_dir.join("30-broken.yml"),
+                dropin_dir.join("40-typed.toml"),
+            ]
+        );
+        assert_eq!(
+            dropin_state(&dropin_dir.join("40-typed.toml")),
+            "invalid - skipped"
+        );
+
+        let r = loader.resolve("", "");
+        assert_eq!(r.config.default_namespace.as_deref(), Some("personal"));
+        assert!(r.config.readonly);
+        for (alias, kind) in [("po", "pods"), ("svc", "services"), ("dep", "deployments")] {
+            assert_eq!(r.config.aliases.get(alias).map(String::as_str), Some(kind));
+        }
+        assert_eq!(r.warnings.len(), 2, "{:?}", r.warnings);
+        assert!(r.warnings[0].contains("30-broken.yml"), "{}", r.warnings[0]);
+        assert!(r.warnings[1].contains("40-typed.toml"), "{}", r.warnings[1]);
+        assert!(r.warnings[1].contains("readonly"), "{}", r.warnings[1]);
+
+        let r = loader.resolve("ctx", "c1");
+        assert!(!r.config.readonly, "cluster override wins over drop-ins");
+        assert_eq!(r.config.default_namespace.as_deref(), Some("personal"));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

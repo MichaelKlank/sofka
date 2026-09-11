@@ -351,6 +351,13 @@ pub fn config_source_lines(
         }
         None => lines.push("  no config directory — using defaults".into()),
     }
+    for path in loader.dropin_paths() {
+        lines.push(format!(
+            "  {} ({})",
+            path.display(),
+            crate::config::dropin_state(&path)
+        ));
+    }
     for path in loader.override_paths(context, cluster) {
         lines.push(format!(
             "  {} ({})",
