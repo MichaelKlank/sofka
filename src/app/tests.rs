@@ -17912,6 +17912,68 @@ async fn reload_loads_a_managed_install_and_keeps_the_first_of_two_palette_comma
 }
 
 #[tokio::test]
+async fn reload_keeps_a_package_published_for_a_target_this_build_does_not_know() {
+    let dir = std::env::temp_dir().join(format!("sofka-future-target-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let package = dir.join("plugins/resource-summary");
+    std::fs::create_dir_all(&package).unwrap();
+    // `platforms` says what the package publishes artifacts for. A triple this
+    // build has never heard of used to fail validation and drop the package at
+    // load, which would unload a working plugin the day the catalog adds a
+    // target — on a machine the package still supports.
+    std::fs::write(
+        package.join("plugin.toml"),
+        r#"
+        schema_version = 1
+        [package]
+        version = "1.0.0"
+        description = "Summarize the selected resource."
+        license = "MIT"
+        platforms = ["x86_64-unknown-linux-musl", "sparc64-unknown-netbsd"]
+        [plugin]
+        name = "Resource summary"
+        palette = "resource-summary"
+        command = "/bin/cat"
+        output = "popup"
+        target = "context"
+        mutating = false
+    "#,
+    )
+    .unwrap();
+
+    let (mut app, mut rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    plugin_command(&mut app, "reload");
+    assert_eq!(app.plugins.iter().filter(|p| !p.bundled).count(), 1);
+    assert!(
+        !app.config_warnings.iter().any(|w| w.contains("platform")),
+        "{:?}",
+        app.config_warnings
+    );
+    plugin_command(&mut app, "resource-summary");
+    app.handle_msg(plugin_result(&mut rx).await);
+    assert!(
+        app.detail
+            .lines
+            .iter()
+            .any(|s| s.contains("schema_version"))
+    );
+
+    // A malformed entry is still refused, so the package stops loading.
+    std::fs::write(
+        package.join("plugin.toml"),
+        std::fs::read_to_string(package.join("plugin.toml"))
+            .unwrap()
+            .replace("\"sparc64-unknown-netbsd\"", "\"\""),
+    )
+    .unwrap();
+    plugin_command(&mut app, "reload");
+    assert!(!app.plugins.iter().any(|p| !p.bundled));
+    assert!(app.config_warnings.iter().any(|w| w.contains("platforms")));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn plugin_forward_uses_selected_target_and_requires_valid_port_before_launch() {
     let (mut app, _rx) = app_with_pod();
     let mut plugin = named_plugin("/bin/cat", &[]);
