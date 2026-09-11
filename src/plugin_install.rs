@@ -1250,6 +1250,42 @@ mod tests {
     }
 
     #[test]
+    fn extraction_digests_match_verification_for_nested_and_empty_files() {
+        let dir = scratch("digest-agreement");
+        let source = dir.join("package.tar.zst");
+        archive(
+            &source,
+            &[
+                (
+                    "plugin.toml",
+                    b"schema_version = 1\n",
+                    tar::EntryType::Regular,
+                ),
+                // An empty file cannot be memory-mapped on every platform, and a
+                // nested path is spelled differently by the two hashers.
+                ("empty", b"", tar::EntryType::Regular),
+                ("bin/adapter", b"binary", tar::EntryType::Regular),
+            ],
+        );
+        let destination = dir.join("out");
+        std::fs::create_dir(&destination).unwrap();
+
+        let extracted = extract(&source, &destination).unwrap();
+        let walked = hash_files(&destination).unwrap();
+
+        assert_eq!(
+            extracted, walked,
+            "extraction and verification disagree, so every install would look modified"
+        );
+        assert!(walked.contains_key("bin/adapter"));
+        assert_eq!(
+            walked["empty"],
+            digest_file(&destination.join("empty")).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn modification_reports_name_the_files_that_moved() {
         let dir = scratch("modified-detail");
         std::fs::write(dir.join("plugin.toml"), "one").unwrap();
