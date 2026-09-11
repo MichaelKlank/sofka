@@ -1,6 +1,7 @@
 # Configure key bindings
 
-All built-in keyboard actions can be changed in `config.toml`. With no `[keys]`
+All built-in keyboard actions can be changed in TOML or YAML config files.
+See [YAML format](configuration.md#yaml-format). With no `[keys]`
 settings, the default bindings remain active. `?` shows the effective bindings
 for each mode. The header and footer show the first binding for each action.
 An action with no binding is shown as `unbound`.
@@ -85,7 +86,7 @@ At startup, invalid bindings leave the default keymap active. On reload or a
 context switch, they leave the previous keymap active. Other valid configuration
 settings still apply, including plugins, bookmarks, skins, and views. Custom
 views apply at startup or on a context switch. Key value
-errors do not reject the rest of the config file. Invalid TOML syntax can still
+errors do not reject the rest of the config file. Invalid TOML or YAML syntax can still
 prevent a file from loading. `:config` shows the source paths and key errors.
 
 Built-in bindings keep their current priority over bookmarks, workspaces, and
@@ -116,8 +117,12 @@ When sofka loads a config with legacy palette fields, it moves the values to
 | `palette_prev`           | `up`                             |
 | `palette_accept`         | `accept`                         |
 
-Migration preserves comments and unrelated settings. Before replacing a file,
-sofka saves the original as `config.toml.bak` in the same directory. An existing
+Migration preserves unrelated settings in both formats. TOML migration also
+preserves comments. YAML migration writes the complete document again, so
+formatting and key order can change, comments are removed, and aliases become
+explicit values. Before replacing a file, sofka saves the exact original with
+a `.bak` suffix in the same directory, such as `config.toml.bak`,
+`config.yaml.bak`, or `config.yml.bak`. An existing
 backup is never overwritten. Each base, cluster, or context file is converted
 before the settings are merged, so override order stays the same.
 
@@ -126,7 +131,7 @@ in memory. Symlinks and read-only files are left intact. For a Nix-managed
 config, update the Nix source to use `[keys.command]`. The warning includes the
 field mapping. After a manual change, use `:reload`.
 
-If both formats define the same action in one file, or a legacy value is
+If legacy and scoped keys define the same action in one file, or a legacy value is
 invalid, sofka leaves that file unchanged and reports the problem. It does not
 save migration results when the effective keymap has conflicts or errors.
 Correct these settings and reload, or move them to the new format manually.

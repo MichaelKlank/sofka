@@ -1,18 +1,81 @@
 # Configuration
 
-sofka reads `$XDG_CONFIG_HOME/sofka/config.toml` (or
-`~/.config/sofka/config.toml`). `:reload` re-reads it live, `:config` shows the
-sources and any warnings.
+sofka reads one config file under `$XDG_CONFIG_HOME/sofka` (or
+`~/.config/sofka`). Use `config.toml`, `config.yaml`, or `config.yml`.
+TOML remains the default. Both formats support the same settings, defaults,
+validation, keybindings, and overrides. `:reload` reads the files again;
+`:config` shows the sources and warnings. Settings that require a restart
+have the same requirement in both formats.
 
-Legacy palette keys are automatically moved to `[keys.command]`, with the
-original file saved as `config.toml.bak`. If the file is read-only or managed
-through a symlink, sofka warns and uses the converted settings in memory.
-See [palette migration](keybindings.md#legacy-palette-migration).
+Keep only one config file at each level: base, cluster, and context. If more
+than one supported file exists at a level, sofka reports a conflict. At
+startup, an invalid or conflicting base config uses defaults. A failed base
+reload keeps the previous config. Conflicting or invalid override files are
+skipped with warnings. A type error in the merged overrides uses the base
+config, as with TOML.
 
-Everything below is optional. An empty config behaves exactly like no config.
+Legacy palette keys are automatically moved to `keys.command`, with the
+original file saved with a `.bak` suffix, such as `config.yaml.bak`. If the
+file is read-only or managed through a symlink, sofka warns and uses the
+converted settings in memory. See [palette migration](keybindings.md#legacy-palette-migration).
 
-The [Home Manager module](home-manager.md) can manage the full configuration,
-dedicated section options, and cluster and context override files.
+Everything below is optional. An empty config behaves like no config.
+
+The [Home Manager module](home-manager.md) can manage generated TOML settings
+or existing TOML and YAML files, including cluster and context overrides.
+
+## YAML format
+
+Examples below use TOML unless marked as YAML. Use the same field names in
+YAML. TOML sections become mappings; arrays of tables become lists of mappings.
+For example, `[keys.table]` becomes `keys: {table: ...}`, and `[[plugins]]`
+becomes a list under `plugins`.
+
+```yaml
+# config.yaml
+default_namespace: kube-system
+default_resource: deployments
+readonly: false
+favorite_namespaces:
+  - kube-system
+  - monitoring
+aliases:
+  dep: deployments
+keys:
+  table:
+    page_down: f8
+  command:
+    down: [ctrl-n, down]
+skin:
+  name: gruvbox-dark
+  colors:
+    red: "#fb4934"
+views:
+  "*":
+    sort: "AGE:desc"
+plugins:
+  - name: Get pods
+    palette: get-pods
+    command: kubectl
+    args: [get, pods, --context, "$CONTEXT", -n, "$NAMESPACE"]
+    target: context
+    mutating: false
+    output: popup
+```
+
+YAML rules:
+
+- Use one document with a mapping at the root. Empty files, comment-only
+  files, and `{}` use defaults.
+- Use string mapping keys. Duplicate keys are errors.
+- Omit a setting to use its default. Explicit `null` and `~` values are
+  errors, including in lists and nested mappings.
+- Anchors and aliases are supported. YAML merge keys (`<<`) and custom tags
+  are not supported. Write explicit settings instead.
+- Use `true` and `false` for booleans. Quote text that YAML could read as a
+  different type. Quote colors such as `"#fb4934"` and wildcard keys such as
+  `"*"`.
+- Integers must fit in a signed 64-bit value, as in TOML.
 
 ## Base options
 
@@ -227,6 +290,11 @@ k9s. Put partial config files under `clusters/`:
             └── config.toml    # that context only
 ```
 
+Each file in this tree can instead be `config.yaml` or `config.yml`. Different
+levels can use different formats. For example, a TOML base can have a YAML
+cluster override and a TOML context override. Do not place two config formats
+in the same directory.
+
 Overrides merge over the base config, cluster level first, then context level.
 Tables like `[aliases]` and `[skin.colors]` merge key by key. Everything else -
 strings, booleans, and arrays like `[[plugins]]` - replaces the base value.
@@ -252,7 +320,7 @@ apply without a restart.
 
 ## Plugin packages
 
-sofka reads packages from the `plugins/` directory next to `config.toml`.
+sofka reads packages from the `plugins/` directory next to the base config.
 Each package directory contains a `plugin.toml` manifest.
 Enter `:reload` to read package changes.
 The `:config` view shows invalid packages and absent executables.

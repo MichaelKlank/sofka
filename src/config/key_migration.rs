@@ -30,8 +30,10 @@ pub(super) fn prepare(
     }
     if !errors.is_empty() {
         warnings.push(format!(
-            "{}: cannot migrate palette keys: {}; correct the values and move them to [keys.command]",
-            path.display(), errors.join("; ")
+            "{}: cannot migrate palette keys: {}; correct the values and move them to {}",
+            path.display(),
+            errors.join("; "),
+            command_section(path)
         ));
         return None;
     }
@@ -57,9 +59,12 @@ pub(super) fn prepare(
             .insert(new.into(), v);
     }
     let prepared = (|| -> Result<Migration, String> {
+        if let Some(dir) = path.parent() {
+            super::document::select(dir)?;
+        }
         let original = fs::read_to_string(path).map_err(|e| e.to_string())?;
         // A prior resolve may already have updated this cached base source.
-        let current = super::parse_doc(&original).map_err(|e| e.to_string())?;
+        let current = super::document::parse(path, &original)?;
         if current == *value {
             return Ok(Migration {
                 path: path.into(),
@@ -70,8 +75,12 @@ pub(super) fn prepare(
         if current != before {
             return Err("config changed since it was loaded; reload it before migration".into());
         }
-        let updated = edit_document(&original)?;
-        if super::parse_doc(&updated).map_err(|e| e.to_string())? != *value {
+        let updated = if super::document::is_yaml(path) {
+            serde_yaml::to_string(value).map_err(|e| e.to_string())?
+        } else {
+            edit_document(&original)?
+        };
+        if super::document::parse(path, &updated)? != *value {
             return Err("migration changed other settings; update the config manually".into());
         }
         Ok(Migration {
@@ -131,8 +140,9 @@ pub(super) fn finish(migrations: Vec<Migration>, valid: bool, warnings: &mut Vec
         }
         match migration.save() {
             Ok(backup) => warnings.push(format!(
-                "{}: moved legacy palette keys to [keys.command]; backup: {}",
+                "{}: moved legacy palette keys to {}; backup: {}",
                 migration.path.display(),
+                command_section(&migration.path),
                 backup.display()
             )),
             Err(e) => warnings.push(failure(&migration.path, &e.to_string())),
@@ -140,10 +150,19 @@ pub(super) fn finish(migrations: Vec<Migration>, valid: bool, warnings: &mut Vec
     }
 }
 
+fn command_section(path: &Path) -> &'static str {
+    if super::document::is_yaml(path) {
+        "keys.command"
+    } else {
+        "[keys.command]"
+    }
+}
+
 fn failure(path: &Path, error: &str) -> String {
     format!(
-        "{}: cannot save config migration: {error}; using migrated keys in memory. Update [keys.command] in the config source: palette_next -> down, palette_prev -> up, palette_accept -> accept",
-        path.display()
+        "{}: cannot save config migration: {error}; using migrated keys in memory. Update {} in the config source: palette_next -> down, palette_prev -> up, palette_accept -> accept",
+        path.display(),
+        command_section(path)
     )
 }
 
@@ -154,7 +173,12 @@ impl Migration {
             return Err(io::Error::other("config is read-only or a symlink"));
         }
         self.check_source()?;
-        let backup = self.path.with_extension("toml.bak");
+        let extension = self
+            .path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("toml");
+        let backup = self.path.with_extension(format!("{extension}.bak"));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -176,7 +200,9 @@ impl Migration {
             let _ = fs::remove_file(&backup);
             return Err(e);
         }
-        let temporary = self.path.with_extension("toml.migration.tmp");
+        let temporary = self
+            .path
+            .with_extension(format!("{extension}.migration.tmp"));
         let mut file = options.open(&temporary)?;
         let saved = (|| {
             file.write_all(self.updated.as_bytes())?;
@@ -234,60 +260,66 @@ mod tests {
 
     #[test]
     fn migration_preserves_existing_backups_and_detects_changed_sources() {
-        let dir = std::env::temp_dir().join(format!("sofka-migrate-save-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        let backup = dir.join("config.toml.bak");
-        let temporary = dir.join("config.toml.migration.tmp");
-        let migration = Migration {
-            path: path.clone(),
-            original: "[keys]\npalette_next = 'ctrl-n'\n".into(),
-            updated: "[keys.command]\ndown = 'ctrl-n'\n".into(),
-        };
-        fs::write(&path, &migration.original).unwrap();
-        fs::write(&backup, "previous backup").unwrap();
-        assert!(migration.save().is_err());
-        assert_eq!(fs::read_to_string(&backup).unwrap(), "previous backup");
-        assert_eq!(fs::read_to_string(&path).unwrap(), migration.original);
-        fs::remove_file(&backup).unwrap();
+        for extension in ["toml", "yaml", "yml"] {
+            let dir =
+                std::env::temp_dir().join(format!("sofka-migrate-save-{}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("config.{extension}"));
+            let backup = dir.join(format!("config.{extension}.bak"));
+            let temporary = dir.join(format!("config.{extension}.migration.tmp"));
+            let migration = Migration {
+                path: path.clone(),
+                original: "[keys]\npalette_next = 'ctrl-n'\n".into(),
+                updated: "[keys.command]\ndown = 'ctrl-n'\n".into(),
+            };
+            fs::write(&path, &migration.original).unwrap();
+            fs::write(&backup, "previous backup").unwrap();
+            assert!(migration.save().is_err());
+            assert_eq!(fs::read_to_string(&backup).unwrap(), "previous backup");
+            assert_eq!(fs::read_to_string(&path).unwrap(), migration.original);
+            fs::remove_file(&backup).unwrap();
 
-        fs::write(&path, "hide_header = true\n").unwrap();
-        assert!(migration.save().is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "hide_header = true\n");
-        assert!(!backup.exists());
+            fs::write(&path, "hide_header = true\n").unwrap();
+            assert!(migration.save().is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), "hide_header = true\n");
+            assert!(!backup.exists());
 
-        fs::write(&path, &migration.original).unwrap();
-        fs::write(&temporary, "another migration").unwrap();
-        assert!(migration.save().is_err());
-        assert_eq!(fs::read_to_string(&temporary).unwrap(), "another migration");
-        assert_eq!(fs::read_to_string(&path).unwrap(), migration.original);
-        assert_eq!(fs::read_to_string(&backup).unwrap(), migration.original);
-        fs::remove_dir_all(dir).unwrap();
+            fs::write(&path, &migration.original).unwrap();
+            fs::write(&temporary, "another migration").unwrap();
+            assert!(migration.save().is_err());
+            assert_eq!(fs::read_to_string(&temporary).unwrap(), "another migration");
+            assert_eq!(fs::read_to_string(&path).unwrap(), migration.original);
+            assert_eq!(fs::read_to_string(&backup).unwrap(), migration.original);
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[cfg(unix)]
     #[test]
     fn migration_preserves_file_and_backup_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("sofka-migrate-mode-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        let migration = Migration {
-            path: path.clone(),
-            original: "[keys]\npalette_next = 'ctrl-n'\n".into(),
-            updated: "[keys.command]\ndown = 'ctrl-n'\n".into(),
-        };
-        fs::write(&path, &migration.original).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
-        let backup = migration.save().unwrap();
-        for file in [&path, &backup] {
-            assert_eq!(
-                fs::metadata(file).unwrap().permissions().mode() & 0o777,
-                0o640
-            );
+        for extension in ["toml", "yaml", "yml"] {
+            use std::os::unix::fs::PermissionsExt;
+            let dir =
+                std::env::temp_dir().join(format!("sofka-migrate-mode-{}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("config.{extension}"));
+            let migration = Migration {
+                path: path.clone(),
+                original: "[keys]\npalette_next = 'ctrl-n'\n".into(),
+                updated: "[keys.command]\ndown = 'ctrl-n'\n".into(),
+            };
+            fs::write(&path, &migration.original).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+            let backup = migration.save().unwrap();
+            for file in [&path, &backup] {
+                assert_eq!(
+                    fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                    0o640
+                );
+            }
+            assert_eq!(fs::read_to_string(&path).unwrap(), migration.updated);
+            assert_eq!(fs::read_to_string(&backup).unwrap(), migration.original);
+            fs::remove_dir_all(dir).unwrap();
         }
-        assert_eq!(fs::read_to_string(&path).unwrap(), migration.updated);
-        assert_eq!(fs::read_to_string(&backup).unwrap(), migration.original);
-        fs::remove_dir_all(dir).unwrap();
     }
 }

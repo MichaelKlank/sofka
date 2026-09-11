@@ -54,6 +54,16 @@ let
       contexts.admin.configFile = ./config.toml;
     };
   };
+  yamlSource = builtins.toFile "sofka-config.yaml" "readonly: true\ndefault_namespace: from-yaml\n";
+  ymlSource = builtins.toFile "sofka-config.yml" "readonly: false\n";
+  yaml = enabled {
+    configFile = yamlSource;
+    clusters.prod = {
+      configFile = ymlSource;
+      contexts.admin.configFile = yamlSource;
+      contexts.other.settings.readonly = true;
+    };
+  };
   forced = enabled {
     settings.skin.name = lib.mkForce "nord";
     skin.name = "gruvbox-dark";
@@ -98,6 +108,13 @@ assert builtins.all (name: raw.xdg.configFile.${name}.source == ./config.toml) [
   "sofka/clusters/prod/config.toml"
   "sofka/clusters/prod/admin/config.toml"
 ];
+assert yaml.xdg.configFile."sofka/config.yaml".source == yamlSource;
+assert yaml.xdg.configFile."sofka/clusters/prod/config.yml".source == ymlSource;
+assert yaml.xdg.configFile."sofka/clusters/prod/admin/config.yaml".source == yamlSource;
+assert yaml.xdg.configFile ? "sofka/clusters/prod/other/config.toml";
+assert !(yaml.xdg.configFile ? "sofka/config.toml");
+assert !(yaml.xdg.configFile ? "sofka/clusters/prod/config.toml");
+assert fails { configFile = yamlSource; settings.readonly = true; };
 assert fails { configFile = ./config.toml; settings.readonly = true; };
 assert fails { configFile = ./config.toml; aliases.dep = "deployments"; };
 assert fails { clusters.prod = { configFile = ./config.toml; settings.readonly = true; }; };

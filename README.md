@@ -148,7 +148,8 @@ The essentials. `?` in the app shows everything, or see the
 
 ## Configuration
 
-`$XDG_CONFIG_HOME/sofka/config.toml` (or `~/.config/sofka/config.toml`). All
+Use `config.toml`, `config.yaml`, or `config.yml` under `$XDG_CONFIG_HOME/sofka`
+(or `~/.config/sofka`). Keep one file at each config level. All
 optional - an empty config behaves like no config. `:reload` re-reads it live.
 
 ```toml

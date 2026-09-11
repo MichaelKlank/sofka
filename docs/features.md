@@ -604,7 +604,7 @@ pod is rejected; browse through a pod that already mounts the claim instead.
   and per-swatch hex overrides. Every semantic color (row status, severity
   badges, headers, borders) is derived from the active palette, so one skin
   change lands everywhere at once.
-- **Config file** (TOML) with per-cluster and per-context overrides and live
+- **Config file** (TOML or YAML) with per-cluster and per-context overrides and live
   `:reload`. See [Configuration](configuration.md).
 
 ## Diagnostics
