@@ -995,7 +995,7 @@ fn trash(config: &Path) -> Result<PathBuf, String> {
         // The name alone claims nothing. A directory that is already here and
         // already holds something was put here by someone else, and emptying it
         // would destroy their files; an empty one has nothing to lose.
-        if contents(&trash)?.next().is_some() {
+        if !contents(&trash)?.is_empty() {
             return Err(format!(
                 "refusing to use {} for removals: it holds files sofka did not put there; \
                  move or remove it manually",
@@ -1008,13 +1008,20 @@ fn trash(config: &Path) -> Result<PathBuf, String> {
     Ok(trash)
 }
 
-/// Everything in the trash directory except the marker that claims it.
-fn contents(trash: &Path) -> Result<impl Iterator<Item = std::fs::DirEntry>, String> {
-    let entries = std::fs::read_dir(trash)
-        .map_err(|e| format!("reading {}: {e}", trash.display()))?
-        .flatten()
-        .filter(|entry| entry.file_name() != std::ffi::OsStr::new(TRASH_MARKER));
-    Ok(entries)
+/// Everything in the trash directory except the marker that claims it. Every
+/// read error is propagated: an entry this cannot see must not read as an empty
+/// directory, because "empty" is what allows sofka to claim someone else's.
+fn contents(trash: &Path) -> Result<Vec<std::fs::DirEntry>, String> {
+    let mut rest = Vec::new();
+    for entry in
+        std::fs::read_dir(trash).map_err(|e| format!("reading {}: {e}", trash.display()))?
+    {
+        let entry = entry.map_err(|e| format!("reading {}: {e}", trash.display()))?;
+        if entry.file_name() != std::ffi::OsStr::new(TRASH_MARKER) {
+            rest.push(entry);
+        }
+    }
+    Ok(rest)
 }
 
 fn empty_trash(trash: &Path) -> Result<(), String> {
@@ -1144,8 +1151,7 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .filter(|name| name.starts_with(".plugin-"))
             .filter(|name| {
-                name != TRASH
-                    || contents(&config.join(TRASH)).is_ok_and(|mut rest| rest.next().is_some())
+                name != TRASH || contents(&config.join(TRASH)).is_ok_and(|rest| !rest.is_empty())
             })
             .collect()
     }
@@ -2622,5 +2628,36 @@ mod tests {
         // And claiming is idempotent.
         assert_eq!(trash(&config).unwrap(), claimed);
         let _ = std::fs::remove_dir_all(config);
+    }
+
+    #[test]
+    fn a_trash_directory_sofka_cannot_inspect_is_never_claimed() {
+        // A stray file under the name: enumeration fails outright, and the
+        // failure must not read as "empty, therefore free to take".
+        let config = scratch("uninspectable-trash");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join(TRASH), "not a directory").unwrap();
+        assert!(trash(&config).is_err());
+        let _ = std::fs::remove_dir_all(&config);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let config = scratch("unreadable-trash");
+            let theirs = config.join(TRASH);
+            std::fs::create_dir_all(&theirs).unwrap();
+            std::fs::write(theirs.join("keep.txt"), "mine").unwrap();
+            std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Root ignores the mode, so only assert when it actually bites.
+            let unreadable = std::fs::read_dir(&theirs).is_err();
+            let claimed = trash(&config);
+            std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if unreadable {
+                assert!(claimed.is_err(), "claimed a directory it could not read");
+                assert!(!theirs.join(TRASH_MARKER).exists());
+            }
+            assert!(theirs.join("keep.txt").is_file());
+            let _ = std::fs::remove_dir_all(config);
+        }
     }
 }
