@@ -160,7 +160,9 @@ md = "machinedeployments.cluster.x-k8s.io"
 The resource table actions `favorite_namespace_1` through
 `favorite_namespace_9` select entries from `favorite_namespaces` in configuration
 order. Recent namespace changes do not change these assignments. Extra entries
-remain available through `n`. Empty or unconfigured slots do nothing.
+remain available through `n`. Empty or unconfigured slots do nothing. The same
+keys work inside the namespace switcher while its filter is empty, and the
+header shows the configured favourites next to the current namespace.
 
 To change or disable a shortcut, use the existing key configuration:
 

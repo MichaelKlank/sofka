@@ -298,12 +298,7 @@ impl App {
             .iter()
             .position(|action| Some(*action) == key.action)
         {
-            if let Some(namespace) = self
-                .namespace_favorites
-                .get(index)
-                .filter(|n| !n.is_empty())
-                .cloned()
-            {
+            if let Some(namespace) = self.favorite_namespace(index) {
                 self.set_namespace(namespace);
             }
             return;

@@ -456,9 +456,33 @@ impl App {
         );
     }
 
+    pub(super) fn favorite_namespace(&self, index: usize) -> Option<String> {
+        self.namespace_favorites
+            .get(index)
+            .filter(|n| !n.is_empty())
+            .cloned()
+    }
+
+    fn namespace_shortcut(&self, key: KeyInput) -> Option<String> {
+        match self.keymap.action("table", &key.event())? {
+            Action::AllNamespaces => Some("<all>".to_string()),
+            action => Action::FAVORITE_NAMESPACES
+                .iter()
+                .position(|favorite| *favorite == action)
+                .and_then(|index| self.favorite_namespace(index)),
+        }
+    }
+
     pub(super) fn key_namespaces(&mut self, key: KeyInput) {
         if edit_action(key.action, &mut self.ns_filter) {
             self.select_best_namespace_match();
+            return;
+        }
+        if key.action.is_none()
+            && self.ns_filter.is_empty()
+            && let Some(namespace) = self.namespace_shortcut(key)
+        {
+            self.set_namespace(namespace);
             return;
         }
         let len = self.filtered_namespaces().len();
