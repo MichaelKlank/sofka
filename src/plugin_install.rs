@@ -16,6 +16,7 @@ const RECORD_SCHEMA: u32 = 1;
 /// interruption left them in, recovery discards them.
 const REMOVED_PREFIX: &str = ".plugin-removed-";
 const TRASH: &str = ".plugin-trash";
+const TRASH_MARKER: &str = ".sofka-trash";
 const EXPANDED_MAX_BYTES: u64 = 200 * 1024 * 1024;
 const FILE_MAX: usize = 2_000;
 /// A package may hold thousands of files; an error message may not.
@@ -983,21 +984,49 @@ fn unique_path(parent: &Path, prefix: &str) -> PathBuf {
 fn trash(config: &Path) -> Result<PathBuf, String> {
     let trash = config.join(TRASH);
     ensure_directory_path(&trash)?;
-    std::fs::create_dir_all(&trash).map_err(|e| format!("creating {}: {e}", trash.display()))?;
+    match std::fs::create_dir(&trash) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("creating {}: {e}", trash.display())),
+    }
     ensure_directory_path(&trash)?;
+    let marker = trash.join(TRASH_MARKER);
+    if !marker.is_file() {
+        // The name alone claims nothing. A directory that is already here and
+        // already holds something was put here by someone else, and emptying it
+        // would destroy their files; an empty one has nothing to lose.
+        if contents(&trash)?.next().is_some() {
+            return Err(format!(
+                "refusing to use {} for removals: it holds files sofka did not put there; \
+                 move or remove it manually",
+                trash.display()
+            ));
+        }
+        std::fs::write(&marker, b"sofka deletes everything in this directory\n")
+            .map_err(|e| format!("claiming {}: {e}", trash.display()))?;
+    }
     Ok(trash)
 }
 
+/// Everything in the trash directory except the marker that claims it.
+fn contents(trash: &Path) -> Result<impl Iterator<Item = std::fs::DirEntry>, String> {
+    let entries = std::fs::read_dir(trash)
+        .map_err(|e| format!("reading {}: {e}", trash.display()))?
+        .flatten()
+        .filter(|entry| entry.file_name() != std::ffi::OsStr::new(TRASH_MARKER));
+    Ok(entries)
+}
+
 fn empty_trash(trash: &Path) -> Result<(), String> {
-    let entries = match std::fs::read_dir(trash) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(format!("reading {}: {e}", trash.display())),
-    };
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("reading {}: {e}", trash.display()))?;
+    if !trash.join(TRASH_MARKER).is_file() {
+        // Unclaimed, so not sofka's to empty. A removal refuses it out loud;
+        // recovery has no business deleting anything here on its own.
+        return Ok(());
+    }
+    for entry in contents(trash)? {
         let path = entry.path();
-        // A symlink reports as neither: unlinked, never followed.
+        // A symlink reports as neither a directory nor a file here: the link is
+        // unlinked, never followed.
         let discarded = if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             std::fs::remove_dir_all(&path)
         } else {
@@ -1027,7 +1056,8 @@ fn recover(config: &Path) -> Result<(), String> {
             }
         } else if name == TRASH {
             // The rename into here committed the removal, so nothing inside is
-            // worth keeping and nothing inside can be anyone else's.
+            // worth keeping — and the marker is what says the directory is
+            // sofka's, rather than its name.
             ensure_directory_path(&path)?;
             empty_trash(&path)?;
         } else if name.starts_with(".plugin-backup-") {
@@ -1115,8 +1145,7 @@ mod tests {
             .filter(|name| name.starts_with(".plugin-"))
             .filter(|name| {
                 name != TRASH
-                    || std::fs::read_dir(config.join(TRASH))
-                        .is_ok_and(|mut entries| entries.next().is_some())
+                    || contents(&config.join(TRASH)).is_ok_and(|mut rest| rest.next().is_some())
             })
             .collect()
     }
@@ -2561,11 +2590,37 @@ mod tests {
 
         assert!(!with_record.exists());
         assert!(!without_record.exists(), "a leftover that lost its record");
-        assert!(trash.is_dir(), "the trash directory itself is kept");
+        assert!(trash.join(TRASH_MARKER).is_file(), "the claim is kept");
         assert!(
             theirs.join("keep.txt").is_file(),
             "recovery deleted a directory it did not create"
         );
+        let _ = std::fs::remove_dir_all(config);
+    }
+
+    #[test]
+    fn a_trash_directory_sofka_did_not_create_is_never_emptied() {
+        let config = scratch("unowned-trash");
+        // Someone else's directory that happens to have the name sofka uses.
+        let theirs = config.join(TRASH);
+        std::fs::create_dir_all(theirs.join("notes")).unwrap();
+        std::fs::write(theirs.join("notes").join("keep.txt"), "mine").unwrap();
+
+        // Recovery runs on every plugin command and must leave it alone.
+        recover(&config).unwrap();
+        assert!(theirs.join("notes").join("keep.txt").is_file());
+
+        // A removal refuses it out loud rather than claiming it silently.
+        let error = trash(&config).unwrap_err();
+        assert!(error.contains("did not put there"), "{error}");
+        assert!(theirs.join("notes").join("keep.txt").is_file());
+
+        // An empty one has nothing to lose, so it is claimed and marked.
+        std::fs::remove_dir_all(theirs.join("notes")).unwrap();
+        let claimed = trash(&config).unwrap();
+        assert!(claimed.join(TRASH_MARKER).is_file());
+        // And claiming is idempotent.
+        assert_eq!(trash(&config).unwrap(), claimed);
         let _ = std::fs::remove_dir_all(config);
     }
 }
