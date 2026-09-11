@@ -1,7 +1,6 @@
 # Roadmap
 
-Milestone status. Longer-form thinking on direction lives in
-[`future.md`](../future.md).
+Milestone status.
 
 ## Milestone 1: power-user foundation
 
