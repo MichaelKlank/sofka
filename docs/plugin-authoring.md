@@ -9,6 +9,12 @@ sofka supplies resource data, process control, output limits, and report display
 The package supplies tool commands and result interpretation.
 A new package does not require changes to sofka's Rust code.
 
+Packages proposed for the reviewed public catalog live in the separate
+[`sofka-plugins`](https://github.com/nklmilojevic/sofka-plugins) repository.
+Its contribution guide defines review, versioning, fixtures, licenses, and
+publication. Compiled package archives are GitHub Release assets; binaries are
+not committed to either source repository.
+
 ## Language choice
 
 For core plugins maintained and shipped by the sofka project, prefer Rust.

@@ -34,6 +34,14 @@ struct Args {
     /// Defaults to config `default_resource`, then "pods".
     resource: Option<String>,
 
+    /// Explicit resource name. Use this to open a resource named `plugin`.
+    #[arg(
+        long = "resource",
+        value_name = "RESOURCE",
+        conflicts_with = "resource"
+    )]
+    explicit_resource: Option<String>,
+
     /// Namespace to start in.
     #[arg(short, long)]
     namespace: Option<String>,
@@ -108,6 +116,8 @@ enum Command {
     /// Connects to the cluster (briefly) unless `--offline`. Identifiers,
     /// paths, and counts only — never credentials, tokens, or Secret values.
     Info(InfoArgs),
+    /// Find, install, update, list, and remove reviewed plugin packages.
+    Plugin(sofka::plugin_cli::PluginArgs),
 }
 
 #[derive(clap::Args, Debug, Clone, Default)]
@@ -147,6 +157,12 @@ fn main() -> Result<()> {
 }
 
 impl Args {
+    fn resource(&self) -> Option<&str> {
+        self.explicit_resource
+            .as_deref()
+            .or(self.resource.as_deref())
+    }
+
     fn launch_namespace(&self) -> Option<String> {
         if self.all_namespaces {
             Some(String::new())
@@ -166,7 +182,7 @@ impl Args {
     }
 
     fn context_picker(&self) -> Result<bool> {
-        let picker = matches!(self.resource.as_deref(), Some("ctx" | "contexts"));
+        let picker = matches!(self.resource(), Some("ctx" | "contexts"));
         anyhow::ensure!(
             !picker || !(self.check || self.snapshot),
             "ctx and contexts require interactive mode; remove --check or --snapshot"
@@ -202,6 +218,11 @@ async fn run_main(args: Args) -> Result<()> {
             println!("{line}");
         }
         return Ok(());
+    }
+    if let Some(Command::Plugin(plugin)) = &args.command {
+        return sofka::plugin_cli::run(plugin)
+            .await
+            .map_err(anyhow::Error::msg);
     }
 
     let (loader, mut config_warnings) = config::ConfigLoader::load();
@@ -704,6 +725,7 @@ fn suspend_and_run(terminal: &mut ratatui::DefaultTerminal, argv: &[String], cap
 fn info_request(args: &Args) -> Option<InfoArgs> {
     match &args.command {
         Some(Command::Info(info)) => Some(info.clone()),
+        Some(Command::Plugin(_)) => None,
         None if args.info => Some(InfoArgs { offline: true }),
         None => None,
     }
@@ -789,8 +811,8 @@ async fn run_info(
     // Exactly what a launch with these flags would open, so the probe below
     // exercises the view the user would actually land on.
     let resource = args
-        .resource
-        .clone()
+        .resource()
+        .map(str::to_owned)
         .or_else(|| cfg.default_resource.clone())
         .unwrap_or_else(|| "pods".into());
     let namespace = starting_namespace(
@@ -1184,6 +1206,21 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    #[test]
+    fn plugin_cli_and_explicit_plugin_resource_do_not_conflict() {
+        let args = Args::try_parse_from(["sofka", "plugin", "update", "resource-summary"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::Plugin(sofka::plugin_cli::PluginArgs {
+                command: sofka::plugin_cli::PluginCommand::Update { ref plugins, .. }
+            })) if plugins == &["resource-summary"]
+        ));
+
+        let args = Args::try_parse_from(["sofka", "--resource", "plugin"]).unwrap();
+        assert!(args.command.is_none());
+        assert_eq!(args.resource(), Some("plugin"));
     }
 
     #[test]

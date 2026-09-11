@@ -7,6 +7,61 @@ To create a package, see [Create a plugin package](plugin-authoring.md).
 Packages support named commands, validated inputs, JSON reports, and managed port-forwards.
 Enter `:plugin-cancel` to stop the active plugin run.
 
+### Official catalog
+
+The [official catalog](https://github.com/nklmilojevic/sofka-plugins) contains
+reviewed plugin packages. Review means a maintainer reviewed that published
+version. Plugins still run with your permissions and inherited environment;
+the catalog does not provide a process sandbox or guarantee that an adapter or
+external tool has no defects.
+
+Catalog commands do not open the TUI, read cluster credentials, connect to
+Kubernetes, or execute adapters:
+
+```sh
+sofka plugin search [QUERY]
+sofka plugin describe ID[@VERSION]
+sofka plugin install ID[@VERSION] [ID[@VERSION] ...]
+sofka plugin update [ID ...]
+sofka plugin list
+sofka plugin remove ID [ID ...]
+```
+
+`install ID` and `update` select the highest compatible, active, stable package
+version. An explicit `ID@VERSION` installs exactly that version and supports
+updates and rollbacks. Reinstalling the same intact version succeeds without
+changing files. Sofka never updates plugins during startup, search, or reload.
+
+Search, describe, install, and update fetch the complete `index.json` once per
+command and cache its validated commit snapshot. Add `--offline` to use that
+snapshot; offline installation also needs the matching cached archive. Sofka
+prints the cache age because withdrawal information may be stale. Network
+failure does not silently fall back to cached metadata.
+
+Managed packages are installed under
+`$XDG_CONFIG_HOME/sofka/plugins/<id>`, or `~/.config/sofka/plugins/<id>`. Each
+contains a `.sofka-install.json` record with its versions and file hashes.
+`list` works offline and labels manual packages and local modifications. Update
+and removal refuse modified packages, symlinks, and unmanaged directories;
+resolve those paths manually. There is no destructive force option.
+
+The installer verifies SHA-256 before extraction, rejects links and unsafe
+paths, validates the existing `plugin.toml` format, and activates a complete
+staged directory. It reports missing external tools and their installation
+instructions, but does not install them. After installation, update, or
+removal, enter `:reload` in an existing session.
+
+Add `--json` to search, describe, and list for stable machine-readable output.
+Search returns an array with `id`, `display_name`, `description`, `tags`,
+`latest_version`, `compatible`, `installed`, and `installed_version`. Describe
+returns the catalog and execution fields printed by the text view. List returns
+an array with `id`, `version`, `path`, `managed`, and `modified`.
+
+Home Manager users can continue to place immutable package sources in the same
+directory. Sofka reports those as manual packages and does not take ownership
+of them. Since `plugin` is now a CLI command, use `sofka --resource plugin` to
+open a Kubernetes resource whose name is exactly `plugin`.
+
 sofka ships one plugin: `:sanitize`, which deletes the pods a namespace has
 finished with. It needs nothing installed - see [Sanitize pods](../plugins/sanitize/README.md).
 An inline entry or a user package of the same name replaces it.
