@@ -398,7 +398,16 @@ async fn update(requested: &[String], offline: bool) -> Result<(), String> {
         if available > current {
             updates.push(id);
         } else {
-            println!("{id} is current at {current}");
+            // Nothing newer is not the same as nothing wrong: the version in
+            // use may since have been withdrawn, and that is the one thing an
+            // update run must not stay quiet about.
+            match installed_withdrawal(selected.plugin, &current.to_string()) {
+                Some(reason) => eprintln!(
+                    "warning: {id} is installed at {current}, which was withdrawn: {reason}; \
+                     the newest version sofka can install is {available}"
+                ),
+                None => println!("{id} is current at {current}"),
+            }
         }
     }
     if updates.is_empty() {
@@ -505,10 +514,22 @@ fn list_rows<'a>(
 fn remove(ids: &[String]) -> Result<(), String> {
     let config = crate::plugin_catalog::config_dir()?;
     let _lock = InstallLock::acquire(&config)?;
-    for (id, path) in crate::plugin_install::remove(ids)? {
+    // Whatever came out before a failure is still out, and saying so is the
+    // difference between "re-run it" and "some of that already happened".
+    let (removed, failure) = match crate::plugin_install::remove(ids) {
+        Ok(removed) => (removed, None),
+        Err(refused) => (refused.removed, Some(refused.error)),
+    };
+    let any = !removed.is_empty();
+    for (id, path) in removed {
         println!("removed {id} from {}", path.display());
     }
-    println!("Run :reload in an existing sofka session to load the changes.");
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if any {
+        println!("Run :reload in an existing sofka session to load the changes.");
+    }
     Ok(())
 }
 
@@ -715,6 +736,24 @@ mod tests {
         assert_eq!(described.status, "withdrawn");
         assert_eq!(described.withdrawal_reason, Some("same defect"));
         assert!(!described.installed);
+    }
+
+    #[test]
+    fn a_withdrawn_installed_version_is_never_called_current() {
+        let catalog = catalog(serde_json::json!([
+            release("0.1.0", "active", None),
+            release("0.2.0", "withdrawn", Some("corrupts reports")),
+        ]));
+        let plugin = catalog.find("resource-summary").unwrap();
+        // Nothing newer is installable, so update has nothing to do — but the
+        // version in use was withdrawn, which is the whole point of saying so.
+        assert_eq!(
+            installed_withdrawal(plugin, "0.2.0"),
+            Some("corrupts reports")
+        );
+        assert_eq!(installed_withdrawal(plugin, "0.1.0"), None);
+        // The newest installable version really is the older one.
+        assert_eq!(plugin.latest_compatible().unwrap().version, "0.1.0");
     }
 
     #[test]

@@ -140,7 +140,13 @@ impl PreparedPackage {
             .and_then(Path::parent)
             .ok_or_else(|| "invalid plugin destination".to_string())?;
         let backup = unique_path(config, &format!(".plugin-backup-{}", self.id));
-        let had_destination = self.destination.exists();
+        // Preparation can be slow — a download, an extraction, a batch of other
+        // packages — and the destination is not locked against its owner in
+        // that window. Anything edited since must not be silently discarded.
+        let had_destination = match inspect_destination(&self.destination, &self.id) {
+            Ok(current) => current.is_some(),
+            Err(error) => return Err(format!("refusing to replace {}: {error}", self.id)),
+        };
         if had_destination {
             std::fs::rename(&self.destination, &backup).map_err(|e| {
                 format!(
@@ -254,6 +260,8 @@ async fn prepare_below(
     }
 
     let mut prepared = Vec::new();
+    // Manifests prepared so far in this batch, by package ID.
+    let mut batch: Vec<(String, crate::config::Plugin)> = Vec::new();
     for (id, version, source_commit, artifact) in selections {
         let destination = plugins.join(&id);
         let previous = inspect_destination(&destination, &id)?;
@@ -297,7 +305,19 @@ async fn prepare_below(
                 return Err(format!("preparing {id}@{version}: {error}"));
             }
         };
-        let conflicts = conflicts(&plugins, &destination, &package);
+        let mut conflicts = conflicts(&plugins, &destination, &package);
+        // Two packages installed in one command never see each other on disk,
+        // so compare the staged manifests directly.
+        conflicts.extend(
+            batch
+                .iter()
+                .filter(|(_, manifest)| {
+                    manifest.name == package.name
+                        || (package.palette.is_some() && manifest.palette == package.palette)
+                })
+                .map(|(other, _)| plugins.join(other)),
+        );
+        batch.push((id.clone(), package.clone()));
         let record = InstallationRecord {
             schema_version: RECORD_SCHEMA,
             id: id.clone(),
@@ -452,11 +472,34 @@ fn managed_ids_in(plugins: &Path) -> Result<Vec<String>, String> {
         .collect())
 }
 
-pub fn remove(ids: &[String]) -> Result<Vec<(String, PathBuf)>, String> {
+/// What a refused removal leaves behind: the packages that did come out before
+/// it stopped, and why it stopped.
+#[derive(Debug)]
+pub struct Removal {
+    pub removed: Vec<(String, PathBuf)>,
+    pub error: String,
+}
+
+impl std::fmt::Display for Removal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.error)
+    }
+}
+
+impl From<String> for Removal {
+    fn from(error: String) -> Self {
+        Self {
+            removed: Vec::new(),
+            error,
+        }
+    }
+}
+
+pub fn remove(ids: &[String]) -> Result<Vec<(String, PathBuf)>, Removal> {
     remove_below(&plugin_catalog::config_dir()?, ids)
 }
 
-fn remove_below(config: &Path, ids: &[String]) -> Result<Vec<(String, PathBuf)>, String> {
+fn remove_below(config: &Path, ids: &[String]) -> Result<Vec<(String, PathBuf)>, Removal> {
     ensure_directory_path(config)?;
     let plugins = config.join("plugins");
     ensure_directory_path(&plugins)?;
@@ -478,17 +521,29 @@ fn remove_below(config: &Path, ids: &[String]) -> Result<Vec<(String, PathBuf)>,
             .ok_or_else(|| format!("plugin {id} is not installed at {}", path.display()))?;
         checked.push((id.clone(), path, record));
     }
+    // A failure partway through must still report what is already gone: the
+    // caller cannot tell the user to re-run something that already happened.
     let mut removed = Vec::new();
     for (id, path, _) in checked {
         let staged = unique_path(config, &format!("{REMOVED_PREFIX}{id}"));
-        std::fs::rename(&path, &staged).map_err(|e| format!("removing {}: {e}", path.display()))?;
-        std::fs::remove_dir_all(&staged).map_err(|e| {
-            format!(
-                "plugin {id} was deactivated, but cleanup of {} failed: {e}",
-                staged.display()
-            )
-        })?;
-        removed.push((id, path));
+        if let Err(e) = std::fs::rename(&path, &staged) {
+            return Err(Removal {
+                removed,
+                error: format!("removing {}: {e}", path.display()),
+            });
+        }
+        // Past the rename the plugin is deactivated, so it counts as removed
+        // even if the directory lingers; recovery discards it later.
+        removed.push((id.clone(), path));
+        if let Err(e) = std::fs::remove_dir_all(&staged) {
+            return Err(Removal {
+                removed,
+                error: format!(
+                    "plugin {id} was deactivated, but cleanup of {} failed: {e}",
+                    staged.display()
+                ),
+            });
+        }
     }
     Ok(removed)
 }
@@ -756,6 +811,18 @@ fn validate_relative_path(path: &Path) -> Result<(), String> {
     {
         return Err(format!("unsafe archive path {}", path.display()));
     }
+    // `bin/./data` has only normal components — Rust drops the `.` while
+    // iterating — but it is written to disk as `bin/data`. Recording the
+    // spelling from the archive would then never match the file that was
+    // created, and the package would look modified the moment it installed.
+    // Compared as strings, not as paths: `Path`'s own equality is
+    // component-wise, so it considers `bin/./data` equal to `bin/data`.
+    if path.components().collect::<PathBuf>().as_os_str() != path.as_os_str() {
+        return Err(format!(
+            "archive path {} is not in its plain form",
+            path.display()
+        ));
+    }
     Ok(())
 }
 
@@ -820,8 +887,14 @@ fn recover(config: &Path) -> Result<(), String> {
                         destination.display()
                     )
                 })?;
-                std::fs::remove_dir_all(&path)
-                    .map_err(|e| format!("recovering {}: {e}", path.display()))?;
+                // Rename first, for the same reason activation does: a
+                // half-deleted backup is unidentifiable, and recovery would
+                // then refuse every later operation.
+                let discarded = unique_path(config, &format!("{REMOVED_PREFIX}{}", record.id));
+                std::fs::rename(&path, &discarded)
+                    .map_err(|e| format!("retiring {}: {e}", path.display()))?;
+                std::fs::remove_dir_all(&discarded)
+                    .map_err(|e| format!("recovering {}: {e}", discarded.display()))?;
             } else {
                 std::fs::create_dir_all(config.join("plugins"))
                     .map_err(|e| format!("recovering plugins directory: {e}"))?;
@@ -1320,6 +1393,153 @@ mod tests {
     }
 
     #[test]
+    fn activation_refuses_a_destination_edited_since_preparation() {
+        let config = scratch("edited-after-prepare");
+        let plugins = config.join("plugins");
+        let destination = plugins.join("sample");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("plugin.toml"), "mine").unwrap();
+        write_record(&destination, &record_for("sample", "1.0.0"));
+        let stage = unique_path(&config, ".plugin-stage-sample");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join(STAGE_MARKER), "stage").unwrap();
+        std::fs::write(stage.join("plugin.toml"), "theirs").unwrap();
+        write_record(&stage, &record_for("sample", "2.0.0"));
+
+        // Preparation verified the destination; the user edits it before the
+        // swap, which can be a long download later.
+        std::fs::write(destination.join("plugin.toml"), "edited since").unwrap();
+
+        let error = PreparedPackage {
+            id: "sample".into(),
+            version: "2.0.0".into(),
+            previous_version: Some("1.0.0".into()),
+            conflicts: Vec::new(),
+            stage: Some(stage),
+            destination: destination.clone(),
+        }
+        .activate()
+        .unwrap_err();
+
+        assert!(error.contains("local modifications"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(destination.join("plugin.toml")).unwrap(),
+            "edited since"
+        );
+        let _ = std::fs::remove_dir_all(config);
+    }
+
+    #[test]
+    fn recovery_discards_a_backup_whose_own_cleanup_was_interrupted() {
+        let config = scratch("interrupted-backup-cleanup");
+        let plugins = config.join("plugins");
+        let destination = plugins.join("sample");
+        write_record(&destination, &record_for("sample", "2.0.0"));
+        // A backup whose destination is already in place: recovery discards it,
+        // and must survive being interrupted while doing so.
+        let backup = unique_path(&config, ".plugin-backup-sample");
+        write_record(&backup, &record_for("sample", "1.0.0"));
+
+        recover(&config).unwrap();
+
+        assert!(!backup.exists());
+        assert!(destination.join(RECORD).is_file());
+        // Nothing is left behind that a later run would refuse to identify.
+        let leftovers: Vec<_> = std::fs::read_dir(&config)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".plugin-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(config);
+    }
+
+    #[test]
+    fn an_archive_path_that_is_not_its_own_plain_form_is_refused() {
+        // `bin/./data` has only normal components, but lands on disk as
+        // `bin/data`, so the recorded path would never match the file.
+        for spelling in ["bin/./data", "./plugin.toml", "a/b/./c"] {
+            assert!(
+                validate_relative_path(Path::new(spelling)).is_err(),
+                "accepted {spelling}"
+            );
+        }
+        validate_relative_path(Path::new("bin/data")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_batch_reports_two_packages_claiming_the_same_command() {
+        let config = scratch("batch-conflict");
+        let cache = config.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let mut snapshot = published(&cache, "first", "1.0.0", MANIFEST);
+        // A second package with a different ID but the same palette command.
+        let second = published(&cache, "second", "1.0.0", MANIFEST);
+        snapshot
+            .catalog
+            .plugins
+            .extend(second.catalog.plugins.clone());
+        snapshot.catalog.validate().unwrap();
+
+        let prepared = prepare_below(
+            &config,
+            &cache,
+            &snapshot,
+            &["first".to_string(), "second".to_string()],
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(prepared.len(), 2);
+        assert!(prepared[0].conflicts.is_empty());
+        // Neither is installed yet, so only the manifests can reveal it.
+        assert_eq!(
+            prepared[1].conflicts,
+            vec![config.join("plugins").join("first")]
+        );
+        let _ = std::fs::remove_dir_all(config);
+    }
+
+    #[test]
+    fn a_refused_removal_still_names_what_it_already_removed() {
+        let config = scratch("partial-removal");
+        let plugins = config.join("plugins");
+        for id in ["first", "second"] {
+            let package = plugins.join(id);
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(package.join("plugin.toml"), "body").unwrap();
+            write_record(&package, &record_for(id, "1.0.0"));
+        }
+        // The second package cannot be renamed out of a read-only parent.
+        let refused = plugins.join("second");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&refused, std::fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        let outcome = remove_below(&config, &["first".to_string(), "second".to_string()]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&refused, std::fs::Permissions::from_mode(0o700));
+        }
+        let _ = std::fs::remove_dir_all(config);
+        // Whatever it decided about the second, the first is gone and says so.
+        if let Err(refusal) = outcome {
+            assert_eq!(
+                refusal
+                    .removed
+                    .iter()
+                    .map(|(id, _)| id.as_str())
+                    .collect::<Vec<_>>(),
+                ["first"]
+            );
+        }
+    }
+
+    #[test]
     fn destinations_are_inspected_before_anything_is_written() {
         let dir = scratch("inspect");
         let missing = dir.join("absent");
@@ -1439,11 +1659,13 @@ mod tests {
         assert!(
             remove_below(&config, &["sample@1.0.0".to_string()])
                 .unwrap_err()
+                .error
                 .contains("without versions")
         );
         assert!(
             remove_below(&config, &["sample".to_string()])
                 .unwrap_err()
+                .error
                 .contains("is not installed")
         );
 
@@ -1455,6 +1677,7 @@ mod tests {
         assert!(
             remove_below(&config, &["sample".to_string()])
                 .unwrap_err()
+                .error
                 .contains("local modifications")
         );
         assert!(managed.is_dir());
@@ -1467,6 +1690,7 @@ mod tests {
         assert!(
             remove_below(&config, &["sample".to_string(), "absent".to_string()])
                 .unwrap_err()
+                .error
                 .contains("is not installed")
         );
         assert!(managed.is_dir() && other.is_dir());
@@ -1824,10 +2048,12 @@ mod tests {
         let destination = plugins.join("sample");
         std::fs::create_dir_all(&destination).unwrap();
         std::fs::write(destination.join("old"), "old").unwrap();
+        write_record(&destination, &record_for("sample", "1.0.0"));
         let stage = unique_path(&config, ".plugin-stage-sample");
         std::fs::create_dir(&stage).unwrap();
         std::fs::write(stage.join(STAGE_MARKER), "stage").unwrap();
         std::fs::write(stage.join("new"), "new").unwrap();
+        write_record(&stage, &record_for("sample", "2.0.0"));
 
         PreparedPackage {
             id: "sample".into(),
@@ -1874,7 +2100,10 @@ mod tests {
 
         let error = remove_below(&config, &["sample".to_string()]).unwrap_err();
 
-        assert!(error.contains("refusing symlinked directory"), "{error}");
+        assert!(
+            error.error.contains("refusing symlinked directory"),
+            "{error}"
+        );
         assert!(package.is_dir());
         assert!(InstallLock::acquire(&config).is_err());
         let _ = std::fs::remove_dir_all(config);
@@ -1947,12 +2176,16 @@ mod tests {
         let destination = plugins.join("sample");
         std::fs::create_dir_all(&destination).unwrap();
         std::fs::write(destination.join("old"), "old").unwrap();
+        write_record(&destination, &record_for("sample", "1.0.0"));
 
+        // Activation re-verifies the destination, so each stage carries the
+        // record `prepare` would have written into it.
         let activate = |version: &str, previous: &str, contents: &str| {
             let stage = unique_path(&config, ".plugin-stage-sample");
             std::fs::create_dir(&stage).unwrap();
             std::fs::write(stage.join(STAGE_MARKER), "stage").unwrap();
             std::fs::write(stage.join("current"), contents).unwrap();
+            write_record(&stage, &record_for("sample", version));
             PreparedPackage {
                 id: "sample".into(),
                 version: version.into(),
