@@ -733,11 +733,7 @@ impl Targets {
                 all.push(candidate);
             }
         }
-        if let Some(d) = &default
-            && !all.iter().any(|t| same_kind(t, d))
-        {
-            all.push(d.clone());
-        }
+        let default = default.filter(|d| all.iter().any(|t| same_kind(t, d)));
         Self { all, default }
     }
 
@@ -1613,6 +1609,34 @@ mod tests {
 
                 [[views.externalsecrets.refs]]
                 path = "/spec/secretStoreRef/name"
+                kind = "secretstores"
+                kind_path = "/spec/secretStoreRef/kind"
+                kinds = ["clustersecretstores"]
+
+                [[views.externalsecrets.refs]]
+                path = "/spec/data/*/sourceRef/name"
+                kind_path = "/spec/other/*/kind"
+                kinds = ["secretstores"]
+
+                [[views.externalsecrets.refs]]
+                path = "/spec/data/*/sourceRef/name"
+                kind_path = "/spec/data/*/sourceRef/*/kind"
+                kinds = ["secretstores"]
+
+                [[views.externalsecrets.refs]]
+                path = "/spec/data/*/sourceRef/name"
+                namespace_path = "/spec/other/*/namespace"
+                kind_path = "/spec/data/*/sourceRef/kind"
+                kinds = ["secretstores"]
+
+                [[views.externalsecrets.refs]]
+                path = "/spec/data/*/sourceRef/name"
+                namespace_path = "/spec/data/0/sourceRef/namespace"
+                kind_path = "/spec/data/*/sourceRef/kind"
+                kinds = ["secretstores"]
+
+                [[views.externalsecrets.refs]]
+                path = "/spec/secretStoreRef/name"
                 kind_path = "/spec/secretStoreRef/kind"
                 kinds = ["SecretStores", " "]
                 "#,
@@ -1620,11 +1644,31 @@ mod tests {
             .unwrap()
             .views,
         );
-        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert_eq!(warnings.len(), 7, "{warnings:?}");
         assert!(warnings[0].contains("ref 1") && warnings[0].contains("kinds"));
         assert!(warnings[1].contains("ref 2") && warnings[1].contains("kind_path"));
         assert!(warnings[2].contains("ref 3") && warnings[2].contains("JSON Pointer"));
+        assert!(
+            warnings[3].contains("ref 4") && warnings[3].contains("must be one of kinds"),
+            "{}",
+            warnings[3]
+        );
+        for (i, what) in [(4, "ref 5"), (5, "ref 6"), (6, "ref 7")] {
+            assert!(
+                warnings[i].contains(what) && warnings[i].contains("same arrays"),
+                "{}",
+                warnings[i]
+            );
+        }
+        assert!(warnings[4].contains("kind_path") && warnings[5].contains("kind_path"));
+        assert!(warnings[6].contains("namespace_path"));
         let rules = &views["externalsecrets"].refs;
+        assert_eq!(rules.len(), 2);
+        assert_eq!(
+            rules[0].namespace_path.as_deref(),
+            Some("/spec/data/0/sourceRef/namespace")
+        );
+        let rules = &rules[1..];
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].kinds, ["secretstores"]);
         assert_eq!(rules[0].kind, "");

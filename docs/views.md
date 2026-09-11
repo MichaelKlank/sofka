@@ -398,17 +398,25 @@ kind      = "secretstores"                # default when the element has no kind
 kind_path = "/spec/secretStoreRef/kind"
 kinds     = ["secretstores", "clustersecretstores"]
 relation  = "reads from"
+reverse   = "cluster"                     # a ClusterSecretStore is used from any namespace
 ```
 
 The value at `kind_path` is matched against each candidate's kind, plural, or
 group-qualified plural, so `SecretStore` and `secretstores` both work. An
 element naming a kind outside `kinds` - a `User` or `Group` among a
 ClusterRoleBinding's subjects - contributes nothing. With `kind` set, an
-element without a kind takes it; without, the element is skipped. Read
-backwards, the rule applies when any candidate is the selected kind, and an
-object matches only when its element names that kind. Candidates that are
-namespaced and cluster-scoped mix freely: `namespace_path` applies to the
-namespaced ones.
+element without a kind takes it; `kind` must then be one of `kinds`. Without
+it, the element is skipped. The `*` segments of `kind_path` and
+`namespace_path` must sit in the same arrays as those of `path`, so each
+element is paired with its own kind and namespace; a pointer that does not is
+reported and the ref skipped. Read backwards, the rule applies when any
+candidate is the selected kind, and an object matches only when its element
+names that kind. Candidates that are namespaced and cluster-scoped mix
+freely: `namespace_path` applies to the namespaced ones, and one `reverse`
+serves both. A cluster-scoped candidate is named from any namespace, so a rule
+that includes one usually wants `reverse = "cluster"`; with `namespace`, a
+selected ClusterSecretStore lists only the ExternalSecrets in the namespace
+the table shows.
 
 Each lookup reads the current source object. Press `r` to include changes to
 its references, such as a new pod node assignment or PVC binding. If the source
