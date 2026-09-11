@@ -30,7 +30,9 @@ sofka plugin remove ID [ID ...]
 `install ID` and `update` select the highest compatible, active, stable package
 version. An explicit `ID@VERSION` installs exactly that version and supports
 updates and rollbacks. Reinstalling the same intact version succeeds without
-changing files. Sofka never updates plugins during startup, search, or reload.
+changing files. An update run reports a plugin the catalog can no longer serve,
+updates the rest, and fails at the end. Sofka never updates plugins during
+startup, search, or reload.
 
 Search, describe, install, and update fetch the complete `index.json` once per
 command and cache its validated commit snapshot. Add `--offline` to use that
@@ -41,9 +43,11 @@ failure does not silently fall back to cached metadata.
 Managed packages are installed under
 `$XDG_CONFIG_HOME/sofka/plugins/<id>`, or `~/.config/sofka/plugins/<id>`. Each
 contains a `.sofka-install.json` record with its versions and file hashes.
-`list` works offline and labels manual packages and local modifications. Update
-and removal refuse modified packages, symlinks, and unmanaged directories;
-resolve those paths manually. There is no destructive force option.
+`list` works offline and labels manual packages and local modifications. A
+symlinked package directory is always manual: sofka runs the package behind the
+link and never takes ownership of it. Update and removal refuse modified
+packages, symlinks, and unmanaged directories; resolve those paths manually.
+There is no destructive force option.
 
 The installer verifies BLAKE3 before extraction, rejects links and unsafe
 paths, validates the existing `plugin.toml` format, and activates a complete
@@ -53,11 +57,11 @@ removal, enter `:reload` in an existing session.
 
 Add `--json` to search, describe, and list for stable machine-readable output.
 Search returns an array with `id`, `display_name`, `description`, `tags`,
-`latest_version`, `compatible`, `installed`, and `installed_version`. Describe
-returns the catalog and execution fields printed by the text view, including
-`installed_withdrawal_reason` when a different installed release was
-withdrawn. List returns an array with `id`, `version`, `path`, `managed`, and
-`modified`.
+`latest_version`, `compatible`, `installed`, `installed_version`, and
+`withdrawal_reason`. Describe returns the catalog and execution fields printed
+by the text view, including `installed_withdrawal_reason` when a different
+installed release was withdrawn. List returns an array with `id`, `version`,
+`path`, `managed`, `modified`, and `withdrawal_reason`.
 
 Home Manager users can continue to place immutable package sources in the same
 directory. Sofka reports those as manual packages and does not take ownership

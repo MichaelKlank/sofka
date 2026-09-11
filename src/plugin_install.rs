@@ -121,7 +121,9 @@ impl PreparedPackage {
     }
 
     pub fn activate(mut self) -> Result<Activation, String> {
-        let Some(stage) = self.stage.take() else {
+        // Cloned, not taken: every step below here can fail, and `Drop` only
+        // clears the staging directory while this still owns it.
+        let Some(stage) = self.stage.clone() else {
             return Ok(Activation::Unchanged);
         };
         let action = match self.previous_version.as_deref() {
@@ -166,6 +168,9 @@ impl PreparedPackage {
                 self.destination.display()
             ));
         }
+        // The stage is the destination now, so there is nothing left to clean
+        // up under its old name.
+        self.stage = None;
         std::fs::remove_file(self.destination.join(STAGE_MARKER)).map_err(|e| {
             format!(
                 "{} was activated, but removing its staging marker failed: {e}",
@@ -383,7 +388,8 @@ fn inspect_destination(path: &Path, id: &str) -> Result<Option<InstallationRecor
     }
     let record = read_record(path).map_err(|error| {
         format!(
-            "refusing unmanaged plugin directory {}: {error}; move or remove it manually",
+            "refusing unmanaged plugin directory {}: {error}; a package sofka did not \
+             install is never reported as installed — move or remove it manually",
             path.display()
         )
     })?;
@@ -428,14 +434,29 @@ fn scan(plugins: &Path, verify: bool) -> Result<Vec<InstalledPackage>, String> {
     let mut packages = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| format!("reading {}: {e}", plugins.display()))?;
-        let metadata = entry
+        let path = entry.path();
+        let linked = entry
             .file_type()
-            .map_err(|e| format!("inspecting {}: {e}", entry.path().display()))?;
-        if !metadata.is_dir() || metadata.is_symlink() {
+            .map_err(|e| format!("inspecting {}: {e}", path.display()))?
+            .is_symlink();
+        // `is_dir` follows the link, as the loader does. Sofka runs a symlinked
+        // package, so hiding it from `list` only made it look absent.
+        if !path.is_dir() {
             continue;
         }
-        let path = entry.path();
         let id = entry.file_name().to_string_lossy().into_owned();
+        if linked {
+            // Reported, never owned: install, update, and removal all refuse a
+            // symlinked path, so it can only ever be somebody else's package.
+            packages.push(InstalledPackage {
+                id,
+                version: None,
+                path,
+                managed: false,
+                modified: false,
+            });
+            continue;
+        }
         match read_record(&path) {
             Ok(record) => packages.push(InstalledPackage {
                 modified: record.id != id || (verify && verify_record(&path, &record).is_err()),
@@ -1433,13 +1454,16 @@ mod tests {
             version: "2.0.0".into(),
             previous_version: Some("1.0.0".into()),
             conflicts: Vec::new(),
-            stage: Some(stage),
+            stage: Some(stage.clone()),
             destination: destination.clone(),
         }
         .activate()
         .unwrap_err();
 
         assert!(error.contains("local modifications"), "{error}");
+        // A refusal owes nothing to the staging directory: it used to be
+        // disowned before the check and left behind until the next command.
+        assert!(!stage.exists(), "staging directory outlived the refusal");
         assert_eq!(
             std::fs::read_to_string(destination.join("plugin.toml")).unwrap(),
             "edited since"
@@ -1646,6 +1670,8 @@ mod tests {
         std::fs::write(plugins.join("loose-file"), "ignored").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&managed, plugins.join("linked")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&managed, plugins.join("linked")).unwrap();
 
         let packages = installed_in(&plugins).unwrap();
         let rows: Vec<_> = packages
@@ -1657,6 +1683,10 @@ mod tests {
             [
                 ("broken", None, true, true),
                 ("edited", Some("2.0.0"), true, true),
+                // The loader follows the link and runs the package behind it,
+                // so listing nothing made a live package look absent. Manual:
+                // sofka reports it and never takes ownership of it.
+                ("linked", None, false, false),
                 ("managed", Some("1.0.0"), true, false),
                 ("manual", None, false, false),
             ]

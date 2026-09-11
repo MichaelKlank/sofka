@@ -342,7 +342,11 @@ async fn describe(request: &str, offline: bool, json: bool) -> Result<(), String
             description.installed_version.unwrap_or("no")
         );
         for requirement in description.requirements {
-            println!("requires: {} — {}", requirement.name, requirement.install);
+            println!(
+                "requires: {} — {}",
+                requirement_names(requirement),
+                requirement.install
+            );
         }
     }
     Ok(())
@@ -355,9 +359,7 @@ async fn install(requests: &[String], offline: bool) -> Result<(), String> {
     let config = crate::plugin_catalog::config_dir()?;
     let _lock = InstallLock::acquire(&config)?;
     let prepared = crate::plugin_install::prepare(&snapshot, requests, offline).await?;
-    activate(prepared)?;
-    println!("Run :reload in an existing sofka session to load the changes.");
-    Ok(())
+    activate(prepared).report()
 }
 
 async fn update(requested: &[String], offline: bool) -> Result<(), String> {
@@ -396,42 +398,125 @@ async fn update(requested: &[String], offline: bool) -> Result<(), String> {
     let snapshot = crate::plugin_catalog::load(offline).await?;
     offline_notice(&snapshot);
     let mut updates = Vec::new();
+    let mut unresolved = Vec::new();
     for id in ids {
-        let current = managed
+        let Some(current) = managed
             .get(id.as_str())
             .and_then(|package| package.version.as_deref())
             .and_then(|version| Version::parse(version).ok())
-            .ok_or_else(|| format!("plugin {id} has an invalid installed version"))?;
-        let selected = snapshot.catalog.select(&id)?;
-        let available = Version::parse(&selected.version.version)
-            .map_err(|e| format!("plugin {id} catalog version: {e}"))?;
-        if available > current {
-            updates.push(id);
-        } else {
+        else {
+            eprintln!("warning: {id} has an invalid installed version");
+            unresolved.push(id);
+            continue;
+        };
+        match update_plan(&snapshot.catalog, &id, &current) {
+            UpdatePlan::Newer => updates.push(id),
+            UpdatePlan::Current => println!("{id} is current at {current}"),
             // Nothing newer is not the same as nothing wrong: the version in
             // use may since have been withdrawn, and that is the one thing an
             // update run must not stay quiet about.
-            match installed_withdrawal(selected.plugin, &current.to_string()) {
-                Some(reason) => eprintln!(
-                    "warning: {id} is installed at {current}, which was withdrawn: {reason}; \
-                     the newest version sofka can install is {available}"
-                ),
-                None => println!("{id} is current at {current}"),
+            UpdatePlan::Withdrawn { reason, newest } => eprintln!(
+                "warning: {id} is installed at {current}, which was withdrawn: {reason}; \
+                 the newest version sofka can install is {newest}"
+            ),
+            UpdatePlan::Unavailable { error, withdrawn } => {
+                match withdrawn {
+                    Some(reason) => eprintln!(
+                        "warning: {id} is installed at {current}, which was withdrawn: \
+                         {reason}; sofka has no version to replace it with: {error}"
+                    ),
+                    None => eprintln!("warning: {id}: {error}"),
+                }
+                unresolved.push(id);
             }
         }
     }
-    if updates.is_empty() {
-        return Ok(());
+    if !updates.is_empty() {
+        report_missing_requirements(&snapshot, &updates)?;
+        let prepared = crate::plugin_install::prepare(&snapshot, &updates, offline).await?;
+        activate(prepared).report()?;
     }
-    report_missing_requirements(&snapshot, &updates)?;
-    let prepared = crate::plugin_install::prepare(&snapshot, &updates, offline).await?;
-    activate(prepared)?;
-    println!("Run :reload in an existing sofka session to load the changes.");
-    Ok(())
+    if unresolved.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("could not update: {}", unresolved.join(", ")))
+    }
 }
 
-fn activate(prepared: Vec<crate::plugin_install::PreparedPackage>) -> Result<(), String> {
+/// What an update run should do about one installed plugin. A plugin the
+/// catalog can no longer serve is that plugin's problem: reporting it as a
+/// plan rather than an error is what keeps it from cancelling the whole run.
+#[derive(Debug, PartialEq, Eq)]
+enum UpdatePlan {
+    Newer,
+    Current,
+    Withdrawn {
+        reason: String,
+        newest: String,
+    },
+    Unavailable {
+        error: String,
+        withdrawn: Option<String>,
+    },
+}
+
+fn update_plan(catalog: &Catalog, id: &str, current: &Version) -> UpdatePlan {
+    let installed = current.to_string();
+    let unavailable = |error: String| UpdatePlan::Unavailable {
+        withdrawn: catalog
+            .find(id)
+            .ok()
+            .and_then(|plugin| installed_withdrawal(plugin, &installed))
+            .map(str::to_owned),
+        error,
+    };
+    let selected = match catalog.select(id) {
+        Ok(selected) => selected,
+        Err(error) => return unavailable(error),
+    };
+    let available = match Version::parse(&selected.version.version) {
+        Ok(available) => available,
+        Err(e) => return unavailable(format!("catalog version {e}")),
+    };
+    if available > *current {
+        return UpdatePlan::Newer;
+    }
+    match installed_withdrawal(selected.plugin, &installed) {
+        Some(reason) => UpdatePlan::Withdrawn {
+            reason: reason.to_owned(),
+            newest: available.to_string(),
+        },
+        None => UpdatePlan::Current,
+    }
+}
+
+/// What an activation batch left behind: whether anything reached the plugins
+/// directory, and which packages did not. A package that fails after an earlier
+/// one succeeded still leaves a running session holding stale packages, so the
+/// two answers are kept apart.
+struct Activated {
+    any: bool,
+    failed: Vec<String>,
+}
+
+impl Activated {
+    fn report(self) -> Result<(), String> {
+        // Ordered before the failure: what already went in has to be reloaded
+        // whether or not a later package in the same batch made it.
+        if self.any {
+            println!("Run :reload in an existing sofka session to load the changes.");
+        }
+        if self.failed.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("failed to activate: {}", self.failed.join(", ")))
+        }
+    }
+}
+
+fn activate(prepared: Vec<crate::plugin_install::PreparedPackage>) -> Activated {
     let mut failed = Vec::new();
+    let mut any = false;
     for package in prepared {
         let id = package.id.clone();
         let version = package.version.clone();
@@ -443,26 +528,25 @@ fn activate(prepared: Vec<crate::plugin_install::PreparedPackage>) -> Result<(),
             );
         }
         match package.activate() {
-            Ok(action) => println!(
-                "{} {id}@{version}",
-                match action {
-                    Activation::Installed => "installed",
-                    Activation::Updated => "updated",
-                    Activation::RolledBack => "rolled back",
-                    Activation::Unchanged => "already installed",
-                }
-            ),
+            Ok(action) => {
+                any = true;
+                println!(
+                    "{} {id}@{version}",
+                    match action {
+                        Activation::Installed => "installed",
+                        Activation::Updated => "updated",
+                        Activation::RolledBack => "rolled back",
+                        Activation::Unchanged => "already installed",
+                    }
+                );
+            }
             Err(error) => {
                 eprintln!("{id}: {error}");
                 failed.push(id);
             }
         }
     }
-    if failed.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("failed to activate: {}", failed.join(", ")))
-    }
+    Activated { any, failed }
 }
 
 fn list(json: bool) -> Result<(), String> {
@@ -534,11 +618,11 @@ fn remove(ids: &[String]) -> Result<(), String> {
     for (id, path) in removed {
         println!("removed {id} from {}", path.display());
     }
-    if let Some(error) = failure {
-        return Err(error);
-    }
     if any {
         println!("Run :reload in an existing sofka session to load the changes.");
+    }
+    if let Some(error) = failure {
+        return Err(error);
     }
     Ok(())
 }
@@ -551,6 +635,16 @@ fn report_missing_requirements(
         eprintln!("warning: {warning}");
     }
     Ok(())
+}
+
+/// The requirement's command and every alternative that satisfies it. Describe
+/// and the missing-tool warning have to agree: a user who already has the
+/// alternative installed needs both to say so.
+fn requirement_names(requirement: &crate::plugin_catalog::RuntimeRequirement) -> String {
+    std::iter::once(requirement.name.as_str())
+        .chain(requirement.alternatives.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" or ")
 }
 
 /// External tools a request needs but this machine does not have. Reported, not
@@ -569,13 +663,11 @@ fn missing_requirements(
                     .chain(&requirement.alternatives)
                     .all(|name| crate::plugins::executable(name).is_none())
             {
-                let names = std::iter::once(requirement.name.as_str())
-                    .chain(requirement.alternatives.iter().map(String::as_str))
-                    .collect::<Vec<_>>()
-                    .join(" or ");
                 warnings.push(format!(
                     "{} requires {} — {}",
-                    selection.plugin.id, names, requirement.install
+                    selection.plugin.id,
+                    requirement_names(requirement),
+                    requirement.install
                 ));
             }
         }
@@ -1009,9 +1101,12 @@ mod tests {
                 config.join(".plugin-stage-bad-absent"),
                 bad.clone(),
             ),
-        ])
-        .unwrap_err();
+        ]);
 
+        // The success is reported apart from the failure, so the reload notice
+        // still reaches a session holding the package that did land.
+        assert!(error.any);
+        let error = error.report().unwrap_err();
         assert_eq!(error, "failed to activate: bad");
         assert_eq!(
             std::fs::read_to_string(good.join("plugin.toml")).unwrap(),
@@ -1080,5 +1175,98 @@ mod tests {
             .iter()
             .filter_map(|package| Some((package.id.clone(), package.version.clone()?)))
             .collect()
+    }
+
+    #[test]
+    fn update_plans_a_newer_release_a_current_one_and_a_recalled_one() {
+        let version = |v: &str| Version::parse(v).unwrap();
+        let active = catalog(serde_json::json!([
+            release("1.0.0", "active", None),
+            release("2.0.0", "active", None),
+        ]));
+        assert_eq!(
+            update_plan(&active, "resource-summary", &version("1.0.0")),
+            UpdatePlan::Newer
+        );
+        assert_eq!(
+            update_plan(&active, "resource-summary", &version("2.0.0")),
+            UpdatePlan::Current
+        );
+
+        let recalled = catalog(serde_json::json!([
+            release("0.1.0", "active", None),
+            release("0.2.0", "withdrawn", Some("corrupts reports")),
+        ]));
+        assert_eq!(
+            update_plan(&recalled, "resource-summary", &version("0.2.0")),
+            UpdatePlan::Withdrawn {
+                reason: "corrupts reports".into(),
+                newest: "0.1.0".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn one_plugin_the_catalog_cannot_serve_never_cancels_an_update_run() {
+        let version = |v: &str| Version::parse(v).unwrap();
+        // Every release recalled, so there is nothing to update to. This used
+        // to abort the run and skip every other installed plugin with it.
+        let catalog = catalog(serde_json::json!([release(
+            "1.0.0",
+            "withdrawn",
+            Some("leaks secrets")
+        )]));
+        assert_eq!(
+            update_plan(&catalog, "resource-summary", &version("1.0.0")),
+            UpdatePlan::Unavailable {
+                error: "plugin resource-summary has no compatible stable version".into(),
+                // The reason the installed version is unusable is the part the
+                // run exists to say, and it survives the failure to select.
+                withdrawn: Some("leaks secrets".into()),
+            }
+        );
+        // A plugin the catalog dropped is reported the same way, not fatally.
+        assert_eq!(
+            update_plan(&catalog, "departed", &version("1.0.0")),
+            UpdatePlan::Unavailable {
+                error: "unknown plugin \"departed\"".into(),
+                withdrawn: None,
+            }
+        );
+    }
+
+    #[test]
+    fn describe_names_every_command_that_satisfies_a_requirement() {
+        let mut versions = serde_json::json!([release("1.0.0", "active", None)]);
+        versions[0]["requirements"] = serde_json::json!([
+            {
+                "name": "popeye",
+                "alternatives": ["kubectl-popeye"],
+                "install": "brew install derailed/popeye/popeye"
+            },
+            {"name": "jq", "install": "brew install jq"},
+        ]);
+        let snapshot = snapshot(versions);
+        let (plugin, release) = described_release(&snapshot, "resource-summary").unwrap();
+        let lines: Vec<_> = description(plugin, release, None)
+            .requirements
+            .iter()
+            .map(|requirement| {
+                format!(
+                    "requires: {} — {}",
+                    requirement_names(requirement),
+                    requirement.install
+                )
+            })
+            .collect();
+        // The text view printed the bare name, so a user who already had the
+        // alternative installed could not tell that it counted.
+        assert_eq!(
+            lines,
+            [
+                "requires: popeye or kubectl-popeye — brew install derailed/popeye/popeye",
+                "requires: jq — brew install jq",
+            ]
+        );
     }
 }
