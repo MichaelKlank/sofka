@@ -387,6 +387,29 @@ A cluster-scoped kind naming a namespaced one must set it - there is no row
 namespace to fall back on - or the view reports the rule as unfollowable
 instead of quietly finding nothing.
 
+When the target kind is itself a field of the object - an ExternalSecret's
+`secretStoreRef` names a SecretStore or a ClusterSecretStore - `kind_path`
+reads it from the same element `path` did, and `kinds` lists what it may be:
+
+```toml
+[[views.externalsecrets.refs]]
+path      = "/spec/secretStoreRef/name"
+kind      = "secretstores"                # default when the element has no kind
+kind_path = "/spec/secretStoreRef/kind"
+kinds     = ["secretstores", "clustersecretstores"]
+relation  = "reads from"
+```
+
+The value at `kind_path` is matched against each candidate's kind, plural, or
+group-qualified plural, so `SecretStore` and `secretstores` both work. An
+element naming a kind outside `kinds` - a `User` or `Group` among a
+ClusterRoleBinding's subjects - contributes nothing. With `kind` set, an
+element without a kind takes it; without, the element is skipped. Read
+backwards, the rule applies when any candidate is the selected kind, and an
+object matches only when its element names that kind. Candidates that are
+namespaced and cluster-scoped mix freely: `namespace_path` applies to the
+namespaced ones.
+
 Each lookup reads the current source object. Press `r` to include changes to
 its references, such as a new pod node assignment or PVC binding. If the source
 was deleted or replaced, the view reports the error. Return to the table to

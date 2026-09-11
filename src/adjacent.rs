@@ -78,9 +78,25 @@ pub struct RefRule {
     pub namespace_path: Option<String>,
     /// Target kind (alias, plural, or kind), resolved against the cluster.
     pub kind: String,
+    pub kind_path: Option<String>,
+    pub kinds: Vec<String>,
     /// Relation label shown on the row: "mounts", "runs on".
     pub relation: String,
     pub reverse: Reverse,
+}
+
+impl RefRule {
+    pub fn is_dynamic(&self) -> bool {
+        self.kind_path.is_some()
+    }
+
+    pub fn target_label(&self) -> String {
+        if self.kinds.is_empty() {
+            self.kind.clone()
+        } else {
+            self.kinds.join("|")
+        }
+    }
 }
 
 struct BuiltinRef {
@@ -99,6 +115,8 @@ impl BuiltinRef {
             path: self.path.to_string(),
             namespace_path: self.namespace_path.map(str::to_string),
             kind: self.kind.to_string(),
+            kind_path: None,
+            kinds: Vec::new(),
             relation: self.relation.to_string(),
             reverse: self.reverse,
         }
@@ -435,20 +453,52 @@ pub fn pointer_pairs(
     path: &str,
     namespace_path: Option<&str>,
 ) -> Vec<(String, Option<String>)> {
+    pointer_hits(obj, path, namespace_path, None)
+        .into_iter()
+        .map(|hit| (hit.name, hit.namespace))
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hit {
+    pub name: String,
+    pub namespace: Option<String>,
+    pub kind: Option<String>,
+}
+
+pub fn pointer_hits(
+    obj: &Value,
+    path: &str,
+    namespace_path: Option<&str>,
+    kind_path: Option<&str>,
+) -> Vec<Hit> {
     let Some(segs) = segments(path) else {
         return Vec::new();
     };
     let mut hits = Vec::new();
     expand(obj, &segs, &mut Vec::new(), &mut hits);
     let ns_segs = namespace_path.and_then(segments);
+    let kind_segs = kind_path.and_then(segments);
     hits.into_iter()
-        .map(|(taken, name)| {
-            let ns = ns_segs
+        .map(|(taken, name)| Hit {
+            name,
+            namespace: ns_segs
                 .as_deref()
-                .and_then(|segs| value_at(obj, segs, &taken));
-            (name, ns)
+                .and_then(|segs| value_at(obj, segs, &taken)),
+            kind: kind_segs
+                .as_deref()
+                .and_then(|segs| value_at(obj, segs, &taken)),
         })
         .collect()
+}
+
+fn rule_hits(obj: &Value, rule: &RefRule) -> Vec<Hit> {
+    pointer_hits(
+        obj,
+        &rule.path,
+        rule.namespace_path.as_deref(),
+        rule.kind_path.as_deref(),
+    )
 }
 
 /// The string at a pointer whose `*`s are filled from `indices`, in order.
@@ -578,43 +628,68 @@ pub fn plan(
     // A rule whose target kind isn't served here — a class from a CSI driver
     // that isn't installed — simply contributes nothing.
     for rule in rules_for(views, &source.ar, row_ns) {
-        let Some(target) = kinds.by_name(&rule.kind) else {
+        let targets = Targets::resolve(kinds, &rule);
+        if targets.all.is_empty() {
             continue;
-        };
-        if let Some(why) = unreachable_namespace(&rule, source.namespaced, target.namespaced) {
+        }
+        if !rule.is_dynamic()
+            && let Some(why) =
+                unreachable_namespace(&rule, source.namespaced, targets.all[0].namespaced)
+        {
             plan.warns.push(why);
             continue;
         }
-        let mut refs: Vec<(String, String)> = Vec::new();
-        for (name, target_ns) in pointer_pairs(&value, &rule.path, rule.namespace_path.as_deref()) {
-            match target_ns {
-                Some(target_ns) => refs.push((name, target_ns)),
+        let mut forwards: Vec<Forward> = Vec::new();
+        for hit in rule_hits(&value, &rule) {
+            let Some(target) = targets.pick(&rule, hit.kind.as_deref()) else {
+                continue;
+            };
+            if rule.is_dynamic()
+                && let Some(why) =
+                    unreachable_namespace(&rule, source.namespaced, target.namespaced)
+            {
+                if !plan.warns.contains(&why) {
+                    plan.warns.push(why);
+                }
+                continue;
+            }
+            let target_ns = match hit.namespace {
+                Some(target_ns) => target_ns,
                 // The row's own namespace covers a missing one — unless the
                 // row has none: then there is nowhere to read, and a GET in
                 // no namespace would quietly find nothing.
-                None if !target.namespaced || !ns.is_empty() => refs.push((name, ns.clone())),
+                None if !target.namespaced || !ns.is_empty() => ns.clone(),
                 None => {
                     plan.warns.push(format!(
-                        "ref {} → {}: {name} has no namespace at {}",
+                        "ref {} → {}: {} has no namespace at {}",
                         rule.from,
-                        rule.kind,
+                        rule.target_label(),
+                        hit.name,
                         rule.namespace_path.as_deref().unwrap_or_default()
                     ));
+                    continue;
                 }
+            };
+            match forwards.iter_mut().find(|f| f.target == *target) {
+                Some(forward) => forward.refs.push((hit.name, target_ns)),
+                None => forwards.push(Forward {
+                    rule: rule.clone(),
+                    target: target.clone(),
+                    refs: vec![(hit.name, target_ns)],
+                }),
             }
         }
-        if !refs.is_empty() {
-            plan.forward.push(Forward { rule, target, refs });
-        }
+        plan.forward.extend(forwards);
     }
     for rule in all_rules(views) {
         if rule.reverse == Reverse::None {
             continue;
         }
-        let Some(target) = kinds.by_name(&rule.kind) else {
-            continue;
-        };
-        if target.ar.plural != source.ar.plural || target.ar.group != source.ar.group {
+        if !Targets::resolve(kinds, &rule)
+            .all
+            .iter()
+            .any(|t| same_kind(t, source))
+        {
             continue;
         }
         let Some(from) = resolve_view_key(kinds, &rule.from) else {
@@ -636,6 +711,61 @@ pub fn plan(
     plan
 }
 
+struct Targets {
+    all: Vec<KindRef>,
+    default: Option<KindRef>,
+}
+
+impl Targets {
+    fn resolve(kinds: &impl Kinds, rule: &RefRule) -> Self {
+        let default = (!rule.kind.is_empty())
+            .then(|| kinds.by_name(&rule.kind))
+            .flatten();
+        if !rule.is_dynamic() {
+            return Self {
+                all: default.clone().into_iter().collect(),
+                default,
+            };
+        }
+        let mut all: Vec<KindRef> = Vec::new();
+        for candidate in rule.kinds.iter().filter_map(|k| kinds.by_name(k)) {
+            if !all.iter().any(|t| same_kind(t, &candidate)) {
+                all.push(candidate);
+            }
+        }
+        if let Some(d) = &default
+            && !all.iter().any(|t| same_kind(t, d))
+        {
+            all.push(d.clone());
+        }
+        Self { all, default }
+    }
+
+    fn pick(&self, rule: &RefRule, named: Option<&str>) -> Option<&KindRef> {
+        if !rule.is_dynamic() {
+            return self.all.first();
+        }
+        match named {
+            Some(named) => self.all.iter().find(|t| kind_is_named(t, named)),
+            None => self
+                .default
+                .as_ref()
+                .and_then(|d| self.all.iter().find(|t| same_kind(t, d))),
+        }
+    }
+}
+
+fn same_kind(a: &KindRef, b: &KindRef) -> bool {
+    a.ar.plural == b.ar.plural && a.ar.group == b.ar.group
+}
+
+fn kind_is_named(kind: &KindRef, name: &str) -> bool {
+    kind.ar.kind.eq_ignore_ascii_case(name)
+        || kind.plural.eq_ignore_ascii_case(name)
+        || (!kind.ar.group.is_empty()
+            && format!("{}.{}", kind.plural, kind.ar.group).eq_ignore_ascii_case(name))
+}
+
 /// Why a rule can't be followed: a cluster-scoped object naming a namespaced
 /// one says nothing about which namespace, unless `namespace_path` does.
 /// Better one warning than a GET in no namespace that quietly finds nothing.
@@ -647,7 +777,8 @@ fn unreachable_namespace(
     (!from_namespaced && to_namespaced && rule.namespace_path.is_none()).then(|| {
         format!(
             "ref {} → {}: a namespaced kind named from a cluster-scoped one needs namespace_path",
-            rule.from, rule.kind
+            rule.from,
+            rule.target_label()
         )
     })
 }
@@ -672,25 +803,34 @@ pub fn owned_by(o: &DynamicObject, uid: Option<&str>) -> bool {
 pub fn names_source(
     o: &DynamicObject,
     rule: &RefRule,
+    source: &KindRef,
     source_name: &str,
     source_ns: Option<&str>,
 ) -> bool {
     let value = serde_json::to_value(o).unwrap_or(Value::Null);
-    pointer_pairs(&value, &rule.path, rule.namespace_path.as_deref())
-        .into_iter()
-        .any(|(name, named_ns)| {
-            if name != source_name {
-                return false;
-            }
-            let Some(source_ns) = source_ns else {
-                return true;
-            };
-            let named_ns = match &rule.namespace_path {
-                Some(_) => named_ns,
-                None => o.metadata.namespace.clone(),
-            };
-            named_ns.as_deref() == Some(source_ns)
-        })
+    rule_hits(&value, rule).into_iter().any(|hit| {
+        if hit.name != source_name || !hit_names_kind(rule, hit.kind.as_deref(), source) {
+            return false;
+        }
+        let Some(source_ns) = source_ns else {
+            return true;
+        };
+        let named_ns = match &rule.namespace_path {
+            Some(_) => hit.namespace,
+            None => o.metadata.namespace.clone(),
+        };
+        named_ns.as_deref() == Some(source_ns)
+    })
+}
+
+fn hit_names_kind(rule: &RefRule, named: Option<&str>, source: &KindRef) -> bool {
+    if !rule.is_dynamic() {
+        return true;
+    }
+    match named {
+        Some(named) => kind_is_named(source, named),
+        None => !rule.kind.is_empty() && kind_is_named(source, &rule.kind),
+    }
 }
 
 /// Drop repeats — the same object reached the same way twice, as a ConfigMap
@@ -1220,12 +1360,19 @@ mod tests {
             .into_iter()
             .find(|r| r.path.contains("persistentVolumeClaim"))
             .unwrap();
+        let pvc = kind("", "PersistentVolumeClaim", "persistentvolumeclaims", true);
         // Same name in the same namespace: a match; same name elsewhere: not.
-        assert!(names_source(&pod, &mounts, "data-db-0", Some("db")));
-        assert!(!names_source(&pod, &mounts, "data-db-0", Some("other")));
-        assert!(!names_source(&pod, &mounts, "wal-db-0", Some("db")));
+        assert!(names_source(&pod, &mounts, &pvc, "data-db-0", Some("db")));
+        assert!(!names_source(
+            &pod,
+            &mounts,
+            &pvc,
+            "data-db-0",
+            Some("other")
+        ));
+        assert!(!names_source(&pod, &mounts, &pvc, "wal-db-0", Some("db")));
         // A cluster-scoped selection has no namespace to match.
-        assert!(names_source(&pod, &mounts, "data-db-0", None));
+        assert!(names_source(&pod, &mounts, &pvc, "data-db-0", None));
 
         // With a namespace path, the pointed-at namespace decides, not the
         // referencing object's own.
@@ -1240,8 +1387,248 @@ mod tests {
         .into_iter()
         .find(|r| r.namespace_path.is_some())
         .unwrap();
-        assert!(names_source(&pv, &bound, "data-db-0", Some("db")));
-        assert!(!names_source(&pv, &bound, "data-db-0", Some("other")));
+        assert!(names_source(&pv, &bound, &pvc, "data-db-0", Some("db")));
+        assert!(!names_source(&pv, &bound, &pvc, "data-db-0", Some("other")));
+    }
+
+    #[test]
+    fn a_dynamic_kind_is_read_from_the_object() {
+        let (views, warnings) = crate::views::compile(
+            &toml::from_str::<crate::config::Config>(
+                r#"
+                [[views.externalsecrets.refs]]
+                path = "/spec/secretStoreRef/name"
+                kind = "secretstores"
+                kind_path = "/spec/secretStoreRef/kind"
+                kinds = ["secretstores", "clustersecretstores"]
+                relation = "reads from"
+
+                [[views.clusterrolebindings.refs]]
+                path = "/subjects/*/name"
+                namespace_path = "/subjects/*/namespace"
+                kind_path = "/subjects/*/kind"
+                kinds = ["serviceaccounts"]
+                relation = "binds"
+                reverse = "cluster"
+                "#,
+            )
+            .unwrap()
+            .views,
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut kinds = cluster();
+        kinds.0.extend([
+            kind("", "ServiceAccount", "serviceaccounts", true),
+            kind(
+                "rbac.authorization.k8s.io",
+                "ClusterRoleBinding",
+                "clusterrolebindings",
+                false,
+            ),
+            kind(
+                "external-secrets.io",
+                "ExternalSecret",
+                "externalsecrets",
+                true,
+            ),
+            kind("external-secrets.io", "SecretStore", "secretstores", true),
+            kind(
+                "external-secrets.io",
+                "ClusterSecretStore",
+                "clustersecretstores",
+                false,
+            ),
+        ]);
+        let es = kind(
+            "external-secrets.io",
+            "ExternalSecret",
+            "externalsecrets",
+            true,
+        );
+        let forward_to = |value: Value| {
+            let plan = self::plan(&views, &kinds, &es, &obj(value), "shop");
+            assert!(plan.warns.is_empty(), "{:?}", plan.warns);
+            plan.forward
+                .into_iter()
+                .map(|f| (f.target.plural, f.refs))
+                .collect::<Vec<_>>()
+        };
+        let es_obj = |store_ref: Value| {
+            json!({"apiVersion": "external-secrets.io/v1", "kind": "ExternalSecret",
+                "metadata": {"name": "db", "namespace": "shop"},
+                "spec": {"secretStoreRef": store_ref}})
+        };
+        assert_eq!(
+            forward_to(es_obj(
+                json!({"name": "vault", "kind": "ClusterSecretStore"})
+            )),
+            [(
+                "clustersecretstores".to_string(),
+                vec![("vault".to_string(), "shop".to_string())]
+            )]
+        );
+        assert_eq!(
+            forward_to(es_obj(json!({"name": "local", "kind": "SecretStore"}))),
+            [(
+                "secretstores".to_string(),
+                vec![("local".to_string(), "shop".to_string())]
+            )]
+        );
+        assert_eq!(
+            forward_to(es_obj(json!({"name": "local"}))),
+            [(
+                "secretstores".to_string(),
+                vec![("local".to_string(), "shop".to_string())]
+            )]
+        );
+        assert!(forward_to(es_obj(json!({"name": "x", "kind": "Widget"}))).is_empty());
+
+        let crb = obj(
+            json!({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRoleBinding",
+            "metadata": {"name": "admins"},
+            "subjects": [
+                {"kind": "User", "name": "alice"},
+                {"kind": "ServiceAccount", "name": "deployer", "namespace": "ci"},
+                {"kind": "Group", "name": "ops"},
+                {"kind": "ServiceAccount", "name": "reader", "namespace": "audit"},
+            ]}),
+        );
+        let crb_kind = kind(
+            "rbac.authorization.k8s.io",
+            "ClusterRoleBinding",
+            "clusterrolebindings",
+            false,
+        );
+        let plan = self::plan(&views, &kinds, &crb_kind, &crb, "");
+        assert!(plan.warns.is_empty(), "{:?}", plan.warns);
+        assert_eq!(plan.forward.len(), 1);
+        assert_eq!(plan.forward[0].target.plural, "serviceaccounts");
+        assert_eq!(
+            plan.forward[0].refs,
+            [
+                ("deployer".to_string(), "ci".to_string()),
+                ("reader".to_string(), "audit".to_string()),
+            ]
+        );
+
+        let store = kind("external-secrets.io", "SecretStore", "secretstores", true);
+        let cluster_store = kind(
+            "external-secrets.io",
+            "ClusterSecretStore",
+            "clustersecretstores",
+            false,
+        );
+        let store_obj = obj(
+            json!({"apiVersion": "external-secrets.io/v1", "kind": "SecretStore",
+            "metadata": {"name": "local", "namespace": "shop"}}),
+        );
+        let plan = self::plan(&views, &kinds, &store, &store_obj, "shop");
+        let back = plan
+            .backward
+            .iter()
+            .find(|b| b.from.plural == "externalsecrets")
+            .expect("externalsecrets are listed for a store");
+        assert_eq!(back.scope, "shop");
+        let rule = &back.rule;
+        let names_local = obj(es_obj(json!({"name": "local", "kind": "SecretStore"})));
+        let names_default = obj(es_obj(json!({"name": "local"})));
+        let names_cluster = obj(es_obj(
+            json!({"name": "local", "kind": "ClusterSecretStore"}),
+        ));
+        assert!(names_source(
+            &names_local,
+            rule,
+            &store,
+            "local",
+            Some("shop")
+        ));
+        assert!(names_source(
+            &names_default,
+            rule,
+            &store,
+            "local",
+            Some("shop")
+        ));
+        assert!(!names_source(
+            &names_cluster,
+            rule,
+            &store,
+            "local",
+            Some("shop")
+        ));
+        assert!(names_source(
+            &names_cluster,
+            rule,
+            &cluster_store,
+            "local",
+            None
+        ));
+        assert!(!names_source(
+            &names_default,
+            rule,
+            &cluster_store,
+            "local",
+            None
+        ));
+        assert!(!names_source(
+            &names_local,
+            rule,
+            &cluster_store,
+            "local",
+            None
+        ));
+        let secret = obj(json!({"apiVersion": "v1", "kind": "Secret",
+            "metadata": {"name": "local", "namespace": "shop"}}));
+        let plan = self::plan(
+            &views,
+            &kinds,
+            &kind("", "Secret", "secrets", true),
+            &secret,
+            "shop",
+        );
+        assert!(
+            plan.backward
+                .iter()
+                .all(|b| b.from.plural != "externalsecrets")
+        );
+    }
+
+    #[test]
+    fn a_dynamic_kind_needs_its_candidates() {
+        let (views, warnings) = crate::views::compile(
+            &toml::from_str::<crate::config::Config>(
+                r#"
+                [[views.externalsecrets.refs]]
+                path = "/spec/secretStoreRef/name"
+                kind_path = "/spec/secretStoreRef/kind"
+
+                [[views.externalsecrets.refs]]
+                path = "/spec/secretStoreRef/name"
+                kinds = ["secretstores"]
+
+                [[views.externalsecrets.refs]]
+                path = "/spec/secretStoreRef/name"
+                kind_path = "spec/secretStoreRef/kind"
+                kinds = ["secretstores"]
+
+                [[views.externalsecrets.refs]]
+                path = "/spec/secretStoreRef/name"
+                kind_path = "/spec/secretStoreRef/kind"
+                kinds = ["SecretStores", " "]
+                "#,
+            )
+            .unwrap()
+            .views,
+        );
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[0].contains("ref 1") && warnings[0].contains("kinds"));
+        assert!(warnings[1].contains("ref 2") && warnings[1].contains("kind_path"));
+        assert!(warnings[2].contains("ref 3") && warnings[2].contains("JSON Pointer"));
+        let rules = &views["externalsecrets"].refs;
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].kinds, ["secretstores"]);
+        assert_eq!(rules[0].kind, "");
+        assert!(rules[0].is_dynamic());
     }
 
     #[test]

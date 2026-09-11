@@ -304,8 +304,10 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   the objects whose specs name it (the pods mounting a claim, the claims using
   a class). `⏎` opens one in its regular view, `y`/`d` show its YAML or
   describe. Relations are data: a built-in table for core kinds, extended per
-  CRD with `[[views."…".refs]]` and `children`. Reverse lookups stay in the
-  row's namespace unless the rule says `cluster`.
+  CRD with `[[views."…".refs]]` and `children`. A ref whose target kind is a
+  field of the object (an ExternalSecret's `secretStoreRef.kind`) reads it
+  with `kind_path` from a list of candidate `kinds`. Reverse lookups stay in
+  the row's namespace unless the rule says `cluster`.
   Press `c` in this view to discover direct children of a namespaced custom
   resource with a UID, including resources with no configured child kinds.
   Wait for the initial adjacent lookup to finish first. The search uses API

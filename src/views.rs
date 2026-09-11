@@ -495,12 +495,31 @@ pub fn compile(
         for (index, r) in cfg.refs.iter().enumerate() {
             let path = r.path.trim();
             let kind = r.kind.trim();
+            let kind_path = r
+                .kind_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty());
+            let kinds: Vec<String> = r
+                .kinds
+                .iter()
+                .map(|k| k.trim().to_lowercase())
+                .filter(|k| !k.is_empty())
+                .collect();
             let mut problem = None;
             if !path.starts_with('/') {
                 problem = Some(format!(
                     "path '{path}' is not a JSON Pointer (must start with '/')"
                 ));
-            } else if kind.is_empty() {
+            } else if let Some(p) = kind_path
+                && !p.starts_with('/')
+            {
+                problem = Some(format!("kind_path '{p}' is not a JSON Pointer"));
+            } else if kind_path.is_some() && kinds.is_empty() {
+                problem = Some("kind_path needs kinds, the kinds it may name".to_string());
+            } else if kind_path.is_none() && !kinds.is_empty() {
+                problem = Some("kinds needs kind_path, where the kind is read from".to_string());
+            } else if kind_path.is_none() && kind.is_empty() {
                 problem = Some("kind is empty".to_string());
             } else if let Some(p) = r.namespace_path.as_deref().map(str::trim)
                 && !p.starts_with('/')
@@ -533,6 +552,8 @@ pub fn compile(
                     .map(str::trim)
                     .map(str::to_string),
                 kind: kind.to_string(),
+                kind_path: kind_path.map(str::to_string),
+                kinds,
                 relation: r
                     .relation
                     .as_deref()
