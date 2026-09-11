@@ -728,12 +728,9 @@ fn extract_bounded(
             .path()
             .map_err(|e| format!("invalid archive path: {e}"))?
             .into_owned();
-        validate_relative_path(&path)?;
-        let normalized = path
-            .to_str()
-            .ok_or_else(|| "archive path is not UTF-8".to_string())?
-            .replace('\\', "/");
-        if !paths.insert(normalized) {
+        let kind = entry.header().entry_type();
+        let normalized = validate_relative_path(&path, kind.is_dir())?;
+        if !paths.insert(normalized.clone()) {
             return Err(format!("duplicate archive path {}", path.display()));
         }
         // Every entry counts, whatever its type: a directory that declares a
@@ -745,7 +742,6 @@ fn extract_bounded(
             return Err(beyond_limit(limit));
         }
         let target = destination.join(&path);
-        let kind = entry.header().entry_type();
         if kind.is_dir() {
             std::fs::create_dir_all(&target)
                 .map_err(|e| format!("creating {}: {e}", target.display()))?;
@@ -772,12 +768,10 @@ fn extract_bounded(
         };
         std::io::copy(&mut entry, &mut output)
             .map_err(|e| format!("extracting {}: {e}", target.display()))?;
-        let relative = path
-            .to_str()
-            .expect("archive path checked as UTF-8")
-            .replace('\\', "/");
+        // The validated spelling, not the archive's: one value decides both
+        // what is written and what the record says about it.
         files.insert(
-            relative,
+            normalized,
             plugin_catalog::hex(output.hasher.finalize().as_bytes()),
         );
         output
@@ -803,7 +797,7 @@ fn extract_bounded(
     Ok(files)
 }
 
-fn validate_relative_path(path: &Path) -> Result<(), String> {
+fn validate_relative_path(path: &Path, directory: bool) -> Result<String, String> {
     if path.as_os_str().is_empty()
         || path
             .components()
@@ -811,19 +805,43 @@ fn validate_relative_path(path: &Path) -> Result<(), String> {
     {
         return Err(format!("unsafe archive path {}", path.display()));
     }
+    let raw = path
+        .to_str()
+        .ok_or_else(|| "archive path is not UTF-8".to_string())?;
+    // A backslash is a separator on Windows but a filename character on Unix.
+    // Refusing it gives one installation record the same meaning everywhere.
+    if raw.contains('\\') {
+        return Err(format!(
+            "archive path {} contains a backslash",
+            path.display()
+        ));
+    }
+    if matches!(raw, RECORD | STAGE_MARKER) {
+        return Err(format!("archive path {raw} is reserved by sofka"));
+    }
     // `bin/./data` has only normal components — Rust drops the `.` while
     // iterating — but it is written to disk as `bin/data`. Recording the
     // spelling from the archive would then never match the file that was
     // created, and the package would look modified the moment it installed.
     // Compared as strings, not as paths: `Path`'s own equality is
     // component-wise, so it considers `bin/./data` equal to `bin/data`.
-    if path.components().collect::<PathBuf>().as_os_str() != path.as_os_str() {
+    let recorded = if directory {
+        raw.strip_suffix('/').unwrap_or(raw)
+    } else {
+        raw
+    };
+    let plain = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    if plain != recorded {
         return Err(format!(
             "archive path {} is not in its plain form",
             path.display()
         ));
     }
-    Ok(())
+    Ok(plain)
 }
 
 fn ensure_directory_path(path: &Path) -> Result<(), String> {
@@ -1461,11 +1479,11 @@ mod tests {
         // `bin/data`, so the recorded path would never match the file.
         for spelling in ["bin/./data", "./plugin.toml", "a/b/./c"] {
             assert!(
-                validate_relative_path(Path::new(spelling)).is_err(),
+                validate_relative_path(Path::new(spelling), false).is_err(),
                 "accepted {spelling}"
             );
         }
-        validate_relative_path(Path::new("bin/data")).unwrap();
+        validate_relative_path(Path::new("bin/data"), false).unwrap();
     }
 
     #[tokio::test]
@@ -1790,6 +1808,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[tokio::test]
+    async fn a_package_with_directories_installs_and_verifies_clean() {
+        let config = scratch("explicit-directories");
+        let cache = config.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        // An explicit directory entry, the kind every ordinary tar writes.
+        let bytes = {
+            let path = cache.join("built.tar.zst");
+            archive(
+                &path,
+                &[
+                    ("plugin.toml", MANIFEST.as_bytes(), tar::EntryType::Regular),
+                    ("bin/", b"", tar::EntryType::Directory),
+                    ("bin/adapter", b"binary", tar::EntryType::Regular),
+                ],
+            );
+            std::fs::read(&path).unwrap()
+        };
+        let digest = plugin_catalog::digest(&bytes);
+        let stored = cache.join("artifacts").join(format!("{digest}.tar.zst"));
+        std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        std::fs::write(&stored, &bytes).unwrap();
+        let mut snapshot = published(&cache, "sample", "1.0.0", MANIFEST);
+        let artifact = &mut snapshot.catalog.plugins[0].versions[0].artifacts[0];
+        artifact.blake3 = digest;
+        artifact.size = bytes.len() as u64;
+
+        let prepared = prepare_below(&config, &cache, &snapshot, &["sample".to_string()], true)
+            .await
+            .unwrap();
+        prepared.into_iter().next().unwrap().activate().unwrap();
+
+        // The whole point: it must not be modified the instant it installs.
+        let destination = config.join("plugins").join("sample");
+        let record = read_record(&destination).unwrap();
+        assert!(record.files.contains_key("bin/adapter"));
+        verify_record(&destination, &record).unwrap();
+        assert!(!installed_in(&config.join("plugins")).unwrap()[0].modified);
+        let _ = std::fs::remove_dir_all(config);
+    }
+
     #[test]
     fn extraction_requires_a_manifest_at_the_root_and_caps_the_entry_count() {
         let dir = scratch("extract-shape");
@@ -1875,11 +1934,20 @@ mod tests {
     fn archive_paths_must_be_plain_relative_components() {
         for bad in ["", ".", "../escape", "/absolute", "dir/../escape"] {
             assert!(
-                validate_relative_path(Path::new(bad)).is_err(),
+                validate_relative_path(Path::new(bad), false).is_err(),
                 "accepted {bad}"
             );
         }
-        assert!(validate_relative_path(Path::new("bin/adapter")).is_ok());
+        assert!(validate_relative_path(Path::new("bin/adapter"), false).is_ok());
+        assert!(validate_relative_path(Path::new("bin\\adapter"), false).is_err());
+        assert!(validate_relative_path(Path::new(RECORD), false).is_err());
+        assert!(validate_relative_path(Path::new(STAGE_MARKER), false).is_err());
+        assert_eq!(
+            validate_relative_path(Path::new("bin/"), true).unwrap(),
+            "bin"
+        );
+        assert!(validate_relative_path(Path::new("bin/"), false).is_err());
+        assert!(validate_relative_path(Path::new("bin//"), true).is_err());
     }
 
     #[test]
@@ -1957,6 +2025,39 @@ mod tests {
         let output = dir.join("linked");
         std::fs::create_dir(&output).unwrap();
         assert!(extract(&linked, &output).unwrap_err().contains("link"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn extraction_accepts_directory_entries_and_refuses_unrecordable_names() {
+        let dir = scratch("archive-record-paths");
+        let directories = dir.join("directories.tar.zst");
+        archive(
+            &directories,
+            &[
+                ("plugin.toml", b"manifest", tar::EntryType::Regular),
+                ("bin/", b"", tar::EntryType::Directory),
+                ("bin/adapter", b"binary", tar::EntryType::Regular),
+            ],
+        );
+        let output = dir.join("directories");
+        std::fs::create_dir(&output).unwrap();
+        let files = extract(&directories, &output).unwrap();
+        assert!(files.contains_key("bin/adapter"));
+
+        for (tag, name) in [("backslash", "bin\\adapter"), ("record", RECORD)] {
+            let source = dir.join(format!("{tag}.tar.zst"));
+            archive(
+                &source,
+                &[
+                    ("plugin.toml", b"manifest", tar::EntryType::Regular),
+                    (name, b"contents", tar::EntryType::Regular),
+                ],
+            );
+            let output = dir.join(tag);
+            std::fs::create_dir(&output).unwrap();
+            assert!(extract(&source, &output).is_err(), "accepted {name}");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -172,6 +172,19 @@ pub struct Package {
     pub platforms: Vec<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Catalog-only tool metadata for adapters that can use any of several
+    /// executable names. Runtime discovery remains the adapter's job.
+    #[serde(default)]
+    pub requirements: Vec<PackageRequirement>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageRequirement {
+    pub name: String,
+    #[serde(default)]
+    pub alternatives: Vec<String>,
+    pub install: String,
 }
 
 pub fn validate_package(package: &Package) -> Result<(), String> {
@@ -217,6 +230,25 @@ pub fn validate_package(package: &Package) -> Result<(), String> {
     }
     if package.tags.iter().any(|tag| tag.trim().is_empty()) {
         return Err("package tags must not contain an empty entry".into());
+    }
+    for requirement in &package.requirements {
+        if requirement.name.trim().is_empty()
+            || requirement.install.trim().is_empty()
+            || requirement
+                .alternatives
+                .iter()
+                .enumerate()
+                .any(|(index, name)| {
+                    name.trim().is_empty()
+                        || name == &requirement.name
+                        || requirement.alternatives[..index].contains(name)
+                })
+        {
+            return Err(
+                "package requirements must name distinct executables and installation instructions"
+                    .into(),
+            );
+        }
     }
     Ok(())
 }
@@ -767,6 +799,7 @@ mod tests {
         "sofka = \">=0.25.5\"\n",
         "platforms = [\"x86_64-apple-darwin\"]\n",
         "tags = [\"diagnostics\"]\n",
+        "requirements = [{ name = \"popeye\", alternatives = [\"kubectl-popeye\"], install = \"Install Popeye\" }]\n",
         "\n",
         "[plugin]\n",
         "name = \"Popeye scan\"\n",
@@ -791,6 +824,8 @@ mod tests {
         assert_eq!(package.sofka.as_deref(), Some(">=0.25.5"));
         assert_eq!(package.platforms, ["x86_64-apple-darwin"]);
         assert_eq!(package.tags, ["diagnostics"]);
+        assert_eq!(package.requirements[0].name, "popeye");
+        assert_eq!(package.requirements[0].alternatives, ["kubectl-popeye"]);
     }
 
     #[test]
@@ -834,6 +869,11 @@ mod tests {
                 "repository = \"http://insecure\"",
             ),
             ("tag", "tags = [\"diagnostics\"]", "tags = [\"\"]"),
+            (
+                "requirement",
+                "alternatives = [\"kubectl-popeye\"]",
+                "alternatives = [\"popeye\"]",
+            ),
         ] {
             let manifest = PACKAGED.replace(from, to);
             assert!(read_manifest(&manifest).is_err(), "accepted {label}");
@@ -864,6 +904,7 @@ mod tests {
         assert!(package.repository.is_none());
         assert!(package.sofka.is_none());
         assert!(package.platforms.is_empty());
+        assert!(package.requirements.is_empty());
     }
 
     #[test]

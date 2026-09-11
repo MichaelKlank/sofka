@@ -132,17 +132,18 @@ platforms = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 tags = ["diagnostics", "report"]
 ```
 
-| Field         | Function                                                                                       |
-| ------------- | ---------------------------------------------------------------------------------------------- |
-| `version`     | Required semantic version of this package release. Separate from `schema_version`.             |
-| `description` | Required one-line summary, shown by `sofka plugin search`.                                     |
-| `license`     | Required SPDX expression.                                                                      |
-| `authors`     | Who is responsible for the package.                                                            |
-| `repository`  | HTTPS URL of the source repository.                                                            |
-| `readme`      | README filename inside the package directory.                                                  |
-| `sofka`       | Semantic version requirement on sofka. Its lower bound must include support for this manifest. |
-| `platforms`   | Target triples the package publishes artifacts for.                                            |
-| `tags`        | Search keywords.                                                                               |
+| Field          | Function                                                                                       |
+| -------------- | ---------------------------------------------------------------------------------------------- |
+| `version`      | Required semantic version of this package release. Separate from `schema_version`.             |
+| `description`  | Required one-line summary, shown by `sofka plugin search`.                                     |
+| `license`      | Required SPDX expression.                                                                      |
+| `authors`      | Who is responsible for the package.                                                            |
+| `repository`   | HTTPS URL of the source repository.                                                            |
+| `readme`       | README filename inside the package directory.                                                  |
+| `sofka`        | Semantic version requirement on sofka. Its lower bound must include support for this manifest. |
+| `platforms`    | Target triples the package publishes artifacts for.                                            |
+| `tags`         | Search keywords.                                                                               |
+| `requirements` | Tools the adapter finds itself. `alternatives` names equivalent executables.                   |
 
 The package ID is its directory name. `[plugin]` keeps its meaning: `name` is
 the display name and `palette` is the command.

@@ -121,6 +121,7 @@ struct Description<'a> {
     network_load: bool,
     installed: bool,
     installed_version: Option<&'a str>,
+    installed_withdrawal_reason: Option<&'a str>,
 }
 
 impl Description<'_> {
@@ -258,6 +259,11 @@ fn description<'a>(
     release: &'a CatalogVersion,
     installed: Option<&'a str>,
 ) -> Description<'a> {
+    // Only a *different* installed version needs its own line; the described
+    // release's own withdrawal is already reported as `withdrawal_reason`.
+    let installed_withdrawal_reason = installed
+        .filter(|version| *version != release.version)
+        .and_then(|version| installed_withdrawal(plugin, version));
     Description {
         id: &plugin.id,
         display_name: &plugin.display_name,
@@ -289,6 +295,7 @@ fn description<'a>(
         network_load: release.network_load,
         installed: installed.is_some(),
         installed_version: installed,
+        installed_withdrawal_reason,
     }
 }
 
@@ -312,6 +319,9 @@ async fn describe(request: &str, offline: bool, json: bool) -> Result<(), String
         println!("version: {} ({})", description.version, description.status);
         if let Some(reason) = description.withdrawal_reason {
             println!("withdrawal: {reason}");
+        }
+        if let Some(reason) = description.installed_withdrawal_reason {
+            println!("installed version withdrawal: {reason}");
         }
         println!("description: {}", description.description);
         println!("publisher: {}", description.publisher);
@@ -555,11 +565,17 @@ fn missing_requirements(
         let selection = snapshot.catalog.select(request)?;
         for requirement in &selection.version.requirements {
             if reported.insert((selection.plugin.id.clone(), requirement.name.clone()))
-                && crate::plugins::executable(&requirement.name).is_none()
+                && std::iter::once(&requirement.name)
+                    .chain(&requirement.alternatives)
+                    .all(|name| crate::plugins::executable(name).is_none())
             {
+                let names = std::iter::once(requirement.name.as_str())
+                    .chain(requirement.alternatives.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" or ");
                 warnings.push(format!(
                     "{} requires {} — {}",
-                    selection.plugin.id, requirement.name, requirement.install
+                    selection.plugin.id, names, requirement.install
                 ));
             }
         }
@@ -788,6 +804,7 @@ mod tests {
         let described = description(plugin, release, packages[0].version.as_deref());
         assert!(described.installed);
         assert_eq!(described.installed_version, Some("1.0.0"));
+        assert_eq!(described.installed_withdrawal_reason, None);
         assert_eq!(described.platforms, ["any"]);
         assert_eq!(described.sofka, ">=0.0.1");
         assert_eq!(described.target, "selection");
@@ -805,6 +822,7 @@ mod tests {
                 "id",
                 "installed",
                 "installed_version",
+                "installed_withdrawal_reason",
                 "license",
                 "mutating",
                 "network_load",
@@ -822,6 +840,35 @@ mod tests {
                 "withdrawal_reason",
             ]
         );
+    }
+
+    #[test]
+    fn describe_reports_when_the_installed_version_was_withdrawn() {
+        let snapshot = snapshot(serde_json::json!([
+            release("0.1.0", "active", None),
+            release("0.2.0", "withdrawn", Some("corrupts reports")),
+        ]));
+        let (plugin, selected) = described_release(&snapshot, "resource-summary").unwrap();
+        assert_eq!(selected.version, "0.1.0");
+
+        let described = description(plugin, selected, Some("0.2.0"));
+
+        assert_eq!(described.status, "active");
+        assert_eq!(described.withdrawal_reason, None);
+        assert_eq!(
+            described.installed_withdrawal_reason,
+            Some("corrupts reports")
+        );
+
+        // Describing the withdrawn release itself must not say it twice.
+        let withdrawn = plugin
+            .versions
+            .iter()
+            .find(|release| release.version == "0.2.0")
+            .unwrap();
+        let described = description(plugin, withdrawn, Some("0.2.0"));
+        assert_eq!(described.withdrawal_reason, Some("corrupts reports"));
+        assert_eq!(described.installed_withdrawal_reason, None);
     }
 
     #[test]
@@ -900,7 +947,16 @@ mod tests {
     fn missing_external_tools_are_reported_once_each_and_never_block_a_request() {
         let mut versions = serde_json::json!([release("1.0.0", "active", None)]);
         versions[0]["requirements"] = serde_json::json!([
-            {"name": "sofka-absent-tool-40412", "install": "brew install absent"},
+            {
+                "name": "sofka-absent-tool-40412",
+                "alternatives": ["sofka-absent-tool-40413"],
+                "install": "brew install absent"
+            },
+            {
+                "name": "sofka-absent-primary-40414",
+                "alternatives": ["sh"],
+                "install": "already present under an alternative name"
+            },
             {"name": "sh", "install": "already present"},
         ]);
         let snapshot = snapshot(versions);
@@ -911,7 +967,9 @@ mod tests {
         let warnings = missing_requirements(&snapshot, &requests).unwrap();
         assert_eq!(
             warnings,
-            ["resource-summary requires sofka-absent-tool-40412 — brew install absent"]
+            [
+                "resource-summary requires sofka-absent-tool-40412 or sofka-absent-tool-40413 — brew install absent"
+            ]
         );
         // Reporting a requirement is not a failure, and an unknown ID still is.
         report_missing_requirements(&snapshot, &requests).unwrap();

@@ -9,10 +9,11 @@ use hyper::body::Bytes;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
-const REPOSITORY: &str = "vyrti/sofka-plugins";
-const COMMIT_URL: &str = "https://api.github.com/repos/vyrti/sofka-plugins/commits/HEAD";
-const RAW_ROOT: &str = "https://raw.githubusercontent.com/vyrti/sofka-plugins";
-pub(crate) const RELEASE_ROOT: &str = "https://github.com/vyrti/sofka-plugins/releases/download/";
+const REPOSITORY: &str = "nklmilojevic/sofka-plugins";
+const COMMIT_URL: &str = "https://api.github.com/repos/nklmilojevic/sofka-plugins/commits/HEAD";
+const RAW_ROOT: &str = "https://raw.githubusercontent.com/nklmilojevic/sofka-plugins";
+pub(crate) const RELEASE_ROOT: &str =
+    "https://github.com/nklmilojevic/sofka-plugins/releases/download/";
 const CATALOG_MAX_BYTES: usize = 10 * 1024 * 1024;
 pub const ARTIFACT_MAX_BYTES: usize = 50 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -74,6 +75,8 @@ fn default_target() -> String {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeRequirement {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alternatives: Vec<String>,
     pub install: String,
 }
 
@@ -188,7 +191,17 @@ impl Catalog {
                     ));
                 }
                 if release.requirements.iter().any(|requirement| {
-                    requirement.name.trim().is_empty() || requirement.install.trim().is_empty()
+                    requirement.name.trim().is_empty()
+                        || requirement.install.trim().is_empty()
+                        || requirement
+                            .alternatives
+                            .iter()
+                            .enumerate()
+                            .any(|(index, name)| {
+                                name.trim().is_empty()
+                                    || name == &requirement.name
+                                    || requirement.alternatives[..index].contains(name)
+                            })
                 }) {
                     return Err(format!(
                         "plugin {} version {} has an invalid runtime requirement",
@@ -831,7 +844,7 @@ mod tests {
                 description: "Summarize a resource".into(),
                 tags: vec!["report".into()],
                 publisher: "sofka".into(),
-                repository: "https://github.com/vyrti/sofka-plugins".into(),
+                repository: "https://github.com/nklmilojevic/sofka-plugins".into(),
                 versions: vec![CatalogVersion {
                     version: "0.1.0".into(),
                     sofka: ">=0.1.0, <1.0.0".into(),
@@ -1037,6 +1050,7 @@ mod tests {
                 Box::new(|c: &mut Catalog| {
                     c.plugins[0].versions[0].requirements = vec![RuntimeRequirement {
                         name: " ".into(),
+                        alternatives: Vec::new(),
                         install: "brew install".into(),
                     }];
                 }),

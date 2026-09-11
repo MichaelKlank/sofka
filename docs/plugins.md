@@ -45,7 +45,7 @@ contains a `.sofka-install.json` record with its versions and file hashes.
 and removal refuse modified packages, symlinks, and unmanaged directories;
 resolve those paths manually. There is no destructive force option.
 
-The installer verifies SHA-256 before extraction, rejects links and unsafe
+The installer verifies BLAKE3 before extraction, rejects links and unsafe
 paths, validates the existing `plugin.toml` format, and activates a complete
 staged directory. It reports missing external tools and their installation
 instructions, but does not install them. After installation, update, or
@@ -54,8 +54,10 @@ removal, enter `:reload` in an existing session.
 Add `--json` to search, describe, and list for stable machine-readable output.
 Search returns an array with `id`, `display_name`, `description`, `tags`,
 `latest_version`, `compatible`, `installed`, and `installed_version`. Describe
-returns the catalog and execution fields printed by the text view. List returns
-an array with `id`, `version`, `path`, `managed`, and `modified`.
+returns the catalog and execution fields printed by the text view, including
+`installed_withdrawal_reason` when a different installed release was
+withdrawn. List returns an array with `id`, `version`, `path`, `managed`, and
+`modified`.
 
 Home Manager users can continue to place immutable package sources in the same
 directory. Sofka reports those as manual packages and does not take ownership
