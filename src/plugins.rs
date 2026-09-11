@@ -223,10 +223,16 @@ pub fn validate_package(package: &Package) -> Result<(), String> {
     {
         return Err("package repository must use HTTPS".into());
     }
-    for platform in &package.platforms {
-        if !crate::plugin_catalog::SUPPORTED_PLATFORMS.contains(&platform.as_str()) {
-            return Err(format!("package platform {platform:?} is not supported"));
-        }
+    // Not checked against the targets this build knows: `platforms` says what
+    // the package publishes for, and rejecting an unfamiliar triple would make
+    // every older sofka drop a working package the day the catalog adds a
+    // target. What decides installability is the artifact list, which
+    // `validate_artifact` still holds to the supported set.
+    if package.platforms.iter().any(|platform| {
+        platform.trim().is_empty()
+            || package.platforms.iter().filter(|p| *p == platform).count() > 1
+    }) {
+        return Err("package platforms must be distinct and not empty".into());
     }
     if package.tags.iter().any(|tag| tag.trim().is_empty()) {
         return Err("package tags must not contain an empty entry".into());
@@ -861,7 +867,12 @@ mod tests {
             (
                 "platform",
                 "platforms = [\"x86_64-apple-darwin\"]",
-                "platforms = [\"risc\"]",
+                "platforms = [\"\"]",
+            ),
+            (
+                "duplicate platform",
+                "platforms = [\"x86_64-apple-darwin\"]",
+                "platforms = [\"x86_64-apple-darwin\", \"x86_64-apple-darwin\"]",
             ),
             (
                 "repository",
@@ -878,6 +889,17 @@ mod tests {
             let manifest = PACKAGED.replace(from, to);
             assert!(read_manifest(&manifest).is_err(), "accepted {label}");
         }
+        // A target this build has never heard of is still a valid declaration.
+        // Refusing it would drop a working package from every older sofka the
+        // day the catalog publishes for a new triple; what gates installation
+        // is the artifact list, which the catalog validates separately.
+        assert!(
+            read_manifest(&PACKAGED.replace(
+                "platforms = [\"x86_64-apple-darwin\"]",
+                "platforms = [\"x86_64-unknown-linux-musl\"]",
+            ))
+            .is_ok()
+        );
         // An unknown key in the new table is refused like any other.
         assert!(
             read_manifest(&PACKAGED.replace("[package]", "[package]\npublisher = \"x\"")).is_err()

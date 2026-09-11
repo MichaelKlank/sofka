@@ -1585,9 +1585,26 @@ fn sanitize(name: &str) -> String {
 }
 
 fn config_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+    config_dir_from(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// Empty is not a setting. An exported `XDG_CONFIG_HOME=""` otherwise resolves
+/// to the relative `sofka`, while `plugin_catalog::config_dir` falls back to
+/// `$HOME/.config/sofka` — so installs would never appear in the session.
+fn config_dir_from(
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let base = xdg
+        .filter(|path| !path.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+        .or_else(|| {
+            home.filter(|path| !path.is_empty())
+                .map(|h| PathBuf::from(h).join(".config"))
+        })?;
     Some(base.join("sofka"))
 }
 
@@ -2256,5 +2273,24 @@ mod tests {
         assert_eq!(r.config.default_namespace.as_deref(), Some("personal"));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_empty_xdg_config_home_falls_back_instead_of_going_relative() {
+        let dir = |xdg: Option<&str>, home: Option<&str>| {
+            config_dir_from(xdg.map(Into::into), home.map(Into::into))
+        };
+        assert_eq!(
+            dir(Some("/xdg"), Some("/home/a")),
+            Some(PathBuf::from("/xdg/sofka"))
+        );
+        // Exported-but-empty is common under Nix and direnv. It used to resolve
+        // to the relative "sofka", which is not where the plugin CLI installs.
+        assert_eq!(
+            dir(Some(""), Some("/home/a")),
+            Some(PathBuf::from("/home/a/.config/sofka"))
+        );
+        assert_eq!(dir(None, Some("")), None);
+        assert_eq!(dir(Some(""), None), None);
     }
 }

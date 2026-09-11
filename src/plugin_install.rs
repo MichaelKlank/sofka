@@ -120,6 +120,20 @@ impl PreparedPackage {
         }
     }
 
+    /// The "already installed and intact" outcome, which preparation models by
+    /// staging nothing at all.
+    #[cfg(test)]
+    pub(crate) fn unchanged(id: &str, version: &str, destination: PathBuf) -> Self {
+        Self {
+            id: id.into(),
+            version: version.into(),
+            previous_version: Some(version.into()),
+            conflicts: Vec::new(),
+            stage: None,
+            destination,
+        }
+    }
+
     pub fn activate(mut self) -> Result<Activation, String> {
         // Cloned, not taken: every step below here can fail, and `Drop` only
         // clears the staging directory while this still owns it.
@@ -332,8 +346,15 @@ async fn prepare_below(
             artifact_digest: artifact.blake3.to_ascii_lowercase(),
             files,
         };
-        let json = serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?;
-        crate::atomicfile::write(&stage.join(RECORD), &json)?;
+        let written = serde_json::to_string_pretty(&record)
+            .map_err(|e| e.to_string())
+            .and_then(|json| crate::atomicfile::write(&stage.join(RECORD), &json));
+        if let Err(error) = written {
+            // Nothing owns the stage until the PreparedPackage below exists, so
+            // `Drop` cannot clean up after an early return here.
+            let _ = std::fs::remove_dir_all(&stage);
+            return Err(format!("preparing {id}@{version}: {error}"));
+        }
         prepared.push(PreparedPackage {
             id,
             version,
@@ -837,9 +858,6 @@ fn validate_relative_path(path: &Path, directory: bool) -> Result<String, String
             path.display()
         ));
     }
-    if matches!(raw, RECORD | STAGE_MARKER) {
-        return Err(format!("archive path {raw} is reserved by sofka"));
-    }
     // `bin/./data` has only normal components — Rust drops the `.` while
     // iterating — but it is written to disk as `bin/data`. Recording the
     // spelling from the archive would then never match the file that was
@@ -861,6 +879,14 @@ fn validate_relative_path(path: &Path, directory: bool) -> Result<String, String
             "archive path {} is not in its plain form",
             path.display()
         ));
+    }
+    // Checked here, not on the archive's spelling: a trailing slash made a
+    // directory entry miss the name entirely, and on a case-insensitive
+    // filesystem a difference in case lands on the same file while the record
+    // keeps the archive's spelling, so the package reads as modified the
+    // moment it installs.
+    if plain.eq_ignore_ascii_case(RECORD) || plain.eq_ignore_ascii_case(STAGE_MARKER) {
+        return Err(format!("archive path {plain} is reserved by sofka"));
     }
     Ok(plain)
 }
@@ -1972,6 +1998,18 @@ mod tests {
         assert!(validate_relative_path(Path::new("bin\\adapter"), false).is_err());
         assert!(validate_relative_path(Path::new(RECORD), false).is_err());
         assert!(validate_relative_path(Path::new(STAGE_MARKER), false).is_err());
+        // A trailing slash used to carry a directory entry past the reserved
+        // check, and a difference in case carried a file past it — which on a
+        // case-insensitive filesystem lands on the record itself.
+        for (raw, directory) in [
+            (".sofka-install-stage/", true),
+            (".sofka-install.json/", true),
+            (".SOFKA-INSTALL.JSON", false),
+            (".Sofka-Install-Stage", false),
+        ] {
+            let error = validate_relative_path(Path::new(raw), directory).unwrap_err();
+            assert!(error.contains("reserved by sofka"), "{raw}: {error}");
+        }
         assert_eq!(
             validate_relative_path(Path::new("bin/"), true).unwrap(),
             "bin"

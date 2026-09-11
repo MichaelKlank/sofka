@@ -16,8 +16,30 @@ pub(crate) const RELEASE_ROOT: &str =
     "https://github.com/nklmilojevic/sofka-plugins/releases/download/";
 const CATALOG_MAX_BYTES: usize = 10 * 1024 * 1024;
 pub const ARTIFACT_MAX_BYTES: usize = 50 * 1024 * 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REDIRECT_LIMIT: usize = 5;
+
+/// How long a download may run, and how long it may make no progress at all.
+/// One budget cannot serve both callers: metadata is a few kilobytes of JSON,
+/// while an artifact runs to `ARTIFACT_MAX_BYTES`, where a total budget tight
+/// enough to catch a dead connection also strangles an ordinary slow link.
+#[derive(Clone, Copy, Debug)]
+struct Budget {
+    total: Duration,
+    stall: Duration,
+}
+
+const METADATA_BUDGET: Budget = Budget {
+    total: Duration::from_secs(30),
+    stall: Duration::from_secs(30),
+};
+
+/// 50 MiB needs roughly 14 Mbit/s to land inside the metadata budget, which is
+/// more than a plugin install can assume. The stall budget, not the total, is
+/// what ends a download that has actually died.
+const ARTIFACT_BUDGET: Budget = Budget {
+    total: Duration::from_secs(900),
+    stall: Duration::from_secs(30),
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -317,7 +339,14 @@ impl Catalog {
                     .unwrap_or("no reason given")
             ));
         }
-        let requirement = VersionReq::parse(&release.sofka).expect("validated compatibility");
+        // `Catalog` and its fields are public, so this cannot assume the value
+        // came through `parse`, which is the only thing that validates it.
+        let requirement = VersionReq::parse(&release.sofka).map_err(|e| {
+            format!(
+                "plugin {id} version {} has an invalid compatibility requirement: {e}",
+                release.version
+            )
+        })?;
         if !requirement.matches(current) {
             return Err(format!(
                 "plugin {id} version {} requires sofka {}, current version is {current}",
@@ -600,7 +629,7 @@ pub async fn artifact_in(
             artifact.blake3
         ));
     }
-    let bytes = get(&artifact.url, ARTIFACT_MAX_BYTES).await?;
+    let bytes = get_with(&artifact.url, ARTIFACT_MAX_BYTES, ARTIFACT_BUDGET, false).await?;
     verify_artifact(artifact, &bytes)?;
     write_bytes(&path, &bytes).map_err(|e| format!("caching artifact: {e}"))?;
     Ok(path)
@@ -712,21 +741,31 @@ fn build_client(allow_http: bool) -> Result<HttpClient, String> {
 }
 
 async fn get(url: &str, limit: usize) -> Result<Vec<u8>, String> {
-    get_with(url, limit, REQUEST_TIMEOUT, false).await
+    get_with(url, limit, METADATA_BUDGET, false).await
 }
 
 async fn get_with(
     url: &str,
     limit: usize,
-    timeout: Duration,
+    budget: Budget,
     allow_test_http: bool,
 ) -> Result<Vec<u8>, String> {
-    tokio::time::timeout(timeout, get_inner(url, limit, allow_test_http))
+    tokio::time::timeout(budget.total, get_inner(url, limit, budget, allow_test_http))
         .await
-        .map_err(|_| format!("request timed out after {}ms: {url}", timeout.as_millis()))?
+        .map_err(|_| {
+            format!(
+                "request timed out after {}ms: {url}",
+                budget.total.as_millis()
+            )
+        })?
 }
 
-async fn get_inner(url: &str, limit: usize, allow_test_http: bool) -> Result<Vec<u8>, String> {
+async fn get_inner(
+    url: &str,
+    limit: usize,
+    budget: Budget,
+    allow_test_http: bool,
+) -> Result<Vec<u8>, String> {
     let client = client(allow_test_http)?;
     let mut current = url.to_string();
     for redirects in 0..=REDIRECT_LIMIT {
@@ -734,6 +773,7 @@ async fn get_inner(url: &str, limit: usize, allow_test_http: bool) -> Result<Vec
             .parse()
             .map_err(|e| format!("invalid catalog URL: {e}"))?;
         validate_http_uri(&uri, allow_test_http)?;
+        let base = uri.clone();
         let request = http::Request::get(uri)
             .header(
                 http::header::USER_AGENT,
@@ -742,9 +782,14 @@ async fn get_inner(url: &str, limit: usize, allow_test_http: bool) -> Result<Vec
             .header(http::header::ACCEPT, "application/vnd.github+json")
             .body(Full::new(Bytes::new()))
             .map_err(|e| format!("building request: {e}"))?;
-        let response = client
-            .request(request)
+        let response = tokio::time::timeout(budget.stall, client.request(request))
             .await
+            .map_err(|_| {
+                format!(
+                    "request timed out after {}ms with no response: {current}",
+                    budget.stall.as_millis()
+                )
+            })?
             .map_err(|e| format!("requesting {current}: {e}"))?;
         if response.status().is_redirection() {
             if redirects == REDIRECT_LIMIT {
@@ -755,7 +800,7 @@ async fn get_inner(url: &str, limit: usize, allow_test_http: bool) -> Result<Vec
                 .get(http::header::LOCATION)
                 .and_then(|value| value.to_str().ok())
                 .ok_or_else(|| "GitHub redirect has no valid Location".to_string())?;
-            current = location.to_string();
+            current = resolve_redirect(&base, location)?;
             continue;
         }
         let status = response.status();
@@ -763,7 +808,15 @@ async fn get_inner(url: &str, limit: usize, allow_test_http: bool) -> Result<Vec
             && response.headers().contains_key("x-ratelimit-remaining");
         let mut body = response.into_body();
         let mut bytes = Vec::new();
-        while let Some(frame) = body.frame().await {
+        while let Some(frame) = tokio::time::timeout(budget.stall, body.frame())
+            .await
+            .map_err(|_| {
+                format!(
+                    "download timed out after {}ms with no data: {current}",
+                    budget.stall.as_millis()
+                )
+            })?
+        {
             let frame = frame.map_err(|e| format!("reading response: {e}"))?;
             if let Ok(data) = frame.into_data() {
                 if bytes.len().saturating_add(data.len()) > limit {
@@ -790,6 +843,42 @@ async fn get_inner(url: &str, limit: usize, allow_test_http: bool) -> Result<Vec
         return Ok(bytes);
     }
     unreachable!()
+}
+
+/// Resolve a `Location` against the URL it came from. RFC 7231 allows a
+/// relative reference, and one used to fail the next scheme check as "catalog
+/// downloads require HTTPS" — a message about the wrong problem. Whatever this
+/// produces still goes through `validate_http_uri`, so a redirect can no more
+/// leave the allowed hosts than an absolute one can.
+fn resolve_redirect(base: &http::Uri, location: &str) -> Result<String, String> {
+    let location = location.trim();
+    if location.is_empty() {
+        return Err("GitHub redirect has an empty Location".into());
+    }
+    let absolute = location.split_once("://").is_some_and(|(scheme, _)| {
+        !scheme.is_empty()
+            && scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    });
+    if absolute {
+        return Ok(location.to_string());
+    }
+    let scheme = base.scheme_str().unwrap_or("https");
+    // Scheme-relative: the target names its own authority.
+    if let Some(rest) = location.strip_prefix("//") {
+        return Ok(format!("{scheme}://{rest}"));
+    }
+    let authority = base
+        .authority()
+        .ok_or_else(|| format!("cannot resolve redirect {location:?} against {base}"))?;
+    if location.starts_with('/') {
+        return Ok(format!("{scheme}://{authority}{location}"));
+    }
+    // Relative to the base's directory, as a browser would read it.
+    let path = base.path();
+    let directory = &path[..path.rfind('/').map_or(0, |slash| slash + 1)];
+    Ok(format!("{scheme}://{authority}{directory}{location}"))
 }
 
 fn validate_http_uri(uri: &http::Uri, allow_test_http: bool) -> Result<(), String> {
@@ -830,6 +919,32 @@ mod tests {
             let _ = stream.read(&mut request);
             std::thread::sleep(delay);
             let _ = stream.write_all(&response);
+        });
+        format!("http://{address}/fixture")
+    }
+
+    /// A budget whose total and stall are the same, so a test that wants one
+    /// deadline does not have to reason about two.
+    fn budget(total: Duration) -> Budget {
+        Budget {
+            total,
+            stall: total,
+        }
+    }
+
+    /// Sends the head and then stops. Only a stall budget ends a download whose
+    /// body never arrives.
+    fn silent_after_head(head: Vec<u8>) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(&head);
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_secs(30));
         });
         format!("http://{address}/fixture")
     }
@@ -1304,7 +1419,7 @@ mod tests {
             b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\n\r\ndown".to_vec(),
             Duration::ZERO,
         );
-        let error = get_with(&url, 100, Duration::from_secs(1), true)
+        let error = get_with(&url, 100, budget(Duration::from_secs(1)), true)
             .await
             .unwrap_err();
         assert!(error.contains("503") && error.contains("down"));
@@ -1313,7 +1428,7 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world".to_vec(),
             Duration::ZERO,
         );
-        let error = get_with(&url, 5, Duration::from_secs(1), true)
+        let error = get_with(&url, 5, budget(Duration::from_secs(1)), true)
             .await
             .unwrap_err();
         assert!(error.contains("exceeds"));
@@ -1323,7 +1438,7 @@ mod tests {
             Duration::ZERO,
         );
         assert!(
-            get_with(&url, 100, Duration::from_secs(1), true)
+            get_with(&url, 100, budget(Duration::from_secs(1)), true)
                 .await
                 .is_err()
         );
@@ -1332,7 +1447,7 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
             Duration::from_millis(100),
         );
-        let error = get_with(&url, 100, Duration::from_millis(10), true)
+        let error = get_with(&url, 100, budget(Duration::from_millis(10)), true)
             .await
             .unwrap_err();
         assert!(error.contains("timed out"));
@@ -1345,9 +1460,84 @@ mod tests {
                 .to_vec(),
             Duration::ZERO,
         );
-        let error = get_with(&url, 100, Duration::from_secs(1), true)
+        let error = get_with(&url, 100, budget(Duration::from_secs(1)), true)
             .await
             .unwrap_err();
         assert!(error.contains("rate limit") && error.contains("--offline"));
+    }
+
+    #[test]
+    fn a_relative_redirect_resolves_against_the_url_it_came_from() {
+        let base: http::Uri = "https://github.com/owner/repo/releases/download/v1/pkg.tar.zst"
+            .parse()
+            .unwrap();
+        // Absolute, and left exactly as sent.
+        assert_eq!(
+            resolve_redirect(&base, "https://objects.githubusercontent.com/x?t=1").unwrap(),
+            "https://objects.githubusercontent.com/x?t=1"
+        );
+        // Root-relative and scheme-relative both used to fail the next scheme
+        // check as "catalog downloads require HTTPS".
+        assert_eq!(
+            resolve_redirect(&base, "/moved?t=1").unwrap(),
+            "https://github.com/moved?t=1"
+        );
+        assert_eq!(
+            resolve_redirect(&base, "//objects.githubusercontent.com/x").unwrap(),
+            "https://objects.githubusercontent.com/x"
+        );
+        // Relative to the base's directory, not its file.
+        assert_eq!(
+            resolve_redirect(&base, "other.tar.zst").unwrap(),
+            "https://github.com/owner/repo/releases/download/v1/other.tar.zst"
+        );
+        assert!(resolve_redirect(&base, "   ").is_err());
+        // Resolution never widens the allowlist: the host is still checked.
+        let resolved = resolve_redirect(&base, "//evil.example/x").unwrap();
+        let error = validate_http_uri(&resolved.parse().unwrap(), false).unwrap_err();
+        assert!(error.contains("untrusted host"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_download_that_stops_delivering_ends_on_the_stall_budget() {
+        // A generous total budget is what lets an artifact take its time; the
+        // stall budget is what still ends a connection that has died. Both
+        // halves of a request need it.
+        let stalling = |stall| Budget {
+            total: Duration::from_secs(30),
+            stall,
+        };
+
+        // Nothing at all comes back.
+        let url = server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+            Duration::from_secs(5),
+        );
+        let error = get_with(&url, 100, stalling(Duration::from_millis(50)), true)
+            .await
+            .unwrap_err();
+        assert!(error.contains("no response"), "{error}");
+
+        // The head arrives and the body never does. The budget is wide enough
+        // that a loaded machine still gets the head inside it, so the failure
+        // this asserts can only come from the body.
+        let url = silent_after_head(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n".to_vec());
+        let error = get_with(&url, 100, stalling(Duration::from_millis(500)), true)
+            .await
+            .unwrap_err();
+        assert!(error.contains("no data"), "{error}");
+    }
+
+    #[test]
+    fn selecting_from_an_unvalidated_catalog_is_an_error_not_a_panic() {
+        // `Catalog` and its fields are public, so a caller can hand `select` a
+        // value that never went through `parse`.
+        let mut catalog = catalog();
+        catalog.plugins[0].versions[0].sofka = "not a requirement".into();
+        let error = catalog.select("resource-summary@0.1.0").unwrap_err();
+        assert!(
+            error.contains("invalid compatibility requirement"),
+            "{error}"
+        );
     }
 }

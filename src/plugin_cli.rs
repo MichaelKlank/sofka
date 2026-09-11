@@ -384,22 +384,21 @@ async fn update(requested: &[String], offline: bool) -> Result<(), String> {
         println!("No managed plugins are installed.");
         return Ok(());
     }
-    for id in &ids {
-        let package = managed
-            .get(id.as_str())
-            .ok_or_else(|| format!("plugin {id} is not a managed installation"))?;
-        if package.modified {
-            return Err(format!(
-                "plugin {id} at {} has local modifications; update refused",
-                package.path.display()
-            ));
-        }
+    // Triaged before the catalog is fetched: when nothing is updatable there is
+    // no reason to reach the network at all.
+    let (ready, refused) = triage(&managed, ids);
+    let mut unresolved = Vec::new();
+    for (id, reason) in refused {
+        eprintln!("warning: {reason}");
+        unresolved.push(id);
+    }
+    if ready.is_empty() {
+        return Err(format!("could not update: {}", unresolved.join(", ")));
     }
     let snapshot = crate::plugin_catalog::load(offline).await?;
     offline_notice(&snapshot);
     let mut updates = Vec::new();
-    let mut unresolved = Vec::new();
-    for id in ids {
+    for id in ready {
         let Some(current) = managed
             .get(id.as_str())
             .and_then(|package| package.version.as_deref())
@@ -441,6 +440,34 @@ async fn update(requested: &[String], offline: bool) -> Result<(), String> {
     } else {
         Err(format!("could not update: {}", unresolved.join(", ")))
     }
+}
+
+/// Split the requested IDs into the installations an update run can work on and
+/// the ones it can only report. One unusable installation is that
+/// installation's problem: it used to leave every other plugin un-updated.
+fn triage(
+    managed: &HashMap<&str, &InstalledPackage>,
+    ids: Vec<String>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut ready = Vec::new();
+    let mut refused = Vec::new();
+    for id in ids {
+        match managed.get(id.as_str()) {
+            None => {
+                let reason = format!("{id} is not a managed installation");
+                refused.push((id, reason));
+            }
+            Some(package) if package.modified => {
+                let reason = format!(
+                    "{id} at {} has local modifications; update refused",
+                    package.path.display()
+                );
+                refused.push((id, reason));
+            }
+            Some(_) => ready.push(id),
+        }
+    }
+    (ready, refused)
 }
 
 /// What an update run should do about one installed plugin. A plugin the
@@ -529,7 +556,7 @@ fn activate(prepared: Vec<crate::plugin_install::PreparedPackage>) -> Activated 
         }
         match package.activate() {
             Ok(action) => {
-                any = true;
+                any |= !matches!(action, Activation::Unchanged);
                 println!(
                     "{} {id}@{version}",
                     match action {
@@ -1266,6 +1293,70 @@ mod tests {
             [
                 "requires: popeye or kubectl-popeye — brew install derailed/popeye/popeye",
                 "requires: jq — brew install jq",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_already_installed_package_reports_no_changes_to_reload() {
+        let config =
+            std::env::temp_dir().join(format!("sofka-plugin-cli-unchanged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        std::fs::create_dir_all(config.join("plugins")).unwrap();
+
+        // A prepared package with no stage is the "already installed, intact"
+        // outcome. Nothing reached the plugins directory, so nothing needs a
+        // reload — saying otherwise sent the user to a session with no change.
+        let outcome = activate(vec![crate::plugin_install::PreparedPackage::unchanged(
+            "sample",
+            "1.0.0",
+            config.join("plugins").join("sample"),
+        )]);
+        assert!(!outcome.any);
+        assert!(outcome.report().is_ok());
+        let _ = std::fs::remove_dir_all(config);
+    }
+
+    #[test]
+    fn a_modified_package_is_refused_without_holding_back_the_others() {
+        let installed = [
+            InstalledPackage {
+                id: "clean".into(),
+                version: Some("1.0.0".into()),
+                path: "/config/plugins/clean".into(),
+                managed: true,
+                modified: false,
+            },
+            InstalledPackage {
+                id: "edited".into(),
+                version: Some("1.0.0".into()),
+                path: "/config/plugins/edited".into(),
+                managed: true,
+                modified: true,
+            },
+        ];
+        let managed: HashMap<_, _> = installed
+            .iter()
+            .map(|package| (package.id.as_str(), package))
+            .collect();
+        let ids = ["clean", "edited", "absent"].map(str::to_owned).to_vec();
+
+        let (ready, refused) = triage(&managed, ids);
+        // The edited package used to abort the run before the catalog was even
+        // fetched, so "clean" never got its update.
+        assert_eq!(ready, ["clean"]);
+        assert_eq!(
+            refused,
+            [
+                (
+                    "edited".to_string(),
+                    "edited at /config/plugins/edited has local modifications; update refused"
+                        .to_string()
+                ),
+                (
+                    "absent".to_string(),
+                    "absent is not a managed installation".to_string()
+                ),
             ]
         );
     }

@@ -141,7 +141,7 @@ tags = ["diagnostics", "report"]
 | `repository`   | HTTPS URL of the source repository.                                                            |
 | `readme`       | README filename inside the package directory.                                                  |
 | `sofka`        | Semantic version requirement on sofka. Its lower bound must include support for this manifest. |
-| `platforms`    | Target triples the package publishes artifacts for.                                            |
+| `platforms`    | Target triples the package publishes artifacts for. A triple sofka does not know is allowed.   |
 | `tags`         | Search keywords.                                                                               |
 | `requirements` | Tools the adapter finds itself. `alternatives` names equivalent executables.                   |
 
