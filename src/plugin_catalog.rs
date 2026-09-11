@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 const REPOSITORY: &str = "nklmilojevic/sofka-plugins";
 const COMMIT_URL: &str = "https://api.github.com/repos/nklmilojevic/sofka-plugins/commits/HEAD";
 const RAW_ROOT: &str = "https://raw.githubusercontent.com/nklmilojevic/sofka-plugins";
-const RELEASE_ROOT: &str = "https://github.com/nklmilojevic/sofka-plugins/releases/download/";
+pub(crate) const RELEASE_ROOT: &str =
+    "https://github.com/nklmilojevic/sofka-plugins/releases/download/";
 const CATALOG_MAX_BYTES: usize = 10 * 1024 * 1024;
 pub const ARTIFACT_MAX_BYTES: usize = 50 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -89,7 +90,7 @@ pub enum VersionStatus {
 pub struct Artifact {
     pub platform: String,
     pub url: String,
-    pub sha256: String,
+    pub blake3: String,
     pub size: u64,
 }
 
@@ -252,13 +253,10 @@ impl Catalog {
             .iter()
             .filter(|plugin| {
                 query.is_empty()
-                    || plugin.id.to_ascii_lowercase().contains(&query)
-                    || plugin.display_name.to_ascii_lowercase().contains(&query)
-                    || plugin.description.to_ascii_lowercase().contains(&query)
-                    || plugin
-                        .tags
-                        .iter()
-                        .any(|tag| tag.to_ascii_lowercase().contains(&query))
+                    || contains_folded(&plugin.id, &query)
+                    || contains_folded(&plugin.display_name, &query)
+                    || contains_folded(&plugin.description, &query)
+                    || plugin.tags.iter().any(|tag| contains_folded(tag, &query))
             })
             .collect();
         plugins.sort_by(|a, b| a.id.cmp(&b.id));
@@ -268,8 +266,7 @@ impl Catalog {
     pub fn select(&self, request: &str) -> Result<Selection<'_>, String> {
         let (id, exact) = parse_request(request)?;
         let plugin = self.find(id)?;
-        let current = Version::parse(env!("CARGO_PKG_VERSION"))
-            .map_err(|e| format!("invalid sofka build version: {e}"))?;
+        let current = current_version().ok_or_else(|| "invalid sofka build version".to_string())?;
         let platform = platform()?;
         let release = if let Some(exact) = exact {
             let wanted = Version::parse(exact)
@@ -285,7 +282,7 @@ impl Catalog {
                 .iter()
                 .filter_map(|release| {
                     let version = Version::parse(&release.version).ok()?;
-                    let compatible = VersionReq::parse(&release.sofka).ok()?.matches(&current);
+                    let compatible = VersionReq::parse(&release.sofka).ok()?.matches(current);
                     (version.pre.is_empty()
                         && compatible
                         && matches!(release.status, VersionStatus::Active)
@@ -309,7 +306,7 @@ impl Catalog {
             ));
         }
         let requirement = VersionReq::parse(&release.sofka).expect("validated compatibility");
-        if !requirement.matches(&current) {
+        if !requirement.matches(current) {
             return Err(format!(
                 "plugin {id} version {} requires sofka {}, current version is {current}",
                 release.version, release.sofka
@@ -339,15 +336,24 @@ impl Catalog {
     }
 }
 
+/// This build's own version and target, parsed once. Selection asks for both
+/// once per release record, and a catalog holds many.
+fn current_version() -> Option<&'static Version> {
+    static CURRENT: std::sync::OnceLock<Option<Version>> = std::sync::OnceLock::new();
+    CURRENT
+        .get_or_init(|| Version::parse(env!("CARGO_PKG_VERSION")).ok())
+        .as_ref()
+}
+
 impl CatalogPlugin {
     pub fn latest_compatible(&self) -> Option<&CatalogVersion> {
-        let current = Version::parse(env!("CARGO_PKG_VERSION")).ok()?;
+        let current = current_version()?;
         let platform = platform().ok()?;
         self.versions
             .iter()
             .filter_map(|release| {
                 let version = Version::parse(&release.version).ok()?;
-                let compatible = VersionReq::parse(&release.sofka).ok()?.matches(&current);
+                let compatible = VersionReq::parse(&release.sofka).ok()?.matches(current);
                 (version.pre.is_empty()
                     && compatible
                     && matches!(release.status, VersionStatus::Active))
@@ -365,6 +371,24 @@ impl CatalogPlugin {
     }
 }
 
+/// Case-insensitive substring search that allocates nothing. `needle` is already
+/// lowercase; every plugin field would otherwise be copied once per search.
+fn contains_folded(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let (haystack, needle) = (haystack.as_bytes(), needle.as_bytes());
+    let Some(last) = haystack.len().checked_sub(needle.len()) else {
+        return false;
+    };
+    (0..=last).any(|start| {
+        haystack[start..start + needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(a, b)| a.to_ascii_lowercase() == *b)
+    })
+}
+
 fn validate_id(id: &str) -> Result<(), String> {
     let valid = !id.is_empty()
         && id
@@ -380,16 +404,17 @@ fn validate_id(id: &str) -> Result<(), String> {
     }
 }
 
+/// The targets the catalog builds for. A package declares the subset it
+/// supports; an artifact names exactly one of them, or `any`.
+pub const SUPPORTED_PLATFORMS: &[&str] = &[
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+];
+
 fn validate_artifact(artifact: &Artifact) -> Result<(), String> {
-    if artifact.platform != "any"
-        && !matches!(
-            artifact.platform.as_str(),
-            "x86_64-unknown-linux-gnu"
-                | "aarch64-unknown-linux-gnu"
-                | "x86_64-apple-darwin"
-                | "aarch64-apple-darwin"
-        )
-    {
+    if artifact.platform != "any" && !SUPPORTED_PLATFORMS.contains(&artifact.platform.as_str()) {
         return Err(format!("unsupported platform {:?}", artifact.platform));
     }
     if !artifact.url.starts_with(RELEASE_ROOT) {
@@ -397,8 +422,8 @@ fn validate_artifact(artifact: &Artifact) -> Result<(), String> {
             "artifact URL must be a release asset of {REPOSITORY}"
         ));
     }
-    if artifact.sha256.len() != 64 || !artifact.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("artifact SHA-256 must contain 64 hexadecimal characters".into());
+    if artifact.blake3.len() != 64 || !artifact.blake3.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("artifact BLAKE3 must contain 64 hexadecimal characters".into());
     }
     if artifact.size == 0 || artifact.size > ARTIFACT_MAX_BYTES as u64 {
         return Err("artifact compressed size must be between 1 byte and 50 MiB".into());
@@ -490,6 +515,12 @@ pub async fn load(offline: bool) -> Result<CatalogSnapshot, String> {
     })
 }
 
+/// The cached catalog when one is readable, for commands that must work
+/// without the network and without failing when nothing has been fetched yet.
+pub fn cached() -> Option<CatalogSnapshot> {
+    load_cached(&cache_dir().join("catalog-cache.json")).ok()
+}
+
 fn load_cached(path: &Path) -> Result<CatalogSnapshot, String> {
     let bytes = std::fs::read(path).map_err(|e| {
         format!(
@@ -531,13 +562,21 @@ pub fn age(fetched_at: u64) -> String {
 }
 
 pub async fn artifact(artifact: &Artifact, offline: bool) -> Result<PathBuf, String> {
+    artifact_in(&cache_dir(), artifact, offline).await
+}
+
+pub async fn artifact_in(
+    cache: &Path,
+    artifact: &Artifact,
+    offline: bool,
+) -> Result<PathBuf, String> {
     validate_artifact(artifact)?;
-    let path = cache_dir()
+    let path = cache
         .join("artifacts")
-        .join(format!("{}.tar.gz", artifact.sha256.to_ascii_lowercase()));
+        .join(format!("{}.tar.zst", artifact.blake3.to_ascii_lowercase()));
     if path.is_file() {
         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-        if digest(&bytes) == artifact.sha256.to_ascii_lowercase() {
+        if digest(&bytes) == artifact.blake3.to_ascii_lowercase() {
             return Ok(path);
         }
         std::fs::remove_file(&path)
@@ -546,10 +585,18 @@ pub async fn artifact(artifact: &Artifact, offline: bool) -> Result<PathBuf, Str
     if offline {
         return Err(format!(
             "artifact {} is not cached; run install without --offline once",
-            artifact.sha256
+            artifact.blake3
         ));
     }
     let bytes = get(&artifact.url, ARTIFACT_MAX_BYTES).await?;
+    verify_artifact(artifact, &bytes)?;
+    write_bytes(&path, &bytes).map_err(|e| format!("caching artifact: {e}"))?;
+    Ok(path)
+}
+
+/// Published bytes must match the catalog exactly. A truncated or interrupted
+/// download fails the length check before its digest is ever considered.
+fn verify_artifact(artifact: &Artifact, bytes: &[u8]) -> Result<(), String> {
     if bytes.len() as u64 != artifact.size {
         return Err(format!(
             "artifact size mismatch: catalog says {}, downloaded {}",
@@ -557,21 +604,34 @@ pub async fn artifact(artifact: &Artifact, offline: bool) -> Result<PathBuf, Str
             bytes.len()
         ));
     }
-    let actual = digest(&bytes);
-    if actual != artifact.sha256.to_ascii_lowercase() {
+    let actual = digest(bytes);
+    if actual != artifact.blake3.to_ascii_lowercase() {
         return Err(format!(
-            "artifact SHA-256 mismatch: expected {}, received {actual}",
-            artifact.sha256
+            "artifact BLAKE3 mismatch: expected {}, received {actual}",
+            artifact.blake3
         ));
     }
-    write_bytes(&path, &bytes).map_err(|e| format!("caching artifact: {e}"))?;
-    Ok(path)
+    Ok(())
 }
 
+/// BLAKE3 over the whole slice, using every core. Artifacts run to tens of
+/// megabytes and this is the only work between download and install.
 pub fn digest(bytes: &[u8]) -> String {
-    use sha2::Digest as _;
-    let value = sha2::Sha256::digest(bytes);
-    value.iter().map(|byte| format!("{byte:02x}")).collect()
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_rayon(bytes);
+    hex(hasher.finalize().as_bytes())
+}
+
+/// Lowercase hex. A `format!` per byte costs twenty times as much, and this runs
+/// once per file of every package sofka verifies.
+pub fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[usize::from(byte >> 4)] as char);
+        out.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    out
 }
 
 fn now() -> u64 {
@@ -612,7 +672,19 @@ type HttpClient = hyper_util::client::legacy::Client<
     Full<Bytes>,
 >;
 
+/// One client for the whole command. Building it parses the system trust store,
+/// which costs more than the request that follows, and every command makes at
+/// least two requests — the commit, then the index, then any artifacts.
 fn client(allow_http: bool) -> Result<HttpClient, String> {
+    if allow_http {
+        // Only the loopback test server takes this path.
+        return build_client(true);
+    }
+    static CLIENT: std::sync::OnceLock<Result<HttpClient, String>> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| build_client(false)).clone()
+}
+
+fn build_client(allow_http: bool) -> Result<HttpClient, String> {
     let builder = hyper_rustls::HttpsConnectorBuilder::new()
         .with_native_roots()
         .map_err(|e| format!("loading system TLS roots: {e}"))?;
@@ -780,9 +852,9 @@ mod tests {
                     artifacts: vec![Artifact {
                         platform: "any".into(),
                         url: format!(
-                            "{RELEASE_ROOT}resource-summary-v0.1.0/resource-summary.tar.gz"
+                            "{RELEASE_ROOT}resource-summary-v0.1.0/resource-summary.tar.zst"
                         ),
-                        sha256: "0".repeat(64),
+                        blake3: "0".repeat(64),
                         size: 10,
                     }],
                 }],
@@ -886,6 +958,326 @@ mod tests {
         std::fs::write(&path, b"{}").unwrap();
         assert!(load_cached(&path).is_err());
         let _ = std::fs::remove_file(path);
+    }
+
+    type Mutation = (&'static str, Box<dyn Fn(&mut Catalog)>);
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sofka-catalog-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn parsed_requests_split_only_on_a_single_version_suffix() {
+        assert_eq!(parse_request("summary").unwrap(), ("summary", None));
+        assert_eq!(
+            parse_request("summary@1.2.3").unwrap(),
+            ("summary", Some("1.2.3"))
+        );
+        for bad in [
+            "",
+            "summary@",
+            "summary@1@2",
+            "Summary",
+            "-summary",
+            "a/b",
+            "..",
+        ] {
+            assert!(parse_request(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn validation_rejects_every_malformed_release_field() {
+        let mutate: Vec<Mutation> = vec![
+            ("schema", Box::new(|c: &mut Catalog| c.schema_version = 2)),
+            (
+                "display name",
+                Box::new(|c: &mut Catalog| c.plugins[0].display_name = "  ".into()),
+            ),
+            (
+                "repository",
+                Box::new(|c: &mut Catalog| c.plugins[0].repository = "http://insecure".into()),
+            ),
+            (
+                "version",
+                Box::new(|c: &mut Catalog| c.plugins[0].versions[0].version = "one".into()),
+            ),
+            (
+                "sofka range",
+                Box::new(|c: &mut Catalog| c.plugins[0].versions[0].sofka = "latest".into()),
+            ),
+            (
+                "source commit",
+                Box::new(|c: &mut Catalog| c.plugins[0].versions[0].source_commit = "abc".into()),
+            ),
+            (
+                "license",
+                Box::new(|c: &mut Catalog| c.plugins[0].versions[0].license = " ".into()),
+            ),
+            (
+                "readme",
+                Box::new(|c: &mut Catalog| c.plugins[0].versions[0].readme = "ftp://x".into()),
+            ),
+            (
+                "command",
+                Box::new(|c: &mut Catalog| c.plugins[0].versions[0].command = " ".into()),
+            ),
+            (
+                "target",
+                Box::new(|c: &mut Catalog| c.plugins[0].versions[0].target = "cluster".into()),
+            ),
+            (
+                "output",
+                Box::new(|c: &mut Catalog| c.plugins[0].versions[0].output = "terminal".into()),
+            ),
+            (
+                "requirement",
+                Box::new(|c: &mut Catalog| {
+                    c.plugins[0].versions[0].requirements = vec![RuntimeRequirement {
+                        name: " ".into(),
+                        install: "brew install".into(),
+                    }];
+                }),
+            ),
+            (
+                "artifacts",
+                Box::new(|c: &mut Catalog| c.plugins[0].versions[0].artifacts.clear()),
+            ),
+            (
+                "digest",
+                Box::new(|c: &mut Catalog| {
+                    c.plugins[0].versions[0].artifacts[0].blake3 = "zz".into();
+                }),
+            ),
+            (
+                "size",
+                Box::new(|c: &mut Catalog| c.plugins[0].versions[0].artifacts[0].size = 0),
+            ),
+            (
+                "oversize",
+                Box::new(|c: &mut Catalog| {
+                    c.plugins[0].versions[0].artifacts[0].size = ARTIFACT_MAX_BYTES as u64 + 1;
+                }),
+            ),
+            (
+                "platform",
+                Box::new(|c: &mut Catalog| {
+                    c.plugins[0].versions[0].artifacts[0].platform = "risc".into();
+                }),
+            ),
+            (
+                "withdrawal without a reason",
+                Box::new(|c: &mut Catalog| {
+                    c.plugins[0].versions[0].status = VersionStatus::Withdrawn;
+                }),
+            ),
+            (
+                "active with a reason",
+                Box::new(|c: &mut Catalog| {
+                    c.plugins[0].versions[0].withdrawal_reason = Some("why".into());
+                }),
+            ),
+        ];
+        for (label, change) in mutate {
+            let mut catalog = catalog();
+            change(&mut catalog);
+            assert!(catalog.validate().is_err(), "accepted {label}");
+        }
+        catalog().validate().unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_colliding_and_repeated_entries() {
+        let mut folded = catalog();
+        let mut twin = folded.plugins[0].clone();
+        twin.id = "resource-summary".into();
+        folded.plugins.push(twin);
+        assert!(folded.validate().is_err());
+
+        let mut repeated = catalog();
+        let twin = repeated.plugins[0].versions[0].clone();
+        repeated.plugins[0].versions.push(twin);
+        assert!(repeated.validate().is_err());
+
+        let mut platforms = catalog();
+        let twin = platforms.plugins[0].versions[0].artifacts[0].clone();
+        platforms.plugins[0].versions[0].artifacts.push(twin);
+        assert!(platforms.validate().is_err());
+    }
+
+    #[test]
+    fn an_empty_query_lists_every_plugin_and_an_unknown_id_is_an_error() {
+        let catalog = catalog();
+        assert_eq!(catalog.matching("").len(), catalog.plugins.len());
+        assert!(catalog.find("resource-summary").is_ok());
+        assert!(catalog.find("absent").unwrap_err().contains("unknown"));
+    }
+
+    #[test]
+    fn latest_compatible_ignores_withdrawn_and_prerelease_releases() {
+        let mut catalog = catalog();
+        assert!(catalog.plugins[0].latest_compatible().is_some());
+        let base = catalog.plugins[0].versions[0].clone();
+        let mut newer = base.clone();
+        newer.version = "0.2.0".into();
+        newer.status = VersionStatus::Withdrawn;
+        newer.withdrawal_reason = Some("unsafe".into());
+        let mut prerelease = base;
+        prerelease.version = "0.3.0-rc.1".into();
+        catalog.plugins[0].versions.extend([newer, prerelease]);
+        assert_eq!(
+            catalog.plugins[0].latest_compatible().unwrap().version,
+            "0.1.0"
+        );
+
+        catalog.plugins[0].versions[0].status = VersionStatus::Withdrawn;
+        catalog.plugins[0].versions[0].withdrawal_reason = Some("unsafe".into());
+        assert!(catalog.plugins[0].latest_compatible().is_none());
+    }
+
+    #[test]
+    fn published_bytes_must_match_the_recorded_size_and_digest() {
+        let bytes = b"package bytes";
+        let mut artifact = catalog().plugins[0].versions[0].artifacts[0].clone();
+        artifact.size = bytes.len() as u64;
+        artifact.blake3 = digest(bytes);
+        verify_artifact(&artifact, bytes).unwrap();
+        // An upper-case digest in the catalog is the same digest.
+        let mut folded = artifact.clone();
+        folded.blake3 = artifact.blake3.to_ascii_uppercase();
+        verify_artifact(&folded, bytes).unwrap();
+
+        let truncated = &bytes[..4];
+        assert!(
+            verify_artifact(&artifact, truncated)
+                .unwrap_err()
+                .contains("size mismatch")
+        );
+        let mut swapped = artifact;
+        swapped.blake3 = "9".repeat(64);
+        assert!(
+            verify_artifact(&swapped, bytes)
+                .unwrap_err()
+                .contains("BLAKE3 mismatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_artifacts_are_reused_and_corrupt_ones_are_discarded() {
+        let cache = scratch("artifacts");
+        let bytes = b"package bytes";
+        let mut artifact = catalog().plugins[0].versions[0].artifacts[0].clone();
+        artifact.size = bytes.len() as u64;
+        artifact.blake3 = digest(bytes);
+        let path = cache
+            .join("artifacts")
+            .join(format!("{}.tar.zst", artifact.blake3));
+
+        // Nothing cached: offline is an error that says how to recover.
+        let error = artifact_in(&cache, &artifact, true).await.unwrap_err();
+        assert!(error.contains("not cached"), "{error}");
+
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(artifact_in(&cache, &artifact, true).await.unwrap(), path);
+
+        // A half-written cache entry is removed rather than trusted.
+        std::fs::write(&path, b"interrupted").unwrap();
+        let error = artifact_in(&cache, &artifact, true).await.unwrap_err();
+        assert!(error.contains("not cached"), "{error}");
+        assert!(!path.exists());
+
+        // The URL allowlist applies before anything is read or fetched.
+        let mut foreign = artifact;
+        foreign.url = "https://example.com/package.tar.zst".into();
+        assert!(artifact_in(&cache, &foreign, true).await.is_err());
+        let _ = std::fs::remove_dir_all(cache);
+    }
+
+    #[test]
+    fn a_cache_is_rejected_when_it_is_oversized_or_internally_inconsistent() {
+        let dir = scratch("cache-guards");
+        let path = dir.join("catalog-cache.json");
+        let cached = CachedCatalog {
+            schema_version: 1,
+            commit: "a".repeat(40),
+            fetched_at: 1,
+            catalog: catalog(),
+        };
+
+        let mut future = cached.clone();
+        future.schema_version = 2;
+        std::fs::write(&path, serde_json::to_vec(&future).unwrap()).unwrap();
+        assert!(
+            load_cached(&path)
+                .unwrap_err()
+                .contains("unsupported catalog cache version")
+        );
+
+        let mut commit = cached.clone();
+        commit.commit = "not-a-commit".into();
+        std::fs::write(&path, serde_json::to_vec(&commit).unwrap()).unwrap();
+        assert!(load_cached(&path).unwrap_err().contains("invalid commit"));
+
+        let mut invalid = cached;
+        invalid.catalog.plugins[0].versions[0].sofka = "latest".into();
+        std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(load_cached(&path).is_err());
+
+        std::fs::write(&path, vec![b' '; CATALOG_MAX_BYTES + 1024 * 1024 + 1]).unwrap();
+        assert!(load_cached(&path).unwrap_err().contains("size limit"));
+
+        assert!(load_cached(&dir.join("absent.json")).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn untrusted_hosts_and_schemes_are_refused_before_any_request() {
+        for url in [
+            "http://api.github.com/x",
+            "https://example.com/x",
+            "https://githubusercontent.com.evil.test/x",
+        ] {
+            let uri: http::Uri = url.parse().unwrap();
+            assert!(validate_http_uri(&uri, false).is_err(), "accepted {url}");
+        }
+        // Non-HTTP schemes are refused by the parser or the allowlist; either
+        // way they never become a request.
+        for url in ["file:///etc/passwd", "ftp://example.com/x", "not a url"] {
+            let refused = url
+                .parse::<http::Uri>()
+                .map_or(true, |uri| validate_http_uri(&uri, false).is_err());
+            assert!(refused, "accepted {url}");
+        }
+        for url in [
+            "https://api.github.com/x",
+            "https://raw.githubusercontent.com/x",
+            "https://github.com/x",
+            "https://objects.githubusercontent.com/x",
+            "https://release-assets.githubusercontent.com/x",
+        ] {
+            let uri: http::Uri = url.parse().unwrap();
+            validate_http_uri(&uri, false).unwrap();
+        }
+        // The test escape hatch stays pinned to loopback.
+        let loopback: http::Uri = "http://127.0.0.1:1/x".parse().unwrap();
+        validate_http_uri(&loopback, true).unwrap();
+        let remote: http::Uri = "http://10.0.0.1/x".parse().unwrap();
+        assert!(validate_http_uri(&remote, true).is_err());
+    }
+
+    #[test]
+    fn cache_age_is_reported_in_the_largest_whole_unit() {
+        let now = now();
+        assert_eq!(age(now), "0s");
+        assert_eq!(age(now - 90), "1m");
+        assert_eq!(age(now - 3 * 3600), "3h");
+        assert_eq!(age(now - 5 * 86_400), "5d");
+        // A clock that moved backwards reports no age rather than panicking.
+        assert_eq!(age(now + 600), "0s");
     }
 
     #[test]

@@ -1,11 +1,14 @@
 //! Cluster-independent `sofka plugin` command output and orchestration.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 
 use semver::Version;
 use serde::Serialize;
 
-use crate::plugin_catalog::{CatalogPlugin, CatalogSnapshot, CatalogVersion, VersionStatus};
+use crate::plugin_catalog::{
+    Catalog, CatalogPlugin, CatalogSnapshot, CatalogVersion, VersionStatus,
+};
 use crate::plugin_install::{Activation, InstallLock, InstalledPackage};
 
 #[derive(clap::Args, Debug, Clone)]
@@ -80,6 +83,17 @@ struct SearchRow<'a> {
     compatible: bool,
     installed: bool,
     installed_version: Option<&'a str>,
+    withdrawal_reason: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct ListRow<'a> {
+    id: &'a str,
+    version: Option<&'a str>,
+    path: &'a Path,
+    managed: bool,
+    modified: bool,
+    withdrawal_reason: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -131,26 +145,8 @@ pub async fn run(args: &PluginArgs) -> Result<(), String> {
 async fn search(query: &str, offline: bool, json: bool) -> Result<(), String> {
     let snapshot = crate::plugin_catalog::load(offline).await?;
     offline_notice(&snapshot);
-    let installed = installed_map()?;
-    let rows: Vec<_> = snapshot
-        .catalog
-        .matching(query)
-        .into_iter()
-        .map(|plugin| {
-            let latest = plugin.latest_compatible();
-            let installed = installed.get(plugin.id.as_str());
-            SearchRow {
-                id: &plugin.id,
-                display_name: &plugin.display_name,
-                description: &plugin.description,
-                tags: &plugin.tags,
-                latest_version: latest.map(|release| release.version.as_str()),
-                compatible: latest.is_some(),
-                installed: installed.is_some(),
-                installed_version: installed.and_then(|package| package.version.as_deref()),
-            }
-        })
-        .collect();
+    let installed = crate::plugin_install::installed_versions()?;
+    let rows = search_rows(&snapshot.catalog, &installed, query);
     if json {
         println!(
             "{}",
@@ -162,12 +158,16 @@ async fn search(query: &str, offline: bool, json: bool) -> Result<(), String> {
             let installed = row
                 .installed_version
                 .map_or(String::new(), |version| format!(" installed={version}"));
+            let withdrawn = row
+                .withdrawal_reason
+                .map_or(String::new(), |reason| format!(" withdrawn: {reason}"));
             println!(
-                "{}\t{}\t{}{}\t{}",
+                "{}\t{}\t{}{}{}\t{}",
                 row.id,
                 row.latest_version.unwrap_or("-"),
                 compatibility,
                 installed,
+                withdrawn,
                 row.description
             );
         }
@@ -175,13 +175,81 @@ async fn search(query: &str, offline: bool, json: bool) -> Result<(), String> {
     Ok(())
 }
 
-async fn describe(request: &str, offline: bool, json: bool) -> Result<(), String> {
-    let snapshot = crate::plugin_catalog::load(offline).await?;
-    offline_notice(&snapshot);
-    let (plugin, release) = described_release(&snapshot, request)?;
-    let installed = installed_map()?;
-    let installed = installed.get(plugin.id.as_str());
-    let description = Description {
+fn search_rows<'a>(
+    catalog: &'a Catalog,
+    installed: &'a BTreeMap<String, String>,
+    query: &str,
+) -> Vec<SearchRow<'a>> {
+    catalog
+        .matching(query)
+        .into_iter()
+        .map(|plugin| {
+            let latest = plugin.latest_compatible();
+            let installed_version = installed.get(plugin.id.as_str()).map(String::as_str);
+            SearchRow {
+                id: &plugin.id,
+                display_name: &plugin.display_name,
+                description: &plugin.description,
+                tags: &plugin.tags,
+                latest_version: latest.map(|release| release.version.as_str()),
+                compatible: latest.is_some(),
+                installed: installed_version.is_some(),
+                installed_version,
+                withdrawal_reason: withdrawal(plugin, installed_version, latest.is_some()),
+            }
+        })
+        .collect()
+}
+
+fn withdrawn_reason(release: &CatalogVersion) -> Option<&str> {
+    match release.status {
+        VersionStatus::Withdrawn => Some(
+            release
+                .withdrawal_reason
+                .as_deref()
+                .unwrap_or("no reason given"),
+        ),
+        VersionStatus::Active => None,
+    }
+}
+
+/// The withdrawal of the exact version a user has installed, while the catalog
+/// still lists it.
+fn installed_withdrawal<'a>(plugin: &'a CatalogPlugin, installed: &str) -> Option<&'a str> {
+    plugin
+        .versions
+        .iter()
+        .find(|release| release.version == installed)
+        .and_then(withdrawn_reason)
+}
+
+/// The withdrawal a searcher needs to see: the installed version's, or — when
+/// nothing compatible is left to install — the newest version's.
+fn withdrawal<'a>(
+    plugin: &'a CatalogPlugin,
+    installed: Option<&str>,
+    compatible: bool,
+) -> Option<&'a str> {
+    let installed = installed.and_then(|version| installed_withdrawal(plugin, version));
+    if installed.is_some() || compatible {
+        return installed;
+    }
+    plugin
+        .versions
+        .iter()
+        .filter_map(|release| Version::parse(&release.version).ok().map(|v| (v, release)))
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .and_then(|(_, release)| withdrawn_reason(release))
+}
+
+/// Everything `describe` reports for one release, in one place, so the text and
+/// JSON views cannot drift apart.
+fn description<'a>(
+    plugin: &'a CatalogPlugin,
+    release: &'a CatalogVersion,
+    installed: Option<&'a str>,
+) -> Description<'a> {
+    Description {
         id: &plugin.id,
         display_name: &plugin.display_name,
         description: &plugin.description,
@@ -211,8 +279,20 @@ async fn describe(request: &str, offline: bool, json: bool) -> Result<(), String
         dangerous: release.dangerous,
         network_load: release.network_load,
         installed: installed.is_some(),
-        installed_version: installed.and_then(|package| package.version.as_deref()),
-    };
+        installed_version: installed,
+    }
+}
+
+async fn describe(request: &str, offline: bool, json: bool) -> Result<(), String> {
+    let snapshot = crate::plugin_catalog::load(offline).await?;
+    offline_notice(&snapshot);
+    let (plugin, release) = described_release(&snapshot, request)?;
+    let installed = crate::plugin_install::installed_versions()?;
+    let description = description(
+        plugin,
+        release,
+        installed.get(plugin.id.as_str()).map(String::as_str),
+    );
     if json {
         println!(
             "{}",
@@ -263,6 +343,10 @@ async fn install(requests: &[String], offline: bool) -> Result<(), String> {
 }
 
 async fn update(requested: &[String], offline: bool) -> Result<(), String> {
+    // The lock finishes any interrupted operation, so hold it before reading
+    // installations: a half-applied update has no state worth deciding from.
+    let config = crate::plugin_catalog::config_dir()?;
+    let _lock = InstallLock::acquire(&config)?;
     let installed = crate::plugin_install::installed()?;
     let managed: HashMap<_, _> = installed
         .iter()
@@ -313,8 +397,6 @@ async fn update(requested: &[String], offline: bool) -> Result<(), String> {
         return Ok(());
     }
     report_missing_requirements(&snapshot, &updates)?;
-    let config = crate::plugin_catalog::config_dir()?;
-    let _lock = InstallLock::acquire(&config)?;
     let prepared = crate::plugin_install::prepare(&snapshot, &updates, offline).await?;
     activate(prepared)?;
     println!("Run :reload in an existing sofka session to load the changes.");
@@ -326,6 +408,13 @@ fn activate(prepared: Vec<crate::plugin_install::PreparedPackage>) -> Result<(),
     for package in prepared {
         let id = package.id.clone();
         let version = package.version.clone();
+        for path in &package.conflicts {
+            eprintln!(
+                "warning: {id} shares a plugin name or palette command with the package at {}; \
+                 sofka loads the first of the two and ignores the other",
+                path.display()
+            );
+        }
         match package.activate() {
             Ok(action) => println!(
                 "{} {id}@{version}",
@@ -351,24 +440,58 @@ fn activate(prepared: Vec<crate::plugin_install::PreparedPackage>) -> Result<(),
 
 fn list(json: bool) -> Result<(), String> {
     let packages = crate::plugin_install::installed()?;
+    // Withdrawals come from whatever was last fetched; list never reaches the
+    // network, and having no cache at all is not an error.
+    let cached = crate::plugin_catalog::cached();
+    let rows = list_rows(&packages, cached.as_ref().map(|snapshot| &snapshot.catalog));
+    if rows.iter().any(|row| row.withdrawal_reason.is_some())
+        && let Some(snapshot) = &cached
+    {
+        offline_notice(snapshot);
+    }
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&packages).map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?
         );
     } else {
-        for package in packages {
-            let kind = if package.managed { "managed" } else { "manual" };
-            let modified = if package.modified { " modified" } else { "" };
+        for row in rows {
+            let kind = if row.managed { "managed" } else { "manual" };
+            let modified = if row.modified { " modified" } else { "" };
+            let withdrawn = row
+                .withdrawal_reason
+                .map_or(String::new(), |reason| format!(" withdrawn: {reason}"));
             println!(
-                "{}\t{}\t{kind}{modified}\t{}",
-                package.id,
-                package.version.as_deref().unwrap_or("-"),
-                package.path.display()
+                "{}\t{}\t{kind}{modified}{withdrawn}\t{}",
+                row.id,
+                row.version.unwrap_or("-"),
+                row.path.display()
             );
         }
     }
     Ok(())
+}
+
+fn list_rows<'a>(
+    packages: &'a [InstalledPackage],
+    catalog: Option<&'a Catalog>,
+) -> Vec<ListRow<'a>> {
+    packages
+        .iter()
+        .map(|package| ListRow {
+            id: &package.id,
+            version: package.version.as_deref(),
+            path: &package.path,
+            managed: package.managed,
+            modified: package.modified,
+            withdrawal_reason: catalog
+                .filter(|_| package.managed)
+                .zip(package.version.as_deref())
+                .and_then(|(catalog, version)| {
+                    installed_withdrawal(catalog.find(&package.id).ok()?, version)
+                }),
+        })
+        .collect()
 }
 
 fn remove(ids: &[String]) -> Result<(), String> {
@@ -381,33 +504,38 @@ fn remove(ids: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn installed_map() -> Result<HashMap<String, InstalledPackage>, String> {
-    Ok(crate::plugin_install::installed()?
-        .into_iter()
-        .filter(|package| package.managed)
-        .map(|package| (package.id.clone(), package))
-        .collect())
-}
-
 fn report_missing_requirements(
     snapshot: &CatalogSnapshot,
     requests: &[String],
 ) -> Result<(), String> {
+    for warning in missing_requirements(snapshot, requests)? {
+        eprintln!("warning: {warning}");
+    }
+    Ok(())
+}
+
+/// External tools a request needs but this machine does not have. Reported, not
+/// enforced: a missing tool never stops a valid package from being installed.
+fn missing_requirements(
+    snapshot: &CatalogSnapshot,
+    requests: &[String],
+) -> Result<Vec<String>, String> {
     let mut reported = HashSet::new();
+    let mut warnings = Vec::new();
     for request in requests {
         let selection = snapshot.catalog.select(request)?;
         for requirement in &selection.version.requirements {
-            if reported.insert((selection.plugin.id.as_str(), requirement.name.as_str()))
+            if reported.insert((selection.plugin.id.clone(), requirement.name.clone()))
                 && crate::plugins::executable(&requirement.name).is_none()
             {
-                eprintln!(
-                    "warning: {} requires {} — {}",
+                warnings.push(format!(
+                    "{} requires {} — {}",
                     selection.plugin.id, requirement.name, requirement.install
-                );
+                ));
             }
         }
     }
-    Ok(())
+    Ok(warnings)
 }
 
 fn described_release<'a>(
@@ -450,5 +578,378 @@ fn offline_notice(snapshot: &CatalogSnapshot) {
             "using cached catalog from {} ago; withdrawal information may be stale",
             crate::plugin_catalog::age(snapshot.fetched_at)
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn catalog(versions: serde_json::Value) -> Catalog {
+        let index = serde_json::json!({
+            "schema_version": 1,
+            "generated_at": "2026-09-11T00:00:00Z",
+            "plugins": [{
+                "id": "resource-summary",
+                "display_name": "Resource summary",
+                "description": "Summarize the selected resource.",
+                "tags": ["example"],
+                "publisher": "sofka maintainers",
+                "repository": "https://github.com/nklmilojevic/sofka-plugins",
+                "versions": versions,
+            }],
+        });
+        Catalog::parse(&serde_json::to_vec(&index).unwrap()).unwrap()
+    }
+
+    fn release(version: &str, status: &str, reason: Option<&str>) -> serde_json::Value {
+        let mut release = serde_json::json!({
+            "version": version,
+            "sofka": ">=0.0.1",
+            "source_commit": "1".repeat(40),
+            "license": "MIT",
+            "readme": "https://example.invalid/readme",
+            "requirements": [],
+            "command": "./adapter",
+            "target": "selection",
+            "output": "report",
+            "mutating": false,
+            "confirm": false,
+            "dangerous": false,
+            "network_load": false,
+            "status": status,
+            "artifacts": [{
+                "platform": "any",
+                "url": format!(
+                    "{}resource-summary-v{version}/resource-summary.tar.zst",
+                    crate::plugin_catalog::RELEASE_ROOT
+                ),
+                "blake3": "2".repeat(64),
+                "size": 1,
+            }],
+        });
+        if let Some(reason) = reason {
+            release["withdrawal_reason"] = reason.into();
+        }
+        release
+    }
+
+    fn package(version: &str) -> Vec<InstalledPackage> {
+        vec![InstalledPackage {
+            id: "resource-summary".into(),
+            version: Some(version.into()),
+            path: std::path::PathBuf::from("/config/plugins/resource-summary"),
+            managed: true,
+            modified: false,
+        }]
+    }
+
+    fn snapshot(versions: serde_json::Value) -> CatalogSnapshot {
+        CatalogSnapshot {
+            catalog: catalog(versions),
+            commit: "0".repeat(40),
+            fetched_at: 0,
+            offline: true,
+        }
+    }
+
+    /// The documented field set of one JSON row, sorted: object key order is
+    /// not part of the contract, the field set is.
+    fn keys(value: &serde_json::Value) -> Vec<&str> {
+        let mut keys: Vec<_> = value
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    #[test]
+    fn describe_selects_exact_versions_and_errors_on_anything_unknown() {
+        let snapshot = snapshot(serde_json::json!([
+            release("1.0.0", "active", None),
+            release("2.0.0", "active", None),
+        ]));
+        let (plugin, release) = described_release(&snapshot, "resource-summary").unwrap();
+        assert_eq!(plugin.id, "resource-summary");
+        assert_eq!(release.version, "2.0.0");
+        assert_eq!(
+            described_release(&snapshot, "resource-summary@1.0.0")
+                .unwrap()
+                .1
+                .version,
+            "1.0.0"
+        );
+        assert!(
+            described_release(&snapshot, "absent")
+                .unwrap_err()
+                .contains("unknown plugin")
+        );
+        assert!(
+            described_release(&snapshot, "resource-summary@9.9.9")
+                .unwrap_err()
+                .contains("has no version 9.9.9")
+        );
+        assert!(described_release(&snapshot, "Bad Id").is_err());
+    }
+
+    #[test]
+    fn describe_still_reports_a_plugin_whose_only_release_was_withdrawn() {
+        let snapshot = snapshot(serde_json::json!([
+            release("1.0.0", "withdrawn", Some("leaks secrets")),
+            release("2.0.0", "withdrawn", Some("same defect")),
+        ]));
+        let (plugin, release) = described_release(&snapshot, "resource-summary").unwrap();
+        assert_eq!(release.version, "2.0.0");
+        let described = description(plugin, release, None);
+        assert_eq!(described.status, "withdrawn");
+        assert_eq!(described.withdrawal_reason, Some("same defect"));
+        assert!(!described.installed);
+    }
+
+    #[test]
+    fn describe_reports_the_release_and_installed_state_as_documented_fields() {
+        let snapshot = snapshot(serde_json::json!([release("1.0.0", "active", None)]));
+        let (plugin, release) = described_release(&snapshot, "resource-summary").unwrap();
+        let packages = package("1.0.0");
+        let described = description(plugin, release, packages[0].version.as_deref());
+        assert!(described.installed);
+        assert_eq!(described.installed_version, Some("1.0.0"));
+        assert_eq!(described.platforms, ["any"]);
+        assert_eq!(described.sofka, ">=0.0.1");
+        assert_eq!(described.target, "selection");
+        assert_eq!(described.output, "report");
+
+        let value = serde_json::to_value(&described).unwrap();
+        assert_eq!(
+            keys(&value),
+            [
+                "command",
+                "confirm",
+                "dangerous",
+                "description",
+                "display_name",
+                "id",
+                "installed",
+                "installed_version",
+                "license",
+                "mutating",
+                "network_load",
+                "output",
+                "platforms",
+                "publisher",
+                "readme",
+                "repository",
+                "requirements",
+                "sofka",
+                "status",
+                "tags",
+                "target",
+                "version",
+                "withdrawal_reason",
+            ]
+        );
+    }
+
+    #[test]
+    fn search_and_list_json_carry_their_documented_fields() {
+        let catalog = catalog(serde_json::json!([release("1.0.0", "active", None)]));
+        let installed = installed_rows(&package("1.0.0"));
+        let rows = serde_json::to_value(search_rows(&catalog, &installed, "")).unwrap();
+        assert_eq!(
+            keys(&rows[0]),
+            [
+                "compatible",
+                "description",
+                "display_name",
+                "id",
+                "installed",
+                "installed_version",
+                "latest_version",
+                "tags",
+                "withdrawal_reason",
+            ]
+        );
+        assert_eq!(rows[0]["latest_version"], "1.0.0");
+        assert_eq!(rows[0]["compatible"], true);
+        assert_eq!(rows[0]["installed"], true);
+        assert_eq!(rows[0]["withdrawal_reason"], serde_json::Value::Null);
+
+        let packages = package("1.0.0");
+        let rows = serde_json::to_value(list_rows(&packages, Some(&catalog))).unwrap();
+        assert_eq!(
+            keys(&rows[0]),
+            [
+                "id",
+                "managed",
+                "modified",
+                "path",
+                "version",
+                "withdrawal_reason"
+            ]
+        );
+        assert_eq!(rows[0]["managed"], true);
+        assert_eq!(rows[0]["modified"], false);
+    }
+
+    #[test]
+    fn a_query_that_matches_nothing_is_an_empty_result_not_an_error() {
+        let catalog = catalog(serde_json::json!([release("1.0.0", "active", None)]));
+        let none = BTreeMap::new();
+        assert!(search_rows(&catalog, &none, "absent").is_empty());
+        assert_eq!(search_rows(&catalog, &none, "RESOURCE").len(), 1);
+        assert!(list_rows(&[], Some(&catalog)).is_empty());
+    }
+
+    #[test]
+    fn a_manual_package_is_never_labelled_with_catalog_withdrawal() {
+        let catalog = catalog(serde_json::json!([release(
+            "1.0.0",
+            "withdrawn",
+            Some("leaks secrets")
+        )]));
+        let mut packages = package("1.0.0");
+        packages[0].managed = false;
+        assert_eq!(
+            list_rows(&packages, Some(&catalog))[0].withdrawal_reason,
+            None
+        );
+
+        // A version the catalog never listed carries no withdrawal either.
+        let unknown = package("9.9.9");
+        assert_eq!(
+            list_rows(&unknown, Some(&catalog))[0].withdrawal_reason,
+            None
+        );
+    }
+
+    #[test]
+    fn missing_external_tools_are_reported_once_each_and_never_block_a_request() {
+        let mut versions = serde_json::json!([release("1.0.0", "active", None)]);
+        versions[0]["requirements"] = serde_json::json!([
+            {"name": "sofka-absent-tool-40412", "install": "brew install absent"},
+            {"name": "sh", "install": "already present"},
+        ]);
+        let snapshot = snapshot(versions);
+        let requests = [
+            "resource-summary".to_string(),
+            "resource-summary".to_string(),
+        ];
+        let warnings = missing_requirements(&snapshot, &requests).unwrap();
+        assert_eq!(
+            warnings,
+            ["resource-summary requires sofka-absent-tool-40412 — brew install absent"]
+        );
+        // Reporting a requirement is not a failure, and an unknown ID still is.
+        report_missing_requirements(&snapshot, &requests).unwrap();
+        assert!(missing_requirements(&snapshot, &["absent".to_string()]).is_err());
+    }
+
+    #[test]
+    fn a_batch_keeps_earlier_successes_and_preserves_the_package_that_failed() {
+        let config =
+            std::env::temp_dir().join(format!("sofka-plugin-cli-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        let plugins = config.join("plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+
+        let good = plugins.join("good");
+        let stage = config.join(".plugin-stage-good");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join(".sofka-install-stage"), "stage").unwrap();
+        std::fs::write(stage.join("plugin.toml"), "new").unwrap();
+
+        let bad = plugins.join("bad");
+        std::fs::create_dir(&bad).unwrap();
+        std::fs::write(bad.join("plugin.toml"), "previous").unwrap();
+
+        let error = activate(vec![
+            crate::plugin_install::PreparedPackage::staged(
+                "good",
+                "1.0.0",
+                None,
+                stage,
+                good.clone(),
+            ),
+            crate::plugin_install::PreparedPackage::staged(
+                "bad",
+                "2.0.0",
+                Some("1.0.0"),
+                config.join(".plugin-stage-bad-absent"),
+                bad.clone(),
+            ),
+        ])
+        .unwrap_err();
+
+        assert_eq!(error, "failed to activate: bad");
+        assert_eq!(
+            std::fs::read_to_string(good.join("plugin.toml")).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            std::fs::read_to_string(bad.join("plugin.toml")).unwrap(),
+            "previous"
+        );
+        let _ = std::fs::remove_dir_all(config);
+    }
+
+    #[test]
+    fn search_reports_why_a_withdrawn_plugin_cannot_be_installed() {
+        let catalog = catalog(serde_json::json!([release(
+            "1.0.0",
+            "withdrawn",
+            Some("unsafe")
+        )]));
+        let none = BTreeMap::new();
+        let rows = search_rows(&catalog, &none, "");
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].compatible);
+        assert_eq!(rows[0].withdrawal_reason, Some("unsafe"));
+    }
+
+    #[test]
+    fn search_reports_a_withdrawn_installed_version_beside_its_replacement() {
+        let catalog = catalog(serde_json::json!([
+            release("1.0.0", "withdrawn", Some("leaks secrets")),
+            release("2.0.0", "active", None),
+        ]));
+        let installed = installed_rows(&package("1.0.0"));
+        let rows = search_rows(&catalog, &installed, "");
+        assert_eq!(rows[0].latest_version, Some("2.0.0"));
+        assert!(rows[0].compatible);
+        assert_eq!(rows[0].withdrawal_reason, Some("leaks secrets"));
+
+        let installed = installed_rows(&package("2.0.0"));
+        let rows = search_rows(&catalog, &installed, "");
+        assert_eq!(rows[0].withdrawal_reason, None);
+    }
+
+    #[test]
+    fn list_reports_a_withdrawn_installed_version_and_survives_an_empty_cache() {
+        let catalog = catalog(serde_json::json!([
+            release("1.0.0", "withdrawn", Some("leaks secrets")),
+            release("2.0.0", "active", None),
+        ]));
+        let packages = package("1.0.0");
+        let rows = list_rows(&packages, Some(&catalog));
+        assert_eq!(rows[0].withdrawal_reason, Some("leaks secrets"));
+
+        let current = package("2.0.0");
+        let rows = list_rows(&current, Some(&catalog));
+        assert_eq!(rows[0].withdrawal_reason, None);
+
+        let rows = list_rows(&packages, None);
+        assert_eq!(rows[0].version, Some("1.0.0"));
+        assert_eq!(rows[0].withdrawal_reason, None);
+    }
+
+    /// What search and describe actually consume: installed versions by ID.
+    fn installed_rows(packages: &[InstalledPackage]) -> BTreeMap<String, String> {
+        packages
+            .iter()
+            .filter_map(|package| Some((package.id.clone(), package.version.clone()?)))
+            .collect()
     }
 }

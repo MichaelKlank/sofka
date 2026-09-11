@@ -163,6 +163,12 @@ impl Args {
             .or(self.resource.as_deref())
     }
 
+    /// The resource a session opens on: the CLI wins over the configured
+    /// default, and `--resource` is as much the CLI as the positional is.
+    fn launch_resource(&self, default: Option<&str>) -> String {
+        self.resource().or(default).unwrap_or("pods").to_string()
+    }
+
     fn launch_namespace(&self) -> Option<String> {
         if self.all_namespaces {
             Some(String::new())
@@ -478,10 +484,7 @@ async fn run_main(args: Args) -> Result<()> {
     } else if let Some(ns) = cfg.default_namespace.clone() {
         app.namespace = ns;
     }
-    let resource = args
-        .resource
-        .or(cfg.default_resource)
-        .unwrap_or_else(|| "pods".into());
+    let resource = args.launch_resource(cfg.default_resource.as_deref());
     match &connect_error {
         // No cluster to watch — open the context picker over the empty table;
         // a successful pick connects and lands on the default resource.
@@ -810,11 +813,7 @@ async fn run_info(
 
     // Exactly what a launch with these flags would open, so the probe below
     // exercises the view the user would actually land on.
-    let resource = args
-        .resource()
-        .map(str::to_owned)
-        .or_else(|| cfg.default_resource.clone())
-        .unwrap_or_else(|| "pods".into());
+    let resource = args.launch_resource(cfg.default_resource.as_deref());
     let namespace = starting_namespace(
         args,
         &cfg,
@@ -1221,6 +1220,24 @@ mod tests {
         let args = Args::try_parse_from(["sofka", "--resource", "plugin"]).unwrap();
         assert!(args.command.is_none());
         assert_eq!(args.resource(), Some("plugin"));
+    }
+
+    #[test]
+    fn launch_opens_the_requested_resource_before_the_configured_default() {
+        let launch = |argv: [&str; 3]| {
+            Args::try_parse_from(argv.into_iter().filter(|a| !a.is_empty()))
+                .unwrap()
+                .launch_resource(Some("svc"))
+        };
+        assert_eq!(launch(["sofka", "--resource", "plugin"]), "plugin");
+        assert_eq!(launch(["sofka", "deploy", ""]), "deploy");
+        assert_eq!(launch(["sofka", "", ""]), "svc");
+        assert_eq!(
+            Args::try_parse_from(["sofka"])
+                .unwrap()
+                .launch_resource(None),
+            "pods"
+        );
     }
 
     #[test]

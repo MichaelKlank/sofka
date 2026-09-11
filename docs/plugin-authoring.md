@@ -111,6 +111,44 @@ type = "boolean"
 default = "false"
 ```
 
+### `[package]`
+
+A package published to the [official catalog](plugins.md#official-catalog) adds
+a `[package]` table naming who publishes it and what it supports. Sofka
+validates the table and otherwise ignores it; the catalog generates its index
+entry from it, and adds the artifact URLs, checksums, source commit, and
+withdrawal status itself. A package installed only by hand can leave it out.
+
+```toml
+[package]
+version = "0.1.0"
+authors = ["sofka maintainers"]
+license = "MIT OR Apache-2.0"
+description = "Scan the active context with Popeye and report findings by linter."
+repository = "https://github.com/nklmilojevic/sofka-plugins"
+readme = "README.md"
+sofka = ">=0.25.5"
+platforms = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+tags = ["diagnostics", "report"]
+```
+
+| Field         | Function                                                                                       |
+| ------------- | ---------------------------------------------------------------------------------------------- |
+| `version`     | Required semantic version of this package release. Separate from `schema_version`.             |
+| `description` | Required one-line summary, shown by `sofka plugin search`.                                     |
+| `license`     | Required SPDX expression.                                                                      |
+| `authors`     | Who is responsible for the package.                                                            |
+| `repository`  | HTTPS URL of the source repository.                                                            |
+| `readme`      | README filename inside the package directory.                                                  |
+| `sofka`       | Semantic version requirement on sofka. Its lower bound must include support for this manifest. |
+| `platforms`   | Target triples the package publishes artifacts for.                                            |
+| `tags`        | Search keywords.                                                                               |
+
+The package ID is its directory name. `[plugin]` keeps its meaning: `name` is
+the display name and `palette` is the command.
+
+### `[plugin]`
+
 | Field            | Function                                                                                   |
 | ---------------- | ------------------------------------------------------------------------------------------ |
 | `schema_version` | Required package format version. Use `1`.                                                  |

@@ -144,7 +144,81 @@ pub fn executable(name: &str) -> Option<PathBuf> {
 #[serde(deny_unknown_fields)]
 struct Manifest {
     schema_version: u32,
+    /// Publication metadata, in Cargo's spelling. Absent from a manifest that is
+    /// only ever installed by hand; required by the catalog, which generates its
+    /// index entry from it.
+    #[serde(default)]
+    package: Option<Package>,
     plugin: Plugin,
+}
+
+/// The `[package]` table: who publishes this package, under what licence, and
+/// which sofka versions and platforms it supports. Sofka validates it and
+/// otherwise leaves it alone — nothing here changes how a plugin runs.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Package {
+    pub version: String,
+    pub description: String,
+    pub license: String,
+    #[serde(default)]
+    pub authors: Vec<String>,
+    pub repository: Option<String>,
+    pub readme: Option<String>,
+    /// Semantic version requirement on sofka itself, like Cargo's
+    /// `rust-version`. Its lower bound must include support for this manifest.
+    pub sofka: Option<String>,
+    #[serde(default)]
+    pub platforms: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+pub fn validate_package(package: &Package) -> Result<(), String> {
+    if semver::Version::parse(&package.version).is_err() {
+        return Err(format!(
+            "package version {:?} is not a semantic version",
+            package.version
+        ));
+    }
+    if package.description.trim().is_empty() || package.license.trim().is_empty() {
+        return Err("package description and license must not be empty".into());
+    }
+    if package
+        .authors
+        .iter()
+        .any(|author| author.trim().is_empty())
+    {
+        return Err("package authors must not contain an empty entry".into());
+    }
+    if let Some(sofka) = &package.sofka
+        && semver::VersionReq::parse(sofka).is_err()
+    {
+        return Err(format!(
+            "package sofka {sofka:?} is not a version requirement"
+        ));
+    }
+    for field in [&package.repository, &package.readme] {
+        if field.as_ref().is_some_and(|value| value.trim().is_empty()) {
+            return Err("package repository and readme must not be empty".into());
+        }
+    }
+    if package
+        .repository
+        .as_ref()
+        .is_some_and(|url| !url.starts_with("https://"))
+    {
+        return Err("package repository must use HTTPS".into());
+    }
+    for platform in &package.platforms {
+        if !crate::plugin_catalog::SUPPORTED_PLATFORMS.contains(&platform.as_str()) {
+            return Err(format!("package platform {platform:?} is not supported"));
+        }
+    }
+    if package.tags.iter().any(|tag| tag.trim().is_empty()) {
+        return Err("package tags must not contain an empty entry".into());
+    }
+    Ok(())
 }
 
 pub fn read_package(dir: &Path) -> Result<Plugin, String> {
@@ -185,12 +259,21 @@ pub fn read_package(dir: &Path) -> Result<Plugin, String> {
 
 /// Parse and validate a `plugin.toml`, wherever it came from.
 pub fn parse_manifest(text: &str) -> Result<Plugin, String> {
+    Ok(read_manifest(text)?.0)
+}
+
+/// The whole manifest: how the plugin runs, and the publication metadata when
+/// the package declares any.
+pub fn read_manifest(text: &str) -> Result<(Plugin, Option<Package>), String> {
     let manifest: Manifest = toml::from_str(text).map_err(|e| e.to_string())?;
     if manifest.schema_version != 1 {
         return Err("unsupported schema_version (expected 1)".into());
     }
+    if let Some(package) = &manifest.package {
+        validate_package(package)?;
+    }
     validate_plugin(&manifest.plugin)?;
-    Ok(manifest.plugin)
+    Ok((manifest.plugin, manifest.package))
 }
 
 /// The manifest of every package sofka ships. Kept as real files under
@@ -669,6 +752,118 @@ mod tests {
         let result = read_package(&dir);
         std::fs::remove_dir_all(dir).unwrap();
         result
+    }
+
+    const PACKAGED: &str = concat!(
+        "schema_version = 1\n",
+        "\n",
+        "[package]\n",
+        "version = \"0.1.0\"\n",
+        "description = \"Scan the active context.\"\n",
+        "license = \"MIT OR Apache-2.0\"\n",
+        "authors = [\"sofka maintainers\"]\n",
+        "repository = \"https://github.com/nklmilojevic/sofka-plugins\"\n",
+        "readme = \"README.md\"\n",
+        "sofka = \">=0.25.5\"\n",
+        "platforms = [\"x86_64-apple-darwin\"]\n",
+        "tags = [\"diagnostics\"]\n",
+        "\n",
+        "[plugin]\n",
+        "name = \"Popeye scan\"\n",
+        "palette = \"popeye\"\n",
+        "command = \"./adapter\"\n",
+        "output = \"report\"\n",
+        "target = \"context\"\n",
+        "mutating = false\n",
+    );
+
+    #[test]
+    fn a_package_table_is_read_beside_the_execution_fields() {
+        let (plugin, package) = read_manifest(PACKAGED).unwrap();
+        // The execution half is untouched by the new table.
+        assert_eq!(plugin.name, "Popeye scan");
+        assert_eq!(plugin.palette.as_deref(), Some("popeye"));
+        assert_eq!(plugin.command, "./adapter");
+        let package = package.unwrap();
+        assert_eq!(package.version, "0.1.0");
+        assert_eq!(package.authors, ["sofka maintainers"]);
+        assert_eq!(package.license, "MIT OR Apache-2.0");
+        assert_eq!(package.sofka.as_deref(), Some(">=0.25.5"));
+        assert_eq!(package.platforms, ["x86_64-apple-darwin"]);
+        assert_eq!(package.tags, ["diagnostics"]);
+    }
+
+    #[test]
+    fn a_manifest_without_a_package_table_stays_valid() {
+        let (plugin, package) = read_manifest(
+            "schema_version = 1\n[plugin]\nname = \"Local\"\npalette = \"local\"\ncommand = \"/bin/echo\"\noutput = \"popup\"\n",
+        )
+        .unwrap();
+        assert_eq!(plugin.name, "Local");
+        assert!(package.is_none());
+    }
+
+    #[test]
+    fn package_metadata_is_validated_field_by_field() {
+        for (label, from, to) in [
+            ("version", "version = \"0.1.0\"", "version = \"one\""),
+            (
+                "description",
+                "description = \"Scan the active context.\"",
+                "description = \"  \"",
+            ),
+            (
+                "license",
+                "license = \"MIT OR Apache-2.0\"",
+                "license = \"\"",
+            ),
+            (
+                "author",
+                "authors = [\"sofka maintainers\"]",
+                "authors = [\"\"]",
+            ),
+            ("sofka range", "sofka = \">=0.25.5\"", "sofka = \"latest\""),
+            (
+                "platform",
+                "platforms = [\"x86_64-apple-darwin\"]",
+                "platforms = [\"risc\"]",
+            ),
+            (
+                "repository",
+                "repository = \"https://github.com/nklmilojevic/sofka-plugins\"",
+                "repository = \"http://insecure\"",
+            ),
+            ("tag", "tags = [\"diagnostics\"]", "tags = [\"\"]"),
+        ] {
+            let manifest = PACKAGED.replace(from, to);
+            assert!(read_manifest(&manifest).is_err(), "accepted {label}");
+        }
+        // An unknown key in the new table is refused like any other.
+        assert!(
+            read_manifest(&PACKAGED.replace("[package]", "[package]\npublisher = \"x\"")).is_err()
+        );
+        read_manifest(PACKAGED).unwrap();
+    }
+
+    #[test]
+    fn optional_package_fields_may_be_absent() {
+        let minimal = concat!(
+            "schema_version = 1\n",
+            "[package]\n",
+            "version = \"0.1.0\"\n",
+            "description = \"Scan.\"\n",
+            "license = \"MIT\"\n",
+            "[plugin]\n",
+            "name = \"Scan\"\n",
+            "palette = \"scan\"\n",
+            "command = \"/bin/echo\"\n",
+            "output = \"popup\"\n",
+        );
+        let package = read_manifest(minimal).unwrap().1.unwrap();
+        assert!(package.authors.is_empty());
+        assert!(package.repository.is_none());
+        assert!(package.sofka.is_none());
+        assert!(package.platforms.is_empty());
     }
 
     #[test]
