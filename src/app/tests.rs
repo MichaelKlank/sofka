@@ -15202,6 +15202,63 @@ async fn resource_context_shortcut_preserves_explicit_namespace() {
 }
 
 #[tokio::test]
+async fn resource_context_selection_fills_and_cycles_before_adding_namespace() {
+    for (next, previous) in [
+        (KeyCode::Down, KeyCode::Up),
+        (KeyCode::Tab, KeyCode::BackTab),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.all_contexts = vec!["gke-east".into(), "gke-west".into()];
+        let generation = app.generation;
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for c in "pods @gke".chars() {
+            app.handle_key(press(KeyCode::Char(c))).unwrap();
+        }
+        for (key, expected) in [
+            (next, "pods @gke-west"),
+            (next, "pods @gke-east"),
+            (previous, "pods @gke-west"),
+            (previous, "pods @gke-east"),
+            (next, "pods @gke-west"),
+        ] {
+            app.handle_key(press(key)).unwrap();
+            assert_eq!(app.command, expected);
+            assert_eq!(app.mode, Mode::Command);
+            assert_eq!(app.generation, generation);
+            assert!(app.pending_resource_query.is_none());
+        }
+        for c in " production".chars() {
+            app.handle_key(press(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        land_context(&mut app, "gke-west");
+        assert_eq!(app.kind_plural, "pods");
+        assert_eq!(app.namespace, "production");
+        assert_eq!(app.cluster.context, "gke-west");
+    }
+}
+
+#[tokio::test]
+async fn resource_context_completion_stays_editable_and_can_be_cancelled() {
+    let (mut app, _rx) = test_app();
+    app.all_contexts = vec!["gke-west".into()];
+    let generation = app.generation;
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "services @gke".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    assert_eq!(app.command, "services @gke-west");
+    app.handle_key(press(KeyCode::Backspace)).unwrap();
+    assert_eq!(app.command, "services @gke-wes");
+    app.handle_key(press(KeyCode::Char('t'))).unwrap();
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.generation, generation);
+    assert!(app.pending_resource_query.is_none());
+}
+
+#[tokio::test]
 async fn resource_context_shortcut_completes_long_names_and_uses_target_default() {
     let (mut app, _rx) = test_app();
     let context = "gke_project_europe-west1_production-cluster";
@@ -26945,9 +27002,9 @@ async fn document_fullscreen_layout_and_prompts_follow_keys() {
         assert!(command[0].contains("document title"));
         assert!(command[19].contains(':'));
         assert!(
-            command
-                .iter()
-                .any(|row| row.contains("commands & resources"))
+            command.iter().any(|row| row.contains(":next")
+                && row.contains(":previous")
+                && row.contains(":run"))
         );
         app.handle_key(press(KeyCode::Esc)).unwrap();
         assert_eq!(app.mode, mode);

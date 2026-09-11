@@ -480,6 +480,7 @@ impl App {
         if key.action == Some(Action::Down) {
             if !self.cmd_suggestions.is_empty() {
                 self.cmd_sel = (self.cmd_sel + 1) % self.cmd_suggestions.len();
+                self.fill_resource_context();
             }
             return;
         }
@@ -489,6 +490,7 @@ impl App {
                     .cmd_sel
                     .checked_sub(1)
                     .unwrap_or(self.cmd_suggestions.len() - 1);
+                self.fill_resource_context();
             }
             return;
         }
@@ -511,6 +513,20 @@ impl App {
                 self.update_suggestions();
             }
             _ => {}
+        }
+    }
+
+    fn fill_resource_context(&mut self) {
+        if let Some(suggestion) = self
+            .cmd_suggestions
+            .get(self.cmd_sel)
+            .filter(|s| s.kind == SuggestKind::Context)
+            && let Some((head, argument)) = self.command.split_once(char::is_whitespace)
+            && !is_ctx_command(head)
+            && argument.trim_start().starts_with('@')
+        {
+            self.command = format!("{head} @{}", suggestion.label);
+            // Keep the matching list so the next key can select another context.
         }
     }
 

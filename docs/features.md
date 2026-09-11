@@ -152,8 +152,9 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   navigation screen, then close back to the screen where they were opened.
 - **Cross-context resource navigation** - `:pods @production-cluster default`
   switches context, resource, and namespace together without changing kubeconfig's
-  `current-context`. Context names after `@` fuzzy-complete: Tab/Shift-Tab select
-  a suggestion and Enter opens it. Omit the namespace to use the target context's
+  `current-context`. Context names after `@` fuzzy-complete: Tab/Shift-Tab or
+  Down/Up fill the selected context in the command. Add a namespace if needed,
+  then press Enter to run the query. Omit the namespace to use the target context's
   remembered or default namespace. Namespace completion after `@context` is not
   provided.
 - **Help scrolling** (`?`) - browse all bindings, including plugins, bookmarks,

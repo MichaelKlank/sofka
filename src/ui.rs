@@ -2730,7 +2730,7 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
     ));
     lines.push(bind(
         ":resource @context [namespace]",
-        "switch context and resource (context fuzzy-completes; kubeconfig unchanged)",
+        "switch context and resource (select to fill context, then add namespace)",
     ));
     lines.push(bind(":rightsize", "historical right-sizing: P50/P95/P99 usage → suggested requests + patch (needs [providers.metrics])"));
     lines.push(bind(
@@ -4034,7 +4034,29 @@ fn draw_palette(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let shown = app.cmd_suggestions.len().min(12) as u16;
     let h = shown + 2;
-    let w = area.width.saturating_sub(4).min(46);
+    let keys = key_hint(
+        app,
+        "command",
+        &[
+            (Action::Down, "next"),
+            (Action::Up, "previous"),
+            (Action::Accept, "run"),
+        ],
+    );
+    let full_title = format!(" commands & resources ({keys}) ");
+    let w = area
+        .width
+        .saturating_sub(4)
+        .min(full_title.width().saturating_add(2).max(46) as u16);
+    let title_width = usize::from(w.saturating_sub(2));
+    let hint = [
+        full_title,
+        format!(" {keys} "),
+        format!(" {} ", key_hint(app, "command", &[(Action::Accept, "run")])),
+    ]
+    .into_iter()
+    .find(|title| title.width() <= title_width)
+    .unwrap_or_else(|| clip_to_width(" commands ", title_width));
     let rect = Rect {
         x: area.x + 1,
         y: area.y + area.height.saturating_sub(h + 1),
@@ -4082,18 +4104,6 @@ fn draw_palette(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     let mut state = ListState::default();
     state.select(Some(app.cmd_sel));
-    let hint = format!(
-        " commands & resources ({}) ",
-        key_hint(
-            app,
-            "command",
-            &[
-                (Action::Down, "next"),
-                (Action::Up, "previous"),
-                (Action::Accept, "run")
-            ]
-        )
-    );
     render_framed_list(
         frame,
         show_scrollbars,
@@ -5158,6 +5168,60 @@ mod tests {
         assert!(clipped.ends_with('…'));
         // No room even for the ellipsis.
         assert_eq!(clip_to_width("abc", 0), "");
+    }
+
+    #[tokio::test]
+    async fn palette_title_fits_wide_and_narrow_terminals() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut app = App::new(crate::k8s::Cluster::fake(), tx);
+        app.all_contexts = vec!["gke-west".into()];
+        for c in ":pods @gke".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .unwrap();
+        }
+        for custom_keys in [false, true] {
+            if custom_keys {
+                let cfg: crate::config::Config = toml::from_str(
+                    "[keys.command]\ndown = 'ctrl-n'\nup = 'ctrl-p'\naccept = 'ctrl-y'",
+                )
+                .unwrap();
+                app.keymap = crate::keymap::Keymap::compile(&cfg.keys).unwrap();
+            }
+            let keys = key_hint(
+                &app,
+                "command",
+                &[
+                    (Action::Down, "next"),
+                    (Action::Up, "previous"),
+                    (Action::Accept, "run"),
+                ],
+            );
+            for (width, expected) in [
+                (100, format!(" commands & resources ({keys}) ")),
+                (60, format!(" {keys} ")),
+                (
+                    30,
+                    format!(
+                        " {} ",
+                        key_hint(&app, "command", &[(Action::Accept, "run")])
+                    ),
+                ),
+            ] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+                terminal
+                    .draw(|f| draw_palette(f, &mut app, f.area()))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let title = (0..width)
+                    .map(|x| buffer[(x, 8)].symbol())
+                    .collect::<String>();
+                assert!(title.contains(&expected), "width {width}: {title:?}");
+                assert!(title.contains('╮'), "missing right border: {title:?}");
+            }
+        }
     }
 
     #[tokio::test]
