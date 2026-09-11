@@ -17,6 +17,7 @@ const RECORD_SCHEMA: u32 = 1;
 const REMOVED_PREFIX: &str = ".plugin-removed-";
 const TRASH: &str = ".plugin-trash";
 const TRASH_MARKER: &str = ".sofka-trash";
+const RECORD_MAX_BYTES: usize = 1024 * 1024;
 const EXPANDED_MAX_BYTES: u64 = 200 * 1024 * 1024;
 const FILE_MAX: usize = 2_000;
 /// A package may hold thousands of files; an error message may not.
@@ -165,6 +166,13 @@ impl PreparedPackage {
             Ok(current) => current.is_some(),
             Err(error) => return Err(format!("refusing to replace {}: {error}", self.id)),
         };
+        // Claim the cleanup directory before moving either package. Otherwise
+        // discovering an unowned directory after the swap reports failure even
+        // though the new package is already active and cannot be rolled back.
+        let trash = had_destination
+            .then(|| trash(config))
+            .transpose()
+            .map_err(|e| format!("refusing to replace {}: {e}", self.id))?;
         if had_destination {
             std::fs::rename(&self.destination, &backup).map_err(|e| {
                 format!(
@@ -196,7 +204,7 @@ impl PreparedPackage {
         if had_destination {
             // Rename first: a half-deleted backup is unidentifiable, so recovery
             // must see it under a name that means "already replaced".
-            let trash = trash(config).map_err(|e| format!("{} was activated, but {e}", self.id))?;
+            let trash = trash.expect("cleanup was prepared before replacement");
             let discarded = unique_path(&trash, &format!("{REMOVED_PREFIX}{}", self.id));
             std::fs::rename(&backup, &discarded).map_err(|e| {
                 format!(
@@ -354,8 +362,7 @@ async fn prepare_below(
             artifact_digest: artifact.blake3.to_ascii_lowercase(),
             files,
         };
-        let written = serde_json::to_string_pretty(&record)
-            .map_err(|e| e.to_string())
+        let written = serialize_record(&record)
             .and_then(|json| crate::atomicfile::write(&stage.join(RECORD), &json));
         if let Err(error) = written {
             // Nothing owns the stage until the PreparedPackage below exists, so
@@ -393,6 +400,11 @@ fn reconcile(
     };
     if let Some(published) = published {
         compare("version", &published.version, &release.version);
+        compare(
+            "sofka",
+            published.sofka.as_deref().unwrap_or(""),
+            &release.sofka,
+        );
     }
     compare("command", &declared.command, &release.command);
     // Resolved the way the loader resolves them, so an omitted field is
@@ -658,7 +670,7 @@ fn remove_below(config: &Path, ids: &[String]) -> Result<Vec<(String, PathBuf)>,
 fn read_record(dir: &Path) -> Result<InstallationRecord, String> {
     let path = dir.join(RECORD);
     let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if bytes.len() > 1024 * 1024 {
+    if bytes.len() > RECORD_MAX_BYTES {
         return Err(format!("{} exceeds 1 MiB", path.display()));
     }
     let record: InstallationRecord =
@@ -670,6 +682,14 @@ fn read_record(dir: &Path) -> Result<InstallationRecord, String> {
         ));
     }
     Ok(record)
+}
+
+fn serialize_record(record: &InstallationRecord) -> Result<String, String> {
+    let json = serde_json::to_string_pretty(record).map_err(|e| e.to_string())?;
+    if json.len() > RECORD_MAX_BYTES {
+        return Err("installation record exceeds 1 MiB".into());
+    }
+    Ok(json)
 }
 
 fn verify_record(dir: &Path, record: &InstallationRecord) -> Result<(), String> {
@@ -1534,6 +1554,51 @@ mod tests {
     }
 
     #[test]
+    fn replacement_refuses_unowned_trash_before_changing_the_active_package() {
+        let config = scratch("activation-unowned-trash");
+        let destination = config.join("plugins").join("sample");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("plugin.toml"), "previous").unwrap();
+        write_record(&destination, &record_for("sample", "1.0.0"));
+
+        let stage = unique_path(&config, ".plugin-stage-sample");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join(STAGE_MARKER), "stage").unwrap();
+        std::fs::write(stage.join("plugin.toml"), "replacement").unwrap();
+        write_record(&stage, &record_for("sample", "2.0.0"));
+        let user_file = config.join(TRASH).join("user-file");
+        std::fs::create_dir_all(user_file.parent().unwrap()).unwrap();
+        std::fs::write(&user_file, "mine").unwrap();
+
+        let error = PreparedPackage::staged(
+            "sample",
+            "2.0.0",
+            Some("1.0.0"),
+            stage.clone(),
+            destination.clone(),
+        )
+        .activate()
+        .unwrap_err();
+
+        assert!(error.contains("did not put there"), "{error}");
+        assert!(!stage.exists(), "the refused stage was not cleaned up");
+        assert_eq!(
+            std::fs::read_to_string(destination.join("plugin.toml")).unwrap(),
+            "previous"
+        );
+        assert_eq!(read_record(&destination).unwrap().package_version, "1.0.0");
+        assert!(user_file.is_file());
+        assert!(!config.join(TRASH).join(TRASH_MARKER).exists());
+        assert!(!std::fs::read_dir(&config).unwrap().flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".plugin-backup-")
+        }));
+        let _ = std::fs::remove_dir_all(config);
+    }
+
+    #[test]
     fn extraction_digests_match_verification_for_nested_and_empty_files() {
         let dir = scratch("digest-agreement");
         let source = dir.join("package.tar.zst");
@@ -2131,6 +2196,26 @@ mod tests {
     }
 
     #[test]
+    fn installation_records_are_bounded_before_they_reach_disk() {
+        let files = (0..FILE_MAX)
+            .map(|index| {
+                (
+                    format!("{}file-{index}", "long-directory/".repeat(40)),
+                    "0".repeat(64),
+                )
+            })
+            .collect();
+        let record = InstallationRecord {
+            files,
+            ..record_for("sample", "1.0.0")
+        };
+
+        let error = serialize_record(&record).unwrap_err();
+
+        assert!(error.contains("exceeds 1 MiB"), "{error}");
+    }
+
+    #[test]
     fn archive_paths_must_be_plain_relative_components() {
         for bad in ["", ".", "../escape", "/absolute", "dir/../escape"] {
             assert!(
@@ -2568,6 +2653,36 @@ mod tests {
             assert!(staged.is_empty(), "{label}: {staged:?}");
             let _ = std::fs::remove_dir_all(config);
         }
+
+        let config = scratch("contradicts-sofka");
+        let cache = config.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let manifest = MANIFEST.replacen(
+            "schema_version = 1\n",
+            concat!(
+                "schema_version = 1\n",
+                "[package]\n",
+                "version = \"1.0.0\"\n",
+                "description = \"Summarize a resource.\"\n",
+                "license = \"MIT\"\n",
+                "sofka = \">=99.0.0\"\n",
+            ),
+            1,
+        );
+        let snapshot = published(&cache, "resource-summary", "1.0.0", &manifest);
+        let error = prepare_below(
+            &config,
+            &cache,
+            &snapshot,
+            &["resource-summary".to_string()],
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("contradicts the catalog entry"), "{error}");
+        assert!(error.contains("sofka"), "{error}");
+        assert!(!config.join("plugins").join("resource-summary").exists());
+        let _ = std::fs::remove_dir_all(config);
     }
 
     #[test]
