@@ -123,6 +123,15 @@ struct Description<'a> {
     installed_version: Option<&'a str>,
 }
 
+impl Description<'_> {
+    /// Whether sofka will ask before running this, matching the rule in
+    /// `App::run_plugin`: confirmation, danger, and traffic generation each
+    /// require it.
+    fn confirms(&self) -> bool {
+        self.confirm || self.dangerous || self.network_load
+    }
+}
+
 pub async fn run(args: &PluginArgs) -> Result<(), String> {
     match &args.command {
         PluginCommand::Search {
@@ -314,10 +323,9 @@ async fn describe(request: &str, offline: bool, json: bool) -> Result<(), String
         println!("target: {}", description.target);
         println!("output: {}", description.output);
         println!("mutating: {}", description.mutating);
-        println!(
-            "confirmation: {}",
-            description.confirm || description.dangerous
-        );
+        // Sofka confirms for traffic generation too, so describe must not
+        // claim a plugin will run unprompted when it will not.
+        println!("confirmation: {}", description.confirms());
         println!("network load: {}", description.network_load);
         println!(
             "installed: {}",
@@ -707,6 +715,30 @@ mod tests {
         assert_eq!(described.status, "withdrawn");
         assert_eq!(described.withdrawal_reason, Some("same defect"));
         assert!(!described.installed);
+    }
+
+    #[test]
+    fn describe_says_a_plugin_will_prompt_whenever_sofka_would() {
+        let variants = [
+            (false, false, false, false),
+            (true, false, false, true),
+            (false, true, false, true),
+            // Traffic generation prompts too; describe used to say it did not.
+            (false, false, true, true),
+        ];
+        for (confirm, dangerous, network_load, expected) in variants {
+            let mut release = release("1.0.0", "active", None);
+            release["confirm"] = confirm.into();
+            release["dangerous"] = dangerous.into();
+            release["network_load"] = network_load.into();
+            let snapshot = snapshot(serde_json::json!([release]));
+            let (plugin, release) = described_release(&snapshot, "resource-summary").unwrap();
+            assert_eq!(
+                description(plugin, release, None).confirms(),
+                expected,
+                "confirm={confirm} dangerous={dangerous} network_load={network_load}"
+            );
+        }
     }
 
     #[test]

@@ -9,11 +9,10 @@ use hyper::body::Bytes;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
-const REPOSITORY: &str = "nklmilojevic/sofka-plugins";
-const COMMIT_URL: &str = "https://api.github.com/repos/nklmilojevic/sofka-plugins/commits/HEAD";
-const RAW_ROOT: &str = "https://raw.githubusercontent.com/nklmilojevic/sofka-plugins";
-pub(crate) const RELEASE_ROOT: &str =
-    "https://github.com/nklmilojevic/sofka-plugins/releases/download/";
+const REPOSITORY: &str = "vyrti/sofka-plugins";
+const COMMIT_URL: &str = "https://api.github.com/repos/vyrti/sofka-plugins/commits/HEAD";
+const RAW_ROOT: &str = "https://raw.githubusercontent.com/vyrti/sofka-plugins";
+pub(crate) const RELEASE_ROOT: &str = "https://github.com/vyrti/sofka-plugins/releases/download/";
 const CATALOG_MAX_BYTES: usize = 10 * 1024 * 1024;
 pub const ARTIFACT_MAX_BYTES: usize = 50 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -832,7 +831,7 @@ mod tests {
                 description: "Summarize a resource".into(),
                 tags: vec!["report".into()],
                 publisher: "sofka".into(),
-                repository: "https://github.com/nklmilojevic/sofka-plugins".into(),
+                repository: "https://github.com/vyrti/sofka-plugins".into(),
                 versions: vec![CatalogVersion {
                     version: "0.1.0".into(),
                     sofka: ">=0.1.0, <1.0.0".into(),
