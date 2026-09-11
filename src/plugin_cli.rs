@@ -226,11 +226,17 @@ fn withdrawn_reason(release: &CatalogVersion) -> Option<&str> {
 /// The withdrawal of the exact version a user has installed, while the catalog
 /// still lists it.
 fn installed_withdrawal<'a>(plugin: &'a CatalogPlugin, installed: &str) -> Option<&'a str> {
+    released(plugin, installed).and_then(withdrawn_reason)
+}
+
+/// The catalog entry for an exact installed version, when the index still
+/// carries one. Absent is not the same as withdrawn: a withdrawal explains
+/// itself, while a dropped entry leaves nothing to say and nothing to install.
+fn released<'a>(plugin: &'a CatalogPlugin, version: &str) -> Option<&'a CatalogVersion> {
     plugin
         .versions
         .iter()
-        .find(|release| release.version == installed)
-        .and_then(withdrawn_reason)
+        .find(|release| release.version == version)
 }
 
 /// The withdrawal a searcher needs to see: the installed version's, or — when
@@ -411,6 +417,13 @@ async fn update(requested: &[String], offline: bool) -> Result<(), String> {
         match update_plan(&snapshot.catalog, &id, &current) {
             UpdatePlan::Newer => updates.push(id),
             UpdatePlan::Current => println!("{id} is current at {current}"),
+            UpdatePlan::Unlisted { newest } => {
+                eprintln!(
+                    "warning: {id} is installed at {current}, which the catalog no longer \
+                     lists; the newest version sofka can install is {newest}"
+                );
+                unresolved.push(id);
+            }
             // Nothing newer is not the same as nothing wrong: the version in
             // use may since have been withdrawn, and that is the one thing an
             // update run must not stay quiet about.
@@ -477,6 +490,9 @@ fn triage(
 enum UpdatePlan {
     Newer,
     Current,
+    Unlisted {
+        newest: String,
+    },
     Withdrawn {
         reason: String,
         newest: String,
@@ -508,7 +524,15 @@ fn update_plan(catalog: &Catalog, id: &str, current: &Version) -> UpdatePlan {
     if available > *current {
         return UpdatePlan::Newer;
     }
-    match installed_withdrawal(selected.plugin, &installed) {
+    let Some(release) = released(selected.plugin, &installed) else {
+        // Newer than anything installable and absent from the index: the entry
+        // was dropped rather than withdrawn, so there is no reason to report
+        // and nothing to update to. Calling that current said the opposite.
+        return UpdatePlan::Unlisted {
+            newest: available.to_string(),
+        };
+    };
+    match withdrawn_reason(release) {
         Some(reason) => UpdatePlan::Withdrawn {
             reason: reason.to_owned(),
             newest: available.to_string(),
@@ -1358,6 +1382,37 @@ mod tests {
                     "absent is not a managed installation".to_string()
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn an_installed_version_the_catalog_dropped_is_never_called_current() {
+        let version = |v: &str| Version::parse(v).unwrap();
+        let catalog = catalog(serde_json::json!([
+            release("1.0.0", "active", None),
+            release("2.0.0", "withdrawn", Some("corrupts reports")),
+        ]));
+
+        // 3.0.0 was published once and the entry has since been dropped, not
+        // withdrawn. Nothing newer is installable and there is no reason to
+        // report, which used to read as "current at 3.0.0" and exit clean.
+        assert_eq!(
+            update_plan(&catalog, "resource-summary", &version("3.0.0")),
+            UpdatePlan::Unlisted {
+                newest: "1.0.0".into()
+            }
+        );
+        // A version the catalog still lists keeps its own answer.
+        assert_eq!(
+            update_plan(&catalog, "resource-summary", &version("2.0.0")),
+            UpdatePlan::Withdrawn {
+                reason: "corrupts reports".into(),
+                newest: "1.0.0".into(),
+            }
+        );
+        assert_eq!(
+            update_plan(&catalog, "resource-summary", &version("1.0.0")),
+            UpdatePlan::Current
         );
     }
 }

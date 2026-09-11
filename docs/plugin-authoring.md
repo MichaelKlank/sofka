@@ -148,6 +148,12 @@ tags = ["diagnostics", "report"]
 The package ID is its directory name. `[plugin]` keeps its meaning: `name` is
 the display name and `palette` is the command.
 
+A catalog install reconciles this manifest against the index entry it came
+from. The `[package]` version and the `[plugin]` command, target, output,
+`mutating`, `confirm`, `dangerous`, and `network_load` must match the published
+entry, and an omitted field is compared as the behaviour it produces — an
+absent `mutating` means `true`. A package that disagrees is refused.
+
 ### `[plugin]`
 
 | Field            | Function                                                                                   |

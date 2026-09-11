@@ -259,8 +259,11 @@ pub fn validate_package(package: &Package) -> Result<(), String> {
     Ok(())
 }
 
-pub fn read_package(dir: &Path) -> Result<Plugin, String> {
-    let dir = dir.canonicalize().map_err(|e| e.to_string())?;
+/// The manifest exactly as the package declares it, before `read_package`
+/// resolves a relative command against the package directory. Checking a
+/// package against the catalog entry it was selected from has to compare what
+/// the author wrote, not the absolute path this process resolved it to.
+pub fn read_package_manifest(dir: &Path) -> Result<(Plugin, Option<Package>), String> {
     let path = dir.join("plugin.toml");
     use std::io::Read;
     let mut bytes = Vec::new();
@@ -272,7 +275,12 @@ pub fn read_package(dir: &Path) -> Result<Plugin, String> {
     if bytes.len() > MAX_BYTES {
         return Err("manifest exceeds 1 MiB".into());
     }
-    let mut plugin = parse_manifest(std::str::from_utf8(&bytes).map_err(|e| e.to_string())?)?;
+    read_manifest(std::str::from_utf8(&bytes).map_err(|e| e.to_string())?)
+}
+
+pub fn read_package(dir: &Path) -> Result<Plugin, String> {
+    let dir = dir.canonicalize().map_err(|e| e.to_string())?;
+    let mut plugin = read_package_manifest(&dir)?.0;
     if plugin.command.starts_with("./") {
         let command = dir
             .join(&plugin.command)

@@ -266,22 +266,22 @@ async fn prepare_below(
         }
         if selections
             .iter()
-            .any(|(id, _, _, _): &(String, String, String, _)| id == &selection.plugin.id)
+            .any(|(id, _, _): &(String, _, _)| id == &selection.plugin.id)
         {
             continue;
         }
         selections.push((
             selection.plugin.id.clone(),
-            selection.version.version.clone(),
-            selection.version.source_commit.clone(),
-            selection.artifact.clone(),
+            selection.version,
+            selection.artifact,
         ));
     }
 
     let mut prepared = Vec::new();
     // Manifests prepared so far in this batch, by package ID.
     let mut batch: Vec<(String, crate::config::Plugin)> = Vec::new();
-    for (id, version, source_commit, artifact) in selections {
+    for (id, release, artifact) in selections {
+        let version = release.version.clone();
         let destination = plugins.join(&id);
         let previous = inspect_destination(&destination, &id)?;
         if let Some(record) = previous.as_ref()
@@ -305,7 +305,7 @@ async fn prepare_below(
             });
             continue;
         }
-        let archive = plugin_catalog::artifact_in(cache, &artifact, offline).await?;
+        let archive = plugin_catalog::artifact_in(cache, artifact, offline).await?;
         let stage = unique_path(config, &format!(".plugin-stage-{id}"));
         std::fs::create_dir(&stage).map_err(|e| format!("creating {}: {e}", stage.display()))?;
         std::fs::write(
@@ -315,8 +315,13 @@ async fn prepare_below(
         .map_err(|e| format!("marking {}: {e}", stage.display()))?;
         // Extraction hashes every byte it writes, so the record below needs no
         // second pass over the package.
-        let staged = extract(&archive, &stage)
-            .and_then(|files| crate::plugins::read_package(&stage).map(|package| (files, package)));
+        let staged = extract(&archive, &stage).and_then(|files| {
+            // The declared manifest, not the resolved one: reconciliation
+            // compares the spellings the author published.
+            let (declared, published) = crate::plugins::read_package_manifest(&stage)?;
+            reconcile(&id, release, &declared, published.as_ref())?;
+            crate::plugins::read_package(&stage).map(|package| (files, package))
+        });
         let (files, package) = match staged {
             Ok(staged) => staged,
             Err(error) => {
@@ -342,7 +347,7 @@ async fn prepare_below(
             id: id.clone(),
             package_version: version.clone(),
             catalog_commit: snapshot.commit.clone(),
-            source_commit,
+            source_commit: release.source_commit.clone(),
             artifact_digest: artifact.blake3.to_ascii_lowercase(),
             files,
         };
@@ -365,6 +370,62 @@ async fn prepare_below(
         });
     }
     Ok(prepared)
+}
+
+/// The catalog's claims about a release and the package's own manifest have to
+/// agree. `describe` reports the catalog while the loader runs the manifest, so
+/// a publishing mistake could otherwise advertise a reviewed, non-mutating,
+/// unprompted plugin and install one that writes to the cluster unasked.
+fn reconcile(
+    id: &str,
+    release: &plugin_catalog::CatalogVersion,
+    declared: &crate::config::Plugin,
+    published: Option<&crate::plugins::Package>,
+) -> Result<(), String> {
+    let mut differences = Vec::new();
+    let mut compare = |field: &str, manifest: &str, catalog: &str| {
+        if manifest != catalog {
+            differences.push(format!("{field} {manifest:?}, catalog says {catalog:?}"));
+        }
+    };
+    if let Some(published) = published {
+        compare("version", &published.version, &release.version);
+    }
+    compare("command", &declared.command, &release.command);
+    // Resolved the way the loader resolves them, so an omitted field is
+    // compared as the behaviour it actually produces.
+    compare(
+        "target",
+        declared.target.as_deref().unwrap_or("selection"),
+        &release.target,
+    );
+    compare(
+        "output",
+        declared.output.as_deref().unwrap_or("terminal"),
+        &release.output,
+    );
+    for (field, manifest, catalog) in [
+        (
+            "mutating",
+            declared.mutating.unwrap_or(true),
+            release.mutating,
+        ),
+        ("confirm", declared.confirm, release.confirm),
+        ("dangerous", declared.dangerous, release.dangerous),
+        ("network_load", declared.network_load, release.network_load),
+    ] {
+        if manifest != catalog {
+            differences.push(format!("{field} {manifest}, catalog says {catalog}"));
+        }
+    }
+    if differences.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "package {id} contradicts the catalog entry it was selected from ({}); \
+         the published archive and the index disagree, so neither can be trusted",
+        differences.join("; ")
+    ))
 }
 
 /// The installed packages a freshly staged one would collide with. Package
@@ -911,6 +972,28 @@ fn unique_path(parent: &Path, prefix: &str) -> PathBuf {
     parent.join(format!("{prefix}-{}-{nanos:x}", std::process::id()))
 }
 
+/// Whether a name is one `unique_path` produced: the prefix, an ID, then the
+/// process and timestamp that made it unique. A staging directory proves itself
+/// with a marker file, which a half-deleted directory may no longer have; this
+/// shape survives a partial deletion and still excludes a directory a user
+/// happened to name with the same prefix.
+fn generated(name: &str, prefix: &str) -> bool {
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some((rest, nanos)) = rest.rsplit_once('-') else {
+        return false;
+    };
+    let Some((id, pid)) = rest.rsplit_once('-') else {
+        return false;
+    };
+    !id.is_empty()
+        && !pid.is_empty()
+        && !nanos.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && nanos.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn recover(config: &Path) -> Result<(), String> {
     let entries = match std::fs::read_dir(config) {
         Ok(entries) => entries,
@@ -930,8 +1013,12 @@ fn recover(config: &Path) -> Result<(), String> {
             }
         } else if name.starts_with(REMOVED_PREFIX) {
             // The rename that created this directory committed the removal, so
-            // there is nothing left to identify and nothing to keep.
-            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            // there is nothing left to identify and nothing to keep — but the
+            // deletion is recursive, so it takes the same care the staging
+            // branch takes with its marker: only a name this process shape
+            // could have produced is sofka's to destroy.
+            if generated(&name, REMOVED_PREFIX) && entry.file_type().is_ok_and(|kind| kind.is_dir())
+            {
                 std::fs::remove_dir_all(&path)
                     .map_err(|e| format!("recovering {}: {e}", path.display()))?;
             }
@@ -1024,6 +1111,10 @@ mod tests {
         "palette = \"resource-summary\"\n",
         "command = \"/bin/echo\"\n",
         "output = \"report\"\n",
+        // Declared, not omitted: the catalog entry says false, and an omitted
+        // `mutating` means true, which is exactly the divergence `reconcile`
+        // exists to refuse.
+        "mutating = false\n",
     );
 
     /// A catalog whose single artifact is a real archive in `cache`, so the
@@ -2389,6 +2480,85 @@ mod tests {
         assert!(InstallLock::acquire(&config).is_err());
         drop(first);
         assert!(InstallLock::acquire(&config).is_ok());
+        let _ = std::fs::remove_dir_all(config);
+    }
+
+    #[tokio::test]
+    async fn a_package_that_contradicts_its_catalog_entry_is_refused() {
+        // `describe` reports the catalog while the loader runs the manifest, so
+        // a package that claims less than it does must never reach the disk.
+        for (label, field) in [
+            ("mutating", "mutating = true\n"),
+            ("confirm", "confirm = true\n"),
+            ("dangerous", "dangerous = true\n"),
+            ("network_load", "network_load = true\n"),
+            ("target", "target = \"context\"\n"),
+        ] {
+            let config = scratch(&format!("contradicts-{label}"));
+            let cache = config.join("cache");
+            std::fs::create_dir_all(&cache).unwrap();
+            let manifest = MANIFEST.replace("mutating = false\n", field);
+            let snapshot = published(&cache, "resource-summary", "1.0.0", &manifest);
+            let error = prepare_below(
+                &config,
+                &cache,
+                &snapshot,
+                &["resource-summary".to_string()],
+                true,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("contradicts the catalog entry"), "{error}");
+            assert!(error.contains(label), "{label}: {error}");
+            // The refusal takes its staging directory with it.
+            let staged: Vec<_> = std::fs::read_dir(&config)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with(".plugin-stage-"))
+                .collect();
+            assert!(staged.is_empty(), "{label}: {staged:?}");
+            let _ = std::fs::remove_dir_all(config);
+        }
+    }
+
+    #[test]
+    fn recovery_only_deletes_directories_it_could_have_created() {
+        assert!(generated(
+            ".plugin-removed-sample-4321-17b2c9f0",
+            REMOVED_PREFIX
+        ));
+        // An ID may contain hyphens of its own.
+        assert!(generated(
+            ".plugin-removed-resource-summary-4321-17b2c9f0",
+            REMOVED_PREFIX
+        ));
+        // Anything a user would plausibly type is not sofka's to delete.
+        for name in [
+            ".plugin-removed-notes",
+            ".plugin-removed-sample-backup",
+            ".plugin-removed-sample-4321-nothex",
+            ".plugin-removed-sample-notdigits-17b2c9f0",
+            ".plugin-removed-",
+            ".plugin-removed-a-b",
+        ] {
+            assert!(!generated(name, REMOVED_PREFIX), "{name}");
+        }
+
+        let config = scratch("removed-prefix");
+        std::fs::create_dir_all(config.join("plugins")).unwrap();
+        let mine = unique_path(&config, &format!("{REMOVED_PREFIX}sample"));
+        std::fs::create_dir(&mine).unwrap();
+        let theirs = config.join(".plugin-removed-my-own-notes");
+        std::fs::create_dir(&theirs).unwrap();
+        std::fs::write(theirs.join("keep.txt"), "mine").unwrap();
+
+        recover(&config).unwrap();
+        assert!(!mine.exists(), "sofka's own leftover survived recovery");
+        assert!(
+            theirs.join("keep.txt").is_file(),
+            "recovery deleted a directory it did not create"
+        );
         let _ = std::fs::remove_dir_all(config);
     }
 }

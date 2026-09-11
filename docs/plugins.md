@@ -31,8 +31,8 @@ sofka plugin remove ID [ID ...]
 version. An explicit `ID@VERSION` installs exactly that version and supports
 updates and rollbacks. Reinstalling the same intact version succeeds without
 changing files. An update run reports every plugin it cannot update — one the
-catalog no longer serves, one with local modifications — updates the rest, and
-fails at the end. Sofka never updates plugins during startup, search, or
+catalog no longer serves, one whose installed version the catalog has dropped,
+one with local modifications — updates the rest, and fails at the end. Sofka never updates plugins during startup, search, or
 reload.
 
 Search, describe, install, and update fetch the complete `index.json` once per
@@ -52,7 +52,10 @@ There is no destructive force option.
 
 The installer verifies BLAKE3 before extraction, rejects links and unsafe
 paths, validates the existing `plugin.toml` format, and activates a complete
-staged directory. It reports missing external tools and their installation
+staged directory. It also reconciles the staged `plugin.toml` against the
+catalog entry the package was selected from and refuses a package whose
+version, command, target, output, or safety flags disagree, so what `describe`
+reports is what the session runs. It reports missing external tools and their installation
 instructions, but does not install them. Metadata and package downloads have
 separate budgets: a download that makes no progress for 30 seconds is dropped,
 while a large package is given up to 15 minutes to arrive. After an
