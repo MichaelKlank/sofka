@@ -1401,7 +1401,7 @@ impl ConfigLoader {
         let base = merged.clone();
 
         for path in self.dropin_paths() {
-            match read_file(&path) {
+            match read_dropin(&path) {
                 Ok(Some(mut v)) => {
                     if let Some(migration) = key_migration::prepare(&mut v, &path, &mut warnings) {
                         migrations.push(migration);
@@ -1508,7 +1508,7 @@ pub fn file_state(path: &Path) -> &'static str {
 }
 
 pub fn dropin_state(path: &Path) -> &'static str {
-    state_of(read_file(path))
+    state_of(read_dropin(path))
 }
 
 fn state_of(result: Result<Option<toml::Value>, String>) -> &'static str {
@@ -1525,6 +1525,14 @@ fn read_value(path: &Path) -> Result<Option<toml::Value>, String> {
         document::select(dir)?;
     }
     read_file(path)
+}
+
+fn read_dropin(path: &Path) -> Result<Option<toml::Value>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => validate_file(path, &text).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn read_file(path: &Path) -> Result<Option<toml::Value>, String> {
@@ -2211,6 +2219,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dropin_dir.join("30-broken.yml"), "aliases: [unclosed\n").unwrap();
+        std::fs::write(dropin_dir.join("40-typed.toml"), "readonly = \"yes\"\n").unwrap();
         std::fs::write(dropin_dir.join("README.md"), "ignored\n").unwrap();
         std::fs::write(cluster_dir.join("config.toml"), "readonly = false\n").unwrap();
 
@@ -2221,7 +2230,12 @@ mod tests {
                 dropin_dir.join("10-team.yaml"),
                 dropin_dir.join("20-personal.toml"),
                 dropin_dir.join("30-broken.yml"),
+                dropin_dir.join("40-typed.toml"),
             ]
+        );
+        assert_eq!(
+            dropin_state(&dropin_dir.join("40-typed.toml")),
+            "invalid - skipped"
         );
 
         let r = loader.resolve("", "");
@@ -2230,8 +2244,10 @@ mod tests {
         for (alias, kind) in [("po", "pods"), ("svc", "services"), ("dep", "deployments")] {
             assert_eq!(r.config.aliases.get(alias).map(String::as_str), Some(kind));
         }
-        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        assert_eq!(r.warnings.len(), 2, "{:?}", r.warnings);
         assert!(r.warnings[0].contains("30-broken.yml"), "{}", r.warnings[0]);
+        assert!(r.warnings[1].contains("40-typed.toml"), "{}", r.warnings[1]);
+        assert!(r.warnings[1].contains("readonly"), "{}", r.warnings[1]);
 
         let r = loader.resolve("ctx", "c1");
         assert!(!r.config.readonly, "cluster override wins over drop-ins");
