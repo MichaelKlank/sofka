@@ -629,6 +629,9 @@ pub fn plan(
     // that isn't installed — simply contributes nothing.
     for rule in rules_for(views, &source.ar, row_ns) {
         let targets = Targets::resolve(kinds, &rule);
+        if let Some(why) = &targets.stray_default {
+            plan.warns.push(why.clone());
+        }
         if targets.all.is_empty() {
             continue;
         }
@@ -714,6 +717,7 @@ pub fn plan(
 struct Targets {
     all: Vec<KindRef>,
     default: Option<KindRef>,
+    stray_default: Option<String>,
 }
 
 impl Targets {
@@ -725,6 +729,7 @@ impl Targets {
             return Self {
                 all: default.clone().into_iter().collect(),
                 default,
+                stray_default: None,
             };
         }
         let mut all: Vec<KindRef> = Vec::new();
@@ -733,8 +738,24 @@ impl Targets {
                 all.push(candidate);
             }
         }
-        let default = default.filter(|d| all.iter().any(|t| same_kind(t, d)));
-        Self { all, default }
+        let (default, stray_default) = match default {
+            Some(d) if all.iter().any(|t| same_kind(t, &d)) => (Some(d), None),
+            Some(_) => (
+                None,
+                Some(format!(
+                    "ref {} → {}: kind {} is not one of kinds",
+                    rule.from,
+                    rule.target_label(),
+                    rule.kind
+                )),
+            ),
+            None => (None, None),
+        };
+        Self {
+            all,
+            default,
+            stray_default,
+        }
     }
 
     fn pick(&self, rule: &RefRule, named: Option<&str>) -> Option<&KindRef> {
@@ -1608,12 +1629,6 @@ mod tests {
                 kinds = ["secretstores"]
 
                 [[views.externalsecrets.refs]]
-                path = "/spec/secretStoreRef/name"
-                kind = "secretstores"
-                kind_path = "/spec/secretStoreRef/kind"
-                kinds = ["clustersecretstores"]
-
-                [[views.externalsecrets.refs]]
                 path = "/spec/data/*/sourceRef/name"
                 kind_path = "/spec/other/*/kind"
                 kinds = ["secretstores"]
@@ -1644,24 +1659,19 @@ mod tests {
             .unwrap()
             .views,
         );
-        assert_eq!(warnings.len(), 7, "{warnings:?}");
+        assert_eq!(warnings.len(), 6, "{warnings:?}");
         assert!(warnings[0].contains("ref 1") && warnings[0].contains("kinds"));
         assert!(warnings[1].contains("ref 2") && warnings[1].contains("kind_path"));
         assert!(warnings[2].contains("ref 3") && warnings[2].contains("JSON Pointer"));
-        assert!(
-            warnings[3].contains("ref 4") && warnings[3].contains("must be one of kinds"),
-            "{}",
-            warnings[3]
-        );
-        for (i, what) in [(4, "ref 5"), (5, "ref 6"), (6, "ref 7")] {
+        for (i, what) in [(3, "ref 4"), (4, "ref 5"), (5, "ref 6")] {
             assert!(
                 warnings[i].contains(what) && warnings[i].contains("same arrays"),
                 "{}",
                 warnings[i]
             );
         }
-        assert!(warnings[4].contains("kind_path") && warnings[5].contains("kind_path"));
-        assert!(warnings[6].contains("namespace_path"));
+        assert!(warnings[3].contains("kind_path") && warnings[4].contains("kind_path"));
+        assert!(warnings[5].contains("namespace_path"));
         let rules = &views["externalsecrets"].refs;
         assert_eq!(rules.len(), 2);
         assert_eq!(
@@ -1673,6 +1683,80 @@ mod tests {
         assert_eq!(rules[0].kinds, ["secretstores"]);
         assert_eq!(rules[0].kind, "");
         assert!(rules[0].is_dynamic());
+    }
+
+    #[test]
+    fn a_default_kind_is_matched_to_the_candidates_by_the_cluster() {
+        let (views, warnings) = crate::views::compile(
+            &toml::from_str::<crate::config::Config>(
+                r#"
+                [[views.externalsecrets.refs]]
+                path = "/spec/secretStoreRef/name"
+                kind = "SecretStore"
+                kind_path = "/spec/secretStoreRef/kind"
+                kinds = ["secretstores", "clustersecretstores"]
+
+                [[views.externalsecrets.refs]]
+                path = "/spec/data/*/sourceRef/name"
+                kind = "secretstores"
+                kind_path = "/spec/data/*/sourceRef/kind"
+                kinds = ["clustersecretstores"]
+                relation = "pulls"
+                "#,
+            )
+            .unwrap()
+            .views,
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut kinds = cluster();
+        kinds.0.extend([
+            kind(
+                "external-secrets.io",
+                "ExternalSecret",
+                "externalsecrets",
+                true,
+            ),
+            kind("external-secrets.io", "SecretStore", "secretstores", true),
+            kind(
+                "external-secrets.io",
+                "ClusterSecretStore",
+                "clustersecretstores",
+                false,
+            ),
+        ]);
+        let es = kind(
+            "external-secrets.io",
+            "ExternalSecret",
+            "externalsecrets",
+            true,
+        );
+        let es_obj = obj(
+            json!({"apiVersion": "external-secrets.io/v1", "kind": "ExternalSecret",
+            "metadata": {"name": "db", "namespace": "shop"},
+            "spec": {"secretStoreRef": {"name": "local"},
+                     "data": [{"sourceRef": {"name": "vault"}}]}}),
+        );
+        let plan = self::plan(&views, &kinds, &es, &es_obj, "shop");
+        assert_eq!(plan.forward.len(), 1);
+        assert_eq!(plan.forward[0].target.plural, "secretstores");
+        assert_eq!(
+            plan.forward[0].refs,
+            [("local".to_string(), "shop".to_string())]
+        );
+        assert_eq!(plan.warns.len(), 1, "{:?}", plan.warns);
+        assert!(
+            plan.warns[0].contains("kind secretstores is not one of kinds"),
+            "{}",
+            plan.warns[0]
+        );
+
+        let store = kind("external-secrets.io", "SecretStore", "secretstores", true);
+        let store_obj = obj(
+            json!({"apiVersion": "external-secrets.io/v1", "kind": "SecretStore",
+            "metadata": {"name": "vault", "namespace": "shop"}}),
+        );
+        let plan = self::plan(&views, &kinds, &store, &store_obj, "shop");
+        assert!(plan.backward.iter().all(|b| b.rule.relation != "pulls"));
     }
 
     #[test]

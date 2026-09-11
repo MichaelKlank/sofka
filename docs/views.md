@@ -405,8 +405,9 @@ The value at `kind_path` is matched against each candidate's kind, plural, or
 group-qualified plural, so `SecretStore` and `secretstores` both work. An
 element naming a kind outside `kinds` - a `User` or `Group` among a
 ClusterRoleBinding's subjects - contributes nothing. With `kind` set, an
-element without a kind takes it; `kind` must then be one of `kinds`. Without
-it, the element is skipped. The `*` segments of `kind_path` and
+element without a kind takes it; `kind` must then name one of `kinds`, in any
+spelling the cluster resolves, or the view reports it and the default is not
+used. Without `kind`, the element is skipped. The `*` segments of `kind_path` and
 `namespace_path` must sit in the same arrays as those of `path`, so each
 element is paired with its own kind and namespace; a pointer that does not is
 reported and the ref skipped. Read backwards, the rule applies when any

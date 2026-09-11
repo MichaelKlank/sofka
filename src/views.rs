@@ -521,11 +521,6 @@ pub fn compile(
                 problem = Some("kinds needs kind_path, where the kind is read from".to_string());
             } else if kind_path.is_none() && kind.is_empty() {
                 problem = Some("kind is empty".to_string());
-            } else if kind_path.is_some()
-                && !kind.is_empty()
-                && !kinds.contains(&kind.to_lowercase())
-            {
-                problem = Some(format!("kind '{kind}' must be one of kinds"));
             } else if let Some(p) = kind_path
                 && !wildcards_align(path, p)
             {
