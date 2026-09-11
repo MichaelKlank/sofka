@@ -575,6 +575,7 @@ pub struct Backward {
     pub rule: RefRule,
     pub from: KindRef,
     pub scope: String,
+    pub default: Option<KindRef>,
 }
 
 /// Everything the gather will read for one selection, decided up front on
@@ -688,11 +689,8 @@ pub fn plan(
         if rule.reverse == Reverse::None {
             continue;
         }
-        if !Targets::resolve(kinds, &rule)
-            .all
-            .iter()
-            .any(|t| same_kind(t, source))
-        {
+        let targets = Targets::resolve(kinds, &rule);
+        if !targets.all.iter().any(|t| same_kind(t, source)) {
             continue;
         }
         let Some(from) = resolve_view_key(kinds, &rule.from) else {
@@ -709,7 +707,12 @@ pub fn plan(
             (None, Reverse::Namespace) if from.namespaced => scope_ns.to_string(),
             _ => String::new(),
         };
-        plan.backward.push(Backward { rule, from, scope });
+        plan.backward.push(Backward {
+            rule,
+            from,
+            scope,
+            default: targets.default,
+        });
     }
     plan
 }
@@ -820,13 +823,14 @@ pub fn owned_by(o: &DynamicObject, uid: Option<&str>) -> bool {
 pub fn names_source(
     o: &DynamicObject,
     rule: &RefRule,
+    default: Option<&KindRef>,
     source: &KindRef,
     source_name: &str,
     source_ns: Option<&str>,
 ) -> bool {
     let value = serde_json::to_value(o).unwrap_or(Value::Null);
     rule_hits(&value, rule).into_iter().any(|hit| {
-        if hit.name != source_name || !hit_names_kind(rule, hit.kind.as_deref(), source) {
+        if hit.name != source_name || !hit_names_kind(rule, hit.kind.as_deref(), default, source) {
             return false;
         }
         let Some(source_ns) = source_ns else {
@@ -840,13 +844,18 @@ pub fn names_source(
     })
 }
 
-fn hit_names_kind(rule: &RefRule, named: Option<&str>, source: &KindRef) -> bool {
+fn hit_names_kind(
+    rule: &RefRule,
+    named: Option<&str>,
+    default: Option<&KindRef>,
+    source: &KindRef,
+) -> bool {
     if !rule.is_dynamic() {
         return true;
     }
     match named {
         Some(named) => kind_is_named(source, named),
-        None => !rule.kind.is_empty() && kind_is_named(source, &rule.kind),
+        None => default.is_some_and(|d| same_kind(d, source)),
     }
 }
 
@@ -914,6 +923,18 @@ mod tests {
                     k.ar.kind.eq_ignore_ascii_case(kind) && k.ar.group.eq_ignore_ascii_case(group)
                 })
                 .cloned()
+        }
+    }
+
+    struct Aliased(Table, &'static str, &'static str);
+
+    impl Kinds for Aliased {
+        fn by_name(&self, name: &str) -> Option<KindRef> {
+            let name = if name == self.1 { self.2 } else { name };
+            self.0.by_name(name)
+        }
+        fn by_kind_in_group(&self, kind: &str, group: &str) -> Option<KindRef> {
+            self.0.by_kind_in_group(kind, group)
         }
     }
 
@@ -1379,17 +1400,32 @@ mod tests {
             .unwrap();
         let pvc = kind("", "PersistentVolumeClaim", "persistentvolumeclaims", true);
         // Same name in the same namespace: a match; same name elsewhere: not.
-        assert!(names_source(&pod, &mounts, &pvc, "data-db-0", Some("db")));
+        assert!(names_source(
+            &pod,
+            &mounts,
+            None,
+            &pvc,
+            "data-db-0",
+            Some("db")
+        ));
         assert!(!names_source(
             &pod,
             &mounts,
+            None,
             &pvc,
             "data-db-0",
             Some("other")
         ));
-        assert!(!names_source(&pod, &mounts, &pvc, "wal-db-0", Some("db")));
+        assert!(!names_source(
+            &pod,
+            &mounts,
+            None,
+            &pvc,
+            "wal-db-0",
+            Some("db")
+        ));
         // A cluster-scoped selection has no namespace to match.
-        assert!(names_source(&pod, &mounts, &pvc, "data-db-0", None));
+        assert!(names_source(&pod, &mounts, None, &pvc, "data-db-0", None));
 
         // With a namespace path, the pointed-at namespace decides, not the
         // referencing object's own.
@@ -1404,8 +1440,22 @@ mod tests {
         .into_iter()
         .find(|r| r.namespace_path.is_some())
         .unwrap();
-        assert!(names_source(&pv, &bound, &pvc, "data-db-0", Some("db")));
-        assert!(!names_source(&pv, &bound, &pvc, "data-db-0", Some("other")));
+        assert!(names_source(
+            &pv,
+            &bound,
+            None,
+            &pvc,
+            "data-db-0",
+            Some("db")
+        ));
+        assert!(!names_source(
+            &pv,
+            &bound,
+            None,
+            &pvc,
+            "data-db-0",
+            Some("other")
+        ));
     }
 
     #[test]
@@ -1555,6 +1605,7 @@ mod tests {
         assert!(names_source(
             &names_local,
             rule,
+            back.default.as_ref(),
             &store,
             "local",
             Some("shop")
@@ -1562,6 +1613,7 @@ mod tests {
         assert!(names_source(
             &names_default,
             rule,
+            back.default.as_ref(),
             &store,
             "local",
             Some("shop")
@@ -1569,6 +1621,7 @@ mod tests {
         assert!(!names_source(
             &names_cluster,
             rule,
+            back.default.as_ref(),
             &store,
             "local",
             Some("shop")
@@ -1576,6 +1629,7 @@ mod tests {
         assert!(names_source(
             &names_cluster,
             rule,
+            back.default.as_ref(),
             &cluster_store,
             "local",
             None
@@ -1583,6 +1637,7 @@ mod tests {
         assert!(!names_source(
             &names_default,
             rule,
+            back.default.as_ref(),
             &cluster_store,
             "local",
             None
@@ -1590,6 +1645,7 @@ mod tests {
         assert!(!names_source(
             &names_local,
             rule,
+            back.default.as_ref(),
             &cluster_store,
             "local",
             None
@@ -1757,6 +1813,101 @@ mod tests {
         );
         let plan = self::plan(&views, &kinds, &store, &store_obj, "shop");
         assert!(plan.backward.iter().all(|b| b.rule.relation != "pulls"));
+    }
+
+    #[test]
+    fn an_alias_default_names_the_source_both_ways() {
+        let (views, warnings) = crate::views::compile(
+            &toml::from_str::<crate::config::Config>(
+                r#"
+                [[views.externalsecrets.refs]]
+                path = "/spec/secretStoreRef/name"
+                kind = "css"
+                kind_path = "/spec/secretStoreRef/kind"
+                kinds = ["secretstores", "clustersecretstores"]
+                reverse = "cluster"
+                "#,
+            )
+            .unwrap()
+            .views,
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut table = cluster();
+        table.0.extend([
+            kind(
+                "external-secrets.io",
+                "ExternalSecret",
+                "externalsecrets",
+                true,
+            ),
+            kind("external-secrets.io", "SecretStore", "secretstores", true),
+            kind(
+                "external-secrets.io",
+                "ClusterSecretStore",
+                "clustersecretstores",
+                false,
+            ),
+        ]);
+        let kinds = Aliased(table, "css", "clustersecretstores");
+        let es = kind(
+            "external-secrets.io",
+            "ExternalSecret",
+            "externalsecrets",
+            true,
+        );
+        let es_obj = obj(
+            json!({"apiVersion": "external-secrets.io/v1", "kind": "ExternalSecret",
+            "metadata": {"name": "db", "namespace": "shop"},
+            "spec": {"secretStoreRef": {"name": "vault"}}}),
+        );
+        let plan = self::plan(&views, &kinds, &es, &es_obj, "shop");
+        assert!(plan.warns.is_empty(), "{:?}", plan.warns);
+        assert_eq!(plan.forward.len(), 1);
+        assert_eq!(plan.forward[0].target.plural, "clustersecretstores");
+
+        let cluster_store = kind(
+            "external-secrets.io",
+            "ClusterSecretStore",
+            "clustersecretstores",
+            false,
+        );
+        let store_obj = obj(
+            json!({"apiVersion": "external-secrets.io/v1", "kind": "ClusterSecretStore",
+            "metadata": {"name": "vault"}}),
+        );
+        let plan = self::plan(&views, &kinds, &cluster_store, &store_obj, "shop");
+        let back = plan
+            .backward
+            .iter()
+            .find(|b| b.from.plural == "externalsecrets")
+            .expect("externalsecrets are listed for a cluster store");
+        assert_eq!(
+            back.default.as_ref().map(|d| d.plural.as_str()),
+            Some("clustersecretstores")
+        );
+        assert!(names_source(
+            &es_obj,
+            &back.rule,
+            back.default.as_ref(),
+            &cluster_store,
+            "vault",
+            None
+        ));
+        let store = kind("external-secrets.io", "SecretStore", "secretstores", true);
+        let plan = self::plan(&views, &kinds, &store, &store_obj, "shop");
+        let back = plan
+            .backward
+            .iter()
+            .find(|b| b.from.plural == "externalsecrets")
+            .unwrap();
+        assert!(!names_source(
+            &es_obj,
+            &back.rule,
+            back.default.as_ref(),
+            &store,
+            "vault",
+            Some("shop")
+        ));
     }
 
     #[test]

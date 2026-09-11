@@ -187,9 +187,15 @@ impl App {
                     }
                 }
             }
-            for Backward { rule, from, scope } in plan.backward {
+            for Backward {
+                rule,
+                from,
+                scope,
+                default,
+            } in plan.backward
+            {
                 for o in cached_list(&mut lists, &client, &from, &scope, &mut warn).await {
-                    if names_source(o, &rule, &source, &source_name, source_ns) {
+                    if names_source(o, &rule, default.as_ref(), &source, &source_name, source_ns) {
                         items.push(item(Direction::NamedBy, &rule.relation, &from, o.clone()));
                     }
                 }
