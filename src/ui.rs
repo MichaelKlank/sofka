@@ -430,25 +430,6 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         ])
     };
 
-    let mut context_line = field("Context:", app.cluster.context.clone(), theme::mauve());
-    if app.readonly {
-        context_line.push_span(Span::styled(
-            "  [read-only]",
-            Style::default().fg(theme::red()),
-        ));
-    }
-    let info = vec![
-        context_line,
-        field(
-            "Cluster:",
-            app.cluster.cluster_url.clone(),
-            theme::sapphire(),
-        ),
-        field("Namespace:", ns, theme::green()),
-        field("Resource:", kind, theme::peach()),
-        field("Count:", app.store.len().to_string(), theme::text()),
-    ];
-
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -457,11 +438,42 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(cols[0]);
     frame.render_widget(block, cols[0]);
 
+    let hints = header_hints(app);
+    let show_hints = !hints.is_empty() && header_hints_fit(area.width);
+    let info_width = if show_hints {
+        inner.width.saturating_sub(HEADER_HINTS_WIDTH)
+    } else {
+        inner.width
+    };
+
+    let mut context_line = field("Context:", app.cluster.context.clone(), theme::mauve());
+    if app.readonly {
+        context_line.push_span(Span::styled(
+            "  [read-only]",
+            Style::default().fg(theme::red()),
+        ));
+    }
+    let mut namespace_line = field("Namespace:", ns.clone(), theme::green());
+    let favorites_width = usize::from(info_width).saturating_sub(12 + ns.width());
+    for span in favorite_namespace_spans(app, favorites_width) {
+        namespace_line.push_span(span);
+    }
+    let info = vec![
+        context_line,
+        field(
+            "Cluster:",
+            app.cluster.cluster_url.clone(),
+            theme::sapphire(),
+        ),
+        namespace_line,
+        field("Resource:", kind, theme::peach()),
+        field("Count:", app.store.len().to_string(), theme::text()),
+    ];
+
     // Per-kind key hints share the box with the info cluster (k9s-style);
     // narrow terminals collapse back to info-only and keep the full hint
     // line at the bottom instead.
-    let hints = header_hints(app);
-    if !hints.is_empty() && header_hints_fit(area.width) {
+    if show_hints {
         let sub = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -506,6 +518,41 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled(format!("   sofka v{VERSION}"), theme::dim())),
     ];
     frame.render_widget(Paragraph::new(logo).alignment(Alignment::Right), cols[1]);
+}
+
+fn favorite_namespace_spans(app: &App, width: usize) -> Vec<Span<'static>> {
+    let key_style = Style::default()
+        .fg(theme::sky())
+        .add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    let mut used = 0;
+    for (namespace, action) in app
+        .namespace_favorites
+        .iter()
+        .zip(Action::FAVORITE_NAMESPACES)
+    {
+        if namespace.is_empty() || app.keymap.chords("table", action).is_empty() {
+            continue;
+        }
+        let key = app.keymap.first_label("table", action);
+        let entry_width = 3 + key.width() + namespace.width();
+        if used + entry_width > width {
+            if used + 3 <= width {
+                spans.push(Span::styled("  …", theme::dim()));
+            }
+            break;
+        }
+        used += entry_width;
+        let name_style = if *namespace == app.namespace {
+            Style::default().fg(theme::green())
+        } else {
+            theme::dim()
+        };
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(key.to_string(), key_style));
+        spans.push(Span::styled(format!(" {namespace}"), name_style));
+    }
+    spans
 }
 
 /// The single-line header for compact mode (`ctrl-e`): kind · count ·
@@ -2599,6 +2646,7 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
     let mut lines = Vec::new();
     let mut previous_scope = "";
     for (scope, action, _) in app.keymap.entries() {
+        let owned;
         if scope != previous_scope {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -2621,6 +2669,14 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
             "toggle refresh (keep the comparison baseline)"
         } else if action == Action::Filter && scope == "table" {
             "filter rows; label:text searches label keys and values locally"
+        } else if scope == "table"
+            && (action == Action::AllNamespaces || Action::FAVORITE_NAMESPACES.contains(&action))
+        {
+            owned = format!(
+                "{}; also in the namespace switcher while the filter is empty",
+                action.description()
+            );
+            owned.as_str()
         } else {
             action.description()
         };
@@ -2955,11 +3011,41 @@ fn draw_namespaces(frame: &mut Frame, app: &mut App, area: Rect) {
     let show_scrollbars = app.scrollbars_visible();
     let names = app.filtered_namespaces();
     let browsing = app.ns_filter.is_empty();
+    let shortcut = |n: &str| -> Option<String> {
+        if !browsing {
+            return None;
+        }
+        let action = if n == "<all>" {
+            Action::AllNamespaces
+        } else {
+            let index = app
+                .namespace_favorites
+                .iter()
+                .position(|favorite| favorite == n)?;
+            *Action::FAVORITE_NAMESPACES.get(index)?
+        };
+        Some(format!("[{}]", app.keymap.label("table", action)))
+    };
+    let shortcut_width = names
+        .iter()
+        .filter_map(|n| shortcut(n))
+        .map(|label| label.width())
+        .max()
+        .unwrap_or(0);
     let items: Vec<ListItem> = names
         .iter()
         .map(|n| {
+            let mut spans = Vec::new();
+            if shortcut_width > 0 {
+                let label = shortcut(n).unwrap_or_default();
+                spans.push(Span::styled(
+                    format!("{label:<shortcut_width$} "),
+                    theme::dim(),
+                ));
+            }
             if n == "<all>" {
-                return ListItem::new(Span::styled(n.clone(), Style::default().fg(theme::teal())));
+                spans.push(Span::styled(n.clone(), Style::default().fg(theme::teal())));
+                return ListItem::new(Line::from(spans));
             }
             // Only tag favourites/recents while browsing (the pinned ordering);
             // a filtered list is ranked by match, so a tag there would mislead.
@@ -2970,23 +3056,11 @@ fn draw_namespaces(frame: &mut Frame, app: &mut App, area: Rect) {
             } else if app.is_recent_namespace(n) {
                 ("· ", theme::sky())
             } else {
-                ("", theme::text())
+                ("  ", theme::text())
             };
-            let shortcut = if browsing {
-                app.namespace_favorites
-                    .iter()
-                    .position(|favorite| favorite == n)
-                    .and_then(|index| Action::FAVORITE_NAMESPACES.get(index))
-                    .map(|action| format!(" [{}]", app.keymap.label("table", *action)))
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(tag.to_string(), theme::dim()),
-                Span::styled(n.clone(), Style::default().fg(color)),
-                Span::styled(shortcut, theme::dim()),
-            ]))
+            spans.push(Span::styled(tag.to_string(), theme::dim()));
+            spans.push(Span::styled(n.clone(), Style::default().fg(color)));
+            ListItem::new(Line::from(spans))
         })
         .collect();
     // Show the type-to-filter buffer in the title so it reads like an input.

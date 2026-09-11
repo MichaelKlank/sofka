@@ -211,8 +211,12 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 - **Namespace switcher** (`n`) with pinned favourites (★) and per-context
   session recents (·) above the rest, plus a context switcher (`:ctx`). In the
   resource table, `1` to `9` select the first nine configured favourites in fixed
-  configuration order. The picker shows these shortcuts beside favourites.
-  Unconfigured slots do nothing. `0` selects all namespaces. The
+  configuration order. The picker lists these shortcuts in a column before the
+  names, and while its filter is empty the same digits select the favourite
+  directly; a digit without a favourite is a filter character. Unconfigured
+  slots do nothing in the table. `0` selects all namespaces in both places. The
+  header's `Namespace:` line shows the configured favourites with their keys
+  when the terminal is wide enough for them. The
   last namespace picked in each context is remembered across restarts
   (`<state-dir>/namespaces.toml`); `-n`/`-A` override it for a session.
 - **Selected namespace** (`W`) switches to the cursor row's namespace and

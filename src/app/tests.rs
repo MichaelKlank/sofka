@@ -25198,6 +25198,112 @@ async fn favorite_namespace_keys_ignore_empty_slots_and_preserve_text_input() {
 }
 
 #[tokio::test]
+async fn namespace_picker_digits_select_favourites_while_browsing() {
+    let (mut app, _rx) = test_app();
+    app.namespace = "default".into();
+    app.switch_kind("pods");
+    app.namespace_favorites = vec!["team-1".into(), String::new(), "team-3".into()];
+    app.ns_list = vec!["default".into(), "team-1".into(), "team-3".into()];
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    app.handle_key(press(KeyCode::Char('3'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.namespace, "team-3");
+    assert_eq!(app.ns_filter, "");
+    assert!(app.is_recent_namespace("team-3"));
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    app.handle_key(press(KeyCode::Char('2'))).unwrap();
+    assert_eq!(app.mode, Mode::Namespaces);
+    assert_eq!(app.ns_filter, "2");
+    app.handle_key(press(KeyCode::Char('1'))).unwrap();
+    assert_eq!(app.mode, Mode::Namespaces);
+    assert_eq!(app.ns_filter, "21");
+    assert_eq!(app.namespace, "team-3");
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.ns_filter, "");
+    app.handle_key(press(KeyCode::Char('1'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.namespace, "team-1");
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    app.handle_key(press(KeyCode::Char('0'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.all_namespaces());
+    assert_eq!(app.flash, "namespace: all namespaces");
+}
+
+#[tokio::test]
+async fn namespace_picker_digits_follow_table_key_configuration() {
+    let (mut app, _rx) = test_app();
+    app.namespace = "default".into();
+    app.switch_kind("pods");
+    app.namespace_favorites = vec!["production".into(), "staging".into()];
+    use_keys(
+        &mut app,
+        "[keys.table]\nfavorite_namespace_1 = 'f1'\nfavorite_namespace_2 = []\n",
+    );
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    app.handle_key(press(KeyCode::Char('1'))).unwrap();
+    assert_eq!(app.mode, Mode::Namespaces);
+    assert_eq!(app.ns_filter, "1");
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Char('2'))).unwrap();
+    assert_eq!(app.ns_filter, "2");
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::F(1))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.namespace, "production");
+}
+
+#[tokio::test]
+async fn header_lists_favorite_namespaces_with_their_keys() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.namespace = "staging".into();
+    app.switch_kind("pods");
+    let screen = |app: &mut App, width: u16| {
+        let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+    };
+    let namespace_row = |rows: &[String]| {
+        rows.iter()
+            .find(|row| row.contains("Namespace:"))
+            .cloned()
+            .unwrap()
+    };
+    let row = namespace_row(&screen(&mut app, 180));
+    assert!(!row.contains("1 "), "{row}");
+
+    app.namespace_favorites = vec![
+        "production".into(),
+        String::new(),
+        "staging".into(),
+        "observability".into(),
+    ];
+    let row = namespace_row(&screen(&mut app, 180));
+    assert!(
+        row.contains("staging  1 production  3 staging  4 observability"),
+        "{row}"
+    );
+
+    let row = namespace_row(&screen(&mut app, 70));
+    assert!(row.contains("1 production"), "{row}");
+    assert!(!row.contains("observability"), "{row}");
+    assert!(row.contains('…'), "{row}");
+
+    use_keys(&mut app, "[keys.table]\nfavorite_namespace_1 = []\n");
+    let row = namespace_row(&screen(&mut app, 180));
+    assert!(!row.contains("production"), "{row}");
+    assert!(row.contains("3 staging"), "{row}");
+}
+
+#[tokio::test]
 async fn favorite_namespace_key_clears_drill_scope() {
     let (mut app, _rx) = test_app();
     app.namespace_favorites = vec!["target".into()];
@@ -25250,8 +25356,9 @@ async fn favorite_namespace_shortcuts_follow_key_configuration_in_picker_and_hel
             .collect::<String>()
     };
     let text = screen(&mut app, &mut terminal);
-    assert!(text.contains("production [f1]"), "{text}");
-    assert!(text.contains("staging [unbound]"), "{text}");
+    assert!(text.contains("[f1]      ★ production"), "{text}");
+    assert!(text.contains("[unbound] ★ staging"), "{text}");
+    assert!(text.contains("[0]       <all>"), "{text}");
     app.handle_key(press(KeyCode::Esc)).unwrap();
     app.handle_key(press(KeyCode::Char('?'))).unwrap();
     app.handle_key(press(KeyCode::Char('/'))).unwrap();
