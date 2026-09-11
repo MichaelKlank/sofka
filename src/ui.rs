@@ -3039,7 +3039,10 @@ fn draw_namespaces(frame: &mut Frame, app: &mut App, area: Rect) {
             if shortcut_width > 0 {
                 let label = shortcut(n).unwrap_or_default();
                 spans.push(Span::styled(
-                    format!("{label:<shortcut_width$} "),
+                    format!(
+                        "{label}{} ",
+                        " ".repeat(shortcut_width.saturating_sub(label.width()))
+                    ),
                     theme::dim(),
                 ));
             }
