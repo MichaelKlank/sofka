@@ -27041,9 +27041,12 @@ async fn yaml_config_reload_keys_sources_and_errors() {
             .join("\n");
         assert!(text.contains("config.toml (conflict - skipped)"), "{text}");
         assert!(
-            text.contains(&format!("config.{extension} (conflict - skipped)")),
+            text.contains(&format!(
+                "config.{extension} (conflict - previous config kept)"
+            )),
             "{text}"
         );
+        assert!(!text.contains("(loaded)"), "{text}");
         app.handle_key(press(KeyCode::Esc)).unwrap();
         std::fs::remove_file(&path).unwrap();
         write_config(&dir, "readonly = 'invalid'\n");

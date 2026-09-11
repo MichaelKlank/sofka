@@ -1568,9 +1568,12 @@ impl App {
         }
         let cached_path = self.config.base_path();
         for path in &base_paths {
-            let state = if base_paths.len() > 1 {
+            let cached = self.config.has_base() && cached_path.as_ref() == Some(path);
+            let state = if base_paths.len() > 1 && cached {
+                "conflict - previous config kept"
+            } else if base_paths.len() > 1 {
                 "conflict - skipped"
-            } else if self.config.has_base() && cached_path.as_ref() == Some(path) {
+            } else if cached {
                 "loaded"
             } else if self.config.has_base() {
                 "not loaded - previous config kept"
