@@ -4063,6 +4063,131 @@ async fn adjacent_reverse_rules_resolve_a_qualified_source_group() {
     );
 }
 
+fn secret_store_views(app: &mut App) {
+    app.cluster
+        .register_kind("external-secrets.io", "SecretStore", "secretstores", true);
+    app.cluster.register_kind(
+        "external-secrets.io",
+        "ClusterSecretStore",
+        "clustersecretstores",
+        false,
+    );
+    let cfg: crate::config::Config = toml::from_str(
+        r#"
+        [[views.externalsecrets.refs]]
+        path = "/spec/secretStoreRef/name"
+        kind = "secretstores"
+        kind_path = "/spec/secretStoreRef/kind"
+        kinds = ["secretstores", "clustersecretstores"]
+        relation = "reads from"
+    "#,
+    )
+    .unwrap();
+    let (views, warnings) = crate::views::compile(&cfg.views);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    app.user_views = views;
+}
+
+fn external_secret(name: &str, store_ref: serde_json::Value) -> serde_json::Value {
+    json!({"apiVersion":"external-secrets.io/v1","kind":"ExternalSecret",
+        "metadata":{"name":name,"namespace":"default","uid":format!("{name}-uid")},
+        "spec":{"secretStoreRef":store_ref}})
+}
+
+#[tokio::test]
+async fn adjacent_follows_the_kind_named_by_the_object() {
+    let root = external_secret("db", json!({"name":"vault","kind":"ClusterSecretStore"}));
+    let (mut app, mut rx, responses, requests) = health_report_app("externalsecrets", root.clone());
+    secret_store_views(&mut app);
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(
+            "/apis/external-secrets.io/v1/namespaces/default/externalsecrets/db".into(),
+            (200, root.clone()),
+        );
+        replies.insert(
+            "/apis/external-secrets.io/v1/clustersecretstores/vault".into(),
+            (200, json!({"apiVersion":"external-secrets.io/v1","kind":"ClusterSecretStore","metadata":{"name":"vault"}})),
+        );
+    }
+    app.handle_key(press(KeyCode::Char('u'))).unwrap();
+    receive_adjacent(&mut app, &mut rx).await;
+    assert_eq!(app.adjacent_items.len(), 1);
+    assert_eq!(app.adjacent_items[0].name, "vault");
+    assert_eq!(
+        app.adjacent_items[0].plural,
+        "clustersecretstores.external-secrets.io"
+    );
+    assert_eq!(app.adjacent_items[0].relation, "reads from");
+    assert!(
+        !requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path.contains("/secretstores/"))
+    );
+
+    let mut defaulted = root;
+    defaulted["spec"]["secretStoreRef"] = json!({"name":"local"});
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(
+            "/apis/external-secrets.io/v1/namespaces/default/externalsecrets/db".into(),
+            (200, defaulted),
+        );
+        replies.insert(
+            "/apis/external-secrets.io/v1/namespaces/default/secretstores/local".into(),
+            (200, json!({"apiVersion":"external-secrets.io/v1","kind":"SecretStore","metadata":{"name":"local","namespace":"default"}})),
+        );
+    }
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    receive_adjacent(&mut app, &mut rx).await;
+    assert_eq!(app.adjacent_items.len(), 1);
+    assert_eq!(app.adjacent_items[0].name, "local");
+    assert_eq!(
+        app.adjacent_items[0].plural,
+        "secretstores.external-secrets.io"
+    );
+}
+
+#[tokio::test]
+async fn adjacent_reverse_lookup_matches_the_kind_named_by_the_object() {
+    let root = json!({"apiVersion":"external-secrets.io/v1","kind":"SecretStore",
+        "metadata":{"name":"local","namespace":"default","uid":"store-uid"}});
+    let (mut app, rx) = test_app();
+    secret_store_views(&mut app);
+    let (mut app, mut rx, responses, _) =
+        health_report_app_with(app, rx, "secretstores", root.clone());
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(
+            "/apis/external-secrets.io/v1/namespaces/default/secretstores/local".into(),
+            (200, root),
+        );
+        replies.insert(
+            "/apis/external-secrets.io/v1/namespaces/default/externalsecrets".into(),
+            (200, json!({"apiVersion":"external-secrets.io/v1","kind":"ExternalSecretList","metadata":{},"items":[
+                external_secret("same-kind", json!({"name":"local","kind":"SecretStore"})),
+                external_secret("defaulted", json!({"name":"local"})),
+                external_secret("other-kind", json!({"name":"local","kind":"ClusterSecretStore"})),
+                external_secret("other-name", json!({"name":"vault","kind":"SecretStore"})),
+            ]})),
+        );
+    }
+    app.handle_key(press(KeyCode::Char('u'))).unwrap();
+    receive_adjacent(&mut app, &mut rx).await;
+    let mut names: Vec<_> = app
+        .adjacent_items
+        .iter()
+        .map(|it| (it.name.as_str(), it.relation.as_str()))
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [("defaulted", "reads from"), ("same-kind", "reads from")]
+    );
+}
+
 #[tokio::test]
 async fn adjacent_rules_share_pod_lists_and_refresh_reads_them_again() {
     let root = json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":"credentials","namespace":"default","uid":"secret-uid"}});
@@ -20848,7 +20973,21 @@ fn health_report_app(
     HealthResponses,
     Arc<std::sync::Mutex<Vec<String>>>,
 ) {
-    let (mut app, rx) = test_app();
+    let (app, rx) = test_app();
+    health_report_app_with(app, rx, plural, resource)
+}
+
+fn health_report_app_with(
+    mut app: App,
+    rx: Receiver<Msg>,
+    plural: &str,
+    resource: serde_json::Value,
+) -> (
+    App,
+    Receiver<Msg>,
+    HealthResponses,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
     app.switch_kind(plural);
     apply(&mut app, resource);
     app.table_state.select(Some(0));

@@ -776,6 +776,8 @@ pub struct ViewConfig {
 pub struct RefConfig {
     pub path: String,
     pub kind: String,
+    pub kind_path: Option<String>,
+    pub kinds: Vec<String>,
     pub relation: Option<String>,
     pub reverse: Option<String>,
     /// Where the target's namespace lives when it isn't the row's own.
