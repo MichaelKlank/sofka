@@ -15,7 +15,8 @@ resource, or pods if none is set.
 
 Use `:resource -n namespace --context context /filter` to apply a complete query.
 Use `:resource @context [namespace]` for cross-context navigation. Context names
-fuzzy-complete after `@`; Tab/Shift-Tab select a suggestion and Enter opens it.
+fuzzy-complete after `@`; Tab/Shift-Tab or Down/Up fill the selected context in
+the command. Add a namespace if needed, then press Enter to run the query.
 Without a namespace, a context switch uses its remembered or default namespace.
 This does not change kubeconfig's `current-context`.
 Scope options precede the slash. Structured filter terms combine with spaces or
