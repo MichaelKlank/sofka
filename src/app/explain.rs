@@ -27,6 +27,7 @@ impl App {
         self.explain_state.select(None);
         self.explain_selection_lost = false;
         self.cancel_gitops_request();
+        self.cancel_argocd_request();
         self.explain_refresh_source = self.resource_source(
             &obj,
             refresh::RefreshView::Explain {
