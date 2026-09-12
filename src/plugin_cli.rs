@@ -125,6 +125,13 @@ struct Description<'a> {
     installed_withdrawal_reason: Option<&'a str>,
 }
 
+/// Whether sofka will ask before running a release, matching the rule in
+/// `App::run_plugin`: confirmation, danger, and traffic generation each
+/// require it.
+fn confirms(release: &CatalogVersion) -> bool {
+    release.confirm || release.dangerous || release.network_load
+}
+
 pub async fn run(args: &PluginArgs) -> Result<(), String> {
     match &args.command {
         PluginCommand::Search {
@@ -289,7 +296,7 @@ fn description<'a>(
         output: &release.output,
         mutating: release.mutating,
         confirm: release.confirm,
-        confirmation: release.confirm || release.dangerous || release.network_load,
+        confirmation: confirms(release),
         dangerous: release.dangerous,
         network_load: release.network_load,
         installed: installed.is_some(),
