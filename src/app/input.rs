@@ -106,7 +106,38 @@ impl App {
         result
     }
 
-    fn handle_key_inner(&mut self, key: KeyInput) -> Result<()> {
+    fn handle_key_inner(&mut self, mut key: KeyInput) -> Result<()> {
+        if self.drain_confirmation() && key.action == Some(Action::Quit) {
+            key.action = Some(Action::Back);
+        }
+        let drain_page = if self.mode == Mode::Drain {
+            match key.action {
+                Some(Action::PageDown) => Some(true),
+                Some(Action::PageUp) => Some(false),
+                _ => None,
+            }
+        } else if self.drain_confirmation() {
+            match key.code {
+                KeyCode::PageDown => Some(true),
+                KeyCode::PageUp => Some(false),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(down) = drain_page {
+            self.drain.focus_field = false;
+            self.drain.scroll = if down {
+                self.drain.scroll.saturating_add(5)
+            } else {
+                self.drain.scroll.saturating_sub(5)
+            };
+            return Ok(());
+        }
+        if self.mode == Mode::Drain {
+            self.key_drain(key);
+            return Ok(());
+        }
         match key.action {
             Some(Action::Quit) => {
                 self.stop_plugins();
@@ -143,6 +174,7 @@ impl App {
             Mode::CopyPicker => self.key_copy_picker(key),
             Mode::Containers => self.key_containers(key),
             Mode::SetImage => self.key_set_image(key),
+            Mode::Drain => self.key_drain(key),
             Mode::Confirm => self.key_confirm(key),
             Mode::Prompt => self.key_prompt(key),
             Mode::Pulse => self.key_pulse(key),
@@ -183,6 +215,7 @@ impl App {
             Mode::CopyPicker => "copy_picker",
             Mode::Containers => "containers",
             Mode::SetImage => "set_image",
+            Mode::Drain => "drain",
             Mode::Confirm => "confirm",
             Mode::Prompt => "prompt",
             Mode::Pulse => "pulse",

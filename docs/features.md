@@ -2,6 +2,56 @@
 
 The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 
+## Node drain options
+
+Press `D` on a node to set options for the current node or marked nodes. The form
+shows the targets and requires confirmation before it sends mutation requests.
+Read-only mode and configured confirmation rules still apply.
+
+- **Ignore DaemonSets** starts on. DaemonSet pods stay on the node. Turn this off
+  to block drain when an eligible DaemonSet pod is present.
+- **Force** starts off. Turn it on to permit pods without a live controller.
+  Pod replacement is not assured. Force does not change the grace period or
+  bypass PodDisruptionBudgets. Without Force, sofka must be able to read each
+  pod controller and verify its UID.
+- **Delete emptyDir data** starts off. Turn it on to permit removal of pods with
+  emptyDir volumes and loss of their local data.
+- **Disable eviction** starts off. Turn it on to use pod deletion and bypass
+  PodDisruptionBudgets. Failed eviction requests never cause an automatic switch
+  to deletion. Eviction and deletion requests both use pod UID checks.
+- **Grace period** is empty by default and uses each pod's setting. Enter a
+  nonnegative whole number of seconds to override it. Zero requests immediate
+  termination.
+- **Timeout** is empty or `0` for unlimited waiting. Use durations such as `30s`,
+  `5m`, or `1h30m`. One deadline covers all selected nodes, including requests,
+  retries, and waiting. Individual API requests have a 30-second limit.
+
+Use `Tab` or the arrow keys to select a field, `Space` to toggle a checkbox, and
+text input to edit a duration. `Backspace` removes a character; `Ctrl-U` clears
+the field. `Enter` reviews the options. `PgUp` and `PgDn` scroll the form,
+confirmation, and progress. Risk options reset to off for each new operation.
+
+Nodes are processed in name order, one at a time. For each node, sofka cordons
+it, lists its pods, and checks all eligible pods before the first pod removal.
+Mirror pods and completed pods are excluded. Pods already terminating are
+included when checking completion. Temporary eviction failures, including
+PodDisruptionBudget rejection, are retried with delays from 1 to 10 seconds.
+Permanent API failures stop the operation. Progress shows the current node,
+remaining pod count, and retry reason.
+
+Sofka reports a node as drained only after its eligible pods are gone. On failure,
+timeout, or cancellation, it stops before starting another node. The result lists
+completed, incomplete, and unstarted nodes and nodes that remain cordoned.
+
+During the operation, `Esc` or `Ctrl-C` cancels requests, retries, and waiting.
+Accepted requests cannot be reversed. Nodes are not automatically uncordoned.
+If cancellation or failure interrupts a cordon request, check that node's state:
+the server may have accepted the request. Press `Enter` or `Esc` to close the
+result. Navigation stays disabled until the operation ends.
+
+Persistent defaults, saved profiles, arbitrary kubectl arguments, pod selectors,
+concurrent drains, and full kubectl drain parity are outside this feature.
+
 ## Core navigation
 
 - **Container details** show readiness, state or failure reason, and restart

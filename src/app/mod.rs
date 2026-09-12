@@ -190,6 +190,7 @@ pub enum Mode {
     CopyPicker,
     Containers,
     SetImage,
+    Drain,
     Confirm,
     Prompt,
     Pulse,
@@ -329,7 +330,10 @@ enum ConfirmAction {
         dest: String,
     },
     /// One or more node names to cordon and drain.
-    Drain { targets: Vec<String> },
+    Drain {
+        targets: Vec<String>,
+        options: drain::DrainOptions,
+    },
     /// Rollout-restart a workload by stamping the pod template's
     /// `restartedAt` annotation (k9s `r`). Single-target — acts on the
     /// selected row, never bulk.
@@ -2183,6 +2187,7 @@ pub struct App {
     pub timeline_target: Option<(String, String)>,
     pub timeline_state: ListState,
 
+    pub drain: drain::DrainState,
     pub confirm_label: String,
     confirm_action: Option<ConfirmAction>,
     pub prompt_label: String,
@@ -2454,6 +2459,7 @@ impl App {
             timeline_target: None,
             timeline_state: ListState::default(),
             confirm_label: String::new(),
+            drain: drain::DrainState::default(),
             confirm_action: None,
             prompt_label: String::new(),
             prompt_input: String::new(),
@@ -2551,6 +2557,7 @@ mod containers;
 mod dashboards;
 mod details;
 mod diagnostics;
+mod drain;
 mod explain;
 mod find;
 mod fleet;

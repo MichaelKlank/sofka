@@ -5608,13 +5608,12 @@ async fn node_drain_key_opens_confirm_for_marked_nodes() {
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
 
     app.handle_key(press(KeyCode::Char('D'))).unwrap();
+    assert_eq!(app.mode, Mode::Drain);
+    app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.mode, Mode::Confirm);
-    assert_eq!(
-        app.confirm_label,
-        "Drain 2 nodes? Cordon and evict eligible pods."
-    );
+    assert_eq!(app.confirm_label, "Confirm node drain");
     assert!(!app.confirm_allows_force_toggle());
-    let Some(ConfirmAction::Drain { mut targets }) = app.confirm_action.take() else {
+    let Some(ConfirmAction::Drain { mut targets, .. }) = app.confirm_action.take() else {
         panic!("expected drain confirm action");
     };
     targets.sort();
@@ -13534,7 +13533,12 @@ async fn help_search_keeps_section_headings_with_matching_bindings() {
                 assert_eq!(positions.len(), 1, "{heading}: {text}");
                 let binding = &rows[positions[0] + 1];
                 assert!(binding.contains(label), "{heading}: {binding}");
-                assert!(binding.contains(action.description()), "{binding}");
+                let description = if scope == "drain" && action == Action::Accept {
+                    "review options; close a completed drain"
+                } else {
+                    action.description()
+                };
+                assert!(binding.contains(description), "{binding}");
             }
             assert!(text.contains(&format!("/enter [{matches}]")), "{text}");
             assert!(!text.contains("Keys: detail"), "{text}");
@@ -20739,48 +20743,131 @@ async fn a_failed_step_out_on_the_local_pane_says_why_too() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-async fn drain_api_case(
-    pods: serde_json::Value,
-    eviction_code: u16,
-    pod_missing: bool,
-) -> (String, bool, Vec<serde_json::Value>) {
+#[derive(Default)]
+struct DrainApiState {
+    pods: Vec<Value>,
+    requests: Vec<Value>,
+    codes: VecDeque<u16>,
+    missing: bool,
+    finish: bool,
+    missing_controller: bool,
+    controller_forbidden: bool,
+    stall_method: Option<String>,
+    fail_node: Option<String>,
+}
+
+type DrainApi = Arc<std::sync::Mutex<DrainApiState>>;
+
+fn drain_app(state: DrainApiState) -> (App, tokio::sync::mpsc::Receiver<Msg>, DrainApi) {
     use http_body_util::BodyExt;
-    let (mut app, mut rx) = test_app();
+    let (mut app, rx) = test_app();
+    app.cluster
+        .register_kind("apps", "ReplicaSet", "replicasets", true);
     app.switch_kind("nodes");
     apply(
         &mut app,
         json!({"apiVersion":"v1", "kind":"Node", "metadata":{"name":"node-a"}}),
     );
     app.table_state.select(Some(0));
-    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let seen = requests.clone();
+    let state = Arc::new(std::sync::Mutex::new(state));
+    let shared = state.clone();
     app.cluster.client = kube::Client::new(
         tower::service_fn(move |request: http::Request<kube::client::Body>| {
-            let seen = seen.clone();
-            let pods = pods.clone();
+            let shared = shared.clone();
             async move {
                 let method = request.method().to_string();
-                let path = request.uri().path().to_owned();
+                let path = request.uri().path().to_string();
+                let query = request.uri().query().unwrap_or("").to_string();
                 let body = request.into_body().collect().await.unwrap().to_bytes();
-                let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or(json!(null));
-                seen.lock()
-                    .unwrap()
-                    .push(json!({"method":method,"path":path,"body":body}));
-                let (code, response) = match (method.as_str(), path.as_str()) {
-                    ("PATCH", "/api/v1/nodes/node-a") => (
-                        200,
-                        json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"node-a"}}),
-                    ),
-                    ("GET", "/api/v1/pods") => (
-                        200,
-                        json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":pods}),
-                    ),
-                    ("POST", "/api/v1/namespaces/default/pods/web/eviction") => (
-                        eviction_code,
-                        json!({"apiVersion":"v1","kind":"Status","code":eviction_code,"status":if eviction_code < 300 {"Success"} else {"Failure"},"reason":"NotFound","message":"mock eviction response", "details":if pod_missing { json!({"kind":"pods","name":"web"}) } else {json!({})}}),
-                    ),
-                    _ => panic!("unexpected drain request: {method} {path}"),
+                let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let (code, response, stall) = {
+                    let mut state = shared.lock().unwrap();
+                    state
+                        .requests
+                        .push(json!({"method":method,"path":path,"body":body,"query":query}));
+                    let status = |code: u16, details: Value| json!({"apiVersion":"v1","kind":"Status","code":code,"status":if code < 300 {"Success"} else {"Failure"},"reason":if code == 404 {"NotFound"} else {"Mock"},"message":"mock response","details":details});
+                    let (code, response) = match method.as_str() {
+                        "PATCH" => {
+                            if state
+                                .fail_node
+                                .as_ref()
+                                .is_some_and(|node| path.ends_with(node))
+                            {
+                                (403, status(403, json!({})))
+                            } else {
+                                (
+                                    200,
+                                    json!({"apiVersion":"v1","kind":"Node","metadata":{"name":path.rsplit('/').next().unwrap()}}),
+                                )
+                            }
+                        }
+                        "GET" if path == "/api/v1/pods" => {
+                            let selector = form_urlencoded::parse(query.as_bytes())
+                                .find(|(key, _)| key == "fieldSelector")
+                                .unwrap()
+                                .1
+                                .into_owned();
+                            let node = selector.strip_prefix("spec.nodeName=").unwrap();
+                            let pods: Vec<_> = state
+                                .pods
+                                .iter()
+                                .filter(|pod| pod["spec"]["nodeName"] == node)
+                                .cloned()
+                                .collect();
+                            (
+                                200,
+                                json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":pods}),
+                            )
+                        }
+                        "GET" if path.contains("/replicasets/") => {
+                            if state.controller_forbidden {
+                                (403, status(403, json!({})))
+                            } else if state.missing_controller {
+                                (404, status(404, json!({})))
+                            } else {
+                                (
+                                    200,
+                                    json!({"apiVersion":"apps/v1","kind":"ReplicaSet","metadata":{"name":"web","uid":"controller-uid"}}),
+                                )
+                            }
+                        }
+                        "POST" | "DELETE" => {
+                            let name = if method == "POST" {
+                                path.split('/').nth_back(1).unwrap()
+                            } else {
+                                path.rsplit('/').next().unwrap()
+                            };
+                            let code = if state.codes.len() > 1 {
+                                state.codes.pop_front().unwrap()
+                            } else {
+                                state.codes.front().copied().unwrap_or(201)
+                            };
+                            if state.finish && (code < 300 || state.missing && code == 404) {
+                                state.pods.retain(|pod| pod["metadata"]["name"] != name);
+                            }
+                            (
+                                code,
+                                status(
+                                    code,
+                                    if state.missing {
+                                        json!({"kind":"pods","name":name})
+                                    } else {
+                                        json!({})
+                                    },
+                                ),
+                            )
+                        }
+                        _ => panic!("unexpected drain request: {method} {path}"),
+                    };
+                    (
+                        code,
+                        response,
+                        state.stall_method.as_deref() == Some(method.as_str()),
+                    )
                 };
+                if stall {
+                    std::future::pending::<()>().await;
+                }
                 Ok::<_, std::convert::Infallible>(
                     http::Response::builder()
                         .status(code)
@@ -20793,22 +20880,415 @@ async fn drain_api_case(
         }),
         "default",
     );
+    (app, rx, state)
+}
+
+fn drain_open(app: &mut App) {
     app.handle_key(press(KeyCode::Char('D'))).unwrap();
+    assert_eq!(app.mode, Mode::Drain);
+}
+
+fn drain_start(app: &mut App) {
+    app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.mode, Mode::Confirm);
     app.handle_key(press(KeyCode::Enter)).unwrap();
-    let (message, err) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if let Some(Msg::Flash { message, err, .. }) = rx.recv().await
-                && message.starts_with("drain")
-            {
-                break (message, err);
-            }
+    assert_eq!(app.mode, Mode::Drain);
+}
+
+fn drain_field(app: &mut App, field: usize, text: &str) {
+    while app.drain.field != field {
+        app.handle_key(press(KeyCode::Tab)).unwrap();
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+        .unwrap();
+    for c in text.chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+}
+
+fn drain_toggle(app: &mut App, field: usize) {
+    while app.drain.field != field {
+        app.handle_key(press(KeyCode::Tab)).unwrap();
+    }
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+}
+
+async fn drain_until(
+    app: &mut App,
+    rx: &mut tokio::sync::mpsc::Receiver<Msg>,
+    predicate: impl Fn(&App) -> bool,
+) {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while !predicate(app) {
+            app.handle_msg(rx.recv().await.expect("drain channel closed"));
         }
     })
     .await
-    .expect("drain did not finish");
-    let captured = requests.lock().unwrap().clone();
-    (message, err, captured)
+    .expect("drain did not reach expected state");
+}
+
+async fn drain_api_case(
+    pods: Value,
+    eviction_code: u16,
+    pod_missing: bool,
+) -> (String, bool, Vec<Value>) {
+    let (mut app, mut rx, api) = drain_app(DrainApiState {
+        pods: pods.as_array().unwrap().clone(),
+        codes: [eviction_code].into(),
+        missing: pod_missing,
+        finish: true,
+        ..Default::default()
+    });
+    drain_open(&mut app);
+    if eviction_code == 429 {
+        drain_field(&mut app, 5, "1s");
+    }
+    drain_start(&mut app);
+    drain_until(&mut app, &mut rx, |app| app.drain.done).await;
+    let captured = api.lock().unwrap().requests.clone();
+    (app.drain.message, app.drain.err, captured)
+}
+
+#[tokio::test]
+async fn drain_form_cancels_resets_and_validates_options() {
+    let (mut app, _rx, api) = drain_app(DrainApiState::default());
+    drain_open(&mut app);
+    assert_eq!(app.drain.options, drain::DrainOptions::default());
+    for field in 1..4 {
+        drain_toggle(&mut app, field);
+    }
+    drain_field(&mut app, 4, "-1");
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Drain);
+    assert!(app.drain.error.contains("Grace period"));
+    drain_field(&mut app, 4, "0");
+    for invalid in ["-1s", "abc", "1", "1m2", "18446744073709551615h"] {
+        drain_field(&mut app, 5, invalid);
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.mode, Mode::Drain);
+        assert!(app.drain.error.contains("Timeout"));
+    }
+    drain_field(&mut app, 5, "1h30m5s");
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let Some(ConfirmAction::Drain { options, .. }) = &app.confirm_action else {
+        panic!("missing drain confirmation")
+    };
+    assert_eq!(options.grace_period, Some(0));
+    assert_eq!(options.timeout, Duration::from_secs(5405));
+    assert!(options.force && options.delete_emptydir && options.disable_eviction);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    drain_open(&mut app);
+    assert_eq!(app.drain.options, drain::DrainOptions::default());
+    assert!(app.drain.grace.is_empty() && app.drain.timeout.is_empty());
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(api.lock().unwrap().requests.is_empty());
+}
+
+#[tokio::test]
+async fn drain_respects_readonly_denial_bulk_limit_and_typed_confirmation() {
+    let (mut app, _rx, api) = drain_app(DrainApiState::default());
+    app.readonly = true;
+    app.handle_key(press(KeyCode::Char('D'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    app.readonly = false;
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["drain".into()],
+        deny: true,
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char('D'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    app.guardrails[0].deny = false;
+    app.guardrails[0].confirmation = Some("type-resource-name".into());
+    drain_open(&mut app);
+    drain_toggle(&mut app, 2);
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Prompt);
+    assert!(app.drain_confirmation());
+    assert!(app.prompt_label.contains("node-a"));
+    for c in "wrong".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(app.flash.contains("did not match"));
+    assert!(api.lock().unwrap().requests.is_empty());
+    app.guardrails[0].max_bulk = Some(1);
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"node-b"}}),
+    );
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Char('D'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash.contains("max"));
+}
+
+#[tokio::test]
+async fn drain_options_control_payloads_without_automatic_deletion() {
+    for deletion in [false, true] {
+        let mut pod = drain_managed_pod();
+        pod["metadata"]["ownerReferences"] = json!([]);
+        pod["spec"]["volumes"] = json!([{"name":"data","emptyDir":{}}]);
+        let (mut app, mut rx, api) = drain_app(DrainApiState {
+            pods: vec![pod],
+            finish: true,
+            ..Default::default()
+        });
+        drain_open(&mut app);
+        drain_toggle(&mut app, 1);
+        drain_toggle(&mut app, 2);
+        if deletion {
+            drain_toggle(&mut app, 3);
+        }
+        drain_field(&mut app, 4, "12");
+        drain_start(&mut app);
+        drain_until(&mut app, &mut rx, |app| app.drain.done).await;
+        assert!(!app.drain.err, "{}", app.drain.message);
+        let state = api.lock().unwrap();
+        let requests: Vec<_> = state
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "POST" || r["method"] == "DELETE")
+            .collect();
+        assert_eq!(requests.len(), 1);
+        let request = requests[0];
+        assert_eq!(request["method"], if deletion { "DELETE" } else { "POST" });
+        let options = if deletion {
+            &request["body"]
+        } else {
+            &request["body"]["deleteOptions"]
+        };
+        assert_eq!(options["gracePeriodSeconds"], 12);
+        assert_eq!(options["preconditions"]["uid"], "original-uid");
+    }
+}
+
+#[tokio::test]
+async fn drain_checks_missing_controller_and_cannot_bypass_forbidden_lookup() {
+    for forbidden in [false, true] {
+        let (mut app, mut rx, api) = drain_app(DrainApiState {
+            pods: vec![drain_managed_pod()],
+            missing_controller: !forbidden,
+            controller_forbidden: forbidden,
+            finish: true,
+            ..Default::default()
+        });
+        drain_open(&mut app);
+        drain_start(&mut app);
+        drain_until(&mut app, &mut rx, |app| app.drain.done).await;
+        assert!(app.drain.err);
+        assert!(app.drain.message.contains(if forbidden {
+            "cannot check controller"
+        } else {
+            "controller is missing"
+        }));
+        assert!(
+            !api.lock()
+                .unwrap()
+                .requests
+                .iter()
+                .any(|r| r["method"] == "POST" || r["method"] == "DELETE")
+        );
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        drain_open(&mut app);
+        drain_toggle(&mut app, 1);
+        drain_start(&mut app);
+        drain_until(&mut app, &mut rx, |app| app.drain.done).await;
+        assert!(!app.drain.err, "{}", app.drain.message);
+    }
+}
+
+#[tokio::test]
+async fn drain_skips_daemonsets_mirrors_completed_and_can_block_daemonsets() {
+    let mut ds = drain_managed_pod();
+    ds["metadata"]["ownerReferences"][0]["kind"] = json!("DaemonSet");
+    let mut mirror = drain_managed_pod();
+    mirror["metadata"]["annotations"] = json!({"kubernetes.io/config.mirror":"hash"});
+    let mut complete = drain_managed_pod();
+    complete["status"]["phase"] = json!("Succeeded");
+    for ignore in [true, false] {
+        let (mut app, mut rx, api) = drain_app(DrainApiState {
+            pods: vec![ds.clone(), mirror.clone(), complete.clone()],
+            ..Default::default()
+        });
+        drain_open(&mut app);
+        if !ignore {
+            drain_toggle(&mut app, 0);
+        }
+        drain_start(&mut app);
+        drain_until(&mut app, &mut rx, |app| app.drain.done).await;
+        assert_eq!(app.drain.err, !ignore);
+        assert!(
+            !api.lock()
+                .unwrap()
+                .requests
+                .iter()
+                .any(|r| r["method"] == "POST" || r["method"] == "DELETE")
+        );
+    }
+}
+
+#[tokio::test]
+async fn drain_retries_temporary_eviction_errors_and_waits_for_removal() {
+    for code in [429, 503] {
+        let (mut app, mut rx, api) = drain_app(DrainApiState {
+            pods: vec![drain_managed_pod()],
+            codes: [code, 201].into(),
+            finish: true,
+            ..Default::default()
+        });
+        drain_open(&mut app);
+        drain_start(&mut app);
+        drain_until(&mut app, &mut rx, |app| {
+            app.drain.message.contains("Retry in")
+        })
+        .await;
+        assert!(!app.drain.done);
+        drain_until(&mut app, &mut rx, |app| app.drain.done).await;
+        assert!(!app.drain.err, "{}", app.drain.message);
+        assert_eq!(
+            api.lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|r| r["method"] == "POST")
+                .count(),
+            2
+        );
+        assert!(app.drain.message.starts_with("drained\n"));
+    }
+}
+
+#[tokio::test]
+async fn drain_waits_for_already_terminating_pods_and_cancels_without_uncordon() {
+    let mut pod = drain_managed_pod();
+    pod["metadata"]["deletionTimestamp"] = json!("2026-09-12T00:00:00Z");
+    let (mut app, mut rx, api) = drain_app(DrainApiState {
+        pods: vec![pod],
+        ..Default::default()
+    });
+    drain_open(&mut app);
+    drain_start(&mut app);
+    drain_until(&mut app, &mut rx, |app| {
+        app.drain.message.contains("Remaining pods: 1")
+    })
+    .await;
+    assert!(!app.drain.done);
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    assert_eq!(app.mode, Mode::Drain);
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(!app.should_quit);
+    drain_until(&mut app, &mut rx, |app| app.drain.done).await;
+    assert!(app.drain.err && app.drain.message.contains("canceled"));
+    assert!(app.drain.message.contains("Remain cordoned: node-a"));
+    let state = api.lock().unwrap();
+    assert!(
+        !state
+            .requests
+            .iter()
+            .any(|r| r["method"] == "POST" || r["method"] == "DELETE")
+    );
+    assert_eq!(
+        state
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "PATCH")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn drain_cancel_interrupts_pending_api_request() {
+    let (mut app, mut rx, api) = drain_app(DrainApiState {
+        pods: vec![drain_managed_pod()],
+        stall_method: Some("POST".into()),
+        ..Default::default()
+    });
+    drain_open(&mut app);
+    drain_start(&mut app);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !api
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|r| r["method"] == "POST")
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    drain_until(&mut app, &mut rx, |app| app.drain.done).await;
+    assert!(app.drain.message.contains("canceled"));
+    assert!(app.drain.message.contains("Incomplete: node-a"));
+}
+
+#[tokio::test]
+async fn drain_timeout_covers_waiting_and_stops_before_next_node() {
+    let (mut app, mut rx, api) = drain_app(DrainApiState {
+        pods: vec![drain_managed_pod()],
+        ..Default::default()
+    });
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"node-b"}}),
+    );
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    drain_open(&mut app);
+    drain_field(&mut app, 5, "1s");
+    drain_start(&mut app);
+    drain_until(&mut app, &mut rx, |app| app.drain.done).await;
+    assert!(app.drain.err && app.drain.message.contains("timed out"));
+    assert!(app.drain.message.contains("Unstarted: node-b"));
+    assert!(
+        !api.lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|r| r["path"] == "/api/v1/nodes/node-b")
+    );
+}
+
+#[tokio::test]
+async fn drain_bulk_reports_completed_incomplete_and_unstarted_nodes() {
+    let (mut app, mut rx, api) = drain_app(DrainApiState {
+        fail_node: Some("node-b".into()),
+        ..Default::default()
+    });
+    for name in ["node-b", "node-c"] {
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1","kind":"Node","metadata":{"name":name}}),
+        );
+    }
+    for _ in 0..3 {
+        app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    }
+    drain_open(&mut app);
+    drain_start(&mut app);
+    drain_until(&mut app, &mut rx, |app| app.drain.done).await;
+    assert!(app.drain.err);
+    assert!(
+        app.drain.message.contains(
+            "Completed: node-a\nIncomplete: node-b\nUnstarted: node-c\nRemain cordoned: node-a"
+        ),
+        "{}",
+        app.drain.message
+    );
+    assert!(
+        !api.lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|r| r["path"] == "/api/v1/nodes/node-c")
+    );
 }
 
 fn drain_managed_pod() -> serde_json::Value {
@@ -20830,10 +21310,10 @@ async fn drain_key_pins_uid_and_never_falls_back_to_delete() {
             err, expected_error,
             "eviction code {code}, missing {missing}"
         );
-        assert_eq!(requests.len(), 3);
-        assert_eq!(requests[2]["method"], "POST");
+        assert!(!requests.iter().any(|r| r["method"] == "DELETE"));
+        let eviction = requests.iter().find(|r| r["method"] == "POST").unwrap();
         assert_eq!(
-            requests[2]["body"]["deleteOptions"]["preconditions"]["uid"],
+            eviction["body"]["deleteOptions"]["preconditions"]["uid"],
             "original-uid"
         );
     }
@@ -20852,7 +21332,11 @@ async fn drain_key_blocks_unmanaged_pods_before_any_evictions() {
             message.contains("default/standalone: pod has no controller"),
             "{message}"
         );
-        assert_eq!(requests.len(), 2);
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r["method"] == "POST" || r["method"] == "DELETE")
+        );
     }
 }
 
@@ -20864,7 +21348,11 @@ async fn drain_key_blocks_emptydir_before_any_evictions() {
         drain_api_case(json!([drain_managed_pod(), unsafe_pod]), 201, false).await;
     assert!(err);
     assert!(message.contains("emptyDir data"), "{message}");
-    assert_eq!(requests.len(), 2);
+    assert!(
+        !requests
+            .iter()
+            .any(|r| r["method"] == "POST" || r["method"] == "DELETE")
+    );
 }
 
 #[tokio::test]
@@ -20877,7 +21365,11 @@ async fn drain_key_blocks_missing_uid_before_any_evictions() {
     let (message, err, requests) = drain_api_case(json!([unsafe_pod]), 201, false).await;
     assert!(err);
     assert!(message.contains("UID is missing"), "{message}");
-    assert_eq!(requests.len(), 2);
+    assert!(
+        !requests
+            .iter()
+            .any(|r| r["method"] == "POST" || r["method"] == "DELETE")
+    );
 }
 
 #[tokio::test]
@@ -25237,6 +25729,7 @@ fn key_action_fixture(scope: &str) -> (App, Receiver<Msg>) {
         "copy_picker" => Mode::CopyPicker,
         "containers" => Mode::Containers,
         "set_image" => Mode::SetImage,
+        "drain" => Mode::Drain,
         "confirm" => Mode::Confirm,
         "prompt" => Mode::Prompt,
         "pulse" => Mode::Pulse,
@@ -28266,4 +28759,331 @@ async fn log_warnings_keep_prefixed_klog_with_timestamps_on_and_off() {
     }
     app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
     assert_eq!(app.logs.refresh_index(0).matched_lines(), lines.len());
+}
+
+#[tokio::test]
+async fn drain_form_and_confirmation_render_targets_risks_and_controls() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx, api) = drain_app(DrainApiState::default());
+    drain_open(&mut app);
+    let screen = |app: &mut App, width, height| {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    };
+    for (width, height) in [(100, 35), (48, 20)] {
+        let text = screen(&mut app, width, height);
+        assert!(text.contains("Node drain"));
+        assert!(text.contains("Ignore DaemonSets"));
+        assert!(text.contains("review"));
+        assert!(text.contains("cancel"));
+        drain_field(&mut app, 5, "5m");
+        let text = screen(&mut app, width, height);
+        assert!(text.contains("> Timeout: 5m"), "{text}");
+        let mut text = screen(&mut app, width, height);
+        for _ in 0..10 {
+            if text.contains("node-a") {
+                break;
+            }
+            app.handle_key(press(KeyCode::PageDown)).unwrap();
+            text = screen(&mut app, width, height);
+        }
+        assert!(text.contains("node-a"), "{text}");
+        while app.drain.field != 0 {
+            app.handle_key(press(KeyCode::Tab)).unwrap();
+        }
+    }
+    drain_field(&mut app, 4, "-1");
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let text = screen(&mut app, 48, 20);
+    assert!(text.contains("Grace period must be"), "{text}");
+    drain_field(&mut app, 4, "");
+    drain_toggle(&mut app, 2);
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let text = screen(&mut app, 100, 35);
+    assert!(text.contains("Confirm drain with these options?"));
+    assert!(text.contains("[x] Delete emptyDir data: lose local data"));
+    assert!(text.contains("node-a"));
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["drain".into()],
+        confirmation: Some("type-context-name".into()),
+        ..Default::default()
+    }];
+    drain_open(&mut app);
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Prompt);
+    let text = screen(&mut app, 100, 35);
+    assert!(text.contains("Type 'test' to confirm:"));
+    assert!(text.contains("[ ] Disable eviction: bypass PodDisruptionBudgets"));
+    assert!(text.contains("node-a"));
+    assert!(api.lock().unwrap().requests.is_empty());
+}
+
+#[tokio::test]
+async fn drain_typed_confirmation_runs_and_readonly_is_checked_again() {
+    let (mut app, mut rx, api) = drain_app(DrainApiState::default());
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["drain".into()],
+        confirmation: Some("type-resource-name".into()),
+        ..Default::default()
+    }];
+    drain_open(&mut app);
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    for c in "node-a".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.readonly = true;
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(api.lock().unwrap().requests.is_empty());
+    assert!(!app.drain.started());
+    app.readonly = false;
+    drain_open(&mut app);
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    for c in "node-a".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Drain);
+    drain_until(&mut app, &mut rx, |app| app.drain.done).await;
+    assert!(!app.drain.err);
+}
+
+#[tokio::test]
+async fn drain_risk_options_do_not_bypass_uid_or_emptydir_checks() {
+    for missing_uid in [false, true] {
+        let mut pod = drain_managed_pod();
+        pod["spec"]["volumes"] = json!([{"name":"data","emptyDir":{}}]);
+        if missing_uid {
+            pod["metadata"].as_object_mut().unwrap().remove("uid");
+        }
+        let (mut app, mut rx, api) = drain_app(DrainApiState {
+            pods: vec![pod],
+            ..Default::default()
+        });
+        drain_open(&mut app);
+        drain_toggle(&mut app, 1);
+        drain_toggle(&mut app, 3);
+        if missing_uid {
+            drain_toggle(&mut app, 2);
+        }
+        drain_start(&mut app);
+        drain_until(&mut app, &mut rx, |app| app.drain.done).await;
+        assert!(app.drain.err);
+        assert!(app.drain.message.contains(if missing_uid {
+            "UID is missing"
+        } else {
+            "emptyDir data"
+        }));
+        assert!(
+            !api.lock()
+                .unwrap()
+                .requests
+                .iter()
+                .any(|r| r["method"] == "POST" || r["method"] == "DELETE")
+        );
+    }
+}
+
+#[tokio::test]
+async fn drain_accepted_eviction_waits_for_pod_disappearance() {
+    let (mut app, mut rx, api) = drain_app(DrainApiState {
+        pods: vec![drain_managed_pod()],
+        ..Default::default()
+    });
+    drain_open(&mut app);
+    drain_start(&mut app);
+    drain_until(&mut app, &mut rx, |app| {
+        app.drain.message.contains("Remaining pods: 1")
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if api
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|r| r["path"] == "/api/v1/pods")
+                .count()
+                >= 2
+            {
+                break;
+            }
+            app.handle_msg(rx.recv().await.unwrap());
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!app.drain.done);
+    api.lock().unwrap().pods.clear();
+    drain_until(&mut app, &mut rx, |app| app.drain.done).await;
+    assert!(!app.drain.err);
+    let state = api.lock().unwrap();
+    let removals: Vec<_> = state
+        .requests
+        .iter()
+        .filter(|r| r["method"] == "POST")
+        .collect();
+    assert_eq!(removals.len(), 1);
+    assert!(
+        removals[0]["body"]["deleteOptions"]
+            .get("gracePeriodSeconds")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn drain_timeout_interrupts_an_api_request_and_reports_uncertain_cordon() {
+    let (mut app, mut rx, api) = drain_app(DrainApiState {
+        stall_method: Some("PATCH".into()),
+        ..Default::default()
+    });
+    drain_open(&mut app);
+    drain_field(&mut app, 5, "1s");
+    drain_start(&mut app);
+    drain_until(&mut app, &mut rx, |app| app.drain.done).await;
+    assert!(app.drain.message.contains("timed out"));
+    assert!(
+        app.drain
+            .message
+            .contains("cordon request may have succeeded")
+    );
+    assert_eq!(api.lock().unwrap().requests.len(), 1);
+}
+
+#[tokio::test]
+async fn drain_bulk_success_verifies_each_node_before_cordoning_the_next() {
+    let (mut app, mut rx, api) = drain_app(DrainApiState {
+        pods: vec![drain_managed_pod()],
+        finish: true,
+        ..Default::default()
+    });
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"node-b"}}),
+    );
+    for _ in 0..2 {
+        app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    }
+    drain_open(&mut app);
+    drain_start(&mut app);
+    drain_until(&mut app, &mut rx, |app| app.drain.done).await;
+    assert!(!app.drain.err, "{}", app.drain.message);
+    assert!(
+        app.drain
+            .message
+            .contains("Completed: node-a, node-b\nIncomplete: none\nUnstarted: none")
+    );
+    let state = api.lock().unwrap();
+    let second_node = state
+        .requests
+        .iter()
+        .position(|r| r["path"] == "/api/v1/nodes/node-b")
+        .unwrap();
+    assert_eq!(
+        state.requests[..second_node]
+            .iter()
+            .filter(|r| r["path"] == "/api/v1/pods")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn drain_review_ctrl_c_cancels_each_confirmation_without_quitting() {
+    for confirmation in [None, Some("type-resource-name"), Some("type-context-name")] {
+        let (mut app, _rx, api) = drain_app(DrainApiState::default());
+        if let Some(confirmation) = confirmation {
+            app.guardrails = vec![crate::config::Guardrail {
+                actions: vec!["drain".into()],
+                confirmation: Some(confirmation.into()),
+                ..Default::default()
+            }];
+        }
+        drain_open(&mut app);
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            app.mode,
+            if confirmation.is_some() {
+                Mode::Prompt
+            } else {
+                Mode::Confirm
+            }
+        );
+        if confirmation.is_some() {
+            for c in "node-a".chars() {
+                app.handle_key(press(KeyCode::Char(c))).unwrap();
+            }
+        }
+        app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
+        assert!(!app.should_quit, "{confirmation:?}");
+        assert_eq!(app.mode, Mode::Table);
+        assert!(app.confirm_action.is_none());
+        assert!(app.prompt_kind.is_none());
+        assert!(!app.drain.started());
+        assert!(api.lock().unwrap().requests.is_empty());
+
+        app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+        assert_eq!(app.mode, Mode::Confirm);
+        assert!(!app.drain_confirmation());
+        app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
+        assert!(app.should_quit);
+        assert!(api.lock().unwrap().requests.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn drain_review_retries_http_408_for_eviction_and_deletion() {
+    for deletion in [false, true] {
+        let (mut app, mut rx, api) = drain_app(DrainApiState {
+            pods: vec![drain_managed_pod()],
+            codes: [408, 201].into(),
+            finish: true,
+            ..Default::default()
+        });
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"node-b"}}),
+        );
+        for _ in 0..2 {
+            app.handle_key(press(KeyCode::Char(' '))).unwrap();
+        }
+        drain_open(&mut app);
+        if deletion {
+            drain_toggle(&mut app, 3);
+        }
+        drain_start(&mut app);
+        drain_until(&mut app, &mut rx, |app| {
+            app.drain.done || app.drain.message.contains("Retry in")
+        })
+        .await;
+        assert!(!app.drain.done, "{}", app.drain.message);
+        drain_until(&mut app, &mut rx, |app| app.drain.done).await;
+        assert!(!app.drain.err, "{}", app.drain.message);
+        assert!(
+            app.drain
+                .message
+                .contains("Completed: node-a, node-b\nIncomplete: none\nUnstarted: none")
+        );
+        let state = api.lock().unwrap();
+        let removals: Vec<_> = state
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "POST" || r["method"] == "DELETE")
+            .collect();
+        assert_eq!(removals.len(), 2);
+        assert!(
+            removals
+                .iter()
+                .all(|r| r["method"] == if deletion { "DELETE" } else { "POST" })
+        );
+        assert_eq!(removals[0]["body"], removals[1]["body"]);
+    }
 }

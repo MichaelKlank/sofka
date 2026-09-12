@@ -88,7 +88,7 @@ ownership scope are cleared. Startup still uses the configured default resource.
 | `r`                                           | rollout restart (workloads) / force-sync (ExternalSecrets/PushSecrets) / refresh (elsewhere)                                                                        |
 | `f` / `shift-f`                               | port-forward (pods/services) — picker shows declared ports, or "Custom…" for manual entry; active forwards show `●` next to the name                                |
 | `t`                                           | Flux: suspend/resume/reconcile menu · ArgoCD App/AppSet: suspend/resume (App: + sync) · CronJobs: trigger/suspend/resume · pods: file transfer (`kubectl cp`)       |
-| `C` / `U` / `D`                               | nodes: cordon / uncordon / drain                                                                                                                                    |
+| `C` / `U` / `D`                               | nodes: cordon / uncordon / open drain options                                                                                                                       |
 | `ctrl-d` / `ctrl-k`                           | delete / force-delete (marked rows, or current); in confirm: `f` toggles force, `c` cycles cascade (background → foreground → orphan)                               |
 | `w`                                           | toggle wide-only columns (kubectl `-o wide`), including node labels                                                                                                 |
 | `←` / `→`                                     | scroll sideways by 5 text positions; NAMESPACE/NAME stay fixed; arrows show more content                                                                            |
@@ -100,6 +100,24 @@ Shift+Arrow selects a range in the visible row order. Reversing direction reduce
 the range and keeps separate marks made with `space`. Other keys end the range
 operation. Normal movement keeps marked rows. Filtering, sorting, view changes,
 and changes to the row order reset the range before the next Shift+Arrow press.
+
+## Node drain (`D` on a node)
+
+| Key                           | Action                                                    |
+| ----------------------------- | --------------------------------------------------------- |
+| `Tab` / `Down`                | Select the next option                                    |
+| `Shift-Tab` / `Up`            | Select the previous option                                |
+| `Space`                       | Toggle the selected checkbox                              |
+| Text / `Backspace` / `Ctrl-U` | Edit / remove a character / clear the selected duration   |
+| `Enter`                       | Review options, then confirm; close a completed operation |
+| `Esc` / `Ctrl-C`              | Cancel the form or active operation; close its result     |
+| `PgUp` / `PgDn`               | Scroll the form, confirmation, or progress                |
+
+Drain options apply to the current operation only. The final confirmation shows
+all target nodes and selected options. Configured confirmation rules still apply.
+During a drain, navigation is disabled. Canceling stops requests and waiting; it
+cannot reverse a request that the API has accepted. Nodes remain cordoned.
+See [Node drain options](features.md#node-drain-options) for defaults and limits.
 
 ## Port-forward picker (`f` on a pod or service)
 

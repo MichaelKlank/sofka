@@ -340,6 +340,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     match app.mode {
+        Mode::Drain => draw_drain(frame, app, chunks[1]),
+        Mode::Confirm | Mode::Prompt if app.drain_confirmation() => {
+            draw_drain(frame, app, chunks[1])
+        }
         Mode::Namespaces => draw_namespaces(frame, app, chunks[1]),
         Mode::Contexts => draw_contexts(frame, app, chunks[1]),
         Mode::SortPicker => draw_sort_picker(frame, app, chunks[1]),
@@ -2576,7 +2580,20 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
             )));
             previous_scope = scope;
         }
-        let description = if scope == "table" && action == Action::Logs {
+        let description = if scope == "table" && action == Action::Drain {
+            "open node drain options for the current or marked nodes"
+        } else if scope == "drain" {
+            match action {
+                Action::Accept => "review options; close a completed drain",
+                Action::Back | Action::Quit => {
+                    "cancel the form or active drain; accepted requests cannot be reversed"
+                }
+                Action::Toggle => "toggle the selected drain option",
+                Action::Down => "select the next drain option",
+                Action::Up => "select the previous drain option",
+                _ => action.description(),
+            }
+        } else if scope == "table" && action == Action::Logs {
             "logs (marked pods, or current row)"
         } else if scope == "port_forward_picker" && action == Action::Edit {
             "edit local port of the selected mapping"
@@ -2711,6 +2728,14 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
             lines.push(bind(&key, &format!("{} ({scope})", p.name)));
         }
     }
+    lines.push(Line::from(Span::styled(
+        "  Node drain controls",
+        theme::title(),
+    )));
+    lines.push(bind(
+        "PgUp/PgDn (node drain)",
+        "scroll options, confirmation, or progress",
+    ));
     // Saved bookmarks: their chord (if any) and where they jump.
     if !app.bookmarks.is_empty() {
         lines.push(Line::from(""));
@@ -3931,6 +3956,146 @@ fn draw_set_image(frame: &mut Frame, app: &mut App, area: Rect) {
         Span::styled(" Set Image ", theme::title()),
         &mut app.container_state,
     );
+}
+
+fn draw_drain(frame: &mut Frame, app: &mut App, area: Rect) {
+    let styled = |text: String, style| Line::from(Span::styled(text, style));
+    clear_region(frame, area);
+    let review = app.drain_confirmation();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Node drain | PgUp/PgDn: scroll ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let mut lines = vec![
+        Line::from(format!(
+            "Context: {} | {} node(s)",
+            app.cluster.context,
+            app.drain.targets.len()
+        )),
+        Line::from(""),
+    ];
+    let footer;
+    if app.drain.started() {
+        lines.extend(app.drain.message.lines().map(|line| {
+            styled(
+                line.to_owned(),
+                if app.drain.err {
+                    Style::default().fg(theme::red())
+                } else {
+                    Style::default().fg(theme::text())
+                },
+            )
+        }));
+        footer = if app.drain.done {
+            "Enter/Esc: close".to_string()
+        } else {
+            "Esc/Ctrl-C: cancel. Accepted requests cannot be reversed.".to_string()
+        };
+    } else {
+        for (i, row) in app.drain.rows().into_iter().enumerate() {
+            let selected = !review && app.drain.field == i;
+            lines.push(styled(
+                format!("{} {row}", if selected { ">" } else { " " }),
+                if selected {
+                    theme::selected_row()
+                } else {
+                    Style::default().fg(theme::text())
+                },
+            ));
+        }
+        lines.extend([
+            Line::from(""),
+            Line::from(
+                "Grace: seconds; empty uses the pod default. Zero requests immediate termination.",
+            ),
+            Line::from("Timeout: 0 (unlimited), 30s, 5m, or 1h30m. One deadline covers all nodes."),
+            Line::from(
+                "Force does not ensure pod replacement. Nodes stay cordoned after this operation.",
+            ),
+        ]);
+        if review {
+            footer = if app.mode == Mode::Prompt {
+                format!(
+                    "{}\n> {}█\nEnter: confirm   Esc: cancel",
+                    app.prompt_label, app.prompt_input
+                )
+            } else {
+                format!(
+                    "Confirm drain with these options?\n{}",
+                    confirm_action_hint(app, false)
+                )
+            };
+        } else {
+            footer = format!(
+                "{}\nType to edit. Backspace: remove character. Ctrl-U: clear.",
+                key_hint(
+                    app,
+                    "drain",
+                    &[
+                        (Action::Down, "next"),
+                        (Action::Up, "previous"),
+                        (Action::Toggle, "toggle"),
+                        (Action::Accept, "review"),
+                        (Action::Back, "cancel")
+                    ]
+                )
+            );
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("Targets:"));
+    lines.extend(
+        app.drain
+            .targets
+            .iter()
+            .map(|target| Line::from(format!("  {target}"))),
+    );
+    let footer = if !review && !app.drain.started() && !app.drain.error.is_empty() {
+        format!("{}\n{footer}", app.drain.error)
+    } else {
+        footer
+    };
+    let footer_lines: Vec<_> = footer
+        .lines()
+        .flat_map(|line| wrap_line(Line::from(line.to_owned()), usize::from(inner.width).max(1)))
+        .collect();
+    let footer_height = footer_lines
+        .len()
+        .min(usize::from(inner.height.saturating_sub(3))) as u16;
+    let parts =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(footer_height)]).split(inner);
+    if app.drain.focus_field && !review && !app.drain.started() {
+        let position: usize = lines
+            .iter()
+            .take(2 + app.drain.field)
+            .map(|line| wrap_line(line.clone(), usize::from(inner.width).max(1)).len())
+            .sum();
+        let row_height = wrap_line(
+            lines[2 + app.drain.field].clone(),
+            usize::from(inner.width).max(1),
+        )
+        .len();
+        let bottom = position
+            .saturating_add(row_height)
+            .saturating_sub(usize::from(parts[0].height));
+        app.drain.scroll = app.drain.scroll.min(position as u16).max(bottom as u16);
+        app.drain.focus_field = false;
+    }
+    let lines: Vec<_> = lines
+        .into_iter()
+        .flat_map(|line| wrap_line(line, usize::from(parts[0].width).max(1)))
+        .collect();
+    let max_scroll = lines
+        .len()
+        .saturating_sub(usize::from(parts[0].height))
+        .min(usize::from(u16::MAX)) as u16;
+    app.drain.scroll = app.drain.scroll.min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(lines).scroll((app.drain.scroll, 0)),
+        parts[0],
+    );
+    frame.render_widget(Paragraph::new(footer_lines), parts[1]);
 }
 
 fn draw_confirm(frame: &mut Frame, app: &App, area: Rect) {

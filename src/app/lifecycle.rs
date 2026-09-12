@@ -1031,6 +1031,22 @@ impl App {
                     writer.acknowledge_failure(id);
                 }
             }
+            Msg::Drain {
+                claim,
+                message,
+                done,
+                err,
+            } => {
+                if self.drain.claim == Some(claim) {
+                    self.drain.message = message.clone();
+                    self.drain.done = done;
+                    self.drain.err = err;
+                    if done {
+                        self.drain.cancel = None;
+                        self.set_claimed_status(claim, message, err);
+                    }
+                }
+            }
             Msg::Flash {
                 generation,
                 claim,

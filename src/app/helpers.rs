@@ -283,9 +283,6 @@ pub(super) fn delete_confirm_label(
 }
 
 pub(super) fn drainable_pod(pod: &Pod) -> bool {
-    if pod.metadata.deletion_timestamp.is_some() {
-        return false;
-    }
     if pod
         .metadata
         .annotations
@@ -312,29 +309,6 @@ pub(super) fn drainable_pod(pod: &Pod) -> bool {
             .and_then(|status| status.phase.as_deref()),
         Some("Succeeded" | "Failed")
     )
-}
-
-pub(super) fn drain_blocker(pod: &Pod) -> Option<&'static str> {
-    if !pod
-        .metadata
-        .owner_references
-        .as_ref()
-        .is_some_and(|owners| owners.iter().any(|owner| owner.controller == Some(true)))
-    {
-        return Some("pod has no controller and will not be replaced");
-    }
-    if pod
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.volumes.as_ref())
-        .is_some_and(|volumes| volumes.iter().any(|volume| volume.empty_dir.is_some()))
-    {
-        return Some("pod has emptyDir data that eviction would delete");
-    }
-    if pod.metadata.uid.as_deref().is_none_or(str::is_empty) {
-        return Some("pod UID is missing; cannot verify the eviction target");
-    }
-    None
 }
 
 /// Pick a version name to query a CRD's custom resources: the storage version
