@@ -32,11 +32,12 @@ pub fn severity(line: &str) -> Severity {
     if let Some(level) = json_field(&l, "level").or_else(|| json_field(&l, "severity")) {
         return parse_level(level);
     }
-    // klog prefixes (`E0627 …`) put the level at the very start.
-    if klog_level(&l, 'e') || klog_level(&l, 'f') {
+    // Skip source labels and timestamps before checking the klog level.
+    let body = log_body(&line);
+    if klog_level(body, 'e') || klog_level(body, 'f') {
         return Severity::Error;
     }
-    if klog_level(&l, 'w') {
+    if klog_level(body, 'w') {
         return Severity::Warning;
     }
     // Otherwise the leftmost level marker wins, since the level precedes the
@@ -109,10 +110,25 @@ fn json_field<'a>(l: &'a str, key: &str) -> Option<&'a str> {
     Some(&rest[..end])
 }
 
-/// True if `l` starts with a klog level marker, e.g. `e0627 …` (lowercased).
-fn klog_level(l: &str, level: char) -> bool {
-    let mut it = l.chars();
-    it.next() == Some(level) && it.next().is_some_and(|c| c.is_ascii_digit())
+fn log_body(mut line: &str) -> &str {
+    if line.starts_with('[')
+        && let Some((_, rest)) = line.split_once("] ")
+    {
+        line = rest;
+    }
+    if let Some((timestamp, rest)) = line.split_once(' ')
+        && timestamp.parse::<k8s_openapi::jiff::Timestamp>().is_ok()
+    {
+        line = rest;
+    }
+    line
+}
+
+/// Check for a klog level marker at the start of the message.
+fn klog_level(line: &str, level: char) -> bool {
+    let mut it = line.chars();
+    it.next().is_some_and(|c| c.eq_ignore_ascii_case(&level))
+        && it.next().is_some_and(|c| c.is_ascii_digit())
 }
 
 /// A compiled log filter. Cheap to query per line; build once when the filter

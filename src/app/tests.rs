@@ -27753,3 +27753,37 @@ async fn log_warnings_shortcut_combines_filters_and_tracks_appends() {
     assert!(!app.logs.warnings_only);
     assert!(app.logs.filter.is_empty());
 }
+
+#[tokio::test]
+async fn log_warnings_keep_prefixed_klog_with_timestamps_on_and_off() {
+    let (mut app, _rx) = test_app();
+    app.mode = Mode::Logs;
+    let timestamp = "2026-06-27T12:00:00Z";
+    let mut lines = Vec::new();
+    for prefix in ["", "[pod] ", "[ns/pod:container] "] {
+        for level in ['W', 'E', 'F', 'I'] {
+            lines.push(format!("{prefix}{timestamp} {level}0627 12:00:00 message"));
+        }
+    }
+    lines.push(format!("[pod] {timestamp} text mentions E0627 in message"));
+    lines.push(format!(
+        "[pod] {timestamp} \x1b[31mE0627\x1b[0m 12:00:00 message"
+    ));
+    shortcut_log_lines(&mut app, lines.clone());
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    for timestamps in [false, true, false] {
+        if app.logs.timestamps != timestamps {
+            app.handle_key(press(KeyCode::Char('t'))).unwrap();
+        }
+        assert_eq!(app.logs.refresh_index(0).matched_lines(), 10);
+        let text = app.filtered_log_text();
+        assert!(!text.contains("I0627"));
+        assert!(!text.contains("text mentions"));
+        assert_eq!(text.contains(timestamp), timestamps);
+        for line in text.lines() {
+            assert!(crate::logfilter::is_warning_or_error(line), "{line}");
+        }
+    }
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.logs.refresh_index(0).matched_lines(), lines.len());
+}
