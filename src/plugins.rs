@@ -144,11 +144,126 @@ pub fn executable(name: &str) -> Option<PathBuf> {
 #[serde(deny_unknown_fields)]
 struct Manifest {
     schema_version: u32,
+    /// Publication metadata, in Cargo's spelling. Absent from a manifest that is
+    /// only ever installed by hand; required by the catalog, which generates its
+    /// index entry from it.
+    #[serde(default)]
+    package: Option<Package>,
     plugin: Plugin,
 }
 
-pub fn read_package(dir: &Path) -> Result<Plugin, String> {
-    let dir = dir.canonicalize().map_err(|e| e.to_string())?;
+/// The `[package]` table: who publishes this package, under what licence, and
+/// which sofka versions and platforms it supports. Sofka validates it and
+/// otherwise leaves it alone — nothing here changes how a plugin runs.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Package {
+    pub version: String,
+    pub description: String,
+    pub license: String,
+    #[serde(default)]
+    pub authors: Vec<String>,
+    pub repository: Option<String>,
+    pub readme: Option<String>,
+    /// Semantic version requirement on sofka itself, like Cargo's
+    /// `rust-version`. Its lower bound must include support for this manifest.
+    pub sofka: Option<String>,
+    #[serde(default)]
+    pub platforms: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Catalog-only tool metadata for adapters that can use any of several
+    /// executable names. Runtime discovery remains the adapter's job.
+    #[serde(default)]
+    pub requirements: Vec<PackageRequirement>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageRequirement {
+    pub name: String,
+    #[serde(default)]
+    pub alternatives: Vec<String>,
+    pub install: String,
+}
+
+pub fn validate_package(package: &Package) -> Result<(), String> {
+    if semver::Version::parse(&package.version).is_err() {
+        return Err(format!(
+            "package version {:?} is not a semantic version",
+            package.version
+        ));
+    }
+    if package.description.trim().is_empty() || package.license.trim().is_empty() {
+        return Err("package description and license must not be empty".into());
+    }
+    if package
+        .authors
+        .iter()
+        .any(|author| author.trim().is_empty())
+    {
+        return Err("package authors must not contain an empty entry".into());
+    }
+    if let Some(sofka) = &package.sofka
+        && semver::VersionReq::parse(sofka).is_err()
+    {
+        return Err(format!(
+            "package sofka {sofka:?} is not a version requirement"
+        ));
+    }
+    for field in [&package.repository, &package.readme] {
+        if field.as_ref().is_some_and(|value| value.trim().is_empty()) {
+            return Err("package repository and readme must not be empty".into());
+        }
+    }
+    if package
+        .repository
+        .as_ref()
+        .is_some_and(|url| !url.starts_with("https://"))
+    {
+        return Err("package repository must use HTTPS".into());
+    }
+    // Not checked against the targets this build knows: `platforms` says what
+    // the package publishes for, and rejecting an unfamiliar triple would make
+    // every older sofka drop a working package the day the catalog adds a
+    // target. What decides installability is the artifact list, which
+    // `validate_artifact` still holds to the supported set.
+    if package.platforms.iter().any(|platform| {
+        platform.trim().is_empty()
+            || package.platforms.iter().filter(|p| *p == platform).count() > 1
+    }) {
+        return Err("package platforms must be distinct and not empty".into());
+    }
+    if package.tags.iter().any(|tag| tag.trim().is_empty()) {
+        return Err("package tags must not contain an empty entry".into());
+    }
+    for requirement in &package.requirements {
+        if requirement.name.trim().is_empty()
+            || requirement.install.trim().is_empty()
+            || requirement
+                .alternatives
+                .iter()
+                .enumerate()
+                .any(|(index, name)| {
+                    name.trim().is_empty()
+                        || name == &requirement.name
+                        || requirement.alternatives[..index].contains(name)
+                })
+        {
+            return Err(
+                "package requirements must name distinct executables and installation instructions"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The manifest exactly as the package declares it, before `read_package`
+/// resolves a relative command against the package directory. Checking a
+/// package against the catalog entry it was selected from has to compare what
+/// the author wrote, not the absolute path this process resolved it to.
+pub fn read_package_manifest(dir: &Path) -> Result<(Plugin, Option<Package>), String> {
     let path = dir.join("plugin.toml");
     use std::io::Read;
     let mut bytes = Vec::new();
@@ -160,7 +275,12 @@ pub fn read_package(dir: &Path) -> Result<Plugin, String> {
     if bytes.len() > MAX_BYTES {
         return Err("manifest exceeds 1 MiB".into());
     }
-    let mut plugin = parse_manifest(std::str::from_utf8(&bytes).map_err(|e| e.to_string())?)?;
+    read_manifest(std::str::from_utf8(&bytes).map_err(|e| e.to_string())?)
+}
+
+pub fn read_package(dir: &Path) -> Result<Plugin, String> {
+    let dir = dir.canonicalize().map_err(|e| e.to_string())?;
+    let mut plugin = read_package_manifest(&dir)?.0;
     if plugin.command.starts_with("./") {
         let command = dir
             .join(&plugin.command)
@@ -185,12 +305,21 @@ pub fn read_package(dir: &Path) -> Result<Plugin, String> {
 
 /// Parse and validate a `plugin.toml`, wherever it came from.
 pub fn parse_manifest(text: &str) -> Result<Plugin, String> {
+    Ok(read_manifest(text)?.0)
+}
+
+/// The whole manifest: how the plugin runs, and the publication metadata when
+/// the package declares any.
+pub fn read_manifest(text: &str) -> Result<(Plugin, Option<Package>), String> {
     let manifest: Manifest = toml::from_str(text).map_err(|e| e.to_string())?;
     if manifest.schema_version != 1 {
         return Err("unsupported schema_version (expected 1)".into());
     }
+    if let Some(package) = &manifest.package {
+        validate_package(package)?;
+    }
     validate_plugin(&manifest.plugin)?;
-    Ok(manifest.plugin)
+    Ok((manifest.plugin, manifest.package))
 }
 
 /// The manifest of every package sofka ships. Kept as real files under
@@ -669,6 +798,143 @@ mod tests {
         let result = read_package(&dir);
         std::fs::remove_dir_all(dir).unwrap();
         result
+    }
+
+    const PACKAGED: &str = concat!(
+        "schema_version = 1\n",
+        "\n",
+        "[package]\n",
+        "version = \"0.1.0\"\n",
+        "description = \"Scan the active context.\"\n",
+        "license = \"MIT OR Apache-2.0\"\n",
+        "authors = [\"sofka maintainers\"]\n",
+        "repository = \"https://github.com/nklmilojevic/sofka-plugins\"\n",
+        "readme = \"README.md\"\n",
+        "sofka = \">=0.26.0\"\n",
+        "platforms = [\"x86_64-apple-darwin\"]\n",
+        "tags = [\"diagnostics\"]\n",
+        "requirements = [{ name = \"popeye\", alternatives = [\"kubectl-popeye\"], install = \"Install Popeye\" }]\n",
+        "\n",
+        "[plugin]\n",
+        "name = \"Popeye scan\"\n",
+        "palette = \"popeye\"\n",
+        "command = \"./adapter\"\n",
+        "output = \"report\"\n",
+        "target = \"context\"\n",
+        "mutating = false\n",
+    );
+
+    #[test]
+    fn a_package_table_is_read_beside_the_execution_fields() {
+        let (plugin, package) = read_manifest(PACKAGED).unwrap();
+        // The execution half is untouched by the new table.
+        assert_eq!(plugin.name, "Popeye scan");
+        assert_eq!(plugin.palette.as_deref(), Some("popeye"));
+        assert_eq!(plugin.command, "./adapter");
+        let package = package.unwrap();
+        assert_eq!(package.version, "0.1.0");
+        assert_eq!(package.authors, ["sofka maintainers"]);
+        assert_eq!(package.license, "MIT OR Apache-2.0");
+        assert_eq!(package.sofka.as_deref(), Some(">=0.26.0"));
+        assert_eq!(package.platforms, ["x86_64-apple-darwin"]);
+        assert_eq!(package.tags, ["diagnostics"]);
+        assert_eq!(package.requirements[0].name, "popeye");
+        assert_eq!(package.requirements[0].alternatives, ["kubectl-popeye"]);
+    }
+
+    #[test]
+    fn a_manifest_without_a_package_table_stays_valid() {
+        let (plugin, package) = read_manifest(
+            "schema_version = 1\n[plugin]\nname = \"Local\"\npalette = \"local\"\ncommand = \"/bin/echo\"\noutput = \"popup\"\n",
+        )
+        .unwrap();
+        assert_eq!(plugin.name, "Local");
+        assert!(package.is_none());
+    }
+
+    #[test]
+    fn package_metadata_is_validated_field_by_field() {
+        for (label, from, to) in [
+            ("version", "version = \"0.1.0\"", "version = \"one\""),
+            (
+                "description",
+                "description = \"Scan the active context.\"",
+                "description = \"  \"",
+            ),
+            (
+                "license",
+                "license = \"MIT OR Apache-2.0\"",
+                "license = \"\"",
+            ),
+            (
+                "author",
+                "authors = [\"sofka maintainers\"]",
+                "authors = [\"\"]",
+            ),
+            ("sofka range", "sofka = \">=0.26.0\"", "sofka = \"latest\""),
+            (
+                "platform",
+                "platforms = [\"x86_64-apple-darwin\"]",
+                "platforms = [\"\"]",
+            ),
+            (
+                "duplicate platform",
+                "platforms = [\"x86_64-apple-darwin\"]",
+                "platforms = [\"x86_64-apple-darwin\", \"x86_64-apple-darwin\"]",
+            ),
+            (
+                "repository",
+                "repository = \"https://github.com/nklmilojevic/sofka-plugins\"",
+                "repository = \"http://insecure\"",
+            ),
+            ("tag", "tags = [\"diagnostics\"]", "tags = [\"\"]"),
+            (
+                "requirement",
+                "alternatives = [\"kubectl-popeye\"]",
+                "alternatives = [\"popeye\"]",
+            ),
+        ] {
+            let manifest = PACKAGED.replace(from, to);
+            assert!(read_manifest(&manifest).is_err(), "accepted {label}");
+        }
+        // A target this build has never heard of is still a valid declaration.
+        // Refusing it would drop a working package from every older sofka the
+        // day the catalog publishes for a new triple; what gates installation
+        // is the artifact list, which the catalog validates separately.
+        assert!(
+            read_manifest(&PACKAGED.replace(
+                "platforms = [\"x86_64-apple-darwin\"]",
+                "platforms = [\"x86_64-unknown-linux-musl\"]",
+            ))
+            .is_ok()
+        );
+        // An unknown key in the new table is refused like any other.
+        assert!(
+            read_manifest(&PACKAGED.replace("[package]", "[package]\npublisher = \"x\"")).is_err()
+        );
+        read_manifest(PACKAGED).unwrap();
+    }
+
+    #[test]
+    fn optional_package_fields_may_be_absent() {
+        let minimal = concat!(
+            "schema_version = 1\n",
+            "[package]\n",
+            "version = \"0.1.0\"\n",
+            "description = \"Scan.\"\n",
+            "license = \"MIT\"\n",
+            "[plugin]\n",
+            "name = \"Scan\"\n",
+            "palette = \"scan\"\n",
+            "command = \"/bin/echo\"\n",
+            "output = \"popup\"\n",
+        );
+        let package = read_manifest(minimal).unwrap().1.unwrap();
+        assert!(package.authors.is_empty());
+        assert!(package.repository.is_none());
+        assert!(package.sofka.is_none());
+        assert!(package.platforms.is_empty());
+        assert!(package.requirements.is_empty());
     }
 
     #[test]

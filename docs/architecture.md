@@ -60,6 +60,10 @@ choices in there.
 `plugins.rs` loads package manifests and validates input values.
 It also controls adapter processes and reads JSON reports.
 `app/plugins.rs` connects this code to commands, guardrails, and document views.
+`plugin_catalog.rs` validates and caches the official single-file index and
+selects compatible platform artifacts. `plugin_install.rs` verifies, stages,
+records, updates, and removes managed packages. `plugin_cli.rs` keeps those
+operations independent of the TUI and Kubernetes initialization.
 
 Adapters receive a resource snapshot through standard input.
 The shared runner serializes that snapshot outside the UI thread.

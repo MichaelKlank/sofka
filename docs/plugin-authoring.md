@@ -9,6 +9,12 @@ sofka supplies resource data, process control, output limits, and report display
 The package supplies tool commands and result interpretation.
 A new package does not require changes to sofka's Rust code.
 
+Packages proposed for the reviewed public catalog live in the separate
+[`sofka-plugins`](https://github.com/nklmilojevic/sofka-plugins) repository.
+Its contribution guide defines review, versioning, fixtures, licenses, and
+publication. Compiled package archives are GitHub Release assets; binaries are
+not committed to either source repository.
+
 ## Language choice
 
 For core plugins maintained and shipped by the sofka project, prefer Rust.
@@ -104,6 +110,51 @@ timeout = "10s"
 type = "boolean"
 default = "false"
 ```
+
+### `[package]`
+
+A package published to the [official catalog](plugins.md#official-catalog) adds
+a `[package]` table naming who publishes it and what it supports. Sofka
+validates the table and otherwise ignores it; the catalog generates its index
+entry from it, and adds the artifact URLs, checksums, source commit, and
+withdrawal status itself. A package installed only by hand can leave it out.
+
+```toml
+[package]
+version = "0.1.0"
+authors = ["sofka maintainers"]
+license = "MIT OR Apache-2.0"
+description = "Scan the active context with Popeye and report findings by linter."
+repository = "https://github.com/nklmilojevic/sofka-plugins"
+readme = "README.md"
+sofka = ">=0.26.0"
+platforms = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+tags = ["diagnostics", "report"]
+```
+
+| Field          | Function                                                                                       |
+| -------------- | ---------------------------------------------------------------------------------------------- |
+| `version`      | Required semantic version of this package release. Separate from `schema_version`.             |
+| `description`  | Required one-line summary, shown by `sofka plugin search`.                                     |
+| `license`      | Required SPDX expression.                                                                      |
+| `authors`      | Who is responsible for the package.                                                            |
+| `repository`   | HTTPS URL of the source repository.                                                            |
+| `readme`       | README filename inside the package directory.                                                  |
+| `sofka`        | Semantic version requirement on sofka. Its lower bound must include support for this manifest. |
+| `platforms`    | Target triples the package publishes artifacts for. A triple sofka does not know is allowed.   |
+| `tags`         | Search keywords.                                                                               |
+| `requirements` | Tools the adapter finds itself. `alternatives` names equivalent executables.                   |
+
+The package ID is its directory name. `[plugin]` keeps its meaning: `name` is
+the display name and `palette` is the command.
+
+A catalog install reconciles this manifest against the index entry it came
+from. The `[package]` version and the `[plugin]` command, target, output,
+`mutating`, `confirm`, `dangerous`, and `network_load` must match the published
+entry, and an omitted field is compared as the behaviour it produces — an
+absent `mutating` means `true`. A package that disagrees is refused.
+
+### `[plugin]`
 
 | Field            | Function                                                                                   |
 | ---------------- | ------------------------------------------------------------------------------------------ |

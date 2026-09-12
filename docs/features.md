@@ -607,7 +607,10 @@ pod is rejected; browse through a pod that already mounts the claim instead.
 - **Plugins** - shell-out commands bound to key chords, scoped per resource,
   with terminal/popup/background output modes, confirmation and dangerous flags,
   read-only declarations, rich placeholders, and bulk execution over marked
-  rows. See [Plugins](plugins.md).
+  rows. The official reviewed catalog supports cluster-independent search,
+  description, checksum-verified installation, explicit update and rollback,
+  offline listing and caching, withdrawal, and safe removal. See
+  [Plugins](plugins.md).
 - **Bookmarks** - saved navigation commands on a chord and in the palette.
 - **Workspaces** - a named set of views for one task, cycled with `Tab`.
 - **Skins** - built-in Catppuccin, Gruvbox, Solarized, Nord, Dracula, Tokyo

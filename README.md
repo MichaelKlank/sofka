@@ -118,6 +118,10 @@ sofka pods --snapshot        # render one frame of a resource view to stdout
 sofka dp -A --snapshot       # deployments, all namespaces
 sofka info                   # runtime diagnostics: build, config, discovery, latency, dirs
 sofka info --offline         # the same report without connecting to a cluster
+sofka plugin search          # search the official reviewed plugin catalog
+sofka plugin install ID      # install the latest compatible package
+sofka plugin update          # explicitly update all managed packages
+sofka plugin list            # offline installed-package inventory
 ```
 
 ### Keys
