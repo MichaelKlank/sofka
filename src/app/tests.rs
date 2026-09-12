@@ -27163,17 +27163,120 @@ async fn header_lists_favorite_namespaces_with_their_keys() {
     assert!(row.contains("3 staging"), "{row}");
 }
 
+/// Switch namespace the way a user does: the switcher takes the typed name
+/// verbatim, so the namespace need not be listed.
+fn pick_namespace(app: &mut App, namespace: &str) {
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    for c in namespace.chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.namespace, namespace);
+}
+
+#[tokio::test]
+async fn visited_namespaces_claim_free_digits_only_when_configured() {
+    let (mut app, _rx) = test_app();
+    app.namespace = "default".into();
+    app.switch_kind("pods");
+    pick_namespace(&mut app, "charlie");
+    pick_namespace(&mut app, "alpha");
+
+    // Off by default: the digits stay tied to the configured favourites, so
+    // with none configured they do nothing at all.
+    assert_eq!(app.namespace_shortcuts(), vec![String::new(); 9]);
+    app.handle_key(press(KeyCode::Char('1'))).unwrap();
+    assert_eq!(app.namespace, "alpha");
+
+    // Switched on, the visited namespaces take the slots in the order they
+    // were given one.
+    app.auto_namespace_shortcuts = true;
+    assert_eq!(app.namespace_shortcuts()[..2], ["charlie", "alpha"]);
+    app.handle_key(press(KeyCode::Char('1'))).unwrap();
+    assert_eq!(app.namespace, "charlie");
+
+    // A further namespace takes the next free slot and moves nothing: the
+    // header advertises these digits, so they have to hold still.
+    pick_namespace(&mut app, "bravo");
+    assert_eq!(
+        app.namespace_shortcuts()[..3],
+        ["charlie", "alpha", "bravo"]
+    );
+
+    // A configured favourite claims its configured slot; the visited ones
+    // fill around it, in their order and without duplicating it.
+    app.namespace_favorites = vec![String::new(), "bravo".into()];
+    assert_eq!(
+        app.namespace_shortcuts()[..3],
+        ["charlie", "bravo", "alpha"]
+    );
+    app.handle_key(press(KeyCode::Char('3'))).unwrap();
+    assert_eq!(app.namespace, "alpha");
+}
+
+#[tokio::test]
+async fn configured_favourites_shrink_the_slots_a_visit_can_claim() {
+    let (mut app, _rx) = test_app();
+    app.namespace = "default".into();
+    app.auto_namespace_shortcuts = true;
+    app.switch_kind("pods");
+    app.namespace_favorites = vec!["fav-1".into(), "fav-2".into()];
+    // Two favourites leave seven slots, so the seventh visit fills the last
+    // one — a namespace must never be parked past the advertised mapping.
+    for i in 1..=7 {
+        pick_namespace(&mut app, &format!("ns-{i:02}"));
+    }
+    let visited: Vec<String> = (1..=7).map(|i| format!("ns-{i:02}")).collect();
+    assert_eq!(app.namespace_shortcuts()[..2], ["fav-1", "fav-2"]);
+    assert_eq!(app.namespace_shortcuts()[2..], visited[..]);
+
+    // `3` is the oldest visit until it is used again.
+    app.handle_key(press(KeyCode::Char('3'))).unwrap();
+    assert_eq!(app.namespace, "ns-01");
+
+    // The eighth visit takes the least recently used of those seven slots,
+    // and leaves the favourites alone.
+    pick_namespace(&mut app, "ns-08");
+    let mut expected = visited.clone();
+    expected[1] = "ns-08".into();
+    assert_eq!(app.namespace_shortcuts()[..2], ["fav-1", "fav-2"]);
+    assert_eq!(app.namespace_shortcuts()[2..], expected[..]);
+    app.handle_key(press(KeyCode::Char('4'))).unwrap();
+    assert_eq!(app.namespace, "ns-08");
+}
+
+#[tokio::test]
+async fn a_full_namespace_shortcut_list_hands_over_only_its_oldest_slot() {
+    let (mut app, _rx) = test_app();
+    app.namespace = "default".into();
+    app.auto_namespace_shortcuts = true;
+    app.switch_kind("pods");
+    for i in 1..=9 {
+        pick_namespace(&mut app, &format!("ns-{i:02}"));
+    }
+    let filled: Vec<String> = (1..=9).map(|i| format!("ns-{i:02}")).collect();
+    assert_eq!(app.namespace_shortcuts(), filled);
+
+    // `1` is the oldest pick until it is used again.
+    app.handle_key(press(KeyCode::Char('1'))).unwrap();
+    assert_eq!(app.namespace, "ns-01");
+
+    // With every slot taken, a tenth namespace takes the least recently used
+    // slot — and only that one.
+    pick_namespace(&mut app, "ns-10");
+    let mut expected = filled.clone();
+    expected[1] = "ns-10".into();
+    assert_eq!(app.namespace_shortcuts(), expected);
+    app.handle_key(press(KeyCode::Char('2'))).unwrap();
+    assert_eq!(app.namespace, "ns-10");
+}
+
 #[tokio::test]
 async fn the_all_namespaces_scope_is_not_a_recent_namespace() {
     let (mut app, _rx) = test_app();
     app.namespace = "default".into();
     app.switch_kind("pods");
-    app.handle_key(press(KeyCode::Char('n'))).unwrap();
-    for c in "alpha".chars() {
-        app.handle_key(press(KeyCode::Char(c))).unwrap();
-    }
-    app.handle_key(press(KeyCode::Enter)).unwrap();
-    assert_eq!(app.namespace, "alpha");
+    pick_namespace(&mut app, "alpha");
     // `:<kind> all` reaches the recents as the literal the user typed, in
     // every spelling the palette accepts.
     for spelling in ["all", "*", "<all>"] {
@@ -27182,6 +27285,57 @@ async fn the_all_namespaces_scope_is_not_a_recent_namespace() {
         assert!(!app.is_recent_namespace(spelling), "{spelling}");
     }
     assert!(app.is_recent_namespace("alpha"));
+}
+
+#[tokio::test]
+async fn all_namespaces_never_takes_a_namespace_shortcut_slot() {
+    let (mut app, _rx) = test_app();
+    app.namespace = "default".into();
+    app.auto_namespace_shortcuts = true;
+    app.switch_kind("pods");
+    pick_namespace(&mut app, "alpha");
+    // Every spelling of the all-namespaces scope reaches the recents as the
+    // literal the user typed; none of them is a namespace to bind a digit to.
+    for spelling in ["all", "*", "<all>"] {
+        palette(&mut app, &format!("pods {spelling}"));
+        assert!(app.all_namespaces(), "{spelling}");
+    }
+    assert_eq!(app.namespace_shortcuts()[..2], ["alpha", ""]);
+}
+
+#[tokio::test]
+async fn header_lists_visited_namespaces_once_they_claim_a_digit() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, _rx) = test_app();
+    app.namespace = "default".into();
+    app.switch_kind("pods");
+    let namespace_row = |app: &mut App| -> String {
+        let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .find(|row| row.contains("Namespace:"))
+            .unwrap()
+    };
+    app.namespace_favorites = vec!["production".into()];
+    pick_namespace(&mut app, "staging");
+    // Off by default: only the configured favourite is advertised.
+    let row = namespace_row(&mut app);
+    assert!(row.contains("1 production"), "{row}");
+    assert!(!row.contains("2 staging"), "{row}");
+
+    // On, the header advertises the visited namespace too — and the digit it
+    // shows is the one that selects it.
+    app.auto_namespace_shortcuts = true;
+    let row = namespace_row(&mut app);
+    assert!(row.contains("1 production  2 staging"), "{row}");
+    app.handle_key(press(KeyCode::Char('2'))).unwrap();
+    assert_eq!(app.namespace, "staging");
 }
 
 #[tokio::test]

@@ -1913,6 +1913,13 @@ pub struct App {
     pub namespace_favorites: Vec<String>,
     /// Session-local recently-selected namespaces, newest first, per context.
     pub recent_namespaces: HashMap<String, VecDeque<String>>,
+    /// Namespaces that were handed a digit slot, per context, in slot order.
+    /// Separate from `recent_namespaces` because that list reorders on every
+    /// pick, while a digit the header advertises has to hold still.
+    pub recent_shortcuts: HashMap<String, Vec<String>>,
+    /// Whether visited namespaces may claim the digit slots the configured
+    /// favourites leave open (config `auto_namespace_shortcuts`).
+    pub auto_namespace_shortcuts: bool,
     /// Type-to-filter buffer for the namespace switcher; also accepted verbatim
     /// (freeform) so you can switch to a namespace that isn't listed (e.g. when
     /// cluster-wide namespace listing is restricted).
@@ -2349,6 +2356,8 @@ impl App {
             ns_state: ListState::default(),
             namespace_favorites: Vec::new(),
             recent_namespaces: HashMap::new(),
+            recent_shortcuts: HashMap::new(),
+            auto_namespace_shortcuts: false,
             ns_filter: String::new(),
             ctx_list: Vec::new(),
             ctx_state: ListState::default(),

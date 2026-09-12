@@ -280,7 +280,9 @@ concurrent drains, and full kubectl drain parity are outside this feature.
   directly; a digit without a favourite is a filter character. Unconfigured
   slots do nothing in the table. `0` selects all namespaces in both places. The
   header's `Namespace:` line shows the configured favourites with their keys
-  when the terminal is wide enough for them. The
+  when the terminal is wide enough for them. With
+  `auto_namespace_shortcuts = true`, the namespaces you visit claim the digits
+  no favourite uses, and keep them. The
   last namespace picked in each context is remembered across restarts
   (`<state-dir>/namespaces.toml`); `-n`/`-A` override it for a session.
 - **Selected namespace** (`W`) switches to the cursor row's namespace and

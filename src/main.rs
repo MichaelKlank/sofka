@@ -407,6 +407,7 @@ async fn run_main(args: Args) -> Result<()> {
     }
     app.user_aliases = cfg.aliases.clone();
     app.namespace_favorites = cfg.favorite_namespaces.clone();
+    app.auto_namespace_shortcuts = cfg.auto_namespace_shortcuts;
     app.plugins = cfg.plugins.clone();
     app.bookmarks = cfg.bookmarks.clone();
     app.workspaces = cfg.workspaces.clone();

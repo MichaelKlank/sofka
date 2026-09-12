@@ -533,7 +533,7 @@ fn favorite_namespace_spans(app: &App, width: usize) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut used = 0;
     for (namespace, action) in app
-        .namespace_favorites
+        .namespace_shortcuts()
         .iter()
         .zip(Action::FAVORITE_NAMESPACES)
     {
@@ -2964,6 +2964,7 @@ fn draw_namespaces(frame: &mut Frame, app: &mut App, area: Rect) {
     let show_scrollbars = app.scrollbars_visible();
     let names = app.filtered_namespaces();
     let browsing = app.ns_filter.is_empty();
+    let shortcuts = app.namespace_shortcuts();
     let shortcut = |n: &str| -> Option<String> {
         if !browsing {
             return None;
@@ -2971,10 +2972,7 @@ fn draw_namespaces(frame: &mut Frame, app: &mut App, area: Rect) {
         let action = if n == "<all>" {
             Action::AllNamespaces
         } else {
-            let index = app
-                .namespace_favorites
-                .iter()
-                .position(|favorite| favorite == n)?;
+            let index = shortcuts.iter().position(|shortcut| shortcut == n)?;
             *Action::FAVORITE_NAMESPACES.get(index)?
         };
         Some(format!("[{}]", app.keymap.label("table", action)))
