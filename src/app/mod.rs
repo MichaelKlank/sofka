@@ -1154,6 +1154,7 @@ pub struct LogsView {
     /// Compiled form of [`Self::filter`] (substring / regex / inverse). Rebuilt
     /// by [`Self::set_filter`] whenever the filter text changes.
     pub matcher: crate::logfilter::LogMatcher,
+    pub warnings_only: bool,
     pub wrap: bool,
     pub timestamps: bool,
     pub stopped: bool,
@@ -1191,6 +1192,7 @@ impl Default for LogsView {
             follow: true,
             filter: String::new(),
             matcher: crate::logfilter::LogMatcher::default(),
+            warnings_only: false,
             wrap: false,
             timestamps: false,
             stopped: false,
@@ -1280,9 +1282,16 @@ impl LogsView {
         self.filter = filter;
     }
 
-    /// Whether `line` passes the active filter (empty filter = everything).
+    pub fn toggle_warnings(&mut self) {
+        self.warnings_only = !self.warnings_only;
+        self.view.scroll = 0;
+        self.reset_index();
+    }
+
+    /// Whether the line passes both active filters.
     pub fn matches(&self, line: &str) -> bool {
         self.matcher.matches(line)
+            && (!self.warnings_only || crate::logfilter::is_warning_or_error(line))
     }
 
     /// The index as it stands. Call [`Self::refresh_index`] first — this does
@@ -1304,6 +1313,7 @@ impl LogsView {
             view,
             filter,
             matcher,
+            warnings_only,
             index,
             markers,
             line_offset,
@@ -1335,7 +1345,9 @@ impl LogsView {
             let Some(line) = view.lines.get(i) else {
                 break;
             };
-            if !matcher.matches(line) {
+            if !matcher.matches(line)
+                || (*warnings_only && !crate::logfilter::is_warning_or_error(line))
+            {
                 continue;
             }
             index.shown.push(Some(i as u32));

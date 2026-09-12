@@ -412,6 +412,13 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   retries until its logs are available. sofka parses ANSI color from the source app
   and maps it onto the active skin instead of printing literal escapes. See
   [Log controls](debugging.md#log-controls).
+- **Log severity filter** (`Ctrl+Z` in logs) shows detected warning and error
+  lines, including fatal and panic levels. The title shows `[warn/error]`.
+  It combines with `/` and uses the same severity rules as log colors.
+  Detection depends on how applications format their logs. Lines with no
+  recognized severity, including stack trace continuation lines, can be hidden.
+  Press `Ctrl+Z` again to show all retained lines. The filter resets when a new
+  log view opens. Copy and save use the filtered lines.
 - **Log markers** (`m` in logs) add visual separators at the buffer tail.
   Markers stay visible through filters, do not move a paused viewport, and are
   excluded from sofka copy/save. Clearing or replacing the buffer removes them.
