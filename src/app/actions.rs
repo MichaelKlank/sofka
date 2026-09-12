@@ -1462,7 +1462,7 @@ impl App {
     }
 
     /// `:reload` — re-read the configuration from disk and apply it live:
-    /// aliases, plugins, the log provider, skin (+ per-swatch overrides),
+    /// aliases, plugins, custom views, the log provider, skin (+ per-swatch overrides),
     /// background fill, and read-only mode. Launch defaults (`default_namespace`/`default_resource`)
     /// are deliberately not re-applied — a reload must never yank the current
     /// view. A reload that fails validation keeps the last known-good config
@@ -1510,9 +1510,9 @@ impl App {
         warnings.extend(crate::config::notify_warnings(&self.notify_cfg));
         warnings.extend(crate::config::pvc_explore_warnings(&self.pvc_cfg));
         warnings.extend(self.configure_keys(&resolved.config.keys));
-        // Thresholds only change cell coloring (never the column layout), so —
-        // unlike custom views — they're safe to re-apply live without yanking
-        // the current view.
+        let (views, view_warnings) = crate::views::compile(&resolved.config.views);
+        self.user_views = views;
+        warnings.extend(view_warnings);
         let (thresholds, threshold_warnings) =
             crate::thresholds::compile(&resolved.config.thresholds);
         self.thresholds = thresholds;
@@ -1545,6 +1545,8 @@ impl App {
         ));
         self.apply_context_skin(resolved.skin_override);
         self.config_warnings = warnings;
+        self.refresh_view_spec();
+        self.apply_view_sort();
         if self.config_warnings.is_empty() {
             self.flash = "config reloaded".into();
             self.flash_err = false;
