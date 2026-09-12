@@ -1462,6 +1462,7 @@ async fn navigation_views_share_palette_and_help_shortcuts() {
         Mode::Explain,
         Mode::Timeline,
         Mode::Gitops,
+        Mode::Argocd,
         Mode::Adjacent,
         Mode::Diff,
         Mode::Events,
@@ -21218,6 +21219,579 @@ async fn gitops_refresh_reads_current_owner_and_source_reference() {
     assert!(requests.contains(&format!("{source_path}/new-source")));
 }
 
+fn argocd_application(destination: serde_json::Value) -> serde_json::Value {
+    json!({
+        "apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
+        "metadata": {"name": "web", "namespace": "default", "uid": "app-uid"},
+        "spec": {
+            "project": "default",
+            "source": {"repoURL": "https://github.com/example/repo", "path": "manifests",
+                       "targetRevision": "HEAD"},
+            "destination": destination,
+            "syncPolicy": {"automated": {"prune": true}}
+        },
+        "status": {
+            "sync": {"status": "OutOfSync", "revision": "53e28ff20cc530b9ada2173fbbd64d48338583ba"},
+            "health": {"status": "Healthy"},
+            "resources": [
+                {"version": "v1", "kind": "Service", "namespace": "default", "name": "web",
+                 "status": "OutOfSync", "health": {"status": "Healthy"}}
+            ]
+        }
+    })
+}
+
+fn open_argocd_view(app: &mut App) {
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for key in "argocd".chars() {
+        app.handle_key(press(KeyCode::Char(key))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+}
+
+async fn receive_argocd_report(app: &mut App, rx: &mut Receiver<Msg>) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(message) = rx.recv().await {
+            if matches!(message, Msg::Argocd { .. }) {
+                app.handle_msg(message);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("argocd report did not finish");
+}
+
+/// An Application deploying into the cluster we are connected to lists what it
+/// manages, and `⏎` opens the managed object.
+#[tokio::test]
+async fn argocd_view_lists_managed_resources_and_jumps_to_one() {
+    let root = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                         "namespace": "default"}));
+    let (mut app, mut rx, responses, _) = health_report_app("applications", root.clone());
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/applications/web",
+        kind.ar.api_version
+    );
+    responses.lock().unwrap().insert(path, (200, root));
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+
+    assert_eq!(app.mode, Mode::Argocd);
+    let texts: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(texts.contains(&"Application/web: OutOfSync / Healthy"));
+    assert!(texts.contains(&"Managed resources (1)"));
+    assert!(texts.contains(&"Service/web: OutOfSync / Healthy"));
+    assert!(texts.contains(&"Service/web is OutOfSync"));
+    assert!(texts.contains(&"destination this cluster/default"));
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.kind_plural, "services");
+    assert_eq!(app.fields.as_deref(), Some("metadata.name=web"));
+}
+
+/// The correctness guarantee: an Application deploying somewhere else must not
+/// offer a jump that would resolve against this cluster.
+#[tokio::test]
+async fn argocd_view_will_not_jump_into_a_remote_destination() {
+    let root = argocd_application(json!({"server": "https://other.example:6443",
+                                         "namespace": "default"}));
+    let (mut app, mut rx, responses, _) = health_report_app("applications", root.clone());
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/applications/web",
+        kind.ar.api_version
+    );
+    responses.lock().unwrap().insert(path, (200, root));
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+
+    assert!(app.argocd_items.iter().all(|f| f.target.is_none()));
+    let texts: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(texts.contains(&"destination https://other.example:6443/default"));
+
+    app.argocd_state.select(Some(
+        app.argocd_items
+            .iter()
+            .position(|f| f.text.starts_with("Service/web:"))
+            .expect("managed resource line"),
+    ));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Argocd, "must not navigate");
+    assert!(
+        app.flash.contains("no kubeconfig context serves"),
+        "{}",
+        app.flash
+    );
+}
+
+/// An object Argo does not manage says so, rather than rendering an empty
+/// Application.
+#[tokio::test]
+async fn argocd_view_reports_objects_argo_does_not_manage() {
+    let root = expression_workload(true);
+    let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+    responses.lock().unwrap().insert(
+        "/apis/apps/v1/namespaces/default/deployments/web".into(),
+        (200, root),
+    );
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+
+    let texts: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(texts.contains(&"Deployment/web is not managed by Argo CD"));
+}
+
+/// Leaving the view must drop a report still in flight, not let it land on a
+/// list the user has already walked away from.
+#[tokio::test]
+async fn argocd_esc_cancels_a_pending_report() {
+    let root = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                         "namespace": "default"}));
+    let (mut app, mut rx, responses, _) = health_report_app("applications", root.clone());
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/applications/web",
+        kind.ar.api_version
+    );
+    responses.lock().unwrap().insert(path, (200, root));
+
+    open_argocd_view(&mut app);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+
+    // The in-flight gather still answers; the view must ignore it.
+    receive_argocd_report(&mut app, &mut rx).await;
+    assert!(
+        app.argocd_items.is_empty(),
+        "a cancelled report landed: {:?}",
+        app.argocd_items
+            .iter()
+            .map(|f| f.text.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The destination decision, exercised without a kubeconfig. The property that
+/// matters: anything that is not provably this cluster must not read as
+/// `Current`, because only `Current` yields jump targets.
+#[test]
+fn argocd_destination_classification() {
+    use crate::argocd::Destination;
+    let none = |_: &str| None;
+    let no_contexts = |_: &str| false;
+    let here = "https://rancher.example/k8s/clusters/c-abc";
+
+    let classify = |server: &str, name: &str| {
+        super::argocd::classify_destination(server, name, here, none, no_contexts)
+    };
+
+    // The service URL, in each spelling Argo may write.
+    for s in [
+        "https://kubernetes.default.svc",
+        "https://kubernetes.default.svc/",
+        "https://kubernetes.default.svc:443",
+        "HTTPS://Kubernetes.Default.SVC",
+    ] {
+        assert_eq!(classify(s, ""), Destination::Current, "{s}");
+    }
+    // The very cluster we are connected to, spelled loosely.
+    assert_eq!(classify(here, ""), Destination::Current);
+    assert_eq!(
+        classify(&format!("{here}/"), ""),
+        Destination::Current,
+        "trailing slash"
+    );
+    // Somewhere else, with nothing in the kubeconfig to name it.
+    assert_eq!(
+        classify("https://other.example:6443", ""),
+        Destination::Unresolved("https://other.example:6443".into())
+    );
+    // A registered name with no matching context.
+    assert_eq!(
+        classify("", "prod-eu"),
+        Destination::Unresolved("prod-eu".into())
+    );
+    // Argo's reserved name for the cluster it runs in.
+    assert_eq!(classify("", "in-cluster"), Destination::Current);
+    // Nothing at all.
+    assert_eq!(classify("", ""), Destination::Unresolved(String::new()));
+
+    // A server that a kubeconfig context serves resolves to that context.
+    assert_eq!(
+        super::argocd::classify_destination(
+            "https://other.example:6443",
+            "",
+            here,
+            |_| Some("prod-eu".to_string()),
+            no_contexts
+        ),
+        Destination::Context("prod-eu".into())
+    );
+    // A context named `in-cluster` wins over the convention, so a remote
+    // cluster registered under that name cannot pass as the local one.
+    assert_eq!(
+        super::argocd::classify_destination("", "in-cluster", here, none, |n| n == "in-cluster"),
+        Destination::Context("in-cluster".into())
+    );
+}
+
+/// A label value stops at 63 characters, so a long Application name reaches the
+/// managed object truncated. An exact-name selector never matches it, so the
+/// lookup has to fall back to a prefix scan.
+#[tokio::test]
+async fn argocd_view_follows_a_truncated_instance_label() {
+    let full = "alpha-address-importer-with-a-very-long-name-that-argo-must-truncate";
+    let truncated: String = full.chars().take(63).collect();
+    let mut deployment = expression_workload(true);
+    deployment["metadata"]["labels"] = json!({"app.kubernetes.io/instance": truncated});
+
+    let mut owner = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                              "namespace": "default"}));
+    owner["metadata"]["name"] = json!(full);
+    owner["status"]["resources"] = json!([
+        {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "default",
+         "name": "web", "status": "Synced", "health": {"status": "Healthy"}}
+    ]);
+
+    let (mut app, mut rx) = test_app();
+    app.switch_kind("deployments");
+    apply(&mut app, deployment.clone());
+    app.table_state.select(Some(0));
+
+    let selectors = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = selectors.clone();
+    // Unlike the shared fixture, this client honours the field selector the way
+    // an API server does, so a selector on the truncated name matches nothing.
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let path = request.uri().path().to_string();
+            let query = request.uri().query().unwrap_or_default().to_string();
+            let body = if path.ends_with("/deployments/web") {
+                deployment.clone()
+            } else if path.ends_with("/applications") {
+                seen.lock().unwrap().push(query.clone());
+                let items = if query.contains("fieldSelector") {
+                    json!([])
+                } else {
+                    json!([owner.clone()])
+                };
+                json!({"apiVersion": "argoproj.io/v1alpha1", "kind": "ApplicationList",
+                       "metadata": {}, "items": items})
+            } else {
+                json!({"apiVersion": "v1", "kind": "List", "metadata": {}, "items": []})
+            };
+            let bytes = serde_json::to_vec(&body).unwrap();
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(200)
+                        .body(kube::client::Body::from(bytes))
+                        .unwrap(),
+                )
+            }
+        }),
+        "default",
+    );
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+
+    let texts: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.starts_with(&format!("Deployment/web is managed by Application/{full}"))),
+        "{texts:?}"
+    );
+    let selectors = selectors.lock().unwrap();
+    assert!(
+        selectors.iter().any(|q| q.contains("fieldSelector")),
+        "the exact-name lookup should be tried first: {selectors:?}"
+    );
+}
+
+/// Running out of pages is not an answer. Reporting "not managed by Argo CD"
+/// because the scan gave up would be a confident wrong result.
+#[tokio::test]
+async fn argocd_truncated_label_scan_reports_when_it_runs_out_of_pages() {
+    let truncated: String = "a".repeat(63);
+    let mut deployment = expression_workload(true);
+    deployment["metadata"]["labels"] = json!({"app.kubernetes.io/instance": truncated});
+
+    let (mut app, mut rx) = test_app();
+    app.switch_kind("deployments");
+    apply(&mut app, deployment.clone());
+    app.table_state.select(Some(0));
+
+    // Always hands back another continuation token and never a match.
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let path = request.uri().path().to_string();
+            let query = request.uri().query().unwrap_or_default().to_string();
+            let body = if path.ends_with("/deployments/web") {
+                deployment.clone()
+            } else if path.ends_with("/applications") && !query.contains("fieldSelector") {
+                json!({"apiVersion": "argoproj.io/v1alpha1", "kind": "ApplicationList",
+                       "metadata": {"continue": "more"}, "items": []})
+            } else {
+                json!({"apiVersion": "v1", "kind": "List", "metadata": {}, "items": []})
+            };
+            let bytes = serde_json::to_vec(&body).unwrap();
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(200)
+                        .body(kube::client::Body::from(bytes))
+                        .unwrap(),
+                )
+            }
+        }),
+        "default",
+    );
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+
+    let texts: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("more than")),
+        "an exhausted scan must say so: {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("not managed by Argo CD")),
+        "giving up was reported as an answer: {texts:?}"
+    );
+}
+
+/// Helm labels a release `app.kubernetes.io/instance: <release>`. If an
+/// unrelated Argo Application happens to share that name, the view must not
+/// claim it manages the object — the label alone is not evidence.
+#[tokio::test]
+async fn argocd_view_does_not_claim_an_object_a_same_named_application_disclaims() {
+    let mut root = expression_workload(true);
+    root["metadata"]["labels"] = json!({"app.kubernetes.io/instance": "web"});
+    let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+    let app_kind = app.cluster.resolve("applications").unwrap();
+
+    // One Application called `web` exists, but it manages something else.
+    let mut unrelated = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                                  "namespace": "default"}));
+    unrelated["status"]["resources"] = json!([
+        {"version": "v1", "kind": "Service", "namespace": "default", "name": "unrelated",
+         "status": "Synced"}
+    ]);
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(
+            "/apis/apps/v1/namespaces/default/deployments/web".into(),
+            (200, root),
+        );
+        replies.insert(
+            format!("/apis/{}/applications", app_kind.ar.api_version),
+            (
+                200,
+                json!({"apiVersion": app_kind.ar.api_version, "kind": "ApplicationList",
+                       "metadata": {}, "items": [unrelated]}),
+            ),
+        );
+    }
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+
+    let texts: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(
+        texts.contains(&"Deployment/web is not managed by Argo CD"),
+        "{texts:?}"
+    );
+    assert!(app.argocd_items.iter().all(|f| f.target.is_none()));
+}
+
+/// The mirror of the above: an exact tracking annotation is Argo's own word
+/// that it owns the object, so a stale `status.resources[]` must not drop it.
+#[tokio::test]
+async fn argocd_view_trusts_the_tracking_annotation_over_a_stale_status() {
+    let mut root = expression_workload(true);
+    root["metadata"]["annotations"] = json!({
+        "argocd.argoproj.io/tracking-id": "web:apps/Deployment:default/web"
+    });
+    let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+    let app_kind = app.cluster.resolve("applications").unwrap();
+    let mut stale = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                              "namespace": "default"}));
+    stale["status"]["resources"] = json!([]);
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(
+            "/apis/apps/v1/namespaces/default/deployments/web".into(),
+            (200, root),
+        );
+        replies.insert(
+            format!("/apis/{}/applications", app_kind.ar.api_version),
+            (
+                200,
+                json!({"apiVersion": app_kind.ar.api_version, "kind": "ApplicationList",
+                       "metadata": {}, "items": [stale]}),
+            ),
+        );
+    }
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+
+    let texts: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.starts_with("Deployment/web is managed by Application/web")),
+        "{texts:?}"
+    );
+}
+
+/// Two Argo CD instances in one cluster, each with an Application called `web`.
+/// The tracking metadata names only `web`, so the right one is the one that
+/// actually claims this Deployment.
+#[tokio::test]
+async fn argocd_view_picks_the_instance_that_claims_the_object() {
+    let mut root = expression_workload(true);
+    root["metadata"]["annotations"] = json!({
+        "argocd.argoproj.io/tracking-id": "web:apps/Deployment:default/web"
+    });
+    let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+    let app_kind = app.cluster.resolve("applications").unwrap();
+
+    // The decoy comes first in the list and manages something else entirely.
+    let mut decoy = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                              "namespace": "default"}));
+    decoy["metadata"]["namespace"] = json!("argocd-dev");
+    decoy["status"]["resources"] = json!([
+        {"version": "v1", "kind": "Service", "namespace": "default", "name": "other",
+         "status": "Synced"}
+    ]);
+    let mut claimant = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                                 "namespace": "default"}));
+    claimant["metadata"]["namespace"] = json!("argocd-prod");
+    claimant["spec"]["project"] = json!("the-right-one");
+    claimant["status"]["resources"] = json!([
+        {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "default",
+         "name": "web", "status": "Synced", "health": {"status": "Healthy"}}
+    ]);
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(
+            "/apis/apps/v1/namespaces/default/deployments/web".into(),
+            (200, root),
+        );
+        replies.insert(
+            format!("/apis/{}/applications", app_kind.ar.api_version),
+            (
+                200,
+                json!({"apiVersion": app_kind.ar.api_version, "kind": "ApplicationList",
+                       "metadata": {}, "items": [decoy, claimant]}),
+            ),
+        );
+    }
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+
+    let texts: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(
+        texts.contains(&"project the-right-one"),
+        "picked the wrong instance: {texts:?}"
+    );
+    assert!(texts.contains(&"Deployment/web: Synced / Healthy"));
+}
+
+/// The reverse direction: a managed object's tracking annotation names the
+/// Application, which is then fetched and reported.
+#[tokio::test]
+async fn argocd_view_follows_a_managed_object_to_its_application() {
+    let mut root = expression_workload(true);
+    root["metadata"]["annotations"] = json!({
+        "argocd.argoproj.io/tracking-id": "web:apps/Deployment:default/web"
+    });
+    let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+    let application = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                                "namespace": "default"}));
+    let app_kind = app.cluster.resolve("applications").unwrap();
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(
+            "/apis/apps/v1/namespaces/default/deployments/web".into(),
+            (200, root),
+        );
+        // No namespace in the tracking id, so the lookup is a field-selector
+        // list across every namespace.
+        replies.insert(
+            format!("/apis/{}/applications", app_kind.ar.api_version),
+            (
+                200,
+                json!({"apiVersion": app_kind.ar.api_version, "kind": "ApplicationList",
+                       "metadata": {}, "items": [application]}),
+            ),
+        );
+    }
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+
+    let texts: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(
+        texts.contains(&"Deployment/web is managed by Application/web: OutOfSync / Healthy"),
+        "{texts:?}"
+    );
+    assert!(texts.contains(&"Managed resources (1)"));
+}
+
+/// `r` re-reads the Application rather than replaying the watch's copy.
+#[tokio::test]
+async fn argocd_refresh_reads_the_application_again() {
+    let root = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                         "namespace": "default"}));
+    let (mut app, mut rx, responses, requests) = health_report_app("applications", root.clone());
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/applications/web",
+        kind.ar.api_version
+    );
+    responses
+        .lock()
+        .unwrap()
+        .insert(path.clone(), (200, root.clone()));
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+
+    let mut fresh = root;
+    fresh["status"]["sync"]["status"] = json!("Synced");
+    fresh["status"]["resources"][0]["status"] = json!("Synced");
+    responses.lock().unwrap().insert(path.clone(), (200, fresh));
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    receive_argocd_report(&mut app, &mut rx).await;
+
+    assert!(
+        app.argocd_items
+            .iter()
+            .any(|f| f.text == "Application/web: Synced / Healthy")
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| **r == path)
+            .count(),
+        2
+    );
+}
+
 #[tokio::test]
 async fn health_refresh_does_not_analyze_replacements_or_failed_root_reads() {
     for gitops in [false, true] {
@@ -24696,6 +25270,7 @@ fn key_action_fixture(scope: &str) -> (App, Receiver<Msg>) {
         "explain" => Mode::Explain,
         "timeline" => Mode::Timeline,
         "gitops" => Mode::Gitops,
+        "argocd" => Mode::Argocd,
         "adjacent" => Mode::Adjacent,
         "flux_menu" => Mode::FluxMenu,
         "transfer_menu" => Mode::TransferMenu,

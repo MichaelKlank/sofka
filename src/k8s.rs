@@ -321,6 +321,12 @@ fn sanitize_server_version(version: &str) -> String {
     crate::text::ellipsize(&visible, SERVER_VERSION_MAX_CHARS)
 }
 
+/// An API-server URL reduced to a comparable form, so the same cluster written
+/// with a stray trailing slash or in mixed case still matches.
+pub(crate) fn normalize_server(server: &str) -> String {
+    server.trim().trim_end_matches('/').to_lowercase()
+}
+
 impl Cluster {
     pub async fn connect(allow_v1_client_cert: bool, no_tls_resumption: bool) -> Result<Self> {
         let mut config = Config::infer()
@@ -507,6 +513,43 @@ impl Cluster {
             .map_err(|e| format!("reading kubeconfig: {e}"))
     }
 
+    /// The kubeconfig context served by `server`, if any.
+    ///
+    /// Argo CD records a destination as the API-server URL of the target
+    /// cluster, which is the same string a kubeconfig holds for it, so the two
+    /// can be matched directly — no Argo CD cluster Secret needs reading, and
+    /// no credentials are involved.
+    pub fn context_for_server(server: &str) -> Option<String> {
+        Self::context_servers().remove(&normalize_server(server))
+    }
+
+    /// Every kubeconfig context keyed by the normalized server URL it talks to.
+    ///
+    /// Read once by callers that resolve several servers, so the file is not
+    /// parsed per lookup and never on a worker thread mid-gather.
+    pub fn context_servers() -> HashMap<String, String> {
+        let Ok(config) = Kubeconfig::read() else {
+            return HashMap::new();
+        };
+        let servers: HashMap<&str, String> = config
+            .clusters
+            .iter()
+            .filter_map(|c| {
+                let server = c.cluster.as_ref()?.server.as_deref()?;
+                Some((c.name.as_str(), normalize_server(server)))
+            })
+            .collect();
+        config
+            .contexts
+            .iter()
+            .filter_map(|c| {
+                let cluster = &c.context.as_ref()?.cluster;
+                let server = servers.get(cluster.as_str())?;
+                (!server.is_empty()).then(|| (server.clone(), c.name.clone()))
+            })
+            .collect()
+    }
+
     /// Merge user-defined aliases (alias -> canonical) into the registry.
     pub fn add_aliases(&mut self, aliases: &HashMap<String, String>) {
         for (alias, target) in aliases {
@@ -591,6 +634,25 @@ impl Cluster {
     /// Resolve a kind within an API group, as an `ownerReference` names it
     /// (`kind` + the group of its `apiVersion`), so a kind name shared by
     /// several groups lands on the right one. "" is the core group.
+    /// Every kind the cluster knows, keyed by lowercased `(kind, group)` and
+    /// mapped to its lowercased plural.
+    ///
+    /// For callers that must resolve kinds off-thread, where the registry isn't
+    /// available. Keyed by group as well as kind because kind names collide
+    /// across groups (`Service` in core and in `serving.knative.dev`), and
+    /// resolving one to the other's plural would open the wrong object.
+    pub fn kind_plurals(&self) -> HashMap<(String, String), String> {
+        self.registry
+            .values()
+            .map(|k| {
+                (
+                    (k.ar.kind.to_lowercase(), k.ar.group.to_lowercase()),
+                    k.ar.plural.to_lowercase(),
+                )
+            })
+            .collect()
+    }
+
     pub fn resolve_in_group(&self, kind: &str, group: &str) -> Option<Kind> {
         let mut found: Vec<&Kind> = self
             .registry
