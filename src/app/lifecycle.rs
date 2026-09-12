@@ -1633,11 +1633,15 @@ impl App {
                 }
             }
             Msg::Namespaces { generation, list } if generation == self.generation => {
-                // Keep the picker open and preserve the selection if possible.
+                let names = self.filtered_namespaces();
                 let keep = self.ns_state.selected().unwrap_or(0);
+                let selected = names.get(keep);
                 self.ns_list = list;
-                self.ns_state
-                    .select(Some(keep.min(self.ns_list.len().saturating_sub(1))));
+                let names = self.filtered_namespaces();
+                let index = selected
+                    .and_then(|selected| names.iter().position(|n| n == selected))
+                    .unwrap_or_else(|| keep.min(names.len().saturating_sub(1)));
+                self.ns_state.select(Some(index));
             }
             Msg::Contexts { generation, list } if generation == self.generation => {
                 if list.is_empty() {

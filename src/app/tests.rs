@@ -10238,6 +10238,186 @@ async fn logs_keep_view_and_restore_selection() {
 }
 
 #[tokio::test]
+async fn namespace_switcher_known_rows_do_not_block_palette_fetch_retry() {
+    let (mut app, mut rx) = test_app();
+    let (requests, mut request_rx) = mpsc::unbounded_channel();
+    let mut attempts = 0;
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            assert_eq!(request.uri().path(), "/api/v1/namespaces");
+            attempts += 1;
+            requests.send(attempts).unwrap();
+            let (status, body) = if attempts == 1 {
+                (
+                    503,
+                    json!({
+                        "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                        "reason": "ServiceUnavailable", "message": "try again", "code": 503
+                    }),
+                )
+            } else {
+                (
+                    200,
+                    json!({
+                        "kind": "NamespaceList", "apiVersion": "v1", "metadata": {},
+                        "items": [{"metadata": {"name": "staging"}}]
+                    }),
+                )
+            };
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                            body.to_string(),
+                        )))
+                        .unwrap(),
+                )
+            }
+        }),
+        "default",
+    );
+    app.namespace = "prod".into();
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    assert_eq!(
+        app.filtered_namespaces().as_ref(),
+        &["<all>", "default", "prod"]
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), request_rx.recv())
+            .await
+            .unwrap(),
+        Some(1)
+    );
+    assert!(app.ns_list.is_empty());
+
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    assert_eq!(app.filtered_namespaces().as_ref(), &["<all>"]);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), request_rx.recv())
+            .await
+            .unwrap(),
+        Some(2)
+    );
+    let message = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(&message, Msg::Namespaces { .. }));
+    app.handle_msg(message);
+    for c in "pods sta".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    let suggestion = app.cmd_suggestions.first().expect("namespace suggestion");
+    assert_eq!(suggestion.kind, SuggestKind::Namespace);
+    assert_eq!(suggestion.label, "staging");
+    assert_eq!(app.ns_list, ["<all>", "staging"]);
+}
+
+#[tokio::test]
+async fn namespace_switcher_selects_current_and_preserves_cursor_on_refresh() {
+    let (mut app, _rx) = test_app();
+    app.namespace = "prod".into();
+    app.namespace_favorites = vec!["staging".into()];
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    assert_eq!(app.mode, Mode::Namespaces);
+    assert_eq!(
+        app.filtered_namespaces()[app.ns_state.selected().unwrap()],
+        "prod"
+    );
+    assert!(app.filtered_namespaces().iter().any(|n| n == "default"));
+
+    app.handle_msg(Msg::Namespaces {
+        generation: app.generation,
+        list: vec!["<all>".into(), "alpha".into(), "prod".into()],
+    });
+    assert_eq!(
+        app.filtered_namespaces().as_ref(),
+        &["<all>", "staging", "alpha", "default", "prod"]
+    );
+    assert_eq!(
+        app.filtered_namespaces()[app.ns_state.selected().unwrap()],
+        "prod"
+    );
+
+    app.handle_key(press(KeyCode::Up)).unwrap();
+    app.handle_msg(Msg::Namespaces {
+        generation: app.generation,
+        list: vec!["<all>".into(), "beta".into(), "gamma".into(), "prod".into()],
+    });
+    assert_eq!(
+        app.filtered_namespaces()[app.ns_state.selected().unwrap()],
+        "default"
+    );
+
+    app.handle_key(press(KeyCode::Char('p'))).unwrap();
+    app.handle_msg(Msg::Namespaces {
+        generation: app.generation,
+        list: vec!["<all>".into(), "alpha".into(), "prod".into()],
+    });
+    assert_eq!(
+        app.filtered_namespaces()[app.ns_state.selected().unwrap()],
+        "prod"
+    );
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.namespace, "prod");
+    assert_eq!(app.mode, Mode::Table);
+}
+
+#[tokio::test]
+async fn namespace_switcher_labels_current_and_context_default() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for (namespace, expected) in [
+        ("default", "default (current, context default)"),
+        ("prod", "prod (current)"),
+        ("", "<all> (current)"),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.namespace = namespace.into();
+        app.handle_key(press(KeyCode::Char('n'))).unwrap();
+        assert_eq!(
+            app.filtered_namespaces()[app.ns_state.selected().unwrap()],
+            if namespace.is_empty() {
+                "<all>"
+            } else {
+                namespace
+            }
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains(expected), "{text}");
+        if namespace != "default" {
+            assert!(text.contains("default (context default)"), "{text}");
+        }
+
+        app.handle_key(press(KeyCode::Char('d'))).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains(expected), "{text}");
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        app.handle_key(press(KeyCode::Char('n'))).unwrap();
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.namespace, namespace);
+    }
+}
+
+#[tokio::test]
 async fn namespace_switcher_pins_all_and_fuzzy_filters() {
     let (mut app, _rx) = test_app();
     app.ns_list = vec![

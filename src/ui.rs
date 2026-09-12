@@ -2969,21 +2969,34 @@ fn draw_namespaces(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             if n == "<all>" {
                 spans.push(Span::styled(n.clone(), Style::default().fg(theme::teal())));
-                return ListItem::new(Line::from(spans));
-            }
-            // Only tag favourites/recents while browsing (the pinned ordering);
-            // a filtered list is ranked by match, so a tag there would mislead.
-            let (tag, color) = if !browsing {
-                ("", theme::text())
-            } else if app.is_favorite_namespace(n) {
-                ("★ ", theme::yellow())
-            } else if app.is_recent_namespace(n) {
-                ("· ", theme::sky())
             } else {
-                ("  ", theme::text())
+                // Only tag favourites/recents while browsing (the pinned ordering);
+                // a filtered list is ranked by match, so a tag there would mislead.
+                let (tag, color) = if !browsing {
+                    ("", theme::text())
+                } else if app.is_favorite_namespace(n) {
+                    ("★ ", theme::yellow())
+                } else if app.is_recent_namespace(n) {
+                    ("· ", theme::sky())
+                } else {
+                    ("  ", theme::text())
+                };
+                spans.push(Span::styled(tag.to_string(), theme::dim()));
+                spans.push(Span::styled(n.clone(), Style::default().fg(color)));
+            }
+            let current = if app.namespace.is_empty() {
+                n == "<all>"
+            } else {
+                n == &app.namespace
             };
-            spans.push(Span::styled(tag.to_string(), theme::dim()));
-            spans.push(Span::styled(n.clone(), Style::default().fg(color)));
+            let context_default = n == &app.cluster.default_namespace;
+            let label = match (current, context_default) {
+                (true, true) => " (current, context default)",
+                (true, false) => " (current)",
+                (false, true) => " (context default)",
+                (false, false) => "",
+            };
+            spans.push(Span::styled(label, theme::dim()));
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -2997,7 +3010,7 @@ fn draw_namespaces(frame: &mut Frame, app: &mut App, area: Rect) {
         frame,
         show_scrollbars,
         area,
-        (40, 60),
+        (70, 60),
         items,
         Span::styled(title, theme::title()),
         &mut app.ns_state,
