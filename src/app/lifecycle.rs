@@ -99,7 +99,7 @@ impl App {
     /// selectors, and reset filter/sort/cursor. A stale selection from the
     /// previous kind (e.g. row 5 on pods) would otherwise carry over — the new
     /// view always starts with its first row selected.
-    fn set_root_view(&mut self, kind: Kind) {
+    pub(super) fn set_root_view(&mut self, kind: Kind) {
         self.stack.clear();
         self.kind_plural = kind.ar.plural.to_lowercase();
         self.kind = Some(kind);

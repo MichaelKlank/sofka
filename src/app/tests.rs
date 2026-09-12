@@ -12761,6 +12761,165 @@ async fn context_switch_resolves_readonly_and_cli_pin_wins() {
 }
 
 #[tokio::test]
+async fn context_switch_keeps_resource_type_and_clears_filter_scope() {
+    for resource in ["deployments", "statefulsets", "nodes"] {
+        for picker in [false, true] {
+            let (mut app, _rx) = test_app();
+            app.all_contexts = vec!["test".into(), "west".into()];
+            app.cluster
+                .register_kind("apps", "StatefulSet", "statefulsets", true);
+            type_resource_query(&mut app, &format!("{resource} /-l app=api"));
+            app.namespace_memory.set("west", "remembered");
+            if picker {
+                palette(&mut app, "ctx");
+                pick_context(&mut app, "west");
+            } else {
+                palette(&mut app, "ctx west");
+            }
+            assert_eq!(
+                app.context_switch_target,
+                Some((app.generation, "west".into())),
+                "resource={resource}, picker={picker}, mode={:?}, flash={}, context filter={}",
+                app.mode,
+                app.flash,
+                app.ctx_filter
+            );
+            let mut target = Cluster::fake();
+            target.context = "west".into();
+            target.register_kind("apps", "StatefulSet", "statefulsets", true);
+            app.handle_msg(Msg::ContextSwitched {
+                generation: app.generation,
+                name: "west".into(),
+                result: Ok(Box::new(target)),
+            });
+            assert_eq!(app.kind_plural, resource);
+            assert_eq!(app.namespace, "remembered");
+            assert!(app.filter.is_empty());
+            assert!(app.labels.is_none());
+            assert!(app.fields.is_none());
+            assert!(app.owner.is_none());
+            assert!(app.applied_filter_labels.is_none());
+            assert!(app.applied_filter_fields.is_none());
+            assert!(app.stack.is_empty());
+            assert_eq!(app.history.len(), 1);
+            assert!(!app.flash_err, "{}", app.flash);
+        }
+    }
+}
+
+#[tokio::test]
+async fn context_switch_resolves_custom_resource_in_target_group() {
+    let (mut app, _rx) = test_app();
+    app.all_contexts = vec!["test".into(), "west".into()];
+    app.cluster
+        .register_kind("example.com", "Widget", "widgets", true);
+    type_resource_query(&mut app, "widgets.example.com");
+    palette(&mut app, "ctx west");
+    assert_eq!(
+        app.context_switch_target,
+        Some((app.generation, "west".into()))
+    );
+    let mut target = Cluster::fake();
+    target.context = "west".into();
+    target.register_kind("example.com", "Widget", "widgets", false);
+    target.register_kind("other.example.com", "Widget", "widgets", true);
+    app.handle_msg(Msg::ContextSwitched {
+        generation: app.generation,
+        name: "west".into(),
+        result: Ok(Box::new(target)),
+    });
+    let kind = app.kind.as_ref().unwrap();
+    assert_eq!(kind.title(), "widgets.example.com");
+    assert!(
+        !kind.namespaced,
+        "resource metadata must come from the target cluster"
+    );
+}
+
+#[tokio::test]
+async fn context_switch_missing_resource_uses_default_then_pods() {
+    for (default, expected) in [("services", "services"), ("missing", "pods")] {
+        let (mut app, _rx) = test_app();
+        app.all_contexts = vec!["test".into(), "west".into()];
+        let dir = std::env::temp_dir().join(format!(
+            "sofka-context-fallback-{}-{default}",
+            std::process::id()
+        ));
+        let context_dir = dir.join("clusters/test-cluster/west");
+        std::fs::create_dir_all(&context_dir).unwrap();
+        std::fs::write(
+            context_dir.join("config.toml"),
+            format!("default_resource = \"{default}\"\n"),
+        )
+        .unwrap();
+        app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+        app.cluster
+            .register_kind("example.com", "Widget", "widgets", true);
+        type_resource_query(&mut app, "widgets.example.com");
+        palette(&mut app, "ctx west");
+        assert_eq!(
+            app.context_switch_target,
+            Some((app.generation, "west".into()))
+        );
+        let mut target = Cluster::fake();
+        target.context = "west".into();
+        target.register_kind("other.example.com", "Widget", "widgets", true);
+        app.handle_msg(Msg::ContextSwitched {
+            generation: app.generation,
+            name: "west".into(),
+            result: Ok(Box::new(target)),
+        });
+        assert_eq!(app.kind_plural, expected);
+        assert!(
+            app.flash
+                .contains("widgets.example.com is unavailable in west"),
+            "{}",
+            app.flash
+        );
+        assert!(
+            app.flash.contains(&format!("viewing {expected}")),
+            "{}",
+            app.flash
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn context_switch_keeps_fallback_message_with_config_warning() {
+    let (mut app, _rx) = test_app();
+    app.all_contexts = vec!["test".into(), "west".into()];
+    let dir = std::env::temp_dir().join(format!(
+        "sofka-context-fallback-warning-{}",
+        std::process::id()
+    ));
+    let context_dir = dir.join("clusters/test-cluster/west");
+    std::fs::create_dir_all(&context_dir).unwrap();
+    std::fs::write(context_dir.join("config.toml"), "readonly = \n").unwrap();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    app.cluster
+        .register_kind("example.com", "Widget", "widgets", true);
+    type_resource_query(&mut app, "widgets.example.com");
+    palette(&mut app, "ctx west");
+    assert_eq!(
+        app.context_switch_target,
+        Some((app.generation, "west".into()))
+    );
+    land_context(&mut app, "west");
+    assert_eq!(app.kind_plural, "pods");
+    assert!(app.flash_err);
+    assert!(
+        app.flash
+            .contains("widgets.example.com is unavailable in west; viewing pods"),
+        "{}",
+        app.flash
+    );
+    assert_eq!(app.config_warnings.len(), 1);
+    assert!(app.flash.contains(&app.config_warnings[0]), "{}", app.flash);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn context_picker_launch_connects_on_enter_and_opens_default_resource() {
     for default in [None, Some("deployments")] {
         let (mut app, _rx) = test_app();
