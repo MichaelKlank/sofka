@@ -1545,6 +1545,7 @@ struct NamespaceMemo {
     filter: String,
     context: String,
     ns_list: Vec<String>,
+    known_namespaces: [String; 2],
     favorites: Vec<String>,
     recents: Vec<String>,
     value: Rc<Vec<String>>,

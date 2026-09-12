@@ -1637,9 +1637,6 @@ impl App {
                 let keep = self.ns_state.selected().unwrap_or(0);
                 let selected = names.get(keep);
                 self.ns_list = list;
-                if self.mode == Mode::Namespaces {
-                    self.ensure_known_namespaces();
-                }
                 let names = self.filtered_namespaces();
                 let index = selected
                     .and_then(|selected| names.iter().position(|n| n == selected))

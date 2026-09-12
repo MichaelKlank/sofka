@@ -10,7 +10,7 @@ pub const DEFAULT_SORT_LABEL: &str = "default (ns/name)";
 impl App {
     /// Open the switcher on the active namespace, then fetch the namespace list.
     pub(super) fn open_namespaces(&mut self) {
-        self.ensure_known_namespaces();
+        self.mode = Mode::Namespaces;
         self.ns_filter.clear();
         let current = if self.namespace.is_empty() {
             "<all>"
@@ -19,17 +19,7 @@ impl App {
         };
         let selected = self.filtered_namespaces().iter().position(|n| n == current);
         self.ns_state.select(selected);
-        self.mode = Mode::Namespaces;
         self.spawn_namespace_fetch();
-    }
-
-    pub(super) fn ensure_known_namespaces(&mut self) {
-        for ns in ["<all>", &self.namespace, &self.cluster.default_namespace] {
-            if !ns.is_empty() && !self.ns_list.iter().any(|n| n == ns) {
-                self.ns_list.push(ns.to_string());
-            }
-        }
-        self.ns_list.sort();
     }
 
     /// Fetch the namespace list off-thread; it arrives as `Msg::Namespaces` and
@@ -77,10 +67,19 @@ impl App {
     /// everything is fuzzy-matched (favourites/recents lose their pinning so
     /// the best textual match wins).
     pub fn filtered_namespaces(&self) -> Rc<Vec<String>> {
+        let known_namespaces = if self.mode == Mode::Namespaces {
+            [
+                self.namespace.as_str(),
+                self.cluster.default_namespace.as_str(),
+            ]
+        } else {
+            ["", ""]
+        };
         if let Some(m) = self.picker_memos.borrow().namespaces.as_ref()
             && m.filter == self.ns_filter
             && m.context == self.cluster.context
             && m.ns_list == self.ns_list
+            && m.known_namespaces.each_ref().map(String::as_str) == known_namespaces
             && m.favorites == self.namespace_favorites
             && m.recents
                 .iter()
@@ -91,14 +90,21 @@ impl App {
         }
 
         let mut out = vec!["<all>".to_string()];
-        let rest = self.ns_list.iter().filter(|n| n.as_str() != "<all>");
+        let mut candidates = self.ns_list.clone();
+        for ns in known_namespaces {
+            if !ns.is_empty() && !candidates.iter().any(|n| n == ns) {
+                candidates.push(ns.to_string());
+            }
+        }
+        candidates.sort();
+        let rest = candidates.iter().filter(|n| n.as_str() != "<all>");
         if !self.ns_filter.is_empty() {
             let mut scored: Vec<(i64, &String)> = rest
                 .filter_map(|n| self.matcher.score(n, &self.ns_filter).map(|s| (s, n)))
                 .collect();
             scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
             out.extend(scored.into_iter().map(|(_, n)| n.clone()));
-            return self.remember_namespaces(out);
+            return self.remember_namespaces(out, known_namespaces);
         }
 
         let available: std::collections::HashSet<&str> = rest.map(String::as_str).collect();
@@ -116,21 +122,26 @@ impl App {
                 out.push(r.to_string());
             }
         }
-        // Then everything else (ns_list is already sorted).
-        for n in self.ns_list.iter().filter(|n| n.as_str() != "<all>") {
+        // Then the remaining names in alphabetical order.
+        for n in candidates.iter().filter(|n| n.as_str() != "<all>") {
             if seen.insert(n.clone()) {
                 out.push(n.clone());
             }
         }
-        self.remember_namespaces(out)
+        self.remember_namespaces(out, known_namespaces)
     }
 
-    fn remember_namespaces(&self, out: Vec<String>) -> Rc<Vec<String>> {
+    fn remember_namespaces(
+        &self,
+        out: Vec<String>,
+        known_namespaces: [&str; 2],
+    ) -> Rc<Vec<String>> {
         let value = Rc::new(out);
         self.picker_memos.borrow_mut().namespaces = Some(NamespaceMemo {
             filter: self.ns_filter.clone(),
             context: self.cluster.context.clone(),
             ns_list: self.ns_list.clone(),
+            known_namespaces: known_namespaces.map(str::to_string),
             favorites: self.namespace_favorites.clone(),
             recents: self
                 .recent_namespaces_for_context()
