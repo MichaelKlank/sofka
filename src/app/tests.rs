@@ -24809,7 +24809,7 @@ fn key_action_state(app: &App) -> serde_json::Value {
         "logs": {
             "scroll": app.logs.view.scroll, "follow": app.logs.follow, "wrap": app.logs.wrap,
             "fullscreen": app.logs.fullscreen, "timestamps": app.logs.timestamps,
-            "stopped": app.logs.stopped, "since": app.logs.since_anchor, "filter": app.logs.filter,
+            "warnings_only": app.logs.warnings_only, "stopped": app.logs.stopped, "since": app.logs.since_anchor, "filter": app.logs.filter,
         },
         "lists": [app.xray_state.selected(), app.timeline_state.selected(), app.explain_state.selected(),
             app.gitops_state.selected(), app.adjacent_state.selected(), app.find_state.selected(),
@@ -27668,4 +27668,88 @@ async fn yaml_migration_validates_conflicts_and_empty_bindings() {
     assert!(app.keymap.chords("command", Action::Down).is_empty());
     assert!(dir.join("config.yaml.bak").exists());
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn log_warnings_shortcut_filters_formats_and_restores_buffer() {
+    let (mut app, _rx) = test_app();
+    app.mode = Mode::Logs;
+    let lines = [
+        r#"{"level":"info","msg":"error in text"}"#,
+        r#"{"level":"warn","msg":"api retry"}"#,
+        r#"{"severity":"fatal","msg":"api stopped"}"#,
+        "W0627 12:00:00 retry",
+        "E0627 12:00:00 failed",
+        "ts level=error msg=api",
+        "ts \x1b[33mwarn\x1b[0m api",
+        "ts panic api",
+        "unrecognized continuation",
+        "ts level=debug msg=error",
+    ];
+    shortcut_log_lines(&mut app, lines.iter().map(|s| (*s).into()).collect());
+    assert_eq!(app.logs.refresh_index(0).matched_lines(), lines.len());
+    app.logs.follow = false;
+    app.logs.view.scroll = 100;
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert!(app.logs.warnings_only);
+    assert!(!app.logs.follow);
+    assert_eq!(app.logs.view.scroll, 0);
+    assert_eq!(app.logs.refresh_index(0).matched_lines(), 7);
+    assert_eq!(app.filtered_log_text(), lines[1..8].join("\n"));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(screen.contains("[warn/error]"));
+    assert!(!screen.contains("unrecognized continuation"));
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.logs.refresh_index(0).matched_lines(), lines.len());
+    assert_eq!(app.filtered_log_text(), lines.join("\n"));
+}
+
+#[tokio::test]
+async fn log_warnings_shortcut_combines_filters_and_tracks_appends() {
+    let (mut app, _rx) = test_app();
+    app.mode = Mode::Logs;
+    shortcut_log_lines(
+        &mut app,
+        vec![
+            "ts warn api".into(),
+            "ts error worker".into(),
+            "ts info api".into(),
+        ],
+    );
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "api".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.logs.refresh_index(4).matched_lines(), 1);
+    app.handle_key(press(KeyCode::Char('m'))).unwrap();
+    shortcut_log_lines(&mut app, vec!["ts error api".into(), "ts info api".into()]);
+    assert_eq!(app.logs.refresh_index(4).matched_lines(), 2);
+    assert_eq!(app.filtered_log_text(), "ts warn api\nts error api");
+    assert!(app.logs.index().shown.contains(&None));
+    assert!(app.logs.follow);
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.logs.filter, "api");
+    assert_eq!(app.logs.refresh_index(4).matched_lines(), 4);
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Pod", "metadata":{"name":"api", "namespace":"default"}, "spec":{"containers":[{"name":"app"}]}}),
+    );
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    app.handle_key(press(KeyCode::Char('l'))).unwrap();
+    assert_eq!(app.mode, Mode::Logs);
+    assert!(!app.logs.warnings_only);
+    assert!(app.logs.filter.is_empty());
 }

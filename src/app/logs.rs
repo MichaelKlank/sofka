@@ -382,6 +382,7 @@ impl App {
         self.logs.clear_lines();
         self.logs.follow = true;
         self.logs.set_filter(String::new());
+        self.logs.warnings_only = false;
         self.logs.stopped = false;
         self.mode = Mode::Logs;
         self.restart_log_stream();

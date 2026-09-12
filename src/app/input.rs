@@ -1186,6 +1186,10 @@ impl App {
     }
 
     pub(super) fn key_logs(&mut self, key: KeyInput) {
+        if key.action == Some(Action::LogWarnings) {
+            self.logs.toggle_warnings();
+            return;
+        }
         if key.action == Some(Action::LogMarker) {
             self.logs.add_marker(self.log_buffer_cap());
             self.set_flash("log marker added");

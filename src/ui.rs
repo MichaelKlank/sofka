@@ -1878,7 +1878,12 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let flags = format!(
-        "{}{}{}{}",
+        "{}{}{}{}{}",
+        if app.logs.warnings_only {
+            " [warn/error]"
+        } else {
+            ""
+        },
         if app.logs.stopped {
             " ⏹stopped"
         } else if app.logs.follow {
@@ -2013,13 +2018,7 @@ fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
 /// style), then the message body in its severity color with search matches
 /// highlighted on top.
 fn render_log_line(line: &str, needle: &str) -> Line<'static> {
-    // Severity is detected on the ANSI-stripped text so a color-wrapped level
-    // token (e.g. "\x1b[33mwarn\x1b[0m") is still recognized.
-    let base = if memchr::memchr(0x1b, line.as_bytes()).is_some() {
-        log_level_color(&strip_ansi(line))
-    } else {
-        log_level_color(line)
-    };
+    let base = log_level_color(line);
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut rest = line;
 
@@ -2212,7 +2211,7 @@ fn strip_ansi(s: &str) -> String {
     ansi_runs(s).into_iter().map(|r| r.text).collect()
 }
 
-fn strip_ansi_if_present(s: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn strip_ansi_if_present(s: &str) -> std::borrow::Cow<'_, str> {
     if memchr::memchr(0x1b, s.as_bytes()).is_some() {
         std::borrow::Cow::Owned(strip_ansi(s))
     } else {
@@ -2340,99 +2339,13 @@ fn ansi_16_color(code: u8) -> Option<Color> {
     })
 }
 
-/// Guess a log line's severity color across common formats: structured JSON
-/// (`"level":"warn"`), space/tab-delimited (` warn `), glued-after-timestamp
-/// (`…Zwarn`), `level=error`, and the klog prefix (`E0627 …`). Errors red,
-/// warnings peach, debug/trace dimmed; info and anything unrecognized stay in
-/// the default text color so they read calmly and real problems pop.
 fn log_level_color(line: &str) -> Color {
-    let l = line.to_ascii_lowercase();
-    // Structured logs: read the level field directly (authoritative — a later
-    // "…error…" in the message can't override it).
-    if let Some(level) = json_field(&l, "level").or_else(|| json_field(&l, "severity")) {
-        return level_color(level);
+    match crate::logfilter::severity(line) {
+        crate::logfilter::Severity::Error => theme::red(),
+        crate::logfilter::Severity::Warning => theme::peach(),
+        crate::logfilter::Severity::Debug => theme::overlay1(),
+        crate::logfilter::Severity::Other => theme::text(),
     }
-    // klog prefixes (`E0627 …`) put the level at the very start.
-    if klog_level(&l, 'e') || klog_level(&l, 'f') {
-        return theme::red();
-    }
-    if klog_level(&l, 'w') {
-        return theme::peach();
-    }
-    // Otherwise the leftmost level marker wins, since the level precedes the
-    // message — so a later "…the last error:" can't override a `warn` level.
-    let first = |needles: &[&str]| needles.iter().filter_map(|n| l.find(n)).min();
-    let candidates = [
-        (
-            first(&[
-                " error",
-                "\terror",
-                "zerror",
-                "level=error",
-                " fatal",
-                "zfatal",
-                " panic",
-            ]),
-            theme::red(),
-        ),
-        (
-            first(&[" warn", "\twarn", "zwarn", "level=warn"]),
-            theme::peach(),
-        ),
-        (
-            first(&[
-                " debug",
-                "\tdebug",
-                "zdebug",
-                " trace",
-                "ztrace",
-                "level=debug",
-            ]),
-            theme::overlay1(),
-        ),
-    ];
-    candidates
-        .into_iter()
-        .filter_map(|(pos, color)| pos.map(|p| (p, color)))
-        .min_by_key(|(p, _)| *p)
-        .map(|(_, color)| color)
-        .unwrap_or(theme::text())
-}
-
-/// Color for a parsed level token (already lowercased).
-fn level_color(level: &str) -> Color {
-    if level.starts_with("err")
-        || level.starts_with("fatal")
-        || level.starts_with("crit")
-        || level.starts_with("panic")
-    {
-        theme::red()
-    } else if level.starts_with("warn") {
-        theme::peach()
-    } else if level.starts_with("debug") || level.starts_with("trace") {
-        theme::overlay1()
-    } else {
-        theme::text() // info, notice, unknown — keep readable
-    }
-}
-
-/// Read a JSON string field's value, e.g. `json_field(r#"…"level":"warn"…"#,
-/// "level") == Some("warn")`. Tolerant of whitespace around the colon. Input is
-/// expected already lowercased.
-fn json_field<'a>(l: &'a str, key: &str) -> Option<&'a str> {
-    let pat = format!("\"{key}\"");
-    let i = l.find(&pat)?;
-    let rest = l[i + pat.len()..].trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
-    let rest = rest.strip_prefix('"')?;
-    let end = rest.find('"')?;
-    Some(&rest[..end])
-}
-
-/// True if `l` starts with a klog level marker, e.g. `e0627 …` (lowercased).
-fn klog_level(l: &str, level: char) -> bool {
-    let mut it = l.chars();
-    it.next() == Some(level) && it.next().is_some_and(|c| c.is_ascii_digit())
 }
 
 /// Unified-diff view with +/- line coloring.
@@ -4773,6 +4686,7 @@ fn navigation_hint(app: &App, width: u16) -> String {
             Action::Filter,
             Action::Follow,
             Action::LogMarker,
+            Action::LogWarnings,
             Action::Wrap,
             Action::Stream,
             Action::Copy,
