@@ -19,10 +19,16 @@ fuzzy-complete after `@`; Tab/Shift-Tab or Down/Up fill the selected context in
 the command. Add a namespace if needed, then press Enter to run the query.
 Without a namespace, a context switch uses its remembered or default namespace.
 This does not change kubeconfig's `current-context`.
+
 Scope options precede the slash. Structured filter terms combine with spaces or
 `&&`, with `||` for OR and `!(...)` for group negation. `/` edits the active filter
 and Esc clears it. See [filtering](filtering.md)
 for the grammar and selector persistence rules.
+
+A normal context switch through `:ctx` keeps the current resource type if the
+target cluster supports it. Otherwise, sofka opens that context's configured
+default resource, or Pods, and shows a fallback message. Filters and object
+ownership scope are cleared. Startup still uses the configured default resource.
 
 | Key                                           | Action                                                                                                                                                              |
 | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

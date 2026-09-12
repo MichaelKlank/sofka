@@ -203,6 +203,12 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 - **RBAC-aware palette browse** - the empty `:` list hides kinds you cannot
   `list`. An explicit search checks the full discovery catalog, because some
   delegated authorizers return incomplete rule reviews.
+- **Resource type on context switch** - `:ctx` keeps the current resource type
+  when the target cluster supports it. If unavailable, sofka opens that context's
+  configured default resource, or Pods, and shows a fallback message. Filters and
+  object ownership scope are cleared. Namespace selection follows the existing
+  per-context rules. Explicit resource queries, bookmarks, and workspaces keep
+  their specified destination.
 - **Context picker at launch** - `sofka ctx` and `sofka contexts` open the picker
   before connecting to a cluster. Enter connects to the selected context and
   opens its configured default resource, or pods. `--context NAME` selects the

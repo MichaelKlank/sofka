@@ -852,6 +852,7 @@ impl App {
     /// re-resolved so per-cluster/per-context overrides (aliases, plugins,
     /// skin, defaults) follow the new context.
     pub(super) fn apply_context_switch(&mut self, name: String, mut cluster: Box<Cluster>) {
+        let previous_kind = self.kind.clone().filter(|_| self.cluster.connected);
         self.stop_notifications();
         let resolved = self.config.resolve(&name, &cluster.cluster_name);
         self.user_aliases = resolved.config.aliases;
@@ -943,8 +944,7 @@ impl App {
         self.config_warnings = resolved.warnings;
         self.config_warnings.extend(plugin_warnings);
         self.config_warnings.extend(threshold_warnings);
-        // A bookmark/workspace that requested this context lands on its own
-        // view(s); a plain switch lands on the context's default resource.
+        // Explicit destinations take priority over the previous resource type.
         if let Some(mut query) = self.pending_resource_query.take() {
             query.context = None;
             self.apply_resource_query(query);
@@ -953,11 +953,37 @@ impl App {
         } else if self.pending_bookmark.is_some() {
             self.apply_pending_bookmark();
         } else {
-            let kind = resolved
+            let retained = previous_kind.as_ref().and_then(|previous| {
+                self.cluster.resolve(&previous.title()).filter(|kind| {
+                    kind.ar.group == previous.ar.group && kind.ar.plural == previous.ar.plural
+                })
+            });
+            let fallback = retained.is_none();
+            let default = resolved
                 .config
                 .default_resource
-                .unwrap_or_else(|| "pods".into());
-            self.switch_kind(&kind);
+                .as_deref()
+                .unwrap_or("pods");
+            let kind = retained
+                .or_else(|| self.cluster.resolve(default))
+                .or_else(|| self.cluster.resolve("pods"));
+            if let Some(kind) = kind {
+                let title = kind.title();
+                self.set_root_view(kind);
+                self.record_history();
+                self.start_watch();
+                self.set_flash(format!("Viewing {title}"));
+                if fallback && let Some(previous) = previous_kind {
+                    self.flash_warn(&format!(
+                        "{} is unavailable in {name}; viewing {title}",
+                        previous.title()
+                    ));
+                }
+            } else {
+                self.flash_warn(&format!(
+                    "No resource matches '{default}' or 'pods' in {name}"
+                ));
+            }
         }
         if let Some(w) = &first_warning {
             self.flash_warn(w);
