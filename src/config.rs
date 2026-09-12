@@ -63,6 +63,9 @@ pub struct Config {
     /// Namespaces pinned to the top of the switcher (a curated team list, in
     /// the given order). Session-local recents follow them.
     pub favorite_namespaces: Vec<String>,
+    /// Fill the digit slots `favorite_namespaces` leaves open with the
+    /// namespaces you visit, instead of leaving them unbound.
+    pub auto_namespace_shortcuts: bool,
     /// User-defined shell-out plugins bound to keys.
     pub plugins: Vec<Plugin>,
     /// Saved navigation commands bound to keys and the palette — see

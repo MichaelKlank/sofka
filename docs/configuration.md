@@ -119,6 +119,9 @@ remember_sort     = true   # save and restore sort choices per resource kind
 # Namespaces pinned to the top of the `n` switcher (★); session recents (·)
 # follow them. Keys 1 to 9 select the first nine entries in this fixed order.
 favorite_namespaces = ["kube-system", "monitoring"]
+# true lets the namespaces you visit claim the digits the list above leaves
+# open, so the keys do something before anything is configured.
+auto_namespace_shortcuts = false
 
 [aliases]
 dep = "deployments"
@@ -185,6 +188,14 @@ order. Recent namespace changes do not change these assignments. Extra entries
 remain available through `n`. Empty or unconfigured slots do nothing. The same
 keys work inside the namespace switcher while its filter is empty, and the
 header shows the configured favourites next to the current namespace.
+
+`auto_namespace_shortcuts = true` lets the namespaces you visit in the current
+context claim the slots the list leaves open, in the order they claim one. A
+configured entry never loses its slot, and an assignment does not move while
+you switch namespaces: only a namespace that has no slot, with none left free,
+claims one — the least recently used. The header and the switcher advertise
+whatever the digits select, so the two cannot disagree. The assignments are
+per context and session-local; nothing is written to disk.
 
 To change or disable a shortcut, use the existing key configuration:
 

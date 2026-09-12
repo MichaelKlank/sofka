@@ -1344,6 +1344,7 @@ impl App {
         let mut warnings = resolved.warnings;
         self.user_aliases = resolved.config.aliases;
         self.namespace_favorites = resolved.config.favorite_namespaces;
+        self.auto_namespace_shortcuts = resolved.config.auto_namespace_shortcuts;
         self.remember_sort = resolved.config.remember_sort.unwrap_or(true);
         self.mouse_scroll_lines =
             crate::config::mouse_scroll_lines(resolved.config.mouse_scroll_lines, &mut warnings);
