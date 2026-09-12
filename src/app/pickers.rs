@@ -8,19 +8,28 @@ const MAX_RECENT_NAMESPACES: usize = 8;
 pub const DEFAULT_SORT_LABEL: &str = "default (ns/name)";
 
 impl App {
-    /// Open the namespace switcher immediately with a loading placeholder, then
-    /// fetch the list off-thread (it arrives as `Msg::Namespaces`).
+    /// Open the switcher on the active namespace, then fetch the namespace list.
     pub(super) fn open_namespaces(&mut self) {
-        // Show whatever is cached immediately (instant reopen); a fresh fetch
-        // refreshes it. Only fall back to the bare `<all>` placeholder when the
-        // cache is empty.
-        if self.ns_list.is_empty() {
-            self.ns_list = vec!["<all>".into()];
-        }
-        self.ns_state.select(Some(0));
+        self.ensure_known_namespaces();
         self.ns_filter.clear();
+        let current = if self.namespace.is_empty() {
+            "<all>"
+        } else {
+            &self.namespace
+        };
+        let selected = self.filtered_namespaces().iter().position(|n| n == current);
+        self.ns_state.select(selected);
         self.mode = Mode::Namespaces;
         self.spawn_namespace_fetch();
+    }
+
+    pub(super) fn ensure_known_namespaces(&mut self) {
+        for ns in ["<all>", &self.namespace, &self.cluster.default_namespace] {
+            if !ns.is_empty() && !self.ns_list.iter().any(|n| n == ns) {
+                self.ns_list.push(ns.to_string());
+            }
+        }
+        self.ns_list.sort();
     }
 
     /// Fetch the namespace list off-thread; it arrives as `Msg::Namespaces` and

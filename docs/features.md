@@ -72,6 +72,12 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   extension API server is down, or it sends an `apiVersion` that is not `v1`.
   Sofka does not load that group. It shows a warning at startup and a flash
   on the first screen. `:info` shows the group and the reason.
+- **Namespace switcher** (`n`) opens with the cursor on the active namespace.
+  `current` marks the active namespace, including `<all>`. `context default`
+  marks the kubeconfig namespace. Both labels can apply to one row and stay
+  visible when you filter the list. The active and context default namespaces
+  are available even if namespace listing is restricted. Favourites, recent
+  namespaces, and shortcuts keep their existing order. Startup rules do not change.
 - **Namespace commands**: `:ns <name>` changes namespace and keeps the current
   resource view, as the namespace switcher does. `:namespace` and `:namespaces`
   accept the same argument; `all` and `*` select all namespaces. From the

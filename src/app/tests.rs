@@ -10238,6 +10238,108 @@ async fn logs_keep_view_and_restore_selection() {
 }
 
 #[tokio::test]
+async fn namespace_switcher_selects_current_and_preserves_cursor_on_refresh() {
+    let (mut app, _rx) = test_app();
+    app.namespace = "prod".into();
+    app.namespace_favorites = vec!["staging".into()];
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    assert_eq!(app.mode, Mode::Namespaces);
+    assert_eq!(
+        app.filtered_namespaces()[app.ns_state.selected().unwrap()],
+        "prod"
+    );
+    assert!(app.filtered_namespaces().iter().any(|n| n == "default"));
+
+    app.handle_msg(Msg::Namespaces {
+        generation: app.generation,
+        list: vec!["<all>".into(), "alpha".into(), "prod".into()],
+    });
+    assert_eq!(
+        app.filtered_namespaces().as_ref(),
+        &["<all>", "staging", "alpha", "default", "prod"]
+    );
+    assert_eq!(
+        app.filtered_namespaces()[app.ns_state.selected().unwrap()],
+        "prod"
+    );
+
+    app.handle_key(press(KeyCode::Up)).unwrap();
+    app.handle_msg(Msg::Namespaces {
+        generation: app.generation,
+        list: vec!["<all>".into(), "beta".into(), "gamma".into(), "prod".into()],
+    });
+    assert_eq!(
+        app.filtered_namespaces()[app.ns_state.selected().unwrap()],
+        "default"
+    );
+
+    app.handle_key(press(KeyCode::Char('p'))).unwrap();
+    app.handle_msg(Msg::Namespaces {
+        generation: app.generation,
+        list: vec!["<all>".into(), "alpha".into(), "prod".into()],
+    });
+    assert_eq!(
+        app.filtered_namespaces()[app.ns_state.selected().unwrap()],
+        "prod"
+    );
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.namespace, "prod");
+    assert_eq!(app.mode, Mode::Table);
+}
+
+#[tokio::test]
+async fn namespace_switcher_labels_current_and_context_default() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for (namespace, expected) in [
+        ("default", "default (current, context default)"),
+        ("prod", "prod (current)"),
+        ("", "<all> (current)"),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.namespace = namespace.into();
+        app.handle_key(press(KeyCode::Char('n'))).unwrap();
+        assert_eq!(
+            app.filtered_namespaces()[app.ns_state.selected().unwrap()],
+            if namespace.is_empty() {
+                "<all>"
+            } else {
+                namespace
+            }
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains(expected), "{text}");
+        if namespace != "default" {
+            assert!(text.contains("default (context default)"), "{text}");
+        }
+
+        app.handle_key(press(KeyCode::Char('d'))).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains(expected), "{text}");
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        app.handle_key(press(KeyCode::Char('n'))).unwrap();
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.namespace, namespace);
+    }
+}
+
+#[tokio::test]
 async fn namespace_switcher_pins_all_and_fuzzy_filters() {
     let (mut app, _rx) = test_app();
     app.ns_list = vec![
