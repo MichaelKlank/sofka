@@ -106,7 +106,10 @@ impl App {
         result
     }
 
-    fn handle_key_inner(&mut self, key: KeyInput) -> Result<()> {
+    fn handle_key_inner(&mut self, mut key: KeyInput) -> Result<()> {
+        if self.drain_confirmation() && key.action == Some(Action::Quit) {
+            key.action = Some(Action::Back);
+        }
         let drain_page = if self.mode == Mode::Drain {
             match key.action {
                 Some(Action::PageDown) => Some(true),

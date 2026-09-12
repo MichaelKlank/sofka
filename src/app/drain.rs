@@ -615,7 +615,7 @@ fn retryable(error: &anyhow::Error) -> bool {
         || error
             .downcast_ref::<kube::Error>()
             .is_some_and(|e| match e {
-                kube::Error::Api(e) => matches!(e.code, 429 | 500 | 502 | 503 | 504),
+                kube::Error::Api(e) => matches!(e.code, 408 | 429 | 500 | 502 | 503 | 504),
                 kube::Error::Service(_) | kube::Error::HyperError(_) => true,
                 _ => false,
             })

@@ -28995,3 +28995,95 @@ async fn drain_bulk_success_verifies_each_node_before_cordoning_the_next() {
         2
     );
 }
+
+#[tokio::test]
+async fn drain_review_ctrl_c_cancels_each_confirmation_without_quitting() {
+    for confirmation in [None, Some("type-resource-name"), Some("type-context-name")] {
+        let (mut app, _rx, api) = drain_app(DrainApiState::default());
+        if let Some(confirmation) = confirmation {
+            app.guardrails = vec![crate::config::Guardrail {
+                actions: vec!["drain".into()],
+                confirmation: Some(confirmation.into()),
+                ..Default::default()
+            }];
+        }
+        drain_open(&mut app);
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            app.mode,
+            if confirmation.is_some() {
+                Mode::Prompt
+            } else {
+                Mode::Confirm
+            }
+        );
+        if confirmation.is_some() {
+            for c in "node-a".chars() {
+                app.handle_key(press(KeyCode::Char(c))).unwrap();
+            }
+        }
+        app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
+        assert!(!app.should_quit, "{confirmation:?}");
+        assert_eq!(app.mode, Mode::Table);
+        assert!(app.confirm_action.is_none());
+        assert!(app.prompt_kind.is_none());
+        assert!(!app.drain.started());
+        assert!(api.lock().unwrap().requests.is_empty());
+
+        app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+        assert_eq!(app.mode, Mode::Confirm);
+        assert!(!app.drain_confirmation());
+        app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
+        assert!(app.should_quit);
+        assert!(api.lock().unwrap().requests.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn drain_review_retries_http_408_for_eviction_and_deletion() {
+    for deletion in [false, true] {
+        let (mut app, mut rx, api) = drain_app(DrainApiState {
+            pods: vec![drain_managed_pod()],
+            codes: [408, 201].into(),
+            finish: true,
+            ..Default::default()
+        });
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"node-b"}}),
+        );
+        for _ in 0..2 {
+            app.handle_key(press(KeyCode::Char(' '))).unwrap();
+        }
+        drain_open(&mut app);
+        if deletion {
+            drain_toggle(&mut app, 3);
+        }
+        drain_start(&mut app);
+        drain_until(&mut app, &mut rx, |app| {
+            app.drain.done || app.drain.message.contains("Retry in")
+        })
+        .await;
+        assert!(!app.drain.done, "{}", app.drain.message);
+        drain_until(&mut app, &mut rx, |app| app.drain.done).await;
+        assert!(!app.drain.err, "{}", app.drain.message);
+        assert!(
+            app.drain
+                .message
+                .contains("Completed: node-a, node-b\nIncomplete: none\nUnstarted: none")
+        );
+        let state = api.lock().unwrap();
+        let removals: Vec<_> = state
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "POST" || r["method"] == "DELETE")
+            .collect();
+        assert_eq!(removals.len(), 2);
+        assert!(
+            removals
+                .iter()
+                .all(|r| r["method"] == if deletion { "DELETE" } else { "POST" })
+        );
+        assert_eq!(removals[0]["body"], removals[1]["body"]);
+    }
+}
