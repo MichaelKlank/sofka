@@ -8519,10 +8519,12 @@ async fn sort_can_be_selected_again_after_clearing_with_memory_disabled() {
 #[tokio::test]
 async fn disabled_sort_memory_keeps_changes_local_and_preserves_saved_state() {
     let dir = std::env::temp_dir().join(format!("sofka-sort-option-{}", std::process::id()));
-    write_config(&dir, "remember_sort = false\n");
+    write_config(
+        &dir,
+        "remember_sort = false\n[views.\"*\"]\nsort = \"AGE:desc\"\n",
+    );
     let (mut app, _rx) = test_app();
     app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
-    install_views(&mut app, "[views.\"*\"]\nsort = \"AGE:desc\"\n");
     let path = dir.join("sort.toml");
     app.sort_memory.set("pods", "NAME", false);
     app.sort_memory.save(&path).unwrap();
@@ -15969,6 +15971,71 @@ fn join_selectors_merges_drill_and_filter() {
 fn write_config(dir: &std::path::Path, text: &str) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("config.toml"), text).unwrap();
+}
+
+#[tokio::test]
+async fn reload_updates_columns_in_the_open_view() {
+    let dir = std::env::temp_dir().join(format!("sofka-reload-columns-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    palette(&mut app, "pods");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "api", "namespace": "default"},
+            "status": {"phase": "Running"}}),
+    );
+    app.table_state.select(Some(0));
+    let original = app.snapshot_table();
+    let generation = app.generation;
+    write_config(
+        &dir,
+        r#"[views."v1/pods"]
+columns = [
+    { name = "%CPU/R", metric = "cpu-request-utilization" },
+    { name = "%CPU/L", metric = "cpu-limit-utilization" },
+    { name = "%MEM/R", metric = "memory-request-utilization" },
+    { name = "%MEM/L", metric = "memory-limit-utilization" },
+]
+"#,
+    );
+    palette(&mut app, "reload");
+    for header in ["%CPU/R", "%CPU/L", "%MEM/R", "%MEM/L"] {
+        assert!(app.display_headers().iter().any(|h| h == header));
+    }
+    assert!(app.config_warnings.is_empty(), "{:?}", app.config_warnings);
+    assert_eq!(app.generation, generation);
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.table_state.selected(), Some(0));
+    assert_eq!(app.rows().len(), 1);
+
+    write_config(
+        &dir,
+        r#"[views."v1/pods"]
+replace = true
+columns = [
+    { name = "NAME", builtin = "NAME" },
+    { name = "PHASE", path = "/status/phase" },
+    { name = "BAD", metric = "unknown" },
+]
+"#,
+    );
+    palette(&mut app, "reload");
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "PHASE"]);
+    assert_eq!(app.snapshot_table().1, vec![vec!["api", "Running"]]);
+    assert!(app.config_warnings.iter().any(|w| w.contains("unknown")));
+
+    write_config(&dir, "[views");
+    palette(&mut app, "reload");
+    assert!(app.flash_err);
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "PHASE"]);
+
+    std::fs::remove_file(dir.join("config.toml")).unwrap();
+    palette(&mut app, "reload");
+    assert_eq!(app.snapshot_table(), original);
+    assert!(app.config_warnings.is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test]
