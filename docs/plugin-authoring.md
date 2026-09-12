@@ -127,7 +127,7 @@ license = "MIT OR Apache-2.0"
 description = "Scan the active context with Popeye and report findings by linter."
 repository = "https://github.com/nklmilojevic/sofka-plugins"
 readme = "README.md"
-sofka = ">=0.25.5"
+sofka = ">=0.26.0"
 platforms = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 tags = ["diagnostics", "report"]
 ```

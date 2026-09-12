@@ -42,7 +42,6 @@ const ARTIFACT_BUDGET: Budget = Budget {
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct Catalog {
     pub schema_version: u32,
     pub generated_at: String,
@@ -50,7 +49,6 @@ pub struct Catalog {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct CatalogPlugin {
     pub id: String,
     pub display_name: String,
@@ -63,7 +61,6 @@ pub struct CatalogPlugin {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct CatalogVersion {
     pub version: String,
     pub sofka: String,
@@ -94,7 +91,6 @@ fn default_target() -> String {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct RuntimeRequirement {
     pub name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -110,7 +106,6 @@ pub enum VersionStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct Artifact {
     pub platform: String,
     pub url: String,
@@ -146,6 +141,18 @@ impl Catalog {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         if bytes.len() > CATALOG_MAX_BYTES {
             return Err("catalog exceeds 10 MiB".into());
+        }
+        #[derive(Deserialize)]
+        struct Schema {
+            schema_version: u32,
+        }
+        let schema: Schema =
+            serde_json::from_slice(bytes).map_err(|e| format!("invalid catalog JSON: {e}"))?;
+        if schema.schema_version != 1 {
+            return Err(format!(
+                "unsupported catalog schema_version {} (expected 1)",
+                schema.schema_version
+            ));
         }
         let catalog: Self =
             serde_json::from_slice(bytes).map_err(|e| format!("invalid catalog JSON: {e}"))?;
@@ -522,10 +529,13 @@ pub fn config_dir() -> Result<PathBuf, String> {
 }
 
 pub async fn load(offline: bool) -> Result<CatalogSnapshot, String> {
+    let cache_path = cache_dir().join("catalog-cache.json");
     if offline {
-        return load_cached(&cache_dir().join("catalog-cache.json"));
+        return load_cached(&cache_path);
     }
-    let commit_bytes = get(COMMIT_URL, CATALOG_MAX_BYTES).await?;
+    let commit_bytes = get(COMMIT_URL, CATALOG_MAX_BYTES)
+        .await
+        .map_err(|error| catalog_fetch_error(error, &cache_path))?;
     #[derive(Deserialize)]
     struct Commit {
         sha: String,
@@ -536,21 +546,43 @@ pub async fn load(offline: bool) -> Result<CatalogSnapshot, String> {
         return Err("GitHub returned an invalid catalog commit".into());
     }
     let url = format!("{RAW_ROOT}/{}/index.json", commit.sha);
-    let bytes = get(&url, CATALOG_MAX_BYTES).await?;
+    let bytes = get(&url, CATALOG_MAX_BYTES)
+        .await
+        .map_err(|error| catalog_fetch_error(error, &cache_path))?;
     let catalog = Catalog::parse(&bytes)?;
+    finish_load(commit.sha, catalog, &cache_path)
+}
+
+fn catalog_fetch_error(error: String, cache_path: &Path) -> String {
+    if cache_path.is_file() {
+        format!("{error}; check the network and retry, or pass --offline to use the cached catalog")
+    } else {
+        format!("{error}; check the network and retry")
+    }
+}
+
+fn finish_load(
+    commit: String,
+    catalog: Catalog,
+    cache_path: &Path,
+) -> Result<CatalogSnapshot, String> {
     let fetched_at = now();
     let cached = CachedCatalog {
         schema_version: 1,
-        commit: commit.sha.clone(),
+        commit: commit.clone(),
         fetched_at,
         catalog: catalog.clone(),
     };
     let cache = serde_json::to_string(&cached).map_err(|e| e.to_string())?;
-    crate::atomicfile::write(&cache_dir().join("catalog-cache.json"), &cache)
-        .map_err(|e| format!("caching catalog: {e}"))?;
+    if let Err(error) = crate::atomicfile::write(cache_path, &cache) {
+        eprintln!(
+            "warning: could not cache catalog at {}: {error}",
+            cache_path.display()
+        );
+    }
     Ok(CatalogSnapshot {
         catalog,
-        commit: commit.sha,
+        commit,
         fetched_at,
         offline: false,
     })
@@ -602,7 +634,27 @@ pub fn age(fetched_at: u64) -> String {
     }
 }
 
-pub async fn artifact(artifact: &Artifact, offline: bool) -> Result<PathBuf, String> {
+#[derive(Debug)]
+pub struct ArtifactArchive {
+    path: PathBuf,
+    temporary: bool,
+}
+
+impl ArtifactArchive {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ArtifactArchive {
+    fn drop(&mut self) {
+        if self.temporary {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+pub async fn artifact(artifact: &Artifact, offline: bool) -> Result<ArtifactArchive, String> {
     artifact_in(&cache_dir(), artifact, offline).await
 }
 
@@ -610,7 +662,7 @@ pub async fn artifact_in(
     cache: &Path,
     artifact: &Artifact,
     offline: bool,
-) -> Result<PathBuf, String> {
+) -> Result<ArtifactArchive, String> {
     validate_artifact(artifact)?;
     let path = cache
         .join("artifacts")
@@ -618,7 +670,10 @@ pub async fn artifact_in(
     if path.is_file() {
         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
         if digest(&bytes) == artifact.blake3.to_ascii_lowercase() {
-            return Ok(path);
+            return Ok(ArtifactArchive {
+                path,
+                temporary: false,
+            });
         }
         std::fs::remove_file(&path)
             .map_err(|e| format!("removing corrupt cached artifact {}: {e}", path.display()))?;
@@ -631,8 +686,44 @@ pub async fn artifact_in(
     }
     let bytes = get_with(&artifact.url, ARTIFACT_MAX_BYTES, ARTIFACT_BUDGET, false).await?;
     verify_artifact(artifact, &bytes)?;
-    write_bytes(&path, &bytes).map_err(|e| format!("caching artifact: {e}"))?;
-    Ok(path)
+    store_artifact(&path, &bytes)
+}
+
+fn store_artifact(path: &Path, bytes: &[u8]) -> Result<ArtifactArchive, String> {
+    if let Err(cache_error) = write_bytes(path, bytes) {
+        let temporary = temporary_artifact_path();
+        write_bytes(&temporary, bytes).map_err(|temporary_error| {
+            format!(
+                "caching artifact at {} failed: {cache_error}; storing it temporarily at {} \
+                 failed: {temporary_error}",
+                path.display(),
+                temporary.display()
+            )
+        })?;
+        eprintln!(
+            "warning: could not cache artifact at {}: {cache_error}; using temporary file {}",
+            path.display(),
+            temporary.display()
+        );
+        return Ok(ArtifactArchive {
+            path: temporary,
+            temporary: true,
+        });
+    }
+    Ok(ArtifactArchive {
+        path: path.to_path_buf(),
+        temporary: false,
+    })
+}
+
+fn temporary_artifact_path() -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    std::env::temp_dir().join(format!(
+        "sofka-plugin-artifact-{}-{nonce:x}.tar.zst",
+        std::process::id()
+    ))
 }
 
 /// Published bytes must match the catalog exactly. A truncated or interrupted
@@ -827,7 +918,7 @@ async fn get_inner(
         }
         if !status.is_success() {
             if rate_limited {
-                return Err("GitHub API rate limit reached; retry later or use --offline".into());
+                return Err("GitHub API rate limit reached; retry later".into());
             }
             let detail: String = String::from_utf8_lossy(&bytes)
                 .trim()
@@ -1000,6 +1091,32 @@ mod tests {
     }
 
     #[test]
+    fn parsing_accepts_additive_fields_and_reports_future_schemas_first() {
+        let mut value = serde_json::to_value(catalog()).unwrap();
+        value["future_catalog_field"] = true.into();
+        value["plugins"][0]["future_plugin_field"] = true.into();
+        value["plugins"][0]["versions"][0]["future_version_field"] = true.into();
+        value["plugins"][0]["versions"][0]["requirements"] = serde_json::json!([{
+            "name": "jq",
+            "install": "install jq",
+            "future_requirement_field": true,
+        }]);
+        value["plugins"][0]["versions"][0]["artifacts"][0]["future_artifact_field"] = true.into();
+
+        Catalog::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let future = serde_json::json!({
+            "schema_version": 2,
+            "future_layout": {},
+        });
+        let error = Catalog::parse(&serde_json::to_vec(&future).unwrap()).unwrap_err();
+        assert!(
+            error.contains("unsupported catalog schema_version 2"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn search_is_case_insensitive_sorted_and_matches_tags() {
         let mut catalog = catalog();
         let mut second = catalog.plugins[0].clone();
@@ -1085,6 +1202,39 @@ mod tests {
         std::fs::write(&path, b"{}").unwrap();
         assert!(load_cached(&path).is_err());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn network_errors_offer_offline_mode_only_when_a_cache_exists() {
+        let dir = scratch("network-guidance");
+        let cache = dir.join("catalog-cache.json");
+        let without = catalog_fetch_error("network failed".into(), &cache);
+        assert!(without.contains("check the network and retry"));
+        assert!(!without.contains("--offline"));
+
+        std::fs::write(&cache, "cached").unwrap();
+        let with = catalog_fetch_error("network failed".into(), &cache);
+        assert!(with.contains("check the network and retry"));
+        assert!(with.contains("--offline"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_catalog_cache_write_failure_does_not_discard_the_snapshot() {
+        let dir = scratch("catalog-cache-write");
+        let blocked = dir.join("not-a-directory");
+        std::fs::write(&blocked, "file").unwrap();
+
+        let snapshot = finish_load(
+            "a".repeat(40),
+            catalog(),
+            &blocked.join("catalog-cache.json"),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.commit, "a".repeat(40));
+        assert!(!snapshot.offline);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     type Mutation = (&'static str, Box<dyn Fn(&mut Catalog)>);
@@ -1310,7 +1460,8 @@ mod tests {
 
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, bytes).unwrap();
-        assert_eq!(artifact_in(&cache, &artifact, true).await.unwrap(), path);
+        let cached = artifact_in(&cache, &artifact, true).await.unwrap();
+        assert_eq!(cached.path(), path);
 
         // A half-written cache entry is removed rather than trusted.
         std::fs::write(&path, b"interrupted").unwrap();
@@ -1323,6 +1474,23 @@ mod tests {
         foreign.url = "https://example.com/package.tar.zst".into();
         assert!(artifact_in(&cache, &foreign, true).await.is_err());
         let _ = std::fs::remove_dir_all(cache);
+    }
+
+    #[test]
+    fn a_failed_artifact_cache_write_uses_a_temporary_file() {
+        let dir = scratch("artifact-cache-write");
+        let blocked = dir.join("not-a-directory");
+        std::fs::write(&blocked, "file").unwrap();
+        let cache_path = blocked.join("artifact.tar.zst");
+
+        let archive = store_artifact(&cache_path, b"verified archive").unwrap();
+        let temporary = archive.path().to_path_buf();
+        assert_ne!(temporary, cache_path);
+        assert_eq!(std::fs::read(&temporary).unwrap(), b"verified archive");
+
+        drop(archive);
+        assert!(!temporary.exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1463,7 +1631,8 @@ mod tests {
         let error = get_with(&url, 100, budget(Duration::from_secs(1)), true)
             .await
             .unwrap_err();
-        assert!(error.contains("rate limit") && error.contains("--offline"));
+        assert!(error.contains("rate limit"));
+        assert!(!error.contains("--offline"));
     }
 
     #[test]

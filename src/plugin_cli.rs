@@ -117,20 +117,12 @@ struct Description<'a> {
     output: &'a str,
     mutating: bool,
     confirm: bool,
+    confirmation: bool,
     dangerous: bool,
     network_load: bool,
     installed: bool,
     installed_version: Option<&'a str>,
     installed_withdrawal_reason: Option<&'a str>,
-}
-
-impl Description<'_> {
-    /// Whether sofka will ask before running this, matching the rule in
-    /// `App::run_plugin`: confirmation, danger, and traffic generation each
-    /// require it.
-    fn confirms(&self) -> bool {
-        self.confirm || self.dangerous || self.network_load
-    }
 }
 
 pub async fn run(args: &PluginArgs) -> Result<(), String> {
@@ -297,6 +289,7 @@ fn description<'a>(
         output: &release.output,
         mutating: release.mutating,
         confirm: release.confirm,
+        confirmation: release.confirm || release.dangerous || release.network_load,
         dangerous: release.dangerous,
         network_load: release.network_load,
         installed: installed.is_some(),
@@ -339,9 +332,7 @@ async fn describe(request: &str, offline: bool, json: bool) -> Result<(), String
         println!("target: {}", description.target);
         println!("output: {}", description.output);
         println!("mutating: {}", description.mutating);
-        // Sofka confirms for traffic generation too, so describe must not
-        // claim a plugin will run unprompted when it will not.
-        println!("confirmation: {}", description.confirms());
+        println!("confirmation: {}", description.confirmation);
         println!("network load: {}", description.network_load);
         println!(
             "installed: {}",
@@ -932,7 +923,7 @@ mod tests {
             let snapshot = snapshot(serde_json::json!([release]));
             let (plugin, release) = described_release(&snapshot, "resource-summary").unwrap();
             assert_eq!(
-                description(plugin, release, None).confirms(),
+                description(plugin, release, None).confirmation,
                 expected,
                 "confirm={confirm} dangerous={dangerous} network_load={network_load}"
             );
@@ -959,6 +950,7 @@ mod tests {
             [
                 "command",
                 "confirm",
+                "confirmation",
                 "dangerous",
                 "description",
                 "display_name",

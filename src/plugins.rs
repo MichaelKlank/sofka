@@ -810,7 +810,7 @@ mod tests {
         "authors = [\"sofka maintainers\"]\n",
         "repository = \"https://github.com/nklmilojevic/sofka-plugins\"\n",
         "readme = \"README.md\"\n",
-        "sofka = \">=0.25.5\"\n",
+        "sofka = \">=0.26.0\"\n",
         "platforms = [\"x86_64-apple-darwin\"]\n",
         "tags = [\"diagnostics\"]\n",
         "requirements = [{ name = \"popeye\", alternatives = [\"kubectl-popeye\"], install = \"Install Popeye\" }]\n",
@@ -835,7 +835,7 @@ mod tests {
         assert_eq!(package.version, "0.1.0");
         assert_eq!(package.authors, ["sofka maintainers"]);
         assert_eq!(package.license, "MIT OR Apache-2.0");
-        assert_eq!(package.sofka.as_deref(), Some(">=0.25.5"));
+        assert_eq!(package.sofka.as_deref(), Some(">=0.26.0"));
         assert_eq!(package.platforms, ["x86_64-apple-darwin"]);
         assert_eq!(package.tags, ["diagnostics"]);
         assert_eq!(package.requirements[0].name, "popeye");
@@ -871,7 +871,7 @@ mod tests {
                 "authors = [\"sofka maintainers\"]",
                 "authors = [\"\"]",
             ),
-            ("sofka range", "sofka = \">=0.25.5\"", "sofka = \"latest\""),
+            ("sofka range", "sofka = \">=0.26.0\"", "sofka = \"latest\""),
             (
                 "platform",
                 "platforms = [\"x86_64-apple-darwin\"]",

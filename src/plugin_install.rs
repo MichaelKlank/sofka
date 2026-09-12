@@ -50,10 +50,8 @@ pub struct InstallLock {
 
 impl InstallLock {
     pub fn acquire(config: &Path) -> Result<Self, String> {
-        ensure_directory_path(config)?;
         std::fs::create_dir_all(config)
             .map_err(|e| format!("creating {}: {e}", config.display()))?;
-        ensure_directory_path(config)?;
         let path = config.join(".plugin-install.lock");
         let file = File::options()
             .create(true)
@@ -68,7 +66,6 @@ impl InstallLock {
                 path.display()
             )
         })?;
-        ensure_directory_path(&config.join("plugins"))?;
         recover(config)?;
         Ok(Self { file })
     }
@@ -256,10 +253,8 @@ async fn prepare_below(
     offline: bool,
 ) -> Result<Vec<PreparedPackage>, String> {
     let plugins = config.join("plugins");
-    ensure_directory_path(config)?;
     std::fs::create_dir_all(&plugins)
         .map_err(|e| format!("creating {}: {e}", plugins.display()))?;
-    ensure_directory_path(&plugins)?;
 
     let mut requested: HashMap<String, String> = HashMap::new();
     let mut selections = Vec::new();
@@ -326,7 +321,7 @@ async fn prepare_below(
         .map_err(|e| format!("marking {}: {e}", stage.display()))?;
         // Extraction hashes every byte it writes, so the record below needs no
         // second pass over the package.
-        let staged = extract(&archive, &stage).and_then(|files| {
+        let staged = extract(archive.path(), &stage).and_then(|files| {
             // The declared manifest, not the resolved one: reconciliation
             // compares the spellings the author published.
             let (declared, published) = crate::plugins::read_package_manifest(&stage)?;
@@ -392,20 +387,20 @@ fn reconcile(
     declared: &crate::config::Plugin,
     published: Option<&crate::plugins::Package>,
 ) -> Result<(), String> {
+    let published = published
+        .ok_or_else(|| format!("catalog package {id} requires a [package] table in plugin.toml"))?;
     let mut differences = Vec::new();
     let mut compare = |field: &str, manifest: &str, catalog: &str| {
         if manifest != catalog {
             differences.push(format!("{field} {manifest:?}, catalog says {catalog:?}"));
         }
     };
-    if let Some(published) = published {
-        compare("version", &published.version, &release.version);
-        compare(
-            "sofka",
-            published.sofka.as_deref().unwrap_or(""),
-            &release.sofka,
-        );
-    }
+    compare("version", &published.version, &release.version);
+    compare(
+        "sofka",
+        published.sofka.as_deref().unwrap_or(""),
+        &release.sofka,
+    );
     compare("command", &declared.command, &release.command);
     // Resolved the way the loader resolves them, so an omitted field is
     // compared as the behaviour it actually produces.
@@ -618,9 +613,7 @@ pub fn remove(ids: &[String]) -> Result<Vec<(String, PathBuf)>, Removal> {
 }
 
 fn remove_below(config: &Path, ids: &[String]) -> Result<Vec<(String, PathBuf)>, Removal> {
-    ensure_directory_path(config)?;
     let plugins = config.join("plugins");
-    ensure_directory_path(&plugins)?;
     let mut checked = Vec::new();
     let mut seen = HashSet::new();
     for id in ids {
@@ -1186,6 +1179,11 @@ mod tests {
 
     const MANIFEST: &str = concat!(
         "schema_version = 1\n",
+        "[package]\n",
+        "version = \"1.0.0\"\n",
+        "description = \"Summarize a resource.\"\n",
+        "license = \"MIT\"\n",
+        "sofka = \">=0.0.1\"\n",
         "[plugin]\n",
         "name = \"Resource summary\"\n",
         "palette = \"resource-summary\"\n",
@@ -2471,9 +2469,12 @@ mod tests {
     }
 
     #[test]
-    fn removal_refuses_a_symlinked_plugins_parent() {
-        let config = scratch("symlinked-parent");
-        let elsewhere = config.join("elsewhere");
+    #[cfg(unix)]
+    fn operations_allow_symlinked_config_and_plugins_parents() {
+        let root = scratch("symlinked-parent");
+        let real_config = root.join("real-config");
+        let config = root.join("linked-config");
+        let elsewhere = root.join("elsewhere");
         let package = elsewhere.join("sample");
         std::fs::create_dir_all(&package).unwrap();
         let record = InstallationRecord {
@@ -2486,20 +2487,16 @@ mod tests {
             files: BTreeMap::new(),
         };
         std::fs::write(package.join(RECORD), serde_json::to_vec(&record).unwrap()).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&elsewhere, config.join("plugins")).unwrap();
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&elsewhere, config.join("plugins")).unwrap();
+        std::fs::create_dir(&real_config).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, real_config.join("plugins")).unwrap();
+        std::os::unix::fs::symlink(&real_config, &config).unwrap();
 
-        let error = remove_below(&config, &["sample".to_string()]).unwrap_err();
+        drop(InstallLock::acquire(&config).unwrap());
+        let removed = remove_below(&config, &["sample".to_string()]).unwrap();
 
-        assert!(
-            error.error.contains("refusing symlinked directory"),
-            "{error}"
-        );
-        assert!(package.is_dir());
-        assert!(InstallLock::acquire(&config).is_err());
-        let _ = std::fs::remove_dir_all(config);
+        assert_eq!(removed[0].0, "sample");
+        assert!(!package.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2657,18 +2654,7 @@ mod tests {
         let config = scratch("contradicts-sofka");
         let cache = config.join("cache");
         std::fs::create_dir_all(&cache).unwrap();
-        let manifest = MANIFEST.replacen(
-            "schema_version = 1\n",
-            concat!(
-                "schema_version = 1\n",
-                "[package]\n",
-                "version = \"1.0.0\"\n",
-                "description = \"Summarize a resource.\"\n",
-                "license = \"MIT\"\n",
-                "sofka = \">=99.0.0\"\n",
-            ),
-            1,
-        );
+        let manifest = MANIFEST.replace("sofka = \">=0.0.1\"", "sofka = \">=99.0.0\"");
         let snapshot = published(&cache, "resource-summary", "1.0.0", &manifest);
         let error = prepare_below(
             &config,
@@ -2681,6 +2667,37 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("contradicts the catalog entry"), "{error}");
         assert!(error.contains("sofka"), "{error}");
+        assert!(!config.join("plugins").join("resource-summary").exists());
+        let _ = std::fs::remove_dir_all(config);
+    }
+
+    #[tokio::test]
+    async fn a_catalog_package_without_publication_metadata_is_refused() {
+        let config = scratch("missing-package-table");
+        let cache = config.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let manifest = concat!(
+            "schema_version = 1\n",
+            "[plugin]\n",
+            "name = \"Resource summary\"\n",
+            "palette = \"resource-summary\"\n",
+            "command = \"/bin/echo\"\n",
+            "output = \"report\"\n",
+            "mutating = false\n",
+        );
+        let snapshot = published(&cache, "resource-summary", "1.0.0", manifest);
+
+        let error = prepare_below(
+            &config,
+            &cache,
+            &snapshot,
+            &["resource-summary".to_string()],
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("requires a [package] table"), "{error}");
         assert!(!config.join("plugins").join("resource-summary").exists());
         let _ = std::fs::remove_dir_all(config);
     }

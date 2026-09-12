@@ -70,10 +70,14 @@ existing session.
 Add `--json` to search, describe, and list for stable machine-readable output.
 Search returns an array with `id`, `display_name`, `description`, `tags`,
 `latest_version`, `compatible`, `installed`, `installed_version`, and
-`withdrawal_reason`. Describe returns the catalog and execution fields printed
-by the text view, including `installed_withdrawal_reason` when a different
-installed release was withdrawn. List returns an array with `id`, `version`,
-`path`, `managed`, `modified`, and `withdrawal_reason`.
+`withdrawal_reason`. Describe returns `id`, `display_name`, `description`,
+`tags`, `publisher`, `repository`, `version`, `status`, `withdrawal_reason`,
+`license`, `readme`, `sofka`, `platforms`, `requirements`, `command`, `target`,
+`output`, `mutating`, `confirm`, `confirmation`, `dangerous`, `network_load`,
+`installed`, `installed_version`, and `installed_withdrawal_reason`.
+`confirmation` is true whenever sofka will prompt: `confirm`, `dangerous`, or
+`network_load` is true. List returns an array with `id`, `version`, `path`,
+`managed`, `modified`, and `withdrawal_reason`.
 
 Home Manager users can continue to place immutable package sources in the same
 directory. Sofka reports those as manual packages and does not take ownership
