@@ -290,6 +290,7 @@ impl App {
                     plural: plural.to_string(),
                 },
                 namespaced: scope.eq_ignore_ascii_case("Namespaced"),
+                scalable: false,
             })
         });
         let Some(kind) = kind else {

@@ -372,6 +372,11 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   all the inspection is native. UPDATED advances with the clock in both the
   release list and revision history. The table keeps the deployment timestamp
   in its row cache, so clock updates do not decode the release again.
+- **Scale discovered resources** (`s`) - scale built-in or custom resources when
+  API discovery lists a `scale` subresource with PATCH support. Changes use
+  `/scale`, including when a CRD stores replicas at a custom path. Marked rows
+  can be scaled together. Custom resources do not show an assumed current count.
+  The action requires patch permission on the scale subresource.
 - **Managed-resource mutation warnings** - before you edit, delete, scale, or
   otherwise change an object Flux (or another controller) owns, sofka tells you
   the next reconcile will revert it or recreate it. Fix the source instead of

@@ -111,7 +111,7 @@ actions! {
     Save => ("save", "save"),
     SetImage => ("set_image", "set image"),
     Shell => ("shell", "shell"),
-    ShellOrScale => ("shell_or_scale", "shell or scale"),
+    ShellOrScale => ("shell_or_scale", "shell or scale through /scale"),
     Sort => ("sort", "sort"),
     SortAge => ("sort_age", "sort by age; repeat to invert"),
     Start => ("start", "start"),
