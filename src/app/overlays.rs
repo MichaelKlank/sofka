@@ -124,8 +124,8 @@ impl App {
             } => {
                 self.start_transfer(ns, pod, container, upload, src, dest);
             }
-            ConfirmAction::Drain { targets } => {
-                self.do_drain_nodes(targets);
+            ConfirmAction::Drain { targets, options } => {
+                self.do_drain_nodes(targets, options);
                 self.marked.clear();
             }
             ConfirmAction::Restart { kind, name, ns } => {

@@ -306,6 +306,11 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("diff", Action::Right, &["l", "right"]),
     ("diff", Action::Up, &["k", "up"]),
     ("diff", Action::Wrap, &["w"]),
+    ("drain", Action::Down, &["tab", "down"]),
+    ("drain", Action::Up, &["backtab", "up"]),
+    ("drain", Action::Toggle, &["space"]),
+    ("drain", Action::PageUp, &["pageup"]),
+    ("drain", Action::PageDown, &["pagedown"]),
     ("events", Action::Back, &["esc"]),
     ("events", Action::Close, &["q"]),
     ("events", Action::Copy, &["c"]),
@@ -527,6 +532,7 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("xray", Action::Up, &["k", "up"]),
 ];
 const TEXT_SCOPES: &[&str] = &[
+    "drain",
     "command",
     "filter",
     "log_filter",

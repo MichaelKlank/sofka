@@ -31,6 +31,12 @@ pub enum RefreshContent {
 /// Messages flowing from watch tasks to the UI loop. Tagged with a
 /// `generation` so messages from a superseded watch can be discarded.
 pub enum Msg {
+    Drain {
+        claim: StatusClaim,
+        message: String,
+        done: bool,
+        err: bool,
+    },
     Reset {
         generation: u64,
     },
