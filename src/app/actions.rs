@@ -4,6 +4,17 @@ use super::*;
 /// ships it, otherwise fall back to sh, in a single `sh -c` invocation.
 pub(super) const SHELL_FALLBACK: &str = "command -v bash >/dev/null 2>&1 && exec bash || exec sh";
 
+pub(super) enum ActionPatch {
+    Resource(Patch<Value>),
+    Scale(Value),
+}
+
+impl From<Patch<Value>> for ActionPatch {
+    fn from(patch: Patch<Value>) -> Self {
+        Self::Resource(patch)
+    }
+}
+
 impl App {
     // ----- actions -------------------------------------------------------
 
@@ -81,13 +92,14 @@ impl App {
         &self,
         kind: Kind,
         targets: Vec<(String, String)>,
-        patch: Patch<Value>,
+        patch: impl Into<ActionPatch>,
         claim: StatusClaim,
         ok_message: String,
         error_message: F,
     ) where
         F: Fn(&str, kube::Error) -> String + Send + 'static,
     {
+        let patch = patch.into();
         let client = self.cluster.client.clone();
         let tx = self.tx.clone();
         let genr = self.generation;
@@ -99,7 +111,17 @@ impl App {
                 } else {
                     Api::all_with(client.clone(), &kind.ar)
                 };
-                if let Err(e) = api.patch(&name, &PatchParams::default(), &patch).await {
+                let result = match &patch {
+                    ActionPatch::Resource(patch) => api
+                        .patch(&name, &PatchParams::default(), patch)
+                        .await
+                        .map(|_| ()),
+                    ActionPatch::Scale(value) => api
+                        .patch_scale(&name, &PatchParams::default(), &Patch::Merge(value))
+                        .await
+                        .map(|_| ()),
+                };
+                if let Err(e) = result {
                     failed = true;
                     let _ = tx
                         .send(Msg::Flash {
@@ -1143,11 +1165,8 @@ impl App {
         if self.deny_readonly() {
             return;
         }
-        if !matches!(
-            self.kind_plural.as_str(),
-            "deployments" | "statefulsets" | "replicasets"
-        ) {
-            self.flash_warn("scale applies to deployments/statefulsets/replicasets");
+        if !self.kind.as_ref().is_some_and(|kind| kind.scalable) {
+            self.flash_warn("resource does not support scale with PATCH");
             return;
         }
         let objs = self.action_target_objects();
@@ -1156,12 +1175,25 @@ impl App {
         }
         self.prompt_label = if let [obj] = objs.as_slice() {
             let name = obj.metadata.name.clone().unwrap_or_default();
-            let cur = obj
-                .data
-                .pointer("/spec/replicas")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-            format!("Scale {name} to replicas (current {cur}):")
+            let cur = self
+                .kind
+                .as_ref()
+                .filter(|kind| {
+                    matches!(kind.ar.group.as_str(), "apps" | "extensions" | "")
+                        && matches!(
+                            kind.ar.plural.as_str(),
+                            "deployments"
+                                | "statefulsets"
+                                | "replicasets"
+                                | "replicationcontrollers"
+                        )
+                })
+                .and_then(|_| obj.data.pointer("/spec/replicas").and_then(Value::as_i64));
+            if let Some(cur) = cur {
+                format!("Scale {name} to replicas (current {cur}):")
+            } else {
+                format!("Scale {name} to replicas:")
+            }
         } else {
             format!("Scale {} {} to replicas:", objs.len(), self.kind_plural)
         };
@@ -1681,7 +1713,7 @@ impl App {
         self.spawn_patch_action(
             kind,
             targets,
-            Patch::Merge(scale_patch(replicas)),
+            ActionPatch::Scale(scale_patch(replicas)),
             claim,
             ok_message,
             |name, e| format!("scale {name} failed: {e}"),

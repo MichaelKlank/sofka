@@ -236,6 +236,7 @@ pub enum WatchProbe {
 pub struct Kind {
     pub ar: ApiResource,
     pub namespaced: bool,
+    pub scalable: bool,
 }
 
 impl Kind {
@@ -1134,6 +1135,7 @@ impl Cluster {
                 plural: "events".to_string(),
             },
             namespaced: true,
+            scalable: false,
         };
         cluster
             .registry
@@ -1164,6 +1166,11 @@ impl Cluster {
                 plural: plural.clone(),
             },
             namespaced,
+            scalable: group == "apps"
+                && matches!(
+                    plural.as_str(),
+                    "deployments" | "statefulsets" | "replicasets"
+                ),
         };
         if namespaced {
             self.child_kinds.push(k.clone());

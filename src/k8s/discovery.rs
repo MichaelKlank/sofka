@@ -91,6 +91,10 @@ fn append_aggregated(out: &mut Vec<Resource>, list: APIGroupDiscoveryList) -> Re
                                 .unwrap_or_default(),
                             plural,
                         },
+                        scalable: resource.subresources.iter().any(|s| {
+                            s.subresource.as_deref() == Some("scale")
+                                && s.verbs.iter().any(|v| v == "patch")
+                        }),
                         namespaced: resource.scope.as_deref() == Some("Namespaced"),
                     },
                     listable: resource.verbs.iter().any(|v| v == "list"),
@@ -146,6 +150,12 @@ async fn legacy(client: &Client, skipped: &mut Vec<String>) -> Result<Vec<Resour
 
 fn append_legacy(out: &mut Vec<Resource>, list: APIResourceList) -> Result<()> {
     let gv: kube::core::GroupVersion = list.group_version.parse()?;
+    let scalable: std::collections::HashSet<_> = list
+        .resources
+        .iter()
+        .filter(|r| r.verbs.iter().any(|v| v == "patch"))
+        .filter_map(|r| r.name.strip_suffix("/scale").map(str::to_owned))
+        .collect();
     for resource in list.resources {
         if resource.name.contains('/') {
             continue;
@@ -157,9 +167,10 @@ fn append_legacy(out: &mut Vec<Resource>, list: APIResourceList) -> Result<()> {
                     version: resource.version.unwrap_or_else(|| gv.version.clone()),
                     api_version: gv.api_version(),
                     kind: resource.kind,
-                    plural: resource.name,
+                    plural: resource.name.clone(),
                 },
                 namespaced: resource.namespaced,
+                scalable: scalable.contains(&resource.name),
             },
             listable: resource.verbs.iter().any(|v| v == "list"),
             short_names: resource.short_names.unwrap_or_default(),
@@ -197,6 +208,42 @@ fn child_candidates(resources: &[Resource]) -> Vec<Kind> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn scale_capability_requires_patch_in_each_discovery_version() {
+        for aggregated in [false, true] {
+            let mut resources = Vec::new();
+            for (version, verbs, expected) in [
+                ("v1", vec!["get", "patch"], true),
+                ("v2", vec!["get", "update"], false),
+            ] {
+                if aggregated {
+                    append_aggregated(&mut resources, serde_json::from_value(json!({
+                        "items":[{"metadata":{"name":"example.com"},"versions":[{
+                            "version":version,"resources":[
+                                {"resource":"todoapps","responseKind":{"kind":"TodoApp"},"scope":"Namespaced","verbs":["list"],
+                                 "subresources":[{"subresource":"scale","verbs":verbs}]},
+                                {"resource":"others","responseKind":{"kind":"Other"},"scope":"Cluster","verbs":["list","patch"]}
+                            ]
+                        }]}]
+                    })).unwrap()).unwrap();
+                } else {
+                    append_legacy(&mut resources, serde_json::from_value(json!({
+                        "groupVersion":format!("example.com/{version}"),"resources":[
+                            {"name":"todoapps/scale","kind":"Scale","namespaced":true,"verbs":verbs},
+                            {"name":"todoapps","kind":"TodoApp","namespaced":true,"verbs":["list"]},
+                            {"name":"others","kind":"Other","namespaced":false,"verbs":["list","patch"]}
+                        ]
+                    })).unwrap()).unwrap();
+                }
+                let kind = &resources[resources.len() - 2].kind;
+                assert_eq!(kind.ar.version, version);
+                assert_eq!(kind.scalable, expected);
+                assert!(!resources.last().unwrap().kind.scalable);
+            }
+            assert_eq!(resources.len(), 4);
+        }
+    }
 
     #[test]
     fn children_use_listable_namespaced_resources_and_one_version() {

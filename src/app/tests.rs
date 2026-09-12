@@ -7,6 +7,7 @@ use tokio::sync::mpsc::{self, Receiver};
 
 mod label_filter;
 mod proxy;
+mod scale;
 mod server_table;
 
 fn obj(v: serde_json::Value) -> DynamicObject {

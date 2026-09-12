@@ -972,6 +972,14 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
             hint_line(app, &[(Action::Edit, "edit"), (Action::Delete, "delete")]),
         ];
     }
+    if app.kind.as_ref().is_some_and(|kind| kind.scalable)
+        && !matches!(
+            app.kind_plural.as_str(),
+            "deployments" | "statefulsets" | "pods" | "persistentvolumeclaims"
+        )
+    {
+        lines.insert(1, hint_line(app, &[(Action::ShellOrScale, "scale")]));
+    }
     if app.flux_suspendable() {
         lines.push(hint_line(app, &[(Action::ActionMenu, "flux menu")]));
     }
