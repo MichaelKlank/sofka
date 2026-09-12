@@ -12886,6 +12886,40 @@ async fn context_switch_missing_resource_uses_default_then_pods() {
 }
 
 #[tokio::test]
+async fn context_switch_keeps_fallback_message_with_config_warning() {
+    let (mut app, _rx) = test_app();
+    app.all_contexts = vec!["test".into(), "west".into()];
+    let dir = std::env::temp_dir().join(format!(
+        "sofka-context-fallback-warning-{}",
+        std::process::id()
+    ));
+    let context_dir = dir.join("clusters/test-cluster/west");
+    std::fs::create_dir_all(&context_dir).unwrap();
+    std::fs::write(context_dir.join("config.toml"), "readonly = \n").unwrap();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    app.cluster
+        .register_kind("example.com", "Widget", "widgets", true);
+    type_resource_query(&mut app, "widgets.example.com");
+    palette(&mut app, "ctx west");
+    assert_eq!(
+        app.context_switch_target,
+        Some((app.generation, "west".into()))
+    );
+    land_context(&mut app, "west");
+    assert_eq!(app.kind_plural, "pods");
+    assert!(app.flash_err);
+    assert!(
+        app.flash
+            .contains("widgets.example.com is unavailable in west; viewing pods"),
+        "{}",
+        app.flash
+    );
+    assert_eq!(app.config_warnings.len(), 1);
+    assert!(app.flash.contains(&app.config_warnings[0]), "{}", app.flash);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn context_picker_launch_connects_on_enter_and_opens_default_resource() {
     for default in [None, Some("deployments")] {
         let (mut app, _rx) = test_app();

@@ -986,7 +986,11 @@ impl App {
             }
         }
         if let Some(w) = &first_warning {
-            self.flash_warn(w);
+            if self.flash_err {
+                self.flash_warn(&format!("{}; {w}", self.flash));
+            } else {
+                self.flash_warn(w);
+            }
         }
         self.flash_discovery_warnings();
         // Saved forwards for the new context. Running ones from the previous
