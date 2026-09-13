@@ -91,6 +91,9 @@ impl App {
         // A re-gather rebuilds every finding, so nothing stays expanded.
         self.argocd_expanded.clear();
         self.cancel_argocd_children();
+        if let Some(stale) = self.argocd_cause_claim.take() {
+            self.clear_claimed_status(stale);
+        }
         self.argocd_claim = Some(claim);
         self.argocd_request = self.argocd_request.wrapping_add(1);
         let request = self.argocd_request;
@@ -648,7 +651,7 @@ async fn gather_children(
         return Vec::new();
     };
 
-    let mut lists: HashMap<String, Vec<DynamicObject>> = HashMap::new();
+    let mut lists: HashMap<(String, String), Vec<DynamicObject>> = HashMap::new();
     let mut warn = None;
     let mut found = Vec::new();
     walk(
@@ -685,7 +688,9 @@ fn walk<'a>(
     parent_uid: &'a str,
     depth: u8,
     plan: &'a ChildPlan,
-    lists: &'a mut HashMap<String, Vec<DynamicObject>>,
+    // Listings already fetched, keyed by namespace and plural so one cache can
+    // serve parents in different namespaces.
+    lists: &'a mut HashMap<(String, String), Vec<DynamicObject>>,
     warn: &'a mut Option<String>,
     out: &'a mut Vec<Descendant>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
@@ -698,7 +703,8 @@ fn walk<'a>(
         };
         for kind in kinds {
             let plural = kind.ar.plural.to_lowercase();
-            if !lists.contains_key(&plural) {
+            let key = (namespace.to_string(), plural.clone());
+            if !lists.contains_key(&key) {
                 let api: Api<DynamicObject> =
                     Api::namespaced_with(client.clone(), namespace, &kind.ar);
                 // A failed listing is reported, not swallowed: an empty tree
@@ -710,9 +716,9 @@ fn walk<'a>(
                         Vec::new()
                     }
                 };
-                lists.insert(plural.clone(), items);
+                lists.insert(key.clone(), items);
             }
-            let owned: Vec<DynamicObject> = lists[&plural]
+            let owned: Vec<DynamicObject> = lists[&key]
                 .iter()
                 .filter(|o| crate::adjacent::owned_by(o, Some(parent_uid)))
                 .cloned()
@@ -841,13 +847,19 @@ impl App {
         self.argocd_cause_claim = Some(claim);
         tokio::spawn(async move {
             let mut findings = Vec::new();
+            // Shared across parents: several workloads in one namespace would
+            // otherwise re-list that namespace's pods once each.
+            let mut lists: HashMap<(String, String), Vec<DynamicObject>> = HashMap::new();
             for (kind, namespace, name, plan) in parents {
                 if findings.len() >= MAX_CAUSES {
                     break;
                 }
                 let plural = kind.ar.plural.to_lowercase();
                 findings.extend(
-                    unhealthy_descendants(&client, kind, plural, &namespace, &name, &plan).await,
+                    unhealthy_descendants(
+                        &client, kind, plural, &namespace, &name, &plan, &mut lists,
+                    )
+                    .await,
                 );
             }
             findings.truncate(MAX_CAUSES);
@@ -875,8 +887,20 @@ impl App {
         else {
             return;
         };
+        let before = self.argocd_items.len();
         for (offset, finding) in findings.into_iter().enumerate() {
             self.argocd_items.insert(at + 1 + offset, finding);
+        }
+        // Drift lines sit below this point, so a cursor parked on one would
+        // otherwise slide onto a different row when the search lands.
+        let shift = self.argocd_items.len() as isize - before as isize;
+        if let Some(selected) = self.argocd_state.selected()
+            && selected > at
+            && shift != 0
+        {
+            let moved = (selected as isize + shift).max(at as isize + 1) as usize;
+            self.argocd_state
+                .select(Some(moved.min(self.argocd_items.len().saturating_sub(1))));
         }
     }
 }
@@ -889,6 +913,7 @@ async fn unhealthy_descendants(
     namespace: &str,
     name: &str,
     plan: &ChildPlan,
+    lists: &mut HashMap<(String, String), Vec<DynamicObject>>,
 ) -> Vec<Finding> {
     let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &parent.ar);
     let Ok(root) = api.get(name).await else {
@@ -897,7 +922,6 @@ async fn unhealthy_descendants(
     let Some(uid) = root.metadata.uid.clone() else {
         return Vec::new();
     };
-    let mut lists: HashMap<String, Vec<DynamicObject>> = HashMap::new();
     let mut warn = None;
     let mut found = Vec::new();
     walk(
@@ -907,7 +931,7 @@ async fn unhealthy_descendants(
         &uid,
         1,
         plan,
-        &mut lists,
+        lists,
         &mut warn,
         &mut found,
     )

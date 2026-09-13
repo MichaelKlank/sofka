@@ -22639,6 +22639,76 @@ async fn receive_argocd_children(app: &mut App, rx: &mut Receiver<Msg>) {
     .expect("argocd children did not arrive");
 }
 
+/// The job controller marks the outcome with `SuccessCriteriaMet` or
+/// `FailureTarget` before it sets the terminal condition, so the tree must read
+/// a Job's outcome by condition type rather than taking whichever is true first.
+#[tokio::test]
+async fn argocd_tree_reads_a_failed_job_behind_a_newer_condition() {
+    let mut root = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                             "namespace": "default"}));
+    root["status"]["resources"] = json!([
+        {"group": "batch", "version": "v1", "kind": "CronJob", "namespace": "default",
+         "name": "backup", "status": "Synced"}
+    ]);
+    let (mut app, mut rx, responses, _) = health_report_app("applications", root.clone());
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/applications/web",
+        kind.ar.api_version
+    );
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(path, (200, root));
+        replies.insert(
+            "/apis/batch/v1/namespaces/default/cronjobs/backup".into(),
+            (
+                200,
+                json!({"apiVersion": "batch/v1", "kind": "CronJob",
+                       "metadata": {"name": "backup", "namespace": "default", "uid": "cj"}}),
+            ),
+        );
+        // The condition order the job controller actually writes.
+        replies.insert(
+            "/apis/batch/v1/namespaces/default/jobs".into(),
+            (
+                200,
+                json!({"apiVersion": "batch/v1", "kind": "JobList", "metadata": {},
+                       "items": [{"metadata": {"name": "backup-1", "namespace": "default",
+                                               "uid": "job", "ownerReferences": [
+                                                 {"apiVersion": "batch/v1", "kind": "CronJob",
+                                                  "name": "backup", "uid": "cj"}]},
+                                  "status": {"conditions": [
+                                      {"type": "FailureTarget", "status": "True"},
+                                      {"type": "Failed", "status": "True"}]}}]}),
+            ),
+        );
+        replies.insert(
+            "/api/v1/namespaces/default/pods".into(),
+            (
+                200,
+                json!({"apiVersion": "v1", "kind": "PodList", "metadata": {}, "items": []}),
+            ),
+        );
+    }
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+    let row = app
+        .argocd_items
+        .iter()
+        .position(|f| f.text.starts_with("CronJob/backup"))
+        .expect("managed resource row");
+    app.argocd_state.select(Some(row));
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    receive_argocd_children(&mut app, &mut rx).await;
+
+    let texts: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(
+        texts.contains(&"Job/backup-1: Failed"),
+        "the job's outcome is missing: {texts:?}"
+    );
+}
+
 /// Children arriving above the cursor must not slide the selection onto a
 /// different line; results land while the user is still moving around.
 #[tokio::test]
@@ -23084,6 +23154,279 @@ async fn argocd_cause_search_uses_each_resources_own_namespace() {
     assert!(
         texts.contains(&"Pod/worker-1-xyz: ErrImagePull"),
         "the cause in the second namespace is missing: {texts:?}"
+    );
+}
+
+/// The dead-end line is followed by drift lines, which sit above the search
+/// insertion point. A cursor parked on one of them must not slide onto a
+/// different row when the causes land.
+#[tokio::test]
+async fn argocd_cause_search_does_not_move_the_cursor_off_a_drift_line() {
+    let mut root = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                             "namespace": "default"}));
+    root["status"]["health"] = json!({"status": "Degraded"});
+    root["status"]["resources"] = json!([
+        {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "default",
+         "name": "web", "status": "Synced"},
+        {"version": "v1", "kind": "ConfigMap", "namespace": "default", "name": "settings",
+         "status": "OutOfSync"}
+    ]);
+    let (mut app, mut rx, responses, _) = health_report_app("applications", root.clone());
+    app.cluster
+        .register_kind("apps", "ReplicaSet", "replicasets", true);
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/applications/web",
+        kind.ar.api_version
+    );
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(path, (200, root));
+        replies.insert(
+            "/apis/apps/v1/namespaces/default/deployments/web".into(),
+            (
+                200,
+                json!({"apiVersion": "apps/v1", "kind": "Deployment",
+                       "metadata": {"name": "web", "namespace": "default", "uid": "dep"}}),
+            ),
+        );
+        replies.insert(
+            "/apis/apps/v1/namespaces/default/replicasets".into(),
+            (
+                200,
+                json!({"apiVersion": "apps/v1", "kind": "ReplicaSetList", "metadata": {},
+                       "items": [{"metadata": {"name": "web-1", "namespace": "default",
+                                               "uid": "rs", "ownerReferences": [
+                                                 {"apiVersion": "apps/v1", "kind": "Deployment",
+                                                  "name": "web", "uid": "dep"}]},
+                                  "spec": {"replicas": 1}, "status": {"replicas": 1}}]}),
+            ),
+        );
+        replies.insert(
+            "/api/v1/namespaces/default/pods".into(),
+            (
+                200,
+                json!({"apiVersion": "v1", "kind": "PodList", "metadata": {},
+                       "items": [{"metadata": {"name": "web-1-abc", "namespace": "default",
+                                               "uid": "pod", "ownerReferences": [
+                                                 {"apiVersion": "apps/v1", "kind": "ReplicaSet",
+                                                  "name": "web-1", "uid": "rs"}]},
+                                  "status": {"phase": "Running", "containerStatuses": [
+                                      {"state": {"waiting": {"reason": "CrashLoopBackOff"}}}]}}]}),
+            ),
+        );
+    }
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+
+    let drift_row = app
+        .argocd_items
+        .iter()
+        .position(|f| f.text == "ConfigMap/settings is OutOfSync")
+        .expect("drift row");
+    app.argocd_state.select(Some(drift_row));
+
+    receive_argocd_cause(&mut app, &mut rx).await;
+
+    let after = app
+        .argocd_items
+        .iter()
+        .position(|f| f.text == "ConfigMap/settings is OutOfSync")
+        .expect("drift row still present");
+    assert_eq!(
+        app.argocd_state.selected(),
+        Some(after),
+        "the cursor slid off the drift line onto a different row"
+    );
+}
+
+/// A suspended sync policy explains why nothing is being fixed, not why
+/// something is broken, so it must not stop the search for a degraded cause.
+#[tokio::test]
+async fn a_suspended_application_still_searches_for_a_degraded_cause() {
+    let mut root = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                             "namespace": "default"}));
+    root["status"]["health"] = json!({"status": "Degraded"});
+    root["status"]["resources"] = json!([
+        {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "default",
+         "name": "web", "status": "Synced"}
+    ]);
+    root["metadata"]["annotations"] = json!({"sofka.io/argocd-automated": "{\"prune\":true}"});
+    root["spec"]["syncPolicy"] = json!({});
+    let (mut app, mut rx, responses, _) = health_report_app("applications", root.clone());
+    app.cluster
+        .register_kind("apps", "ReplicaSet", "replicasets", true);
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/applications/web",
+        kind.ar.api_version
+    );
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(path, (200, root));
+        replies.insert(
+            "/apis/apps/v1/namespaces/default/deployments/web".into(),
+            (
+                200,
+                json!({"apiVersion": "apps/v1", "kind": "Deployment",
+                       "metadata": {"name": "web", "namespace": "default", "uid": "dep"}}),
+            ),
+        );
+        replies.insert(
+            "/apis/apps/v1/namespaces/default/replicasets".into(),
+            (
+                200,
+                json!({"apiVersion": "apps/v1", "kind": "ReplicaSetList", "metadata": {},
+                       "items": [{"metadata": {"name": "web-1", "namespace": "default",
+                                               "uid": "rs", "ownerReferences": [
+                                                 {"apiVersion": "apps/v1", "kind": "Deployment",
+                                                  "name": "web", "uid": "dep"}]},
+                                  "spec": {"replicas": 1}, "status": {"replicas": 1}}]}),
+            ),
+        );
+        replies.insert(
+            "/api/v1/namespaces/default/pods".into(),
+            (
+                200,
+                json!({"apiVersion": "v1", "kind": "PodList", "metadata": {},
+                       "items": [{"metadata": {"name": "web-1-abc", "namespace": "default",
+                                               "uid": "pod", "ownerReferences": [
+                                                 {"apiVersion": "apps/v1", "kind": "ReplicaSet",
+                                                  "name": "web-1", "uid": "rs"}]},
+                                  "status": {"phase": "Running", "containerStatuses": [
+                                      {"state": {"waiting": {"reason": "CrashLoopBackOff"}}}]}}]}),
+            ),
+        );
+    }
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+    let before: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(
+        before.iter().any(|t| t.contains("auto-sync suspended")),
+        "{before:?}"
+    );
+    receive_argocd_cause(&mut app, &mut rx).await;
+
+    let texts: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(
+        texts.contains(&"Pod/web-1-abc: CrashLoopBackOff"),
+        "suspension hid the real cause: {texts:?}"
+    );
+}
+
+/// Two parents in the same namespace must not each re-list it: the cache is
+/// shared across the whole search, not rebuilt per parent.
+#[tokio::test]
+async fn argocd_cause_search_lists_one_namespace_once_for_all_its_parents() {
+    let mut root = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                             "namespace": "default"}));
+    root["status"]["health"] = json!({"status": "Degraded"});
+    root["status"]["resources"] = json!([
+        {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "default",
+         "name": "front", "status": "Synced"},
+        {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "default",
+         "name": "back", "status": "Synced"}
+    ]);
+    let (mut app, mut rx, responses, requests) = health_report_app("applications", root.clone());
+    app.cluster
+        .register_kind("apps", "ReplicaSet", "replicasets", true);
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/applications/web",
+        kind.ar.api_version
+    );
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(path, (200, root));
+        for (name, uid) in [("front", "d1"), ("back", "d2")] {
+            replies.insert(
+                format!("/apis/apps/v1/namespaces/default/deployments/{name}"),
+                (
+                    200,
+                    json!({"apiVersion": "apps/v1", "kind": "Deployment",
+                           "metadata": {"name": name, "namespace": "default", "uid": uid}}),
+                ),
+            );
+        }
+        replies.insert(
+            "/apis/apps/v1/namespaces/default/replicasets".into(),
+            (
+                200,
+                json!({"apiVersion": "apps/v1", "kind": "ReplicaSetList", "metadata": {},
+                       "items": []}),
+            ),
+        );
+    }
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+    receive_argocd_cause(&mut app, &mut rx).await;
+
+    let seen = requests.lock().unwrap();
+    let listings = seen.iter().filter(|p| p.ends_with("/replicasets")).count();
+    assert_eq!(
+        listings, 1,
+        "listed the shared namespace more than once: {seen:?}"
+    );
+}
+
+/// Opening a new report while a cause search is still in flight must not leave
+/// its status claim behind for the new gather to inherit.
+#[tokio::test]
+async fn opening_a_new_report_clears_a_stale_cause_claim() {
+    let mut root = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                             "namespace": "default"}));
+    root["status"]["health"] = json!({"status": "Degraded"});
+    root["status"]["resources"] = json!([
+        {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "default",
+         "name": "web", "status": "Synced"}
+    ]);
+    let (mut app, mut rx, responses, _) = health_report_app("applications", root.clone());
+    app.cluster
+        .register_kind("apps", "ReplicaSet", "replicasets", true);
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/applications/web",
+        kind.ar.api_version
+    );
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(path, (200, root));
+        replies.insert(
+            "/apis/apps/v1/namespaces/default/deployments/web".into(),
+            (
+                200,
+                json!({"apiVersion": "apps/v1", "kind": "Deployment",
+                       "metadata": {"name": "web", "namespace": "default", "uid": "dep"}}),
+            ),
+        );
+        replies.insert(
+            "/apis/apps/v1/namespaces/default/replicasets".into(),
+            (
+                200,
+                json!({"apiVersion": "apps/v1", "kind": "ReplicaSetList", "metadata": {},
+                       "items": []}),
+            ),
+        );
+    }
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+    assert!(
+        app.argocd_cause_claim.is_some(),
+        "the search never claimed anything to leak"
+    );
+
+    // `r` re-gathers without leaving the view. The old request is now stale, so
+    // its eventual `Msg::ArgocdCause` will fail the request guard and never
+    // reach `clear_claimed_status`; only the new gather itself can free it.
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+
+    assert!(
+        app.argocd_cause_claim.is_none(),
+        "the previous search's claim was not released when the new gather started"
     );
 }
 

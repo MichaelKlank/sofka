@@ -464,14 +464,36 @@ fn waiting_reason(obj: &DynamicObject) -> Option<&str> {
 }
 
 /// `Complete` or `Failed` from a Job's conditions.
+///
+/// Searched by type rather than by position: the job controller holds the
+/// terminal condition back until every pod is gone and marks the outcome with
+/// `SuccessCriteriaMet` or `FailureTarget` meanwhile, so on any supported
+/// Kubernetes the first true condition is not the one that says how it ended.
+///
+/// `FailureTarget` and `SuccessCriteriaMet` are surfaced too, mapped the same
+/// way `col_job_status` maps them for the Jobs table: a Job can sit in that
+/// delay for a while, and the search must see a failure the moment the
+/// controller commits to it rather than wait for pod cleanup to finish.
 fn job_state(obj: &DynamicObject) -> Option<&str> {
-    obj.data
+    let conditions = obj
+        .data
         .pointer("/status/conditions")
-        .and_then(Value::as_array)?
-        .iter()
-        .find(|c| c.get("status").and_then(Value::as_str) == Some("True"))
-        .and_then(|c| c.get("type").and_then(Value::as_str))
-        .filter(|t| matches!(*t, "Complete" | "Failed"))
+        .and_then(Value::as_array)?;
+    let is_true = |kind: &str| {
+        conditions.iter().any(|c| {
+            c.get("type").and_then(Value::as_str) == Some(kind)
+                && c.get("status").and_then(Value::as_str) == Some("True")
+        })
+    };
+    if is_true("Failed") || is_true("FailureTarget") {
+        Some("Failed")
+    } else if is_true("Complete") {
+        Some("Complete")
+    } else if is_true("SuccessCriteriaMet") {
+        Some("Completing")
+    } else {
+        None
+    }
 }
 
 /// Whether `app` lists this object in `status.resources[]`.
@@ -754,8 +776,6 @@ fn source_detail(source: &Value) -> String {
     parts.join(" · ")
 }
 
-/// What is stopping this Application from being synced and healthy, most
-/// serious first, or a single line saying nothing is.
 /// Whether the Application is unhealthy and nothing in its own status says why.
 ///
 /// True is the case worth searching the cluster for: with
@@ -766,20 +786,14 @@ pub fn health_unexplained(app: &DynamicObject, resources: &[ManagedResource]) ->
     matches!(health_status(app), "Degraded" | "Missing") && health_causes(app, resources).is_empty()
 }
 
-/// What the Application's own status says is wrong, most serious first. Empty
-/// when it says nothing.
-/// The causes that account for an Application being unhealthy. Drift is left
-/// out: an OutOfSync resource says the cluster differs from git, which is not a
-/// reason anything is Degraded, and treating it as one hides the real fault.
+/// The causes that account for an Application being unhealthy, most serious
+/// first. Empty when its status names none.
+///
+/// Drift is left out: an OutOfSync resource says the cluster differs from git,
+/// which is not a reason anything is Degraded, and treating it as one hides the
+/// real fault. Suspension is left out for the same reason.
 fn health_causes(app: &DynamicObject, resources: &[ManagedResource]) -> Vec<(Level, String)> {
     let mut out = Vec::new();
-
-    if auto_sync(app) == AutoSync::Suspended {
-        out.push((
-            Level::Warn,
-            "auto-sync suspended, so this Application will not sync itself".into(),
-        ));
-    }
 
     let phase = str_at(&app.data, "/status/operationState/phase");
     if matches!(phase, "Failed" | "Error") {
@@ -817,6 +831,19 @@ fn health_causes(app: &DynamicObject, resources: &[ManagedResource]) -> Vec<(Lev
     out
 }
 
+/// Why the Application will not reconcile on its own. Kept apart from
+/// [`health_causes`] because a suspended sync policy explains why nothing is
+/// being fixed, never why something is broken.
+fn policy_causes(app: &DynamicObject) -> Vec<(Level, String)> {
+    if auto_sync(app) == AutoSync::Suspended {
+        return vec![(
+            Level::Warn,
+            "auto-sync suspended, so this Application will not sync itself".into(),
+        )];
+    }
+    Vec::new()
+}
+
 /// Managed resources the cluster no longer matches.
 fn drift_causes(resources: &[ManagedResource]) -> Vec<(Level, String)> {
     let mut out = Vec::new();
@@ -834,18 +861,23 @@ fn drift_causes(resources: &[ManagedResource]) -> Vec<(Level, String)> {
     out
 }
 
+/// What is stopping this Application from being synced and healthy, most
+/// serious first, or a single line saying nothing is.
 fn sync_summary(
     ev: &Evidence,
     app: &DynamicObject,
     sync: &str,
     health: &str,
 ) -> Vec<(Level, String)> {
-    let mut out = health_causes(app, &ev.resources);
+    let mut out = policy_causes(app);
+    let health_causes = health_causes(app, &ev.resources);
+    let unexplained = health_causes.is_empty();
+    out.extend(health_causes);
 
     // Argo can roll a health up from live cluster state it does not publish per
-    // resource, leaving nothing above to name. Decided before drift is added,
-    // because an OutOfSync resource is not an answer to why anything is broken.
-    if out.is_empty() && matches!(health, "Degraded" | "Missing" | "Progressing") {
+    // resource, leaving nothing above to name. Decided from the health causes
+    // alone: neither drift nor a suspended policy answers why something broke.
+    if unexplained && matches!(health, "Degraded" | "Missing" | "Progressing") {
         let level = if health == "Progressing" {
             Level::Warn
         } else {
@@ -1619,5 +1651,61 @@ mod tests {
         obj.data["status"]["resources"] = json!(many);
         let out = describe(&evidence(obj, Destination::Current));
         assert!(texts(&out).iter().any(|t| t == "… and 3 more"));
+    }
+
+    /// A Job carries its terminal condition after the newer staging one, and
+    /// both are true at once.
+    #[test]
+    fn a_jobs_outcome_is_read_by_condition_type_not_by_order() {
+        let failed = app(json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "backup-1", "namespace": "default"},
+            "status": {"conditions": [
+                {"type": "FailureTarget", "status": "True"},
+                {"type": "Failed", "status": "True"}]}
+        }));
+        assert_eq!(descendant_state(&failed), "Failed");
+
+        let complete = app(json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "backup-2", "namespace": "default"},
+            "status": {"conditions": [
+                {"type": "SuccessCriteriaMet", "status": "True"},
+                {"type": "Complete", "status": "True"}]}
+        }));
+        assert_eq!(descendant_state(&complete), "Complete");
+    }
+
+    /// The controller commits to `FailureTarget` or `SuccessCriteriaMet` before
+    /// it terminates the pods, and that delay can last a while. The search must
+    /// not wait for cleanup to finish before it sees the outcome.
+    #[test]
+    fn a_jobs_interim_condition_is_read_before_the_terminal_one_lands() {
+        let failing = app(json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "backup-3", "namespace": "default"},
+            "status": {"conditions": [{"type": "FailureTarget", "status": "True"}]}
+        }));
+        assert_eq!(descendant_state(&failing), "Failed");
+
+        let succeeding = app(json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "backup-4", "namespace": "default"},
+            "status": {"conditions": [{"type": "SuccessCriteriaMet", "status": "True"},
+                                      {"type": "Complete", "status": "False"}]}
+        }));
+        assert_eq!(descendant_state(&succeeding), "Completing");
+    }
+
+    /// A job with no interim or terminal condition yet has nothing worth
+    /// summarising.
+    #[test]
+    fn a_job_without_a_terminal_condition_has_no_state() {
+        let running = app(json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "backup-5", "namespace": "default"},
+            "status": {"active": 1}
+        }));
+        assert_eq!(descendant_state(&running), "");
     }
 }
