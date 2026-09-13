@@ -14,9 +14,11 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+use k8s_openapi::jiff::Timestamp;
 use kube::core::DynamicObject;
 use serde_json::Value;
 
+use crate::columns::humanize;
 use crate::explain::{Finding, Level, Target};
 
 /// Annotation holding the `spec.syncPolicy.automated` block sofka removed when
@@ -716,7 +718,7 @@ fn primary_condition(app: &DynamicObject) -> Option<(String, String)> {
 // ----- findings -------------------------------------------------------------
 
 /// Render the Application into ranked findings with jump targets.
-pub fn describe(ev: &Evidence) -> Vec<Finding> {
+pub fn describe(ev: &Evidence, now: i64) -> Vec<Finding> {
     let mut out = Vec::new();
 
     let Some(app) = &ev.app else {
@@ -772,7 +774,7 @@ pub fn describe(ev: &Evidence) -> Vec<Finding> {
     out.push(finding(
         0,
         headline_level(sync, health),
-        headline(ev, sync, health),
+        headline(ev, app, sync, health, now),
     ));
 
     // Application block.
@@ -876,19 +878,40 @@ pub fn describe(ev: &Evidence) -> Vec<Finding> {
     out
 }
 
-fn headline(ev: &Evidence, sync: &str, health: &str) -> String {
+fn headline(ev: &Evidence, app: &DynamicObject, sync: &str, health: &str, now: i64) -> String {
     // Opened from a managed object, the useful headline is the relationship,
     // not the Application alone.
     let subject = match &ev.via {
         Some(via) => format!("{via} is managed by {}", ev.subject),
         None => ev.subject.clone(),
     };
-    match (sync, health) {
+    let base = match (sync, health) {
         ("", "") => format!("{subject}: no status yet"),
         (s, "") => format!("{subject}: {s}"),
         ("", h) => format!("{subject}: {h}"),
         (s, h) => format!("{subject}: {s} / {h}"),
+    };
+    // A degraded Application that just broke and one that has sat broken for
+    // a week look identical without this — Argo updates the timestamp on
+    // every health transition, healthy or not, so it always names how long
+    // the *current* state has held.
+    match health_since(app, now) {
+        Some(since) if !health.is_empty() => format!("{base} (since {since})"),
+        _ => base,
     }
+}
+
+/// How long an Application has held its current health, from
+/// `status.health.lastTransitionTime`. `None` when Argo hasn't written the
+/// field (older versions may not), it doesn't parse, or it is somehow ahead
+/// of `now` (clock skew, not a real case worth reporting as negative).
+pub fn health_since(app: &DynamicObject, now: i64) -> Option<String> {
+    let raw = app
+        .data
+        .pointer("/status/health/lastTransitionTime")?
+        .as_str()?;
+    let secs = raw.parse::<Timestamp>().ok()?.as_second();
+    (now >= secs).then(|| humanize(now - secs))
 }
 
 fn headline_level(sync: &str, health: &str) -> Level {
@@ -1099,6 +1122,7 @@ fn short_revision(rev: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::columns::now_secs;
     use serde_json::json;
 
     fn app(value: serde_json::Value) -> DynamicObject {
@@ -1196,7 +1220,7 @@ mod tests {
     #[test]
     fn healthy_application_reports_synced_and_healthy() {
         let ev = evidence(healthy(), Destination::Current);
-        let out = describe(&ev);
+        let out = describe(&ev, now_secs());
         assert_eq!(out[0].text, "Application/guestbook: Synced / Healthy");
         assert_eq!(out[0].level, Level::Good);
         assert!(
@@ -1249,7 +1273,7 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let out = describe(&evidence(obj, Destination::Current));
+        let out = describe(&evidence(obj, Destination::Current), now_secs());
         assert!(
             texts(&out)
                 .iter()
@@ -1262,7 +1286,7 @@ mod tests {
         let mut obj = healthy();
         obj.data["status"]["health"]["status"] = json!("Degraded");
         obj.data["status"]["resources"][0]["health"]["status"] = json!("Degraded");
-        let out = describe(&evidence(obj, Destination::Current));
+        let out = describe(&evidence(obj, Destination::Current), now_secs());
         assert_eq!(out[0].level, Level::Critical);
         assert!(
             texts(&out)
@@ -1278,7 +1302,7 @@ mod tests {
         let mut obj = healthy();
         obj.data["status"]["health"]["status"] = json!("Degraded");
         obj.data["status"]["resources"][0]["health"] = json!(null);
-        let out = describe(&evidence(obj, Destination::Current));
+        let out = describe(&evidence(obj, Destination::Current), now_secs());
         assert!(
             texts(&out)
                 .iter()
@@ -1293,7 +1317,7 @@ mod tests {
         let mut obj = healthy();
         obj.data["status"]["sync"]["status"] = json!("OutOfSync");
         obj.data["status"]["resources"][0]["status"] = json!("OutOfSync");
-        let out = describe(&evidence(obj, Destination::Current));
+        let out = describe(&evidence(obj, Destination::Current), now_secs());
         assert!(
             texts(&out)
                 .iter()
@@ -1308,7 +1332,7 @@ mod tests {
             let mut obj = healthy();
             obj.data["status"]["sync"]["status"] = json!(sync);
             obj.data["status"]["health"]["status"] = json!(health);
-            describe(&evidence(obj, Destination::Current))[0].level
+            describe(&evidence(obj, Destination::Current), now_secs())[0].level
         };
         assert_eq!(at("Synced", "Healthy"), Level::Good);
         assert_eq!(at("Synced", "Progressing"), Level::Info);
@@ -1316,6 +1340,56 @@ mod tests {
         for health in ["Degraded", "Missing", "Unknown"] {
             assert_eq!(at("Synced", health), Level::Critical, "{health}");
         }
+    }
+
+    /// `status.health.lastTransitionTime` is the same field regardless of
+    /// which way health changed, so age reads the same for a recovery as for
+    /// a fresh break.
+    #[test]
+    fn health_since_reads_the_health_transition_timestamp() {
+        let mut obj = healthy();
+        let now = 1_700_000_000;
+        obj.data["status"]["health"]["lastTransitionTime"] = json!("2023-11-14T22:09:20Z");
+        assert_eq!(health_since(&obj, now).as_deref(), Some("4m"));
+    }
+
+    /// Older Argo CD versions may not write the field at all, and a clock
+    /// skewed ahead of ours must not report a negative age.
+    #[test]
+    fn health_since_is_none_without_a_usable_timestamp() {
+        let missing = healthy();
+        assert_eq!(health_since(&missing, 1_700_000_000), None);
+
+        let mut unparseable = healthy();
+        unparseable.data["status"]["health"]["lastTransitionTime"] = json!("not a timestamp");
+        assert_eq!(health_since(&unparseable, 1_700_000_000), None);
+
+        let mut future = healthy();
+        future.data["status"]["health"]["lastTransitionTime"] = json!("2023-11-14T22:09:20Z");
+        assert_eq!(health_since(&future, 1_700_000_000 - 300), None);
+    }
+
+    /// The headline separates something that just broke from something
+    /// that's been sitting broken for a week — the whole point of nr5.
+    #[test]
+    fn the_headline_names_how_long_the_current_health_has_held() {
+        let now = 1_700_000_000;
+        let mut obj = healthy();
+        obj.data["status"]["health"]["status"] = json!("Degraded");
+        obj.data["status"]["health"]["lastTransitionTime"] = json!("2023-11-14T22:09:20Z");
+        let out = describe(&evidence(obj, Destination::Current), now);
+        assert_eq!(
+            out[0].text,
+            "Application/guestbook: Synced / Degraded (since 4m)"
+        );
+    }
+
+    /// No timestamp, no guess: the headline reads exactly as it did before
+    /// this field existed.
+    #[test]
+    fn the_headline_omits_staleness_without_a_timestamp() {
+        let out = describe(&evidence(healthy(), Destination::Current), now_secs());
+        assert_eq!(out[0].text, "Application/guestbook: Synced / Healthy");
     }
 
     /// A failed operation is the immediate cause and outranks the conditions
@@ -1327,7 +1401,7 @@ mod tests {
             json!({"phase": "Failed", "message": "one or more objects failed"});
         obj.data["status"]["conditions"] =
             json!([{"type": "SyncError", "message": "could not apply"}]);
-        let out = describe(&evidence(obj, Destination::Current));
+        let out = describe(&evidence(obj, Destination::Current), now_secs());
         let summary: Vec<&str> = out
             .iter()
             .skip_while(|f| f.text != "Blocking")
@@ -1352,7 +1426,7 @@ mod tests {
             {"type": "SharedResourceWarning", "message": "also owned by other-app"},
             {"type": "ComparisonError", "message": "rpc error: code = Unknown"}
         ]);
-        let out = describe(&evidence(obj, Destination::Current));
+        let out = describe(&evidence(obj, Destination::Current), now_secs());
         let summary = texts(&out);
         assert!(
             summary
@@ -1371,7 +1445,7 @@ mod tests {
         let mut obj = healthy();
         obj.data["status"]["operationState"] =
             json!({"phase": "Failed", "message": "one or more objects failed"});
-        let out = describe(&evidence(obj, Destination::Current));
+        let out = describe(&evidence(obj, Destination::Current), now_secs());
         assert!(
             texts(&out)
                 .iter()
@@ -1384,7 +1458,7 @@ mod tests {
     #[test]
     fn remote_destination_yields_no_jump_targets() {
         let ev = evidence(healthy(), Destination::Context("sandbox-east".into()));
-        let out = describe(&ev);
+        let out = describe(&ev, now_secs());
         assert!(out.iter().all(|f| f.target.is_none()));
         assert!(
             texts(&out)
@@ -1395,7 +1469,7 @@ mod tests {
 
     #[test]
     fn current_destination_yields_a_jump_target() {
-        let out = describe(&evidence(healthy(), Destination::Current));
+        let out = describe(&evidence(healthy(), Destination::Current), now_secs());
         let target = out.iter().find_map(|f| f.target.clone());
         assert_eq!(
             target,
@@ -1413,7 +1487,7 @@ mod tests {
             healthy(),
             Destination::Unresolved("https://10.0.1.5".into()),
         );
-        let out = describe(&ev);
+        let out = describe(&ev, now_secs());
         assert!(
             texts(&out)
                 .iter()
@@ -1430,7 +1504,7 @@ mod tests {
             {"repoURL": "https://example.com/repo", "path": "app", "targetRevision": "v1.2.3"}
         ]);
         assert_eq!(sources(&obj)[0].repo_url, "https://example.com/repo");
-        let out = describe(&evidence(obj, Destination::Current));
+        let out = describe(&evidence(obj, Destination::Current), now_secs());
         let texts = texts(&out);
         assert!(
             texts
@@ -1479,7 +1553,7 @@ mod tests {
         ]);
         obj.data["status"]["sync"] = json!({"status": "Synced", "revision": "abc1234"});
 
-        let texts = texts(&describe(&evidence(obj, Destination::Current)));
+        let texts = texts(&describe(&evidence(obj, Destination::Current), now_secs()));
         assert!(
             texts.iter().any(|t| t == "revision abc1234"),
             "the only revision went missing: {texts:?}"
@@ -1515,7 +1589,7 @@ mod tests {
             "revisions": ["1.2.0", "9f7a301596ed7c2e9fcb4f3067425432c30d014e"]
         });
 
-        let out = describe(&evidence(obj, Destination::Current));
+        let out = describe(&evidence(obj, Destination::Current), now_secs());
         let texts = texts(&out);
         assert!(
             texts.iter().any(|t| t == "harbor.example/charts"),
@@ -1555,7 +1629,7 @@ mod tests {
             destination_namespace: String::new(),
             resources: Vec::new(),
         };
-        let out = describe(&ev);
+        let out = describe(&ev, now_secs());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text, "Application/gone not found");
     }
@@ -1667,7 +1741,7 @@ mod tests {
             destination_namespace: String::new(),
             resources: Vec::new(),
         };
-        let out = describe(&ev);
+        let out = describe(&ev, now_secs());
         assert_eq!(out[0].text, "Deployment/web is not managed by Argo CD");
         assert_eq!(out[0].level, Level::Info);
     }
@@ -1689,7 +1763,7 @@ mod tests {
             destination_namespace: String::new(),
             resources: Vec::new(),
         };
-        let out = describe(&ev);
+        let out = describe(&ev, now_secs());
         assert_eq!(out[0].level, Level::Warn);
         assert_eq!(
             out[0].text,
@@ -1716,7 +1790,7 @@ mod tests {
             destination_namespace: String::new(),
             resources: Vec::new(),
         };
-        let out = describe(&ev);
+        let out = describe(&ev, now_secs());
         assert_eq!(out[0].level, Level::Info);
         assert_eq!(
             out[0].text,
@@ -1777,7 +1851,7 @@ mod tests {
     fn opening_from_a_managed_object_leads_the_headline_with_the_relationship() {
         let mut ev = evidence(healthy(), Destination::Current);
         ev.via = Some("Deployment/guestbook-ui".into());
-        let out = describe(&ev);
+        let out = describe(&ev, now_secs());
         assert_eq!(
             out[0].text,
             "Deployment/guestbook-ui is managed by Application/guestbook: Synced / Healthy"
@@ -1794,7 +1868,7 @@ mod tests {
             })
             .collect();
         obj.data["status"]["resources"] = json!(many);
-        let out = describe(&evidence(obj, Destination::Current));
+        let out = describe(&evidence(obj, Destination::Current), now_secs());
         assert!(texts(&out).iter().any(|t| t == "… and 3 more"));
     }
 

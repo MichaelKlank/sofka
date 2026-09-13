@@ -438,6 +438,11 @@ concurrent drains, and full kubectl drain parity are outside this feature.
   blocking - a suspended sync policy, a `ComparisonError`, a failed sync
   operation, degraded or missing objects, or drift. Each managed resource is a finding you can `⏎` into. Read entirely from
   the Application CRD: no Argo CD API server, no token, no `argocd` binary.
+  The headline names how long the current health has held, from
+  `status.health.lastTransitionTime` - "Degraded (since 4m)" is a different
+  problem from "Degraded (since 7d)", and the same field marks how long a
+  recovery has held too. Missing on older Argo CD versions that don't write
+  it, in which case the headline reads as it always did.
   When health is `Degraded` or `Missing` and nothing in the Application's own
   status accounts for it, sofka looks for the cause in the objects themselves
   and lists what it finds under the blocking line, each row a finding you can
