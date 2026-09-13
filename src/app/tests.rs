@@ -18127,18 +18127,47 @@ async fn context_plugin_runs_without_selection_and_receives_request() {
 #[tokio::test]
 async fn package_report_renders_tables_and_remains_searchable() {
     let (mut app, mut rx) = app_with_pod();
-    let report = r#"{"schema_version":1,"title":"Scan","sections":[{"title":"Findings","columns":["Resource","Severity"],"rows":[["api","high"]]}]}"#;
+    let report = r#"{"schema_version":1,"title":"Scan","sections":[{"title":"Findings","columns":["Resource","Severity"],"rows":[["api","high"],["certificate","low"]]}]}"#;
     let mut plugin = named_plugin("/bin/echo", &[report]);
     plugin.output = Some("report".into());
     app.plugins = vec![plugin];
     plugin_command(&mut app, "example-plugin");
     app.handle_msg(plugin_result(&mut rx).await);
     assert_eq!(app.mode, Mode::Detail);
-    assert!(app.detail.lines.iter().any(|s| s == "api | high"));
+    let table = [
+        "Resource    │ Severity",
+        "────────────┼─────────",
+        "api         │ high",
+        "certificate │ low",
+    ];
+    assert_eq!(
+        app.detail
+            .lines
+            .iter()
+            .skip(3)
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        table
+    );
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    for row in table {
+        assert!(text.contains(row), "missing table row: {row}");
+    }
     app.handle_key(press(KeyCode::Char('/'))).unwrap();
     app.handle_key(press(KeyCode::Char('h'))).unwrap();
     app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.detail.filter, "h");
+    assert_eq!(app.detail.match_lines().len(), 1);
 }
 
 #[tokio::test]

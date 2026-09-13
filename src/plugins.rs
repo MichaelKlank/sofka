@@ -7,6 +7,7 @@ use std::process::Stdio;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use unicode_width::UnicodeWidthStr;
 
 use crate::config::Plugin;
 
@@ -590,29 +591,64 @@ pub fn render_report(bytes: &[u8]) -> Result<Vec<String>, String> {
     if report.schema_version != 1 {
         return Err("unsupported report schema_version (expected 1)".into());
     }
-    let mut lines = vec![clean(&report.title)];
+    let mut lines = Lines::default();
+    lines.push(clean(&report.title));
     for section in report.sections {
+        if section
+            .rows
+            .iter()
+            .any(|row| row.len() != section.columns.len())
+        {
+            return Err("report row length does not match columns".into());
+        }
+        if lines.truncated {
+            continue;
+        }
         lines.push(String::new());
         lines.push(clean(&section.title));
         lines.extend(section.lines.iter().map(|s| clean(s)));
-        if !section.columns.is_empty() {
+        let columns: Vec<String> = section.columns.iter().map(|s| clean(s)).collect();
+        let rows: Vec<Vec<String>> = section
+            .rows
+            .iter()
+            .map(|row| row.iter().map(|s| clean(s)).collect())
+            .collect();
+        let mut widths: Vec<usize> = columns.iter().map(|s| s.width()).collect();
+        for row in &rows {
+            for (width, cell) in widths.iter_mut().zip(row) {
+                *width = (*width).max(cell.width());
+            }
+        }
+        if !columns.is_empty() {
+            lines.push(report_row(&columns, &widths));
             lines.push(
-                section
-                    .columns
+                widths
                     .iter()
-                    .map(|s| clean(s))
+                    .map(|width| "─".repeat(*width))
                     .collect::<Vec<_>>()
-                    .join(" | "),
+                    .join("─┼─"),
             );
         }
-        for row in section.rows {
-            if row.len() != section.columns.len() {
-                return Err("report row length does not match columns".into());
+        for row in rows {
+            if lines.truncated {
+                break;
             }
-            lines.push(row.iter().map(|s| clean(s)).collect::<Vec<_>>().join(" | "));
+            lines.push(report_row(&row, &widths));
         }
     }
-    Ok(bound_lines(lines))
+    Ok(lines.finish())
+}
+
+fn report_row(cells: &[String], widths: &[usize]) -> String {
+    let mut line = String::new();
+    for (index, (cell, width)) in cells.iter().zip(widths).enumerate() {
+        line.push_str(cell);
+        if index + 1 < cells.len() {
+            line.extend(std::iter::repeat_n(' ', width - cell.width()));
+            line.push_str(" │ ");
+        }
+    }
+    line
 }
 
 fn clean(s: &str) -> String {
@@ -1177,6 +1213,67 @@ default = "false"
             package(&format!("{valid}args = ['${{input.missing}}']\n"))
                 .unwrap_err()
                 .contains("invalid input placeholder")
+        );
+    }
+
+    #[test]
+    fn report_aligns_cleaned_unicode_cells_and_sizes_each_section() {
+        let report = serde_json::json!({
+            "schema_version": 1,
+            "title": "Report",
+            "sections": [
+                {"title": "Summary", "lines": ["Plain text stays unchanged."]},
+                {"title": "Rows", "columns": ["Name", "State", "Value"],
+                 "rows": [["界", "ok", "1"], ["e\u{301}", "ready", ""], ["a\tb", "", "3"]]},
+                {"title": "Empty", "columns": ["ID", "Count"]}
+            ]
+        });
+        let lines = render_report(&serde_json::to_vec(&report).unwrap()).unwrap();
+        assert_eq!(
+            lines,
+            [
+                "Report",
+                "",
+                "Summary",
+                "Plain text stays unchanged.",
+                "",
+                "Rows",
+                "Name │ State │ Value",
+                "─────┼───────┼──────",
+                "界   │ ok    │ 1",
+                "e\u{301}    │ ready │ ",
+                "a b  │       │ 3",
+                "",
+                "Empty",
+                "ID │ Count",
+                "───┼──────"
+            ]
+        );
+    }
+
+    #[test]
+    fn report_bounds_expanded_tables_and_validates_after_truncation() {
+        let mut rows = vec![vec!["x".repeat(100_000), "1".into()]];
+        rows.extend(vec![vec!["short".into(), "2".into()]; 200]);
+        let mut report = serde_json::json!({
+            "schema_version": 1, "title": "Report",
+            "sections": [{"title": "Rows", "columns": ["Name", "Count"], "rows": rows}]
+        });
+        let bytes = serde_json::to_vec(&report).unwrap();
+        assert!(bytes.len() < MAX_BYTES);
+        let lines = render_report(&bytes).unwrap();
+        assert!(lines.iter().map(String::len).sum::<usize>() <= MAX_BYTES + 32);
+        assert!(lines.last().unwrap().contains("truncated"));
+        report["sections"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "title": "Invalid", "columns": ["Name"], "rows": [["a", "b"]]
+            }));
+        assert!(
+            render_report(&serde_json::to_vec(&report).unwrap())
+                .unwrap_err()
+                .contains("row length")
         );
     }
 
