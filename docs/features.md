@@ -458,7 +458,13 @@ concurrent drains, and full kubectl drain parity are outside this feature.
   Applications deploying to a **remote cluster** are handled honestly - the
   destination is resolved against your kubeconfig and shown by context name, and
   because those objects do not live in the cluster you are connected to, `⏎`
-  reports where they are instead of searching here. `c` on a managed resource
+  reports where they are instead of searching here. A `destination.server` URL
+  matches the context whose cluster has that server. A `destination.name`
+  matches a context named the same, then a context whose cluster entry is named
+  the same, then one whose cluster entry ends in `/<name>` - so an EKS entry
+  `aws eks update-kubeconfig` named by ARN resolves for an Argo cluster
+  registered as `eks-dev-general`. A short alias and the full name pointing at
+  one cluster both resolve. `c` on a managed resource
   expands what it owns, indented underneath - Deployment to ReplicaSet to Pod,
   CronJob to Job to Pod - read from the children's own `ownerReferences`. Child
   kinds come from the same rules the adjacent view uses, so a `[views."…"]`

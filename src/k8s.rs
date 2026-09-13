@@ -551,6 +551,21 @@ impl Cluster {
             .collect()
     }
 
+    /// Every kubeconfig context as `(context name, cluster entry name)`, in
+    /// file order. Two contexts may point at one cluster (a short alias next to
+    /// the full name); this keeps both, where [`Self::context_servers`] keeps
+    /// whichever came last.
+    pub fn context_clusters() -> Vec<(String, String)> {
+        Kubeconfig::read()
+            .map(|k| {
+                k.contexts
+                    .into_iter()
+                    .filter_map(|c| Some((c.name, c.context?.cluster)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Merge user-defined aliases (alias -> canonical) into the registry.
     pub fn add_aliases(&mut self, aliases: &HashMap<String, String>) {
         for (alias, target) in aliases {

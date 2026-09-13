@@ -519,6 +519,32 @@ pub fn destination_ref(app: &DynamicObject) -> (&str, &str) {
     )
 }
 
+/// The kubeconfig context serving a `spec.destination.name`, from
+/// `(context name, cluster entry name)` pairs in kubeconfig order.
+///
+/// Argo registers a cluster under a free-form name, and a kubeconfig rarely
+/// spells the context the same way. Three tiers, first hit wins: a context
+/// named exactly `name`; a context whose cluster entry is named `name`; a
+/// context whose cluster entry ends in `/name` — the EKS shape, where
+/// `aws eks update-kubeconfig` names the entry by ARN
+/// (`arn:aws:eks:…:cluster/eks-dev-general`) while Argo holds the bare
+/// cluster name. Within a tier the first context in file order wins, so a
+/// short alias and the full name pointing at one cluster both resolve.
+pub fn context_for_name(name: &str, contexts: &[(String, String)]) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    let first = |pred: &dyn Fn(&str, &str) -> bool| {
+        contexts
+            .iter()
+            .find(|(ctx, cluster)| pred(ctx, cluster))
+            .map(|(ctx, _)| ctx.clone())
+    };
+    first(&|ctx, _| ctx == name)
+        .or_else(|| first(&|_, cluster| cluster == name))
+        .or_else(|| first(&|_, cluster| cluster.rsplit('/').next() == Some(name)))
+}
+
 /// `spec.destination.namespace`.
 pub fn destination_namespace(app: &DynamicObject) -> &str {
     str_at(&app.data, "/spec/destination/namespace")
@@ -1451,6 +1477,45 @@ mod tests {
                 .iter()
                 .any(|t| t == "last sync Failed — one or more objects failed")
         );
+    }
+
+    /// A destination name matches a context by its own name, by its cluster
+    /// entry, or by the last `/` segment of that entry (the EKS ARN shape).
+    #[test]
+    fn destination_name_resolves_by_context_cluster_or_arn_tail() {
+        let arn = |c: &str| format!("arn:aws:eks:us-east-1:1:cluster/{c}");
+        let contexts = vec![
+            ("dev".to_string(), arn("eks-dev-general")),
+            ("eks-dev-general".to_string(), arn("eks-dev-general")),
+            ("eks-prod-general".to_string(), arn("eks-prod-general")),
+            ("prod".to_string(), arn("eks-prod-general")),
+            ("staging".to_string(), "staging-cluster".to_string()),
+        ];
+        let resolve = |n: &str| context_for_name(n, &contexts);
+
+        // An exact context name wins over an alias sharing the cluster,
+        // whichever of the two the kubeconfig lists first.
+        assert_eq!(
+            resolve("eks-dev-general").as_deref(),
+            Some("eks-dev-general")
+        );
+        assert_eq!(
+            resolve("eks-prod-general").as_deref(),
+            Some("eks-prod-general")
+        );
+        assert_eq!(resolve("prod").as_deref(), Some("prod"));
+        // The cluster entry name.
+        assert_eq!(resolve("staging-cluster").as_deref(), Some("staging"));
+        // The ARN tail, when only an alias serves the cluster.
+        let alias_only = vec![("prod".to_string(), arn("eks-prod-general"))];
+        assert_eq!(
+            context_for_name("eks-prod-general", &alias_only).as_deref(),
+            Some("prod")
+        );
+        // Not a suffix match: `general` is not the tail of the ARN.
+        assert_eq!(resolve("general"), None);
+        assert_eq!(resolve("nowhere"), None);
+        assert_eq!(resolve(""), None);
     }
 
     /// The whole point of [`Destination`]: a managed resource in another

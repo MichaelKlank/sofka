@@ -24119,7 +24119,7 @@ async fn argocd_view_will_not_expand_a_remote_destination() {
 fn argocd_destination_classification() {
     use crate::argocd::Destination;
     let none = |_: &str| None;
-    let no_contexts = |_: &str| false;
+    let no_contexts = |_: &str| None;
     let here = "https://rancher.example/k8s/clusters/c-abc";
 
     let classify = |server: &str, name: &str| {
@@ -24171,8 +24171,18 @@ fn argocd_destination_classification() {
     // A context named `in-cluster` wins over the convention, so a remote
     // cluster registered under that name cannot pass as the local one.
     assert_eq!(
-        super::argocd::classify_destination("", "in-cluster", here, none, |n| n == "in-cluster"),
+        super::argocd::classify_destination("", "in-cluster", here, none, |n| {
+            (n == "in-cluster").then(|| n.to_string())
+        }),
         Destination::Context("in-cluster".into())
+    );
+    // A registered name resolves to whatever context the kubeconfig lookup
+    // names for it — the alias, not the Argo spelling.
+    assert_eq!(
+        super::argocd::classify_destination("", "eks-prod-general", here, none, |_| {
+            Some("prod".to_string())
+        }),
+        Destination::Context("prod".into())
     );
 }
 
