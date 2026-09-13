@@ -290,10 +290,22 @@ port-forward go through the kube API (or a backgrounded process) directly.
 | Command                            | Action                                                       |
 | ---------------------------------- | ------------------------------------------------------------ |
 | `:<plugin> [name=value ...]`       | Run a plugin with validated inputs.                          |
+| `:plugin-activity`                 | Reopen the active plugin panel or retained report.           |
 | `:plugin-cancel`                   | Stop the active plugin run and its temporary forward.        |
 | `:sanitize [states=…] [dry_run=…]` | Delete the pods the namespace has finished with (pods view). |
 
 `:sanitize` ships with sofka; see [Sanitize pods](../plugins/sanitize/README.md).
+Popup/report runs open a floating activity panel immediately. In that panel:
+
+- `Ctrl+Alt+T` toggles the popup without cancelling or restarting the job.
+- `Esc` hides without cancelling; `:plugin-activity` reopens it.
+- After completion, `Ctrl+Alt+T` restores diagnostics; `Enter` opens the report.
+- Rebind the toggle with `[keys.global].plugin_activity`.
+- `Ctrl+C` cancels the focused run, not sofka. Outside the panel it still quits.
+- `↑`/`↓` or `k`/`j`, `PgUp`/`PgDn` scroll; `Home`/`g` goes to the start;
+  `End`/`G` resumes following. `←`/`→` or `h`/`l` scroll horizontally.
+- `:` hides the panel and opens the command palette.
+
 Installed packages add their commands and key chords to `?` help.
 Use `:reload` after a package change.
 See [Create a plugin package](plugin-authoring.md).

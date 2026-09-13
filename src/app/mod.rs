@@ -651,9 +651,14 @@ enum PaletteAction {
     Notify,
     Reload,
     ConfigInfo,
+    PluginActivity,
 }
 
 const PALETTE_COMMANDS: &[PaletteCommand] = &[
+    PaletteCommand {
+        action: PaletteAction::PluginActivity,
+        names: &["plugin-activity"],
+    },
     PaletteCommand {
         action: PaletteAction::Ctx,
         names: &["ctx", "context", "contexts"],
@@ -1950,6 +1955,7 @@ pub struct App {
     pub user_aliases: HashMap<String, String>,
     /// User-defined shell-out plugins.
     pub plugins: Vec<crate::config::Plugin>,
+    pub(crate) plugin_activity: Option<plugins::PluginActivity>,
     pub(super) plugin_task: Option<crate::plugins::Task>,
     pub(super) plugin_run: u64,
     pub(super) plugin_claim: Option<StatusClaim>,
@@ -2386,6 +2392,7 @@ impl App {
             all_contexts: Vec::new(),
             user_aliases: HashMap::new(),
             plugins: Vec::new(),
+            plugin_activity: None,
             plugin_task: None,
             plugin_run: 0,
             plugin_claim: None,

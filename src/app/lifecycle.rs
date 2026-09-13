@@ -1405,19 +1405,47 @@ impl App {
                 lines,
                 warn,
             } if generation == self.generation && run == self.plugin_run => {
-                self.stop_resource_refresh();
-                self.clear_document_source();
                 self.plugin_task = None;
                 self.plugin_claim = None;
-                self.detail = Scrollable {
-                    title,
-                    lines: lines.into(),
-                    ..Default::default()
+                let mut lines = lines;
+                let visible = self.plugin_activity.as_ref().is_none_or(|a| a.visible);
+                if let Some(activity) = &mut self.plugin_activity {
+                    activity.finished = Some(activity.started.elapsed());
+                    activity.refresh();
+                    if warn.is_some() && !activity.view.lines.is_empty() {
+                        let mut diagnostics = vec!["[stderr — bounded activity tail]".into()];
+                        if activity.dropped > 0 {
+                            diagnostics.push("… earlier diagnostics discarded".into());
+                        }
+                        diagnostics.extend(activity.view.lines.iter().cloned());
+                        diagnostics.push(String::new());
+                        diagnostics.extend(lines);
+                        lines = crate::plugins::bound_lines(diagnostics);
+                    }
+                    activity.result = Some((title.clone(), lines.clone()));
+                    activity.visible = false;
+                }
+                if visible {
+                    self.stop_resource_refresh();
+                    self.clear_document_source();
+                    self.detail = Scrollable::doc(title, lines);
+                    self.mode = Mode::Detail;
+                }
+                let suffix = if visible {
+                    ""
+                } else {
+                    " — :plugin-activity to open"
                 };
-                self.mode = Mode::Detail;
-                match warn {
-                    Some(w) => self.set_claimed_status(claim, w, true),
-                    None => self.set_claimed_status(claim, "plugin done", false),
+                let failed = warn.is_some();
+                let message = format!("{}{suffix}", warn.as_deref().unwrap_or("plugin done"));
+                self.set_claimed_status(claim, message.clone(), failed);
+                if !visible {
+                    if let Some(owner) = &mut self.status_claim
+                        && owner.claim == claim
+                    {
+                        owner.pending = false;
+                    }
+                    self.borrow_status(message, failed);
                 }
             }
             Msg::PluginBulkDone {

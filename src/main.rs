@@ -1055,6 +1055,8 @@ async fn run(
 ) -> Result<()> {
     let mut reader = crossterm::event::EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut activity_frame = tokio::time::interval(Duration::from_millis(100));
+    activity_frame.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Watch messages mark the frame dirty and the redraw waits for this
     // interval, so a rollout storm costs at most ~60 renders a second instead
     // of one per message. Key events still redraw immediately for input
@@ -1137,6 +1139,9 @@ async fn run(
                     ring_notification(&text, &app.notify_cfg);
                 }
                 take_suspend(terminal, app, captured);
+                dirty = true;
+            }
+            _ = activity_frame.tick(), if app.plugin_activity_visible() => {
                 dirty = true;
             }
             _ = frame.tick(), if dirty || app.scrollbar_activity.is_some() => {

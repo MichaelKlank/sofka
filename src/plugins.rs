@@ -11,6 +11,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::config::Plugin;
 
+pub mod activity;
+
 pub const MAX_BYTES: usize = 1 << 20;
 pub const MAX_LINES: usize = 5_000;
 
@@ -753,16 +755,29 @@ impl Drop for Process {
     }
 }
 
-async fn read_limited(mut stream: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+async fn read_limited(
+    mut stream: impl AsyncRead + Unpin,
+    activity: Option<(activity::Activity, String)>,
+) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    (&mut stream)
-        .take((MAX_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .await?;
-    if bytes.len() > MAX_BYTES {
-        return Err(std::io::Error::other("plugin output exceeds 1 MiB"));
+    let mut chunk = [0u8; 4096];
+    let mut sanitizer = activity::Sanitizer::default();
+    loop {
+        let n = stream.read(&mut chunk).await?;
+        if let Some((activity, label)) = &activity {
+            let text = sanitizer.feed(&chunk[..n], n == 0);
+            if !text.is_empty() {
+                activity.append(&clean(label), &text);
+            }
+        }
+        if n == 0 {
+            return Ok(bytes);
+        }
+        if bytes.len() + n > MAX_BYTES {
+            return Err(std::io::Error::other("plugin output exceeds 1 MiB"));
+        }
+        bytes.extend_from_slice(&chunk[..n]);
     }
-    Ok(bytes)
 }
 
 async fn forward(spec: &Forward) -> std::io::Result<(u16, Option<(Process, Task)>)> {
@@ -821,7 +836,14 @@ impl std::io::Write for RequestBuffer {
     }
 }
 
-pub async fn execute(mut job: Job) -> std::io::Result<std::process::Output> {
+pub async fn execute(job: Job) -> std::io::Result<std::process::Output> {
+    execute_with_activity(job, None).await
+}
+
+pub async fn execute_with_activity(
+    mut job: Job,
+    activity: Option<(activity::Activity, String)>,
+) -> std::io::Result<std::process::Output> {
     let mut forward_owner = None;
     if let Some(spec) = &job.forward {
         let (port, owner) = forward(spec).await?;
@@ -878,8 +900,8 @@ pub async fn execute(mut job: Job) -> std::io::Result<std::process::Output> {
     };
     let (_, stdout, stderr, status) = tokio::try_join!(
         write,
-        read_limited(stdout),
-        read_limited(stderr),
+        read_limited(stdout, None),
+        read_limited(stderr, activity),
         process.child.wait()
     )?;
     drop(forward_owner);
@@ -1309,6 +1331,65 @@ default = "false"
             .await
             .unwrap_err();
         assert!(error.to_string().contains("exceeds 1 MiB"));
+    }
+
+    #[tokio::test]
+    async fn activity_drains_both_pipes_without_ui_consumption_and_preserves_exact_caps() {
+        let (activity, receiver) = activity::Activity::new();
+        let command = job(
+            "/bin/sh",
+            &[
+                "-c",
+                r"head -c 1048576 /dev/zero & head -c 1048576 /dev/zero | tr '\000' x >&2; wait",
+            ],
+        );
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            execute_with_activity(command, Some((activity, String::new()))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), MAX_BYTES);
+        assert_eq!(output.stderr.len(), MAX_BYTES);
+        let snapshot = receiver.borrow().clone();
+        assert_eq!(snapshot.lines.len(), 1);
+        assert_eq!(snapshot.lines[0].len(), 2048);
+        assert!(snapshot.lines.iter().map(String::len).sum::<usize>() <= 64 * 1024);
+        for redirection in ["", ">&2"] {
+            let script = format!("head -c 1048577 /dev/zero {redirection}");
+            let error = execute(job("/bin/sh", &["-c", &script])).await.unwrap_err();
+            assert!(error.to_string().contains("exceeds 1 MiB"));
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_streams_before_adapter_exit_without_altering_stdout() {
+        let (activity, mut receiver) = activity::Activity::new();
+        let command = job(
+            "/bin/sh",
+            &["-c", "printf 'phase one\\n' >&2; sleep 0.2; printf report"],
+        );
+        let task = tokio::spawn(execute_with_activity(
+            command,
+            Some((activity, String::new())),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(3), receiver.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            receiver
+                .borrow()
+                .lines
+                .iter()
+                .any(|line| line == "phase one")
+        );
+        assert!(!task.is_finished());
+        let output = task.await.unwrap().unwrap();
+        assert_eq!(output.stdout, b"report");
+        assert_eq!(output.stderr, b"phase one\n");
     }
 
     #[tokio::test]

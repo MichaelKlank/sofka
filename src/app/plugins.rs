@@ -1,5 +1,31 @@
 use super::*;
 
+pub(crate) struct PluginActivity {
+    pub visible: bool,
+    pub started: std::time::Instant,
+    pub finished: Option<Duration>,
+    pub receiver: tokio::sync::watch::Receiver<Arc<crate::plugins::activity::Snapshot>>,
+    pub view: Scrollable,
+    pub follow: bool,
+    pub dropped: usize,
+    pub result: Option<(String, Vec<String>)>,
+}
+
+impl PluginActivity {
+    pub fn refresh(&mut self) {
+        let snapshot = self.receiver.borrow_and_update().clone();
+        self.view.scroll = self
+            .view
+            .scroll
+            .saturating_sub(snapshot.dropped.saturating_sub(self.dropped));
+        self.dropped = snapshot.dropped;
+        self.view.replace_lines(snapshot.lines.clone());
+        if self.follow {
+            self.view.scroll_to_bottom();
+        }
+    }
+}
+
 impl App {
     /// Run a config-defined plugin bound to `c` if it applies to the current
     /// kind. Blocked in read-only mode: plugins shell out to arbitrary
@@ -303,10 +329,12 @@ impl App {
                 self.pending = Some(Suspend::Shell(argv));
             }
             PluginMode::Popup | PluginMode::Report => {
-                // Mirror describe: stay put, swap to the doc view when output
-                // lands, so a view switch mid-run cleanly drops the result.
                 self.set_return_mode();
-                let claim = self.claim_status(plugin_flash(&name, n, ""));
+                let toggle = self.keymap.label(self.key_scope(), Action::PluginActivity);
+                let claim = self.claim_status(format!(
+                    "{} · {toggle} activity",
+                    plugin_flash(&name, n, "")
+                ));
                 self.spawn_plugin(jobs, format!("{name} — output"), mode, timeout, claim);
             }
             PluginMode::Background => {
@@ -334,14 +362,47 @@ impl App {
         self.stop_plugins();
         let run = self.plugin_run;
         self.plugin_claim = Some(claim);
+        let activity = if matches!(mode, PluginMode::Popup | PluginMode::Report) {
+            let (activity, receiver) = crate::plugins::activity::Activity::new();
+            self.plugin_activity = Some(PluginActivity {
+                visible: true,
+                started: std::time::Instant::now(),
+                finished: None,
+                receiver,
+                view: Scrollable::doc(title.clone(), Vec::new()),
+                follow: true,
+                dropped: 0,
+                result: None,
+            });
+            Some(activity)
+        } else {
+            None
+        };
         self.plugin_task = Some(crate::plugins::Task(tokio::spawn(async move {
             let dur = Duration::from_secs(timeout);
             // Bounded concurrency, results in the marked order.
             let total = jobs.len();
-            let mut results = futures_util::stream::iter(jobs.into_iter().map(|job| async move {
-                let label = job.label.clone();
-                let out = tokio::time::timeout(dur, crate::plugins::execute(job)).await;
-                (label, out)
+            let mut results = futures_util::stream::iter(jobs.into_iter().map(|job| {
+                let activity = activity.clone();
+                async move {
+                    let label = job.label.clone();
+                    let progress = activity.map(|activity| {
+                        (
+                            activity,
+                            if total > 1 {
+                                label.clone()
+                            } else {
+                                String::new()
+                            },
+                        )
+                    });
+                    let out = tokio::time::timeout(
+                        dur,
+                        crate::plugins::execute_with_activity(job, progress),
+                    )
+                    .await;
+                    (label, out)
+                }
             }))
             .buffered(8);
             let mut lines = crate::plugins::Lines::default();
@@ -381,8 +442,104 @@ impl App {
         })));
     }
 
+    pub(super) fn toggle_plugin_activity(&mut self) {
+        if let Some(activity) = &mut self.plugin_activity {
+            activity.visible = !activity.visible;
+        } else {
+            self.flash_warn("no plugin activity");
+        }
+    }
+
+    pub(super) fn open_plugin_activity(&mut self) {
+        if let Some(activity) = &mut self.plugin_activity {
+            if let Some((title, lines)) = &activity.result {
+                let result = Scrollable::doc(title.clone(), lines.clone());
+                activity.visible = false;
+                self.stop_resource_refresh();
+                self.clear_document_source();
+                self.detail = result;
+                self.mode = Mode::Detail;
+                // Opening the retained document is not navigation cancellation.
+                self.plugin_run = self.plugin_run.wrapping_add(1);
+            } else {
+                activity.visible = true;
+            }
+        } else {
+            self.flash_warn("no plugin activity");
+        }
+    }
+
+    pub(super) fn key_plugin_activity(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Enter
+            && self
+                .plugin_activity
+                .as_ref()
+                .is_some_and(|a| a.result.is_some())
+        {
+            self.open_plugin_activity();
+            return;
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+            self.plugin_task = None;
+            self.plugin_run = self.plugin_run.wrapping_add(1);
+            if let Some(claim) = self.plugin_claim.take() {
+                self.set_claimed_status(claim, "plugin cancelled", true);
+            }
+            if let Some(activity) = &mut self.plugin_activity {
+                activity.finished = Some(activity.started.elapsed());
+                activity.view.title = "Plugin cancelled — diagnostics".into();
+            }
+            return;
+        }
+        let Some(activity) = &mut self.plugin_activity else {
+            return;
+        };
+        activity.refresh();
+        match key.code {
+            KeyCode::Esc => activity.visible = false,
+            KeyCode::Up | KeyCode::Char('k') => {
+                activity.follow = false;
+                activity.view.scroll_by(-1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                activity.follow = false;
+                activity.view.scroll_by(1);
+            }
+            KeyCode::PageUp => {
+                activity.follow = false;
+                activity.view.scroll_by(-10);
+            }
+            KeyCode::PageDown => {
+                activity.follow = false;
+                activity.view.scroll_by(10);
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                activity.follow = false;
+                activity.view.scroll = 0;
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                activity.follow = true;
+                activity.view.scroll_to_bottom();
+            }
+            KeyCode::Left | KeyCode::Char('h') => activity.view.scroll_h(-4),
+            KeyCode::Right | KeyCode::Char('l') => activity.view.scroll_h(4),
+            KeyCode::Char(':') => {
+                activity.visible = false;
+                self.open_palette();
+            }
+            _ => {}
+        }
+    }
+
+    pub fn plugin_activity_visible(&self) -> bool {
+        self.plugin_activity
+            .as_ref()
+            .is_some_and(|activity| activity.visible)
+    }
+
     pub(super) fn stop_plugins(&mut self) {
         self.plugin_task = None;
+        self.plugin_activity = None;
         if let Some(claim) = self.plugin_claim.take() {
             self.clear_claimed_status(claim);
         }
@@ -426,7 +583,7 @@ fn bounded_lines(bytes: &[u8]) -> Vec<String> {
 
 /// First non-empty line of stderr, for a compact failure summary.
 fn stderr_summary(stderr: &[u8]) -> String {
-    String::from_utf8_lossy(stderr)
+    crate::plugins::activity::plain_text(stderr)
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())

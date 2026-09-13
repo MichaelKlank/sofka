@@ -807,6 +807,14 @@ pod is rejected; browse through a pod that already mounts the claim instead.
   A package can contain several commands with separate scopes, inputs, and safety settings.
 - **Validated inputs** supply named arguments with types, defaults, choices, and limits.
 - **JSON reports** show text sections and tables in a searchable document.
+- **Live plugin activity** floats over popup/report runs with a spinner, elapsed
+  time, and a bounded, scrollable plain-text stderr tail. `Esc` hides without
+  cancelling, `Ctrl+Alt+T` toggles the panel, and focused `Ctrl+C` cancels the process
+  group. The toggle is configurable with `[keys.global].plugin_activity`.
+  `:plugin-activity` opens the current run or report; `Enter` in a completed panel
+  opens its report. `↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End` scroll; `G` follows the tail.
+  Visible completion opens the report; hidden completion notifies without moving
+  focus and retains the report for reopening. Background runs stay unobtrusive.
 - **Shared execution** limits output and concurrency.
   It cancels processes on timeout, navigation, or `:plugin-cancel`.
 - **Safety controls** apply read-only mode, confirmation, and guardrails to plugins.

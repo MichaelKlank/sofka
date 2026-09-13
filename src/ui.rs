@@ -112,6 +112,94 @@ pub fn resize<B: ratatui::backend::Backend>(
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    draw_base(frame, app);
+    draw_plugin_activity(frame, app);
+}
+
+fn draw_plugin_activity(frame: &mut Frame, app: &mut App) {
+    let toggle = app
+        .keymap
+        .label(app.key_scope(), Action::PluginActivity)
+        .to_string();
+    let Some(activity) = &mut app.plugin_activity else {
+        return;
+    };
+    if !activity.visible {
+        return;
+    }
+    activity.refresh();
+    let viewport = frame.area();
+    let area = centered_rect_exact(
+        viewport.width.saturating_sub(4).min(100),
+        viewport.height.saturating_sub(4).min(18),
+        viewport,
+    );
+    let elapsed = activity
+        .finished
+        .unwrap_or_else(|| activity.started.elapsed());
+    let spinner = if activity.finished.is_some() {
+        "■"
+    } else {
+        ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+            [(elapsed.as_millis() / 100 % 10) as usize]
+    };
+    let dropped = if activity.dropped > 0 {
+        " · older tail discarded"
+    } else {
+        ""
+    };
+    let title = format!(
+        " {spinner} {} · {:.1}s{dropped} ",
+        activity.view.title,
+        elapsed.as_secs_f64()
+    );
+    let action = if activity.result.is_some() {
+        "Enter report"
+    } else {
+        "Ctrl+C cancel"
+    };
+    let hint = format!(" {toggle} toggle · Esc hide · {action} · ↑↓ scroll · G follow ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::title())
+        .title(title)
+        .title_bottom(hint);
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    activity
+        .view
+        .set_viewport(inner.width as usize, inner.height as usize);
+    if activity.follow {
+        activity.view.scroll_to_bottom();
+    }
+    if activity.view.lines.is_empty() {
+        frame.render_widget(
+            Paragraph::new(if activity.finished.is_some() {
+                "(no diagnostics)"
+            } else {
+                "Waiting for plugin diagnostics…"
+            })
+            .style(theme::dim()),
+            inner,
+        );
+    } else {
+        let lines: Vec<Line> = activity
+            .view
+            .lines
+            .iter()
+            .skip(activity.view.scroll)
+            .take(inner.height as usize)
+            .map(|s| Line::raw(s.as_str()))
+            .collect();
+        frame.render_widget(
+            Paragraph::new(lines).scroll((0, activity.view.hscroll.min(u16::MAX as usize) as u16)),
+            inner,
+        );
+    }
+}
+
+fn draw_base(frame: &mut Frame, app: &mut App) {
     let show_scrollbars = app.scrollbars_visible();
     // Fill the whole frame with the skin's background first (when enabled), so
     // every view that only sets foreground colors sits on it. Widgets that set
@@ -2735,6 +2823,14 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
     lines.push(bind(
         ":plugin-cancel",
         "cancel the active plugin and its temporary forward",
+    ));
+    lines.push(bind(
+        ":plugin-activity",
+        "reopen plugin activity or its completed report",
+    ));
+    lines.push(bind(
+        "Esc / Ctrl+C (activity)",
+        "hide without cancelling / cancel the focused plugin",
     ));
     // Config-defined plugins, with their (possibly modified) key chords.
     if !app.plugins.is_empty() {

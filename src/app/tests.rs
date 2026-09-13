@@ -18213,6 +18213,7 @@ async fn cancelling_and_replacing_plugins_rejects_stale_results() {
     let first = app.plugin_run;
     plugin_command(&mut app, "example-plugin");
     assert!(app.plugin_run > first);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
     app.handle_key(press(KeyCode::Char('y'))).unwrap();
     assert_eq!(app.mode, Mode::Detail);
     assert!(app.plugin_task.is_none(), "opening YAML cancels work");
@@ -18229,6 +18230,7 @@ async fn context_switch_and_quit_cancel_plugin_tasks() {
     assert!(app.plugin_task.is_none());
     app.plugins[0].target = Some("context".into());
     plugin_command(&mut app, "example-plugin");
+    app.handle_key(press(KeyCode::Esc)).unwrap();
     app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
     assert!(app.should_quit);
     assert!(app.plugin_task.is_none());
@@ -31354,4 +31356,441 @@ async fn drain_review_retries_http_408_for_eviction_and_deletion() {
         );
         assert_eq!(removals[0]["body"], removals[1]["body"]);
     }
+}
+
+async fn wait_plugin_diagnostic(app: &App, needle: &str) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let snapshot = app
+                .plugin_activity
+                .as_ref()
+                .unwrap()
+                .receiver
+                .borrow()
+                .clone();
+            if snapshot.lines.iter().any(|line| line.contains(needle)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("plugin did not stream diagnostics before exit");
+}
+
+#[tokio::test]
+async fn plugin_activity_opens_immediately_and_hides_reopens_and_scrolls_without_cancelling() {
+    let (mut app, _rx) = app_with_pod();
+    let mut plugin = named_plugin(
+        "/bin/sh",
+        &[
+            "-c",
+            "i=0; while [ $i -lt 100 ]; do echo phase-$i >&2; i=$((i+1)); done; sleep 20",
+        ],
+    );
+    plugin.output = Some("popup".into());
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    assert!(app.plugin_activity_visible());
+    assert_eq!(app.mode, Mode::Table);
+    assert!(!app.wants_mouse_capture());
+    let run = app.plugin_run;
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".chars().any(|spinner| text.contains(spinner)));
+    assert!(text.contains("Example — output · "));
+    assert!(text.contains("Waiting for plugin diagnostics"));
+    wait_plugin_diagnostic(&app, "phase-99").await;
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let end = app.plugin_activity.as_ref().unwrap().view.scroll;
+    assert!(end > 0);
+    app.handle_key(press(KeyCode::Up)).unwrap();
+    assert_eq!(app.plugin_activity.as_ref().unwrap().view.scroll, end - 1);
+    assert!(!app.plugin_activity.as_ref().unwrap().follow);
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    assert_eq!(app.plugin_activity.as_ref().unwrap().view.scroll, 0);
+    app.handle_key(press(KeyCode::PageDown)).unwrap();
+    assert_eq!(app.plugin_activity.as_ref().unwrap().view.scroll, 10);
+    app.handle_key(press(KeyCode::End)).unwrap();
+    assert!(app.plugin_activity.as_ref().unwrap().follow);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert!(!app.plugin_activity_visible());
+    assert!(app.plugin_task.is_some());
+    assert_eq!(app.plugin_run, run);
+    plugin_command(&mut app, "plugin-activity");
+    assert!(app.plugin_activity_visible());
+    assert_eq!(app.plugin_run, run);
+    app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
+    assert!(!app.should_quit);
+    assert!(app.plugin_task.is_none());
+    assert!(app.plugin_activity.as_ref().unwrap().finished.is_some());
+}
+
+#[tokio::test]
+async fn plugin_activity_hidden_completion_preserves_palette_and_reopens_report() {
+    let (mut app, mut rx) = app_with_pod();
+    let mut plugin = named_plugin(
+        "/bin/echo",
+        &[r#"{"schema_version":1,"title":"Finished","sections":[]}"#],
+    );
+    plugin.output = Some("report".into());
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    app.handle_key(press(KeyCode::Char('p'))).unwrap();
+    app.flash = "another notification".into();
+    app.handle_msg(plugin_result(&mut rx).await);
+    assert_eq!(app.mode, Mode::Command);
+    assert_eq!(app.command, "p");
+    assert!(app.flash.contains(":plugin-activity"));
+    assert!(app.status_claim.as_ref().is_none_or(|owner| !owner.pending));
+    assert!(app.detail.lines.is_empty());
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    plugin_command(&mut app, "plugin-activity");
+    assert_eq!(app.mode, Mode::Detail);
+    assert_eq!(app.detail.lines.front().unwrap(), "Finished");
+    assert!(!app.plugin_activity_visible());
+    assert!(app.plugin_activity.as_ref().unwrap().result.is_some());
+    plugin_command(&mut app, "plugin-activity");
+    assert_eq!(app.detail.lines.front().unwrap(), "Finished");
+}
+
+#[tokio::test]
+async fn plugin_activity_keeps_sanitized_failure_timeout_and_invalid_report_diagnostics() {
+    for (script, timeout, expected) in [
+        (
+            "printf '\\033[31mfirst\\033[0m\rsecond\n' >&2; exit 4",
+            "5s",
+            "second",
+        ),
+        (
+            "printf 'before timeout\n' >&2; sleep 20",
+            "1s",
+            "before timeout",
+        ),
+        (
+            "printf 'parser clue\n' >&2; printf 'invalid json'",
+            "5s",
+            "parser clue",
+        ),
+        (
+            "printf 'before limit\n' >&2; sleep 0.05; head -c 1100000 /dev/zero",
+            "5s",
+            "before limit",
+        ),
+        (
+            "printf 'stderr limit\n' >&2; head -c 1100000 /dev/zero >&2",
+            "5s",
+            "stderr limit",
+        ),
+    ] {
+        let (mut app, mut rx) = app_with_pod();
+        let mut plugin = named_plugin("/bin/sh", &["-c", script]);
+        plugin.output = Some("report".into());
+        plugin.timeout = Some(timeout.into());
+        app.plugins = vec![plugin];
+        plugin_command(&mut app, "example-plugin");
+        app.handle_msg(plugin_result(&mut rx).await);
+        assert_eq!(app.mode, Mode::Detail);
+        assert!(app.flash_err);
+        let text = app
+            .detail
+            .lines
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains(expected), "{text}");
+        assert!(!text.contains('\u{1b}'));
+        assert!(!text.contains('\r'));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn plugin_activity_ctrl_c_kills_descendants_and_rejects_stale_completion_and_diagnostics() {
+    let dir = std::env::temp_dir().join(format!("sofka-activity-cancel-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let marker = dir.join("orphan");
+    let (mut app, _rx) = app_with_pod();
+    let mut plugin = named_plugin(
+        "/bin/sh",
+        &[
+            "-c",
+            "(sleep 1; printf orphan > \"$1\") & printf 'ready\n' >&2; wait",
+            "adapter",
+            marker.to_str().unwrap(),
+        ],
+    );
+    plugin.output = Some("popup".into());
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    wait_plugin_diagnostic(&app, "ready").await;
+    let run = app.plugin_run;
+    let claim = current_claim(&app);
+    let old_receiver = app.plugin_activity.as_ref().unwrap().receiver.clone();
+    app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
+    assert!(!app.should_quit);
+    assert!(app.plugin_task.is_none());
+    app.handle_msg(Msg::PluginOutput {
+        run,
+        generation: app.generation,
+        claim,
+        title: "stale".into(),
+        lines: vec!["stale".into()],
+        warn: None,
+    });
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.detail.lines.is_empty());
+    assert!(app.plugin_activity_visible());
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.plugins[0].command = "/bin/sleep".into();
+    app.plugins[0].args = vec!["20".into()];
+    plugin_command(&mut app, "example-plugin");
+    assert!(
+        old_receiver
+            .borrow()
+            .lines
+            .iter()
+            .any(|line| line == "ready")
+    );
+    assert!(
+        app.plugin_activity
+            .as_ref()
+            .unwrap()
+            .receiver
+            .borrow()
+            .lines
+            .is_empty()
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(!marker.exists(), "a descendant survived Ctrl+C");
+    app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn plugin_activity_background_remains_unobtrusive_and_empty_reopen_is_a_notice() {
+    let (mut app, mut rx) = app_with_pod();
+    plugin_command(&mut app, "plugin-activity");
+    assert!(app.flash.contains("no plugin activity"));
+    let mut plugin = named_plugin("/bin/sh", &["-c", "echo diagnostic >&2; echo done"]);
+    plugin.output = Some("background".into());
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    assert!(!app.plugin_activity_visible());
+    assert!(app.plugin_activity.is_none());
+    app.handle_msg(plugin_result(&mut rx).await);
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash.contains("1 ok"));
+}
+
+#[tokio::test]
+async fn plugin_activity_bulk_streams_later_targets_before_ordered_completion() {
+    let (mut app, mut rx) = app_with_two_marked_pods();
+    let mut plugin = named_plugin(
+        "/bin/sh",
+        &[
+            "-c",
+            "if [ \"$1\" = a ]; then sleep 0.3; echo first; else echo later-target >&2; echo second; fi",
+            "adapter",
+            "$NAME",
+        ],
+    );
+    plugin.output = Some("popup".into());
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    wait_plugin_diagnostic(&app, "later-target").await;
+    let snapshot = app
+        .plugin_activity
+        .as_ref()
+        .unwrap()
+        .receiver
+        .borrow()
+        .clone();
+    assert!(snapshot.lines.iter().any(|line| line.contains("[b]")));
+    app.handle_msg(plugin_result(&mut rx).await);
+    assert_eq!(app.mode, Mode::Detail);
+    assert_eq!(
+        app.detail
+            .lines
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["== a ==", "first", "== b ==", "second"]
+    );
+}
+
+#[tokio::test]
+async fn plugin_activity_hidden_failure_records_error_and_silent_cancel_stays_readable() {
+    let (mut app, mut rx) = app_with_pod();
+    let mut plugin = named_plugin("/bin/sh", &["-c", "echo failure-clue >&2; exit 1"]);
+    plugin.output = Some("popup".into());
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_msg(plugin_result(&mut rx).await);
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash_err);
+    assert!(
+        app.last_action_error
+            .as_ref()
+            .unwrap()
+            .contains("1 of 1 failed")
+    );
+    plugin_command(&mut app, "plugin-activity");
+    assert!(
+        app.detail
+            .lines
+            .iter()
+            .any(|line| line.contains("failure-clue"))
+    );
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.plugins[0].args = vec!["-c".into(), "sleep 20".into()];
+    plugin_command(&mut app, "example-plugin");
+    app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("cancelled"));
+    assert!(text.contains("(no diagnostics)"));
+    for (width, height) in [(1, 1), (20, 5), (40, 10)] {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn plugin_activity_toggle_preserves_running_job_and_typed_input_and_can_be_rebound() {
+    for binding in ["ctrl-alt-t", "ctrl-alt-y"] {
+        let (mut app, _rx) = app_with_pod();
+        let config: crate::config::Config =
+            toml::from_str(&format!("[keys.global]\nplugin_activity = '{binding}'\n")).unwrap();
+        app.keymap = Keymap::compile(&config.keys).unwrap();
+        let toggle = KeyEvent::new(
+            KeyCode::Char(if binding.ends_with('t') { 't' } else { 'y' }),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        let mut plugin = named_plugin("/bin/sleep", &["20"]);
+        plugin.output = Some("popup".into());
+        app.plugins = vec![plugin];
+        plugin_command(&mut app, "example-plugin");
+        let run = app.plugin_run;
+        assert!(app.plugin_activity_visible());
+        assert!(app.flash.contains(binding));
+        app.handle_key(toggle).unwrap();
+        assert!(!app.plugin_activity_visible());
+        assert!(app.plugin_task.is_some());
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        app.handle_key(press(KeyCode::Char('p'))).unwrap();
+        app.handle_key(toggle).unwrap();
+        assert!(app.plugin_activity_visible());
+        assert_eq!(app.mode, Mode::Command);
+        assert_eq!(app.command, "p");
+        app.handle_key(toggle).unwrap();
+        assert!(!app.plugin_activity_visible());
+        assert_eq!(app.mode, Mode::Command);
+        assert_eq!(app.command, "p");
+        assert_eq!(app.plugin_run, run);
+        assert!(app.plugin_task.is_some());
+        app.handle_key(toggle).unwrap();
+        app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
+        assert!(app.plugin_task.is_none());
+        assert!(!app.should_quit);
+    }
+}
+
+#[tokio::test]
+async fn plugin_activity_toggle_restores_completed_diagnostics_and_enter_opens_report() {
+    let (mut app, mut rx) = app_with_pod();
+    let toggle = KeyEvent::new(
+        KeyCode::Char('t'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    app.handle_key(toggle).unwrap();
+    assert!(app.flash.contains("no plugin activity"));
+    let mut plugin = named_plugin("/bin/echo", &["done"]);
+    plugin.output = Some("popup".into());
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    app.handle_key(toggle).unwrap();
+    app.handle_msg(plugin_result(&mut rx).await);
+    assert_eq!(app.mode, Mode::Table);
+    app.handle_key(toggle).unwrap();
+    assert!(app.plugin_activity_visible());
+    assert!(app.plugin_activity.as_ref().unwrap().finished.is_some());
+    app.handle_key(toggle).unwrap();
+    assert!(!app.plugin_activity_visible());
+    app.handle_key(toggle).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Detail);
+    assert_eq!(app.detail.lines.front().unwrap(), "done");
+    assert!(!app.plugin_activity_visible());
+}
+
+#[tokio::test]
+async fn plugin_activity_trivy_redraws_stay_on_one_line_in_a_compact_centered_panel() {
+    let (mut app, _rx) = app_with_pod();
+    let script = format!(
+        "printf 'Starting scan\\nINFO scanning\\n2 / 81 [{}] 2.47%%\\r\\033[2K3 / 81 [{}] 3.70%%\\r\\033[2K8 / 81 [{}] 9.88%%'; sleep 20",
+        "-".repeat(6000), "-".repeat(3000), "=".repeat(3000),
+    ).replace("; sleep 20", " >&2; sleep 20");
+    let mut plugin = named_plugin("/bin/sh", &["-c", &script]);
+    plugin.output = Some("popup".into());
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    wait_plugin_diagnostic(&app, "8 / 81").await;
+    let snapshot = app
+        .plugin_activity
+        .as_ref()
+        .unwrap()
+        .receiver
+        .borrow()
+        .clone();
+    assert_eq!(snapshot.lines.len(), 3);
+    assert_eq!(snapshot.lines[0], "Starting scan");
+    assert_eq!(snapshot.lines[1], "INFO scanning");
+    assert!(snapshot.lines[2].starts_with("8 / 81 ["));
+    assert_eq!(snapshot.lines[2].len(), 2048);
+    for (width, height) in [(300u16, 80u16), (120, 40), (80, 24), (40, 10)] {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let panel_w = width.saturating_sub(4).min(100);
+        let panel_h = height.saturating_sub(4).min(18);
+        let (x, y) = ((width - panel_w) / 2, (height - panel_h) / 2);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(x, y)].symbol(), "┌");
+        assert_eq!(buffer[(x + panel_w - 1, y + panel_h - 1)].symbol(), "┘");
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert_eq!(text.matches("8 / 81").count(), 1);
+        assert!(!text.contains("2 / 81"));
+        assert!(!text.contains("3 / 81"));
+    }
+    app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
 }
