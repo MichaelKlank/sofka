@@ -2006,7 +2006,9 @@ pub(crate) fn wrapped_height(raw: &str, width: usize) -> usize {
 /// breaking spans mid-way as needed. A wide glyph that doesn't fit in the
 /// remaining columns moves whole to the next row. Counterpart of
 /// [`wrapped_height`] — keep the fill rules identical.
-fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+fn wrap_line<'a>(line: Line<'a>, width: usize) -> Vec<Line<'a>> {
+    let line_style = line.style;
+    let alignment = line.alignment;
     let width = width.max(1);
     let mut out: Vec<Line> = Vec::new();
     let mut cur: Vec<Span> = Vec::new();
@@ -2020,7 +2022,11 @@ fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
                 if !buf.is_empty() {
                     cur.push(Span::styled(std::mem::take(&mut buf), style));
                 }
-                out.push(Line::from(std::mem::take(&mut cur)));
+                out.push(Line {
+                    style: line_style,
+                    alignment,
+                    ..Line::from(std::mem::take(&mut cur))
+                });
                 col = 0;
             }
             buf.push(c);
@@ -2030,7 +2036,11 @@ fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
             cur.push(Span::styled(buf, style));
         }
     }
-    out.push(Line::from(cur)); // final row; an empty line still takes one row
+    out.push(Line {
+        style: line_style,
+        alignment,
+        ..Line::from(cur)
+    }); // An empty line still takes one row.
     out
 }
 
@@ -2759,6 +2769,7 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
         "PgUp/PgDn (node drain)",
         "scroll options, confirmation, or progress",
     ));
+    lines.push(bind("PgUp/PgDn (confirm/input)", "scroll popup text"));
     // Saved bookmarks: their chord (if any) and where they jump.
     if !app.bookmarks.is_empty() {
         lines.push(Line::from(""));
@@ -3001,7 +3012,7 @@ fn draw_namespaces(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|label| label.width())
         .max()
         .unwrap_or(0);
-    let items: Vec<ListItem> = names
+    let items: Vec<Text> = names
         .iter()
         .map(|n| {
             let mut spans = Vec::new();
@@ -3045,7 +3056,7 @@ fn draw_namespaces(frame: &mut Frame, app: &mut App, area: Rect) {
                 (false, false) => "",
             };
             spans.push(Span::styled(label, theme::dim()));
-            ListItem::new(Line::from(spans))
+            Text::from(Line::from(spans))
         })
         .collect();
     // Show the type-to-filter buffer in the title so it reads like an input.
@@ -3068,7 +3079,7 @@ fn draw_namespaces(frame: &mut Frame, app: &mut App, area: Rect) {
 fn draw_contexts(frame: &mut Frame, app: &mut App, area: Rect) {
     let show_scrollbars = app.scrollbars_visible();
     let current = app.cluster.context.clone();
-    let items: Vec<ListItem> = app
+    let items: Vec<Text> = app
         .filtered_contexts()
         .iter()
         .map(|c| {
@@ -3079,7 +3090,7 @@ fn draw_contexts(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 "  "
             };
-            ListItem::new(Line::from(vec![
+            Text::from(Line::from(vec![
                 Span::styled(fleet, Style::default().fg(theme::mark())),
                 Span::styled(
                     format!("{marker}{c}"),
@@ -3123,19 +3134,19 @@ fn draw_sort_picker(frame: &mut Frame, app: &mut App, area: Rect) {
             .cloned()
             .map(|h| (h, app.sort_desc))
     });
-    let items: Vec<ListItem> = app
+    let items: Vec<Text> = app
         .filtered_sort_entries()
         .iter()
         .map(|e| {
             if e == DEFAULT_SORT_LABEL {
-                return ListItem::new(Span::styled(e.clone(), Style::default().fg(theme::teal())));
+                return Text::from(Span::styled(e.clone(), Style::default().fg(theme::teal())));
             }
             match &active {
-                Some((h, desc)) if h == e => ListItem::new(Span::styled(
+                Some((h, desc)) if h == e => Text::from(Span::styled(
                     format!("{e}{}", if *desc { " ↓" } else { " ↑" }),
                     Style::default().fg(theme::sorter()),
                 )),
-                _ => ListItem::new(Span::styled(e.clone(), Style::default().fg(theme::text()))),
+                _ => Text::from(Span::styled(e.clone(), Style::default().fg(theme::text()))),
             }
         })
         .collect();
@@ -3167,10 +3178,10 @@ fn draw_copy_picker(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|(h, _)| h.chars().count())
         .max()
         .unwrap_or(0);
-    let items: Vec<ListItem> = entries
+    let items: Vec<Text> = entries
         .iter()
         .map(|(h, v)| {
-            ListItem::new(Line::from(vec![
+            Text::from(Line::from(vec![
                 Span::styled(format!("{h:<pad$}  "), Style::default().fg(theme::teal())),
                 Span::styled(v.clone(), Style::default().fg(theme::text())),
             ]))
@@ -3204,7 +3215,7 @@ fn draw_flux_menu(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         format!("{count} marked {}", app.kind_plural)
     };
-    let items: Vec<ListItem> = app
+    let items: Vec<Text> = app
         .action_menu_items()
         .iter()
         .map(|label| {
@@ -3213,7 +3224,7 @@ fn draw_flux_menu(frame: &mut Frame, app: &mut App, area: Rect) {
                 "Resume" | "Trigger now" | "Sync now" => theme::green(),
                 _ => theme::overlay1(),
             };
-            ListItem::new(Span::styled(*label, Style::default().fg(color)))
+            Text::from(Span::styled(*label, Style::default().fg(color)))
         })
         .collect();
     let subject = if app.cronjob_kind() {
@@ -3243,7 +3254,7 @@ fn draw_port_forward_picker(frame: &mut Frame, app: &mut App, area: Rect) {
         .as_ref()
         .map(|(_, name)| name.clone())
         .unwrap_or_default();
-    let items: Vec<ListItem> = app
+    let items: Vec<Text> = app
         .pf_picker_items
         .iter()
         .map(|label| {
@@ -3252,7 +3263,7 @@ fn draw_port_forward_picker(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 theme::green()
             };
-            ListItem::new(Span::styled(label.as_str(), Style::default().fg(color)))
+            Text::from(Span::styled(label.as_str(), Style::default().fg(color)))
         })
         .collect();
     render_popup_list(
@@ -3275,7 +3286,7 @@ fn draw_transfer_menu(frame: &mut Frame, app: &mut App, area: Rect) {
         Some((_, pod, None)) => pod.clone(),
         None => String::new(),
     };
-    let items: Vec<ListItem> = TRANSFER_MENU_ITEMS
+    let items: Vec<Text> = TRANSFER_MENU_ITEMS
         .iter()
         .map(|label| {
             let color = match *label {
@@ -3283,7 +3294,7 @@ fn draw_transfer_menu(frame: &mut Frame, app: &mut App, area: Rect) {
                 "Upload to pod" => theme::peach(),
                 _ => theme::overlay1(),
             };
-            ListItem::new(Span::styled(*label, Style::default().fg(color)))
+            Text::from(Span::styled(*label, Style::default().fg(color)))
         })
         .collect();
     render_popup_list(
@@ -3475,11 +3486,11 @@ fn draw_adjacent(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_skins(frame: &mut Frame, app: &mut App, area: Rect) {
     let show_scrollbars = app.scrollbars_visible();
-    let items: Vec<ListItem> = app
+    let items: Vec<Text> = app
         .skin_list
         .iter()
         .map(|name| {
-            ListItem::new(Span::styled(
+            Text::from(Span::styled(
                 name.clone(),
                 Style::default().fg(theme::text()),
             ))
@@ -3498,11 +3509,11 @@ fn draw_skins(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_snapshots(frame: &mut Frame, app: &mut App, area: Rect) {
     let show_scrollbars = app.scrollbars_visible();
-    let items: Vec<ListItem> = app
+    let items: Vec<Text> = app
         .snapshot_list
         .iter()
         .map(|(_, label)| {
-            ListItem::new(Span::styled(
+            Text::from(Span::styled(
                 label.clone(),
                 Style::default().fg(theme::text()),
             ))
@@ -3918,52 +3929,19 @@ fn draw_container_trends(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn draw_prompt_popup(frame: &mut Frame, app: &App, area: Rect) {
-    let popup = centered_rect_with_min(60, 34, 44, 8, area);
-    clear_region(frame, popup);
-    let lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("  {}", app.prompt_label),
-            Style::default().fg(theme::text()),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  ▸ ", Style::default().fg(theme::peach())),
-            Span::styled(app.prompt_input.clone(), Style::default().fg(theme::text())),
-            Span::styled("█", Style::default().fg(theme::peach())),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            key_hint(
-                app,
-                "prompt",
-                &[(Action::Accept, "apply"), (Action::Back, "cancel")],
-            ),
-            theme::dim(),
-        )),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme::peach()))
-                .title(Span::styled(" Input ", Style::default().fg(theme::peach()))),
-        ),
-        popup,
-    );
+fn draw_prompt_popup(frame: &mut Frame, app: &mut App, _area: Rect) {
+    draw_text_popup(frame, app, true);
 }
 
 fn draw_set_image(frame: &mut Frame, app: &mut App, area: Rect) {
     let show_scrollbars = app.scrollbars_visible();
-    let items: Vec<ListItem> = app
+    let items: Vec<Text> = app
         .container_list
         .iter()
         .enumerate()
         .map(|(i, c)| {
             let img = app.image_values.get(i).map(String::as_str).unwrap_or("");
-            ListItem::new(Line::from(vec![
+            Text::from(Line::from(vec![
                 Span::styled(format!("{c}  "), Style::default().fg(theme::text())),
                 Span::styled("→ ", theme::dim()),
                 Span::styled(img.to_string(), Style::default().fg(theme::peach())),
@@ -4121,41 +4099,115 @@ fn draw_drain(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Paragraph::new(footer_lines), parts[1]);
 }
 
-fn draw_confirm(frame: &mut Frame, app: &App, area: Rect) {
-    let popup = centered_rect_with_min(50, 20, 56, 7, area);
-    clear_region(frame, popup);
-    let lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("  {}", app.confirm_label),
-            Style::default().fg(theme::text()),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
+fn draw_confirm(frame: &mut Frame, app: &mut App, _area: Rect) {
+    draw_text_popup(frame, app, false);
+}
+
+fn draw_text_popup(frame: &mut Frame, app: &mut App, input: bool) {
+    let screen = frame.area();
+    let bounds = centered_rect_with_min(90, 70, 0, 0, screen);
+    let initial = if input {
+        centered_rect_with_min(60, 34, 44, 8, bounds)
+    } else {
+        centered_rect_with_min(50, 20, 56, 7, bounds)
+    };
+    let color = if input { theme::peach() } else { theme::red() };
+    let (label, scope, title, hint) = if input {
+        (
+            &app.prompt_label,
+            "prompt",
+            " Input ",
+            key_hint(
+                app,
+                "prompt",
+                &[(Action::Accept, "apply"), (Action::Back, "cancel")],
+            ),
+        )
+    } else {
+        (
+            &app.confirm_label,
+            "confirm",
+            " Confirm ",
             confirm_action_hint(app, app.confirm_allows_force_toggle()),
-            Style::default().fg(theme::yellow()),
-        )),
-    ];
+        )
+    };
+    let mut content = Text::from(label.clone()).lines;
+    if input {
+        content.push(Line::from(""));
+        content.push(Line::from(vec![
+            Span::styled("▸ ", Style::default().fg(theme::peach())),
+            Span::raw(app.prompt_input.clone()),
+            Span::styled("█", Style::default().fg(theme::peach())),
+        ]));
+    }
+    let width = usize::from(initial.width.saturating_sub(2));
+    let content: Vec<_> = content
+        .into_iter()
+        .flat_map(|line| wrap_line(line, width))
+        .collect();
+    let mut footer = wrap_line(
+        Line::styled(hint, Style::default().fg(theme::yellow())),
+        width,
+    );
+    if content.len() + footer.len() + 2 > usize::from(bounds.height) {
+        footer.extend(wrap_line(
+            Line::styled(
+                key_hint(
+                    app,
+                    scope,
+                    &[(Action::PageUp, "up"), (Action::PageDown, "down")],
+                ),
+                theme::dim(),
+            ),
+            width,
+        ));
+    }
+    let height = (content.len() + footer.len() + 2).min(usize::from(u16::MAX)) as u16;
+    let popup = centered_rect_exact(initial.width, initial.height.max(height), bounds);
+    clear_region(frame, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(color))
+        .title(Span::styled(title, Style::default().fg(color)));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let footer_height = footer
+        .len()
+        .min(usize::from(inner.height.saturating_sub(1))) as u16;
+    let [body, controls] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(footer_height)]).areas(inner);
+    app.popup_viewport = usize::from(body.height);
+    app.popup_max_scroll = content.len().saturating_sub(app.popup_viewport);
+    app.popup_scroll = app.popup_scroll.min(app.popup_max_scroll);
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme::red()))
-                .title(Span::styled(" Confirm ", Style::default().fg(theme::red()))),
-        ),
+        Paragraph::new(
+            content
+                .into_iter()
+                .skip(app.popup_scroll)
+                .take(app.popup_viewport)
+                .collect::<Vec<_>>(),
+        )
+        .style(Style::default().fg(theme::text())),
+        body,
+    );
+    frame.render_widget(Paragraph::new(footer), controls);
+    draw_border_scrollbar(
+        frame,
+        app.scrollbars_visible(),
         popup,
+        app.popup_scroll,
+        app.popup_max_scroll,
+        app.popup_viewport,
+        false,
     );
 }
 
-/// Command-palette suggestion list, anchored bottom-left over the table.
 fn draw_palette(frame: &mut Frame, app: &mut App, area: Rect) {
     let show_scrollbars = app.scrollbars_visible();
     if app.cmd_suggestions.is_empty() {
         return;
     }
-    let shown = app.cmd_suggestions.len().min(12) as u16;
-    let h = shown + 2;
     let keys = key_hint(
         app,
         "command",
@@ -4179,6 +4231,49 @@ fn draw_palette(frame: &mut Frame, app: &mut App, area: Rect) {
     .into_iter()
     .find(|title| title.width() <= title_width)
     .unwrap_or_else(|| clip_to_width(" commands ", title_width));
+    let items: Vec<Text> = app
+        .cmd_suggestions
+        .iter()
+        .map(|s| match s.kind {
+            // Commands stand out (peach `:name` + a tag) so they read as actions
+            // rather than resource kinds.
+            SuggestKind::Command => Text::from(Line::from(vec![
+                Span::styled(format!(":{}", s.label), Style::default().fg(theme::peach())),
+                Span::styled("  cmd", theme::dim()),
+            ])),
+            SuggestKind::Resource => Text::from(Span::styled(
+                s.label.clone(),
+                Style::default().fg(theme::text()),
+            )),
+            // Argument completions echo the header colors (namespace green,
+            // context mauve) with a tag, so they read as an argument choice.
+            SuggestKind::Namespace => Text::from(Line::from(vec![
+                Span::styled(s.label.clone(), Style::default().fg(theme::green())),
+                Span::styled("  ns", theme::dim()),
+            ])),
+            SuggestKind::Context => Text::from(Line::from(vec![
+                Span::styled(s.label.clone(), Style::default().fg(theme::mauve())),
+                Span::styled("  ctx", theme::dim()),
+            ])),
+            // Saved bookmarks read as a distinct, high-value jump (a ★ tag).
+            SuggestKind::Bookmark => Text::from(Line::from(vec![
+                Span::styled(
+                    format!("★ {}", s.label),
+                    Style::default().fg(theme::yellow()),
+                ),
+                Span::styled("  bookmark", theme::dim()),
+            ])),
+            SuggestKind::Workspace => Text::from(Line::from(vec![
+                Span::styled(format!("▦ {}", s.label), Style::default().fg(theme::sky())),
+                Span::styled("  workspace", theme::dim()),
+            ])),
+        })
+        .collect();
+    let items = wrap_popup_items(&items, w);
+    let shown: usize = items.iter().take(12).map(ListItem::height).sum();
+    let h = shown
+        .saturating_add(2)
+        .min(usize::from(area.height.saturating_sub(1))) as u16;
     let rect = Rect {
         x: area.x + 1,
         y: area.y + area.height.saturating_sub(h + 1),
@@ -4186,44 +4281,6 @@ fn draw_palette(frame: &mut Frame, app: &mut App, area: Rect) {
         height: h,
     };
     clear_region(frame, rect);
-    let items: Vec<ListItem> = app
-        .cmd_suggestions
-        .iter()
-        .map(|s| match s.kind {
-            // Commands stand out (peach `:name` + a tag) so they read as actions
-            // rather than resource kinds.
-            SuggestKind::Command => ListItem::new(Line::from(vec![
-                Span::styled(format!(":{}", s.label), Style::default().fg(theme::peach())),
-                Span::styled("  cmd", theme::dim()),
-            ])),
-            SuggestKind::Resource => ListItem::new(Span::styled(
-                s.label.clone(),
-                Style::default().fg(theme::text()),
-            )),
-            // Argument completions echo the header colors (namespace green,
-            // context mauve) with a tag, so they read as an argument choice.
-            SuggestKind::Namespace => ListItem::new(Line::from(vec![
-                Span::styled(s.label.clone(), Style::default().fg(theme::green())),
-                Span::styled("  ns", theme::dim()),
-            ])),
-            SuggestKind::Context => ListItem::new(Line::from(vec![
-                Span::styled(s.label.clone(), Style::default().fg(theme::mauve())),
-                Span::styled("  ctx", theme::dim()),
-            ])),
-            // Saved bookmarks read as a distinct, high-value jump (a ★ tag).
-            SuggestKind::Bookmark => ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("★ {}", s.label),
-                    Style::default().fg(theme::yellow()),
-                ),
-                Span::styled("  bookmark", theme::dim()),
-            ])),
-            SuggestKind::Workspace => ListItem::new(Line::from(vec![
-                Span::styled(format!("▦ {}", s.label), Style::default().fg(theme::sky())),
-                Span::styled("  workspace", theme::dim()),
-            ])),
-        })
-        .collect();
     let mut state = ListState::default();
     state.select(Some(app.cmd_sel));
     render_framed_list(
@@ -5211,20 +5268,110 @@ fn clear_region(frame: &mut Frame, area: Rect) {
     }
 }
 
+fn wrap_popup_items<'a>(items: &[Text<'a>], width: u16) -> Vec<ListItem<'a>> {
+    let width = usize::from(width.saturating_sub(4));
+    items
+        .iter()
+        .map(|item| {
+            let lines: Vec<_> = item
+                .lines
+                .iter()
+                .cloned()
+                .flat_map(|line| wrap_line(line, width))
+                .collect();
+            ListItem::new(lines).style(item.style)
+        })
+        .collect()
+}
+
 fn render_popup_list<'a, T>(
     frame: &mut Frame,
     show_scrollbars: bool,
     area: Rect,
     percent: (u16, u16),
-    items: Vec<ListItem<'a>>,
+    items: Vec<Text<'a>>,
     title: T,
     state: &mut ListState,
 ) where
     T: Into<Line<'a>>,
 {
-    let popup = centered_rect_with_min(percent.0, percent.1, 32, 8, area);
+    let area = centered_rect_with_min(90, 80, 0, 0, area);
+    let initial = centered_rect_with_min(percent.0, percent.1, 32, 8, area);
+    let title = title.into();
+    let title_overflows = title.width() > usize::from(initial.width.saturating_sub(2));
+    let title_rows = |width: u16| {
+        if title_overflows {
+            wrap_line(title.clone(), usize::from(width.saturating_sub(2)))
+        } else {
+            Vec::new()
+        }
+    };
+    let mut popup = initial;
+    let mut wrapped;
+    loop {
+        wrapped = wrap_popup_items(&items, popup.width);
+        let heading_height = title_rows(popup.width).len();
+        let tallest = wrapped.iter().map(ListItem::height).max().unwrap_or(0);
+        let needed = tallest.saturating_add(heading_height).saturating_add(2);
+        if needed > usize::from(area.height) && popup.width < area.width {
+            popup.width = area.width;
+            continue;
+        }
+        let total = wrapped
+            .iter()
+            .map(ListItem::height)
+            .sum::<usize>()
+            .saturating_add(heading_height)
+            .saturating_add(2);
+        popup = centered_rect_exact(
+            popup.width,
+            initial
+                .height
+                .max(total.min(usize::from(area.height)) as u16),
+            area,
+        );
+        break;
+    }
     clear_region(frame, popup);
-    render_framed_list(frame, show_scrollbars, popup, items, title, state);
+    if title_overflows {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(theme::border_focused());
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        let heading = title_rows(popup.width);
+        let height = heading.len().min(usize::from(inner.height)) as u16;
+        frame.render_widget(Paragraph::new(heading), Rect { height, ..inner });
+        // Keep one item per selection, including items with multiple rows.
+        let list_area = Rect {
+            y: inner.y + height,
+            height: inner.height.saturating_sub(height),
+            ..inner
+        };
+        let heights: Vec<_> = wrapped.iter().map(ListItem::height).collect();
+        let list = List::new(wrapped)
+            .highlight_style(theme::selected_row())
+            .highlight_symbol("▌ ")
+            .highlight_spacing(HighlightSpacing::Always);
+        frame.render_stateful_widget(list, list_area, state);
+        let visible = usize::from(list_area.height);
+        draw_border_scrollbar(
+            frame,
+            show_scrollbars,
+            Rect {
+                y: popup.y + height,
+                height: popup.height.saturating_sub(height),
+                ..popup
+            },
+            heights.iter().take(state.offset()).sum(),
+            heights.iter().sum::<usize>().saturating_sub(visible),
+            visible,
+            false,
+        );
+    } else {
+        render_framed_list(frame, show_scrollbars, popup, wrapped, title, state);
+    }
 }
 
 fn render_framed_list<'a, T>(
