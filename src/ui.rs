@@ -5341,7 +5341,9 @@ fn render_popup_list<'a, T>(
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
         let heading = title_rows(popup.width);
-        let height = heading.len().min(usize::from(inner.height)) as u16;
+        let height = heading
+            .len()
+            .min(usize::from(inner.height.saturating_sub(1))) as u16;
         frame.render_widget(Paragraph::new(heading), Rect { height, ..inner });
         // Keep one item per selection, including items with multiple rows.
         let list_area = Rect {

@@ -203,3 +203,37 @@ async fn input_popup_follows_the_cursor_after_scrolling() {
     popup_text(&mut app, 120, 40, "Input");
     assert_eq!(app.popup_scroll, 0);
 }
+
+#[tokio::test]
+async fn long_picker_title_keeps_selected_choices_visible() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let name = format!("{}pod", "long-pod-name.".repeat(17));
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": name, "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "example",
+                "ports": [{"containerPort": 8080}, {"containerPort": 9090}]}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('f'))).unwrap();
+    assert_eq!(app.mode, Mode::PortForwardPicker);
+    for (width, height) in [(40, 24), (60, 18), (40, 24)] {
+        let text = popup_text(&mut app, width, height, "Port-forward");
+        assert!(text.contains("8080"), "{width}x{height}: {text}");
+        app.handle_key(press(KeyCode::Down)).unwrap();
+        let text = popup_text(&mut app, width, height, "Port-forward");
+        assert!(text.contains("9090"), "{width}x{height}: {text}");
+        app.handle_key(press(KeyCode::Down)).unwrap();
+        let text = popup_text(&mut app, width, height, "Port-forward");
+        assert!(text.contains("Custom"), "{width}x{height}: {text}");
+        app.handle_key(press(KeyCode::Up)).unwrap();
+        app.handle_key(press(KeyCode::Up)).unwrap();
+    }
+    assert!(app.port_forwards.is_empty());
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+}
