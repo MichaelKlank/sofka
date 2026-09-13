@@ -776,8 +776,6 @@ fn source_detail(source: &Value) -> String {
     parts.join(" · ")
 }
 
-/// What is stopping this Application from being synced and healthy, most
-/// serious first, or a single line saying nothing is.
 /// Whether the Application is unhealthy and nothing in its own status says why.
 ///
 /// True is the case worth searching the cluster for: with
@@ -788,20 +786,14 @@ pub fn health_unexplained(app: &DynamicObject, resources: &[ManagedResource]) ->
     matches!(health_status(app), "Degraded" | "Missing") && health_causes(app, resources).is_empty()
 }
 
-/// What the Application's own status says is wrong, most serious first. Empty
-/// when it says nothing.
-/// The causes that account for an Application being unhealthy. Drift is left
-/// out: an OutOfSync resource says the cluster differs from git, which is not a
-/// reason anything is Degraded, and treating it as one hides the real fault.
+/// The causes that account for an Application being unhealthy, most serious
+/// first. Empty when its status names none.
+///
+/// Drift is left out: an OutOfSync resource says the cluster differs from git,
+/// which is not a reason anything is Degraded, and treating it as one hides the
+/// real fault. Suspension is left out for the same reason.
 fn health_causes(app: &DynamicObject, resources: &[ManagedResource]) -> Vec<(Level, String)> {
     let mut out = Vec::new();
-
-    if auto_sync(app) == AutoSync::Suspended {
-        out.push((
-            Level::Warn,
-            "auto-sync suspended, so this Application will not sync itself".into(),
-        ));
-    }
 
     let phase = str_at(&app.data, "/status/operationState/phase");
     if matches!(phase, "Failed" | "Error") {
@@ -839,6 +831,19 @@ fn health_causes(app: &DynamicObject, resources: &[ManagedResource]) -> Vec<(Lev
     out
 }
 
+/// Why the Application will not reconcile on its own. Kept apart from
+/// [`health_causes`] because a suspended sync policy explains why nothing is
+/// being fixed, never why something is broken.
+fn policy_causes(app: &DynamicObject) -> Vec<(Level, String)> {
+    if auto_sync(app) == AutoSync::Suspended {
+        return vec![(
+            Level::Warn,
+            "auto-sync suspended, so this Application will not sync itself".into(),
+        )];
+    }
+    Vec::new()
+}
+
 /// Managed resources the cluster no longer matches.
 fn drift_causes(resources: &[ManagedResource]) -> Vec<(Level, String)> {
     let mut out = Vec::new();
@@ -856,18 +861,23 @@ fn drift_causes(resources: &[ManagedResource]) -> Vec<(Level, String)> {
     out
 }
 
+/// What is stopping this Application from being synced and healthy, most
+/// serious first, or a single line saying nothing is.
 fn sync_summary(
     ev: &Evidence,
     app: &DynamicObject,
     sync: &str,
     health: &str,
 ) -> Vec<(Level, String)> {
-    let mut out = health_causes(app, &ev.resources);
+    let mut out = policy_causes(app);
+    let health_causes = health_causes(app, &ev.resources);
+    let unexplained = health_causes.is_empty();
+    out.extend(health_causes);
 
     // Argo can roll a health up from live cluster state it does not publish per
-    // resource, leaving nothing above to name. Decided before drift is added,
-    // because an OutOfSync resource is not an answer to why anything is broken.
-    if out.is_empty() && matches!(health, "Degraded" | "Missing" | "Progressing") {
+    // resource, leaving nothing above to name. Decided from the health causes
+    // alone: neither drift nor a suspended policy answers why something broke.
+    if unexplained && matches!(health, "Degraded" | "Missing" | "Progressing") {
         let level = if health == "Progressing" {
             Level::Warn
         } else {
