@@ -7,6 +7,7 @@ use tokio::sync::mpsc::{self, Receiver};
 
 mod flux;
 mod label_filter;
+mod popup_wrapping;
 mod proxy;
 mod scale;
 mod server_table;

@@ -823,3 +823,8 @@ READY compares ready replicas with the desired count from the specification.
 An active rollout with some ready replicas shows `Progressing` even when
 `Available=False`. A workload with no ready replicas shows `Unavailable`. A
 failed rollout shows `Stalled`.
+
+### Popup text
+
+Popups wrap long text within the terminal margins. Confirmation and input popups
+use `PgUp` and `PgDn` to scroll text that does not fit. Action keys stay visible.

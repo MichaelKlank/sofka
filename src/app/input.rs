@@ -37,6 +37,7 @@ impl App {
         };
         let run = self.plugin_run;
         let input_mode = self.mode;
+        let prompt_len = self.prompt_input.len();
         let scroll_action = matches!(
             key.action,
             Some(
@@ -56,9 +57,14 @@ impl App {
         );
         let result = self.handle_key_inner(key);
         if self.mode != input_mode {
+            self.popup_scroll = 0;
+            self.popup_max_scroll = 0;
             self.scrollbar_activity = None;
         } else if scroll_action {
             self.scrollbar_activity = Some(std::time::Instant::now());
+        }
+        if self.mode == Mode::Prompt && self.prompt_input.len() != prompt_len {
+            self.popup_scroll = usize::MAX;
         }
         self.check_resource_refresh();
         self.sync_container_history();
@@ -133,6 +139,23 @@ impl App {
                 self.drain.scroll.saturating_sub(5)
             };
             return Ok(());
+        }
+        if matches!(self.mode, Mode::Confirm | Mode::Prompt) && !self.drain_confirmation() {
+            let page = self.popup_viewport.max(1);
+            match key.action {
+                Some(Action::PageDown) => {
+                    self.popup_scroll = self
+                        .popup_scroll
+                        .saturating_add(page)
+                        .min(self.popup_max_scroll);
+                    return Ok(());
+                }
+                Some(Action::PageUp) => {
+                    self.popup_scroll = self.popup_scroll.saturating_sub(page);
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
         if self.mode == Mode::Drain {
             self.key_drain(key);
