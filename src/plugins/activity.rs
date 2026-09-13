@@ -16,6 +16,7 @@ pub struct Snapshot {
 
 #[derive(Clone)]
 pub struct Activity {
+    stream: usize,
     tail: Arc<Mutex<Tail>>,
     published: watch::Sender<Arc<Snapshot>>,
 }
@@ -25,6 +26,7 @@ impl Activity {
         let (published, receiver) = watch::channel(Arc::new(Snapshot::default()));
         (
             Self {
+                stream: 0,
                 tail: Arc::new(Mutex::new(Tail::default())),
                 published,
             },
@@ -32,12 +34,23 @@ impl Activity {
         )
     }
 
+    /// Share the bounded tail but identify this job independently of its label.
+    pub fn for_stream(&self, stream: usize) -> Self {
+        Self {
+            stream,
+            ..self.clone()
+        }
+    }
+
     pub fn append(&self, label: &str, text: &str) {
         // Only producers lock the tail. The UI clones an Arc from the watch
         // slot, then releases that borrow before doing any layout or rendering.
         let mut tail = self.tail.lock().unwrap();
-        if tail.label != label {
-            tail.append("\n");
+        if tail.stream != Some(self.stream) {
+            if tail.stream.is_some() {
+                tail.append("\n");
+            }
+            tail.stream = Some(self.stream);
             tail.label = label.chars().take(256).collect();
         }
         tail.append(text);
@@ -50,6 +63,7 @@ struct Tail {
     snapshot: Snapshot,
     bytes: usize,
     label: String,
+    stream: Option<usize>,
     pending_cr: bool,
 }
 
@@ -256,6 +270,26 @@ mod tests {
                 "redraws must not accumulate history"
             );
         }
+    }
+
+    #[test]
+    fn same_label_streams_do_not_share_partial_lines_or_carriage_returns() {
+        let (activity, receiver) = Activity::new();
+        let first = activity.for_stream(0);
+        let second = activity.for_stream(1);
+        first.append("same", "first unfinished\r");
+        second.append("same", "second unfinished");
+        first.append("same", "\rfirst update");
+        second.append("same", "\rsecond update");
+        assert_eq!(
+            receiver.borrow().lines,
+            [
+                "[same] first unfinished",
+                "[same] second unfinished",
+                "[same] first update",
+                "[same] second update",
+            ]
+        );
     }
 
     #[test]

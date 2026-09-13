@@ -29,8 +29,9 @@ Background and interactive terminal modes do not open activity panels.
 The compact activity panel is capped at 100 columns and 18 rows, shrinking for
 small terminals. The tail keeps at most 64 KiB and 256 lines across the run,
 clipping each long line at 2048 bytes rather than wrapping progress bars. Older lines are discarded even while scrolling is
-paused. Bulk diagnostics are target-labelled and may
-interleave; final results retain marked order and eight-job concurrency. UTF-8
+paused. Bulk diagnostics include the namespace for namespaced targets and use
+separate stream identities even when names match. They may interleave; final
+results retain marked order and eight-job concurrency. UTF-8
 is decoded across chunks, invalid bytes are replaced, terminal escapes and
 controls are stripped. A bare carriage return replaces the current transient
 line; CRLF commits a normal newline, including across read boundaries. Repeated

@@ -701,6 +701,7 @@ pub fn bound_lines(lines: Vec<String>) -> Vec<String> {
 
 pub struct Job {
     pub label: String,
+    pub namespace: String,
     pub argv: Vec<String>,
     pub directory: Option<PathBuf>,
     pub request: Option<Value>,
@@ -919,6 +920,7 @@ mod tests {
     fn job(command: &str, args: &[&str]) -> Job {
         Job {
             label: "test".into(),
+            namespace: String::new(),
             argv: std::iter::once(command)
                 .chain(args.iter().copied())
                 .map(str::to_string)

@@ -31620,7 +31620,12 @@ async fn plugin_activity_bulk_streams_later_targets_before_ordered_completion() 
         .receiver
         .borrow()
         .clone();
-    assert!(snapshot.lines.iter().any(|line| line.contains("[b]")));
+    assert!(
+        snapshot
+            .lines
+            .iter()
+            .any(|line| line.contains("[default/b]"))
+    );
     app.handle_msg(plugin_result(&mut rx).await);
     assert_eq!(app.mode, Mode::Detail);
     assert_eq!(
@@ -31749,6 +31754,115 @@ async fn plugin_activity_toggle_restores_completed_diagnostics_and_enter_opens_r
     assert_eq!(app.mode, Mode::Detail);
     assert_eq!(app.detail.lines.front().unwrap(), "done");
     assert!(!app.plugin_activity_visible());
+}
+
+#[tokio::test]
+async fn plugin_activity_colon_preserves_an_existing_palette_and_its_return_view() {
+    let (mut app, _rx) = app_with_pod();
+    let toggle = KeyEvent::new(
+        KeyCode::Char('t'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    let mut plugin = named_plugin("/bin/sleep", &["20"]);
+    plugin.output = Some("popup".into());
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    app.handle_key(toggle).unwrap();
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    app.handle_key(press(KeyCode::Char('p'))).unwrap();
+    let return_mode = app.palette_return;
+    let run = app.plugin_run;
+    assert_eq!(return_mode, Mode::Table);
+    app.handle_key(toggle).unwrap();
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    assert!(!app.plugin_activity_visible());
+    assert_eq!(app.mode, Mode::Command);
+    assert_eq!(app.command, "p");
+    assert_eq!(app.palette_return, return_mode);
+    assert_eq!(app.plugin_run, run);
+    assert!(app.plugin_task.is_some());
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, return_mode);
+}
+
+#[tokio::test]
+async fn plugin_activity_ctrl_c_preserves_completed_outcome_and_duration() {
+    let (mut app, mut rx) = app_with_pod();
+    let toggle = KeyEvent::new(
+        KeyCode::Char('t'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    let mut plugin = named_plugin("/bin/echo", &["done"]);
+    plugin.output = Some("popup".into());
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    app.handle_msg(plugin_result(&mut rx).await);
+    app.handle_key(toggle).unwrap();
+    let activity = app.plugin_activity.as_ref().unwrap();
+    let finished = activity.finished;
+    let title = activity.view.title.clone();
+    let result = activity.result.clone();
+    let run = app.plugin_run;
+    assert!(finished.is_some());
+    assert!(result.is_some());
+    assert!(app.plugin_task.is_none());
+    app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
+    let activity = app.plugin_activity.as_ref().unwrap();
+    assert_eq!(activity.finished, finished);
+    assert_eq!(activity.view.title, title);
+    assert_eq!(activity.result, result);
+    assert_eq!(app.plugin_run, run);
+    assert!(!app.should_quit);
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.detail.lines.front().unwrap(), "done");
+}
+
+#[tokio::test]
+async fn plugin_activity_distinguishes_same_name_jobs_in_different_namespaces() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    app.namespace.clear();
+    for namespace in ["team-a", "team-b"] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "web", "namespace": namespace}}),
+        );
+        app.marked.insert(format!("{namespace}/web"));
+    }
+    app.table_state.select(Some(0));
+    let mut plugin = named_plugin(
+        "/bin/sh",
+        &[
+            "-c",
+            "printf '%s partial\\r' \"$1\" >&2; sleep 20",
+            "adapter",
+            "$NAMESPACE",
+        ],
+    );
+    plugin.output = Some("popup".into());
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    wait_plugin_diagnostic(&app, "team-a partial").await;
+    wait_plugin_diagnostic(&app, "team-b partial").await;
+    let snapshot = app
+        .plugin_activity
+        .as_ref()
+        .unwrap()
+        .receiver
+        .borrow()
+        .clone();
+    for namespace in ["team-a", "team-b"] {
+        assert!(
+            snapshot
+                .lines
+                .iter()
+                .any(|line| line == &format!("[{namespace}/web] {namespace} partial")),
+            "{:?}",
+            snapshot.lines
+        );
+    }
+    app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
 }
 
 #[tokio::test]

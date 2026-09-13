@@ -224,6 +224,7 @@ impl App {
                 });
                 crate::plugins::Job {
                     label: name.clone(),
+                    namespace: ns.clone(),
                     argv,
                     directory: plugin.package_dir.clone(),
                     request,
@@ -382,29 +383,34 @@ impl App {
             let dur = Duration::from_secs(timeout);
             // Bounded concurrency, results in the marked order.
             let total = jobs.len();
-            let mut results = futures_util::stream::iter(jobs.into_iter().map(|job| {
-                let activity = activity.clone();
-                async move {
-                    let label = job.label.clone();
-                    let progress = activity.map(|activity| {
-                        (
-                            activity,
-                            if total > 1 {
-                                label.clone()
-                            } else {
-                                String::new()
-                            },
+            let mut results =
+                futures_util::stream::iter(jobs.into_iter().enumerate().map(|(id, job)| {
+                    let activity = activity.as_ref().map(|activity| activity.for_stream(id));
+                    async move {
+                        let label = job.label.clone();
+                        let progress = activity.map(|activity| {
+                            (
+                                activity,
+                                if total > 1 {
+                                    if job.namespace.is_empty() {
+                                        label.clone()
+                                    } else {
+                                        format!("{}/{label}", job.namespace)
+                                    }
+                                } else {
+                                    String::new()
+                                },
+                            )
+                        });
+                        let out = tokio::time::timeout(
+                            dur,
+                            crate::plugins::execute_with_activity(job, progress),
                         )
-                    });
-                    let out = tokio::time::timeout(
-                        dur,
-                        crate::plugins::execute_with_activity(job, progress),
-                    )
-                    .await;
-                    (label, out)
-                }
-            }))
-            .buffered(8);
+                        .await;
+                        (label, out)
+                    }
+                }))
+                .buffered(8);
             let mut lines = crate::plugins::Lines::default();
             let mut failures = crate::plugins::Lines::default();
             let mut failed = 0;
@@ -480,6 +486,9 @@ impl App {
             return;
         }
         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+            if self.plugin_task.is_none() {
+                return;
+            }
             self.plugin_task = None;
             self.plugin_run = self.plugin_run.wrapping_add(1);
             if let Some(claim) = self.plugin_claim.take() {
@@ -525,7 +534,9 @@ impl App {
             KeyCode::Right | KeyCode::Char('l') => activity.view.scroll_h(4),
             KeyCode::Char(':') => {
                 activity.visible = false;
-                self.open_palette();
+                if self.mode != Mode::Command {
+                    self.open_palette();
+                }
             }
             _ => {}
         }
