@@ -475,6 +475,14 @@ concurrent drains, and full kubectl drain parity are outside this feature.
   actually lists the object among its managed resources wins. `r` re-reads the resource and
   follows its tracking metadata again. These reads require `get` and `list`
   access.
+  Opened on an **ApplicationSet** directly, there is no owning Application to
+  walk up to, so the view instead names its configured generators - unwrapping
+  a `matrix` or `merge` generator to what it actually combines rather than
+  reporting just "matrix" - and lists the Applications it produced, straight
+  out of `status.resources[]`, each one a finding you can `⏎` into. The
+  ApplicationSet table view carries its own curated columns: `STATUS` from the
+  `ErrorOccurred` / `ResourcesUpToDate` conditions, `GENERATORS`, and
+  `APPS` - the count of Applications produced.
 - **Native Helm inspector** (`:helm` / `:hm`) - sofka decodes Helm's release
   storage Secrets directly (double base64 → gunzip → JSON, same as Helm) and
   lists one row per release at its latest revision, like `helm list`. `⏎` opens

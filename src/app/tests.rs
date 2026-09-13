@@ -22542,6 +22542,58 @@ async fn argocd_view_lists_managed_resources_and_jumps_to_one() {
     assert_eq!(app.fields.as_deref(), Some("metadata.name=web"));
 }
 
+fn argocd_applicationset() -> serde_json::Value {
+    json!({
+        "apiVersion": "argoproj.io/v1alpha1", "kind": "ApplicationSet",
+        "metadata": {"name": "team-a", "namespace": "argocd", "uid": "appset-uid"},
+        "spec": {"generators": [{"git": {}}]},
+        "status": {
+            "conditions": [{"type": "ResourcesUpToDate", "status": "True"}],
+            "resources": [
+                {"group": "argoproj.io", "kind": "Application", "namespace": "argocd",
+                 "name": "team-a-dev", "status": "Synced", "health": {"status": "Healthy"}}
+            ]
+        }
+    })
+}
+
+/// Opening `:argocd` directly on an ApplicationSet names its generators and
+/// the Applications it produced, and `⏎` jumps straight to one — there is no
+/// owning Application to walk up to first.
+#[tokio::test]
+async fn argocd_view_on_an_applicationset_lists_generators_and_produced_apps() {
+    let root = argocd_applicationset();
+    let (mut app, mut rx, responses, _) = health_report_app("applicationsets", root.clone());
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/argocd/applicationsets/team-a",
+        kind.ar.api_version
+    );
+    responses.lock().unwrap().insert(path, (200, root));
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+
+    assert_eq!(app.mode, Mode::Argocd);
+    let texts: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(texts.contains(&"ApplicationSet/team-a: Synced"));
+    assert!(texts.contains(&"Generators"));
+    assert!(texts.contains(&"git"));
+    assert!(texts.contains(&"Applications (1)"));
+    assert!(texts.contains(&"Application/team-a-dev: Synced / Healthy"));
+
+    app.argocd_state.select(Some(
+        app.argocd_items
+            .iter()
+            .position(|f| f.text.starts_with("Application/team-a-dev"))
+            .unwrap(),
+    ));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.kind_plural, "applications");
+    assert_eq!(app.fields.as_deref(), Some("metadata.name=team-a-dev"));
+}
+
 /// The correctness guarantee: an Application deploying somewhere else must not
 /// offer a jump that would resolve against this cluster.
 #[tokio::test]
