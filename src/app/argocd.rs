@@ -73,6 +73,7 @@ impl App {
         let subject = format!("{}/{name}", kind.ar.kind);
         let title = self.argocd_title.clone();
         let self_is_app = self.argocd_app_kind();
+        let self_is_appset = self.argocd_kind() && !self_is_app;
         // Resolved here: the spawned task has no cluster registry.
         let Some(app_kind) = self.cluster.resolve_in_group("Application", ARGOCD_GROUP) else {
             return;
@@ -102,6 +103,22 @@ impl App {
                 // Re-read so the report reflects the cluster now, not whatever
                 // the watch last delivered.
                 let selection = report_source(&client, &kind.ar, kind.namespaced, &obj).await?;
+
+                // An ApplicationSet has no owning Application and nothing
+                // `describe` expects — it names generators and produced
+                // Applications, not a sync/health rollup.
+                if self_is_appset {
+                    let mut resources = argocd::managed_resources(&selection);
+                    for r in &mut resources {
+                        let key = (r.kind.to_lowercase(), r.group.to_lowercase());
+                        if let Some(plural) = plurals.get(&key) {
+                            r.plural = plural.clone();
+                        }
+                    }
+                    let findings =
+                        argocd::describe_applicationset(&selection, &subject, &resources);
+                    return Ok((selection, findings, Destination::Current, resources));
+                }
 
                 // Either the selection is the Application, or its tracking
                 // metadata names one to fetch.

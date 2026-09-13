@@ -363,6 +363,151 @@ pub fn managed_resources(app: &DynamicObject) -> Vec<ManagedResource> {
         .unwrap_or_default()
 }
 
+/// `status.conditions[]` on an ApplicationSet: `ErrorOccurred` wins over
+/// `ResourcesUpToDate` when both are stale, and the words match ones the
+/// rest of the app already colors (`Error` red, `Synced` green) rather than
+/// invent a status vocabulary of one.
+///
+/// `ResourcesUpToDate` is the condition *type*; the controller reuses the
+/// name `ApplicationSetUpToDate` as its *reason*, which reads like a type at
+/// a glance but never appears in `type` itself.
+pub fn applicationset_status(appset: &DynamicObject) -> &'static str {
+    let is_true = |t: &str| {
+        appset
+            .data
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .is_some_and(|cs| {
+                cs.iter().any(|c| {
+                    c.get("type").and_then(Value::as_str) == Some(t)
+                        && c.get("status").and_then(Value::as_str) == Some("True")
+                })
+            })
+    };
+    if is_true("ErrorOccurred") {
+        "Error"
+    } else if is_true("ResourcesUpToDate") {
+        "Synced"
+    } else {
+        "Unknown"
+    }
+}
+
+/// The `ErrorOccurred` condition's message, when that is why the status reads
+/// `Error`.
+fn applicationset_error(appset: &DynamicObject) -> Option<&str> {
+    appset
+        .data
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|c| {
+            c.get("type").and_then(Value::as_str) == Some("ErrorOccurred")
+                && c.get("status").and_then(Value::as_str) == Some("True")
+        })?
+        .get("message")
+        .and_then(Value::as_str)
+}
+
+/// Which generator types are configured, in `spec.generators` order. `matrix`
+/// and `merge` generators wrap others, so those unwrap one level to name what
+/// they combine instead of reporting "matrix" for every cluster this produces.
+pub fn generators(appset: &DynamicObject) -> Vec<String> {
+    appset
+        .data
+        .pointer("/spec/generators")
+        .and_then(Value::as_array)
+        .map(|gens| gens.iter().flat_map(generator_names).collect())
+        .unwrap_or_default()
+}
+
+fn generator_names(generator: &Value) -> Vec<String> {
+    let Some(obj) = generator.as_object() else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for (key, val) in obj {
+        if key == "selector" {
+            continue;
+        }
+        if matches!(key.as_str(), "matrix" | "merge")
+            && let Some(nested) = val.get("generators").and_then(Value::as_array)
+        {
+            names.extend(nested.iter().flat_map(generator_names));
+        } else {
+            names.push(key.clone());
+        }
+    }
+    names
+}
+
+/// Findings for an ApplicationSet opened directly. sofka evaluates no
+/// generator itself: `status.resources[]` is Argo's own record of every
+/// Application the generators produced, one entry per app in the same shape
+/// `managed_resources` reads for an Application's own managed objects.
+pub fn describe_applicationset(
+    appset: &DynamicObject,
+    subject: &str,
+    resources: &[ManagedResource],
+) -> Vec<Finding> {
+    let mut out = Vec::new();
+
+    let status = applicationset_status(appset);
+    let level = match status {
+        "Error" => Level::Critical,
+        "Synced" => Level::Good,
+        _ => Level::Info,
+    };
+    out.push(finding(0, level, format!("{subject}: {status}")));
+    if let Some(msg) = applicationset_error(appset) {
+        out.push(finding(1, Level::Critical, msg.to_string()));
+    }
+
+    out.push(finding(0, Level::Heading, "Generators"));
+    let gens = generators(appset);
+    if gens.is_empty() {
+        out.push(finding(1, Level::Info, "none configured"));
+    } else {
+        out.push(finding(1, Level::Info, gens.join(", ")));
+    }
+
+    out.push(finding(
+        0,
+        Level::Heading,
+        format!("Applications ({})", resources.len()),
+    ));
+    if resources.is_empty() {
+        out.push(finding(1, Level::Info, "none generated"));
+    }
+    let mut seen: HashMap<(&str, &str, &str), usize> = HashMap::new();
+    for r in resources {
+        *seen
+            .entry((r.kind.as_str(), r.namespace.as_str(), r.name.as_str()))
+            .or_default() += 1;
+    }
+    for r in resources.iter().take(MAX_LISTED) {
+        let qualified = seen
+            .get(&(r.kind.as_str(), r.namespace.as_str(), r.name.as_str()))
+            .is_some_and(|n| *n > 1);
+        let mut f = finding(1, r.level(), r.line(qualified));
+        // The Applications an ApplicationSet produces are always objects in
+        // the same cluster the ApplicationSet itself was just read from.
+        if let Some(t) = r.target(&Destination::Current) {
+            f = f.with_target(t);
+        }
+        out.push(f);
+    }
+    if resources.len() > MAX_LISTED {
+        out.push(finding(
+            1,
+            Level::Info,
+            format!("… and {} more", resources.len() - MAX_LISTED),
+        ));
+    }
+
+    out
+}
+
 /// The `spec.destination` server URL (preferred) or registered cluster name,
 /// for the app layer to resolve against the kubeconfig.
 pub fn destination_ref(app: &DynamicObject) -> (&str, &str) {
@@ -1707,5 +1852,138 @@ mod tests {
             "status": {"active": 1}
         }));
         assert_eq!(descendant_state(&running), "");
+    }
+
+    fn appset(value: serde_json::Value) -> DynamicObject {
+        serde_json::from_value(value).expect("valid ApplicationSet")
+    }
+
+    #[test]
+    fn applicationset_status_prefers_error_over_up_to_date() {
+        let error = appset(json!({
+            "apiVersion": "argoproj.io/v1alpha1", "kind": "ApplicationSet",
+            "metadata": {"name": "team-a"},
+            "status": {"conditions": [
+                {"type": "ResourcesUpToDate", "reason": "ApplicationSetUpToDate", "status": "True"},
+                {"type": "ErrorOccurred", "status": "True", "message": "bad generator"}
+            ]}
+        }));
+        assert_eq!(applicationset_status(&error), "Error");
+        assert_eq!(applicationset_error(&error), Some("bad generator"));
+
+        // The controller's own reason string for this condition is
+        // `ApplicationSetUpToDate` — easy to mistake for the `type`, which is
+        // `ResourcesUpToDate`. This is the exact shape a real ApplicationSet
+        // reports once reconciled.
+        let synced = appset(json!({
+            "apiVersion": "argoproj.io/v1alpha1", "kind": "ApplicationSet",
+            "metadata": {"name": "team-b"},
+            "status": {"conditions": [
+                {"type": "ErrorOccurred", "status": "False", "reason": "ApplicationSetUpToDate"},
+                {"type": "ParametersGenerated", "status": "True"},
+                {"type": "ResourcesUpToDate", "status": "True", "reason": "ApplicationSetUpToDate"}
+            ]}
+        }));
+        assert_eq!(applicationset_status(&synced), "Synced");
+        assert_eq!(applicationset_error(&synced), None);
+
+        let unknown = appset(json!({
+            "apiVersion": "argoproj.io/v1alpha1", "kind": "ApplicationSet",
+            "metadata": {"name": "team-c"},
+            "status": {}
+        }));
+        assert_eq!(applicationset_status(&unknown), "Unknown");
+    }
+
+    /// `matrix` and `merge` generators wrap others; the names they combine
+    /// matter more than the wrapper, so those unwrap one level.
+    #[test]
+    fn generators_unwraps_matrix_and_merge_but_not_a_plain_generator() {
+        let a = appset(json!({
+            "apiVersion": "argoproj.io/v1alpha1", "kind": "ApplicationSet",
+            "metadata": {"name": "team-a"},
+            "spec": {"generators": [
+                {"git": {"repoURL": "x"}},
+                {"matrix": {"generators": [{"list": {}}, {"clusters": {}}]}}
+            ]}
+        }));
+        assert_eq!(generators(&a), vec!["git", "list", "clusters"]);
+    }
+
+    /// A `selector` sits alongside the generator, not inside it — it must not
+    /// be read as a generator kind of its own.
+    #[test]
+    fn generators_skips_the_selector_key() {
+        let a = appset(json!({
+            "apiVersion": "argoproj.io/v1alpha1", "kind": "ApplicationSet",
+            "metadata": {"name": "team-a"},
+            "spec": {"generators": [
+                {"clusters": {}, "selector": {"matchLabels": {"env": "prod"}}}
+            ]}
+        }));
+        assert_eq!(generators(&a), vec!["clusters"]);
+    }
+
+    /// The headline, generator summary, and produced-Applications list all
+    /// come from `status.resources[]` the same way an Application's own
+    /// managed resources do, jump targets included.
+    #[test]
+    fn describe_applicationset_lists_generators_and_produced_apps() {
+        let a = appset(json!({
+            "apiVersion": "argoproj.io/v1alpha1", "kind": "ApplicationSet",
+            "metadata": {"name": "team-a"},
+            "spec": {"generators": [{"git": {}}]},
+            "status": {
+                "conditions": [{"type": "ResourcesUpToDate", "status": "True"}],
+                "resources": [
+                    {"group": "argoproj.io", "kind": "Application", "namespace": "argocd",
+                     "name": "team-a-dev", "status": "Synced", "health": {"status": "Healthy"}}
+                ]
+            }
+        }));
+        let mut resources = managed_resources(&a);
+        for r in &mut resources {
+            r.plural = "applications".into();
+        }
+        let findings = describe_applicationset(&a, "ApplicationSet/team-a", &resources);
+        assert_eq!(findings[0].level, Level::Good);
+        assert_eq!(findings[0].text, "ApplicationSet/team-a: Synced");
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.level == Level::Heading && f.text == "Generators")
+        );
+        assert!(findings.iter().any(|f| f.text == "git"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.level == Level::Heading && f.text == "Applications (1)")
+        );
+        let app_line = findings
+            .iter()
+            .find(|f| f.text.starts_with("Application/team-a-dev"))
+            .expect("produced Application line");
+        assert!(app_line.target.is_some());
+    }
+
+    /// Nothing in `describe_applicationset` should assume a generator ran
+    /// cleanly — the error message is a finding of its own, not folded into
+    /// the headline.
+    #[test]
+    fn describe_applicationset_surfaces_the_generator_error() {
+        let a = appset(json!({
+            "apiVersion": "argoproj.io/v1alpha1", "kind": "ApplicationSet",
+            "metadata": {"name": "team-a"},
+            "status": {"conditions": [
+                {"type": "ErrorOccurred", "status": "True", "message": "invalid repo URL"}
+            ]}
+        }));
+        let findings = describe_applicationset(&a, "ApplicationSet/team-a", &[]);
+        assert_eq!(findings[0].level, Level::Critical);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.level == Level::Critical && f.text == "invalid repo URL")
+        );
     }
 }

@@ -329,6 +329,14 @@ const ARGOCD_APP_COLUMNS: &[Column] = &[
     column("AGE", col_age),
 ];
 
+const ARGOCD_APPSET_COLUMNS: &[Column] = &[
+    column("NAME", col_name),
+    status_column("STATUS", col_argocd_appset_status),
+    column("GENERATORS", col_argocd_appset_generators),
+    column("APPS", col_argocd_appset_apps),
+    column("AGE", col_age),
+];
+
 fn columns_for(group: &str, plural: &str) -> &'static [Column] {
     match (group, plural) {
         ("", "pods") => POD_COLUMNS,
@@ -358,6 +366,7 @@ fn columns_for(group: &str, plural: &str) -> &'static [Column] {
             "gitrepositories" | "helmrepositories" | "ocirepositories" | "buckets",
         ) => FLUX_SOURCE_COLUMNS,
         ("argoproj.io", "applications") => ARGOCD_APP_COLUMNS,
+        ("argoproj.io", "applicationsets") => ARGOCD_APPSET_COLUMNS,
         ("", "helm") => HELM_COLUMNS,
         ("", "helmhistory") => HELM_HISTORY_COLUMNS,
         _ => DEFAULT_COLUMNS,
@@ -1458,6 +1467,27 @@ fn col_argocd_revision<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
 /// sofka is the one holding its original policy.
 fn col_argocd_auto_sync<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     Cow::Borrowed(crate::argocd::auto_sync(ctx.obj).label())
+}
+
+fn col_argocd_appset_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(crate::argocd::applicationset_status(ctx.obj))
+}
+
+fn col_argocd_appset_generators<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(crate::argocd::generators(ctx.obj).join(", "))
+}
+
+/// `status.resources[]` holds one entry per Application the generators
+/// produced; counting it directly avoids relying on `status.resourcesCount`,
+/// which older Argo CD versions don't write.
+fn col_argocd_appset_apps<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    let n = ctx
+        .data
+        .pointer("/status/resources")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    Cow::Owned(n.to_string())
 }
 
 // A Helm release row's underlying object is the raw storage `Secret`
@@ -3313,6 +3343,29 @@ mod tests {
     }
 
     #[test]
+    fn argocd_applicationset_cells_read_status_generators_and_app_count() {
+        let a = obj(json!({
+            "apiVersion": "argoproj.io/v1alpha1", "kind": "ApplicationSet",
+            "metadata": {"name": "team-a"},
+            "spec": {"generators": [{"git": {}}, {"list": {}}]},
+            "status": {
+                "conditions": [{"type": "ResourcesUpToDate", "status": "True"}],
+                "resources": [
+                    {"name": "team-a-dev", "kind": "Application"},
+                    {"name": "team-a-prod", "kind": "Application"}
+                ]
+            }
+        }));
+        let (cells, status_idx) = cells(&a, "argoproj.io", "applicationsets", now_secs());
+        let headers = headers("argoproj.io", "applicationsets");
+        let at = |h: &str| cells[headers.iter().position(|x| *x == h).expect(h)].clone();
+        assert_eq!(at("STATUS"), "Synced");
+        assert_eq!(at("GENERATORS"), "git, list");
+        assert_eq!(at("APPS"), "2");
+        assert_eq!(status_idx, headers.iter().position(|x| *x == "STATUS"));
+    }
+
+    #[test]
     fn curated_headers_and_cells_stay_aligned() {
         let o = obj(json!({
             "apiVersion": "v1",
@@ -3341,6 +3394,7 @@ mod tests {
             ("", "endpoints"),
             ("apiextensions.k8s.io", "customresourcedefinitions"),
             ("argoproj.io", "applications"),
+            ("argoproj.io", "applicationsets"),
             ("kustomize.toolkit.fluxcd.io", "kustomizations"),
             ("helm.toolkit.fluxcd.io", "helmreleases"),
             ("source.toolkit.fluxcd.io", "gitrepositories"),
