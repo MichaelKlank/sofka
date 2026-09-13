@@ -14671,6 +14671,74 @@ async fn fleet_seeds_connecting_rows_and_applies_summaries() {
     );
 }
 
+/// `argo N✗` used to give a count with no way to see which Applications made
+/// it up; `⏎` on that row now lands straight on them, filtered the same way
+/// the count itself was computed.
+#[tokio::test]
+async fn entering_a_degraded_argocd_fleet_row_lands_on_its_applications() {
+    let (mut app, _rx) = test_app();
+    app.fleet_cfg = crate::config::FleetConfig {
+        contexts: vec!["prod".into()],
+    };
+    app.open_fleet();
+    let mut row = crate::fleet::FleetRow::connecting("prod".into(), false);
+    row.status = crate::fleet::FleetStatus::Ok;
+    row.argocd_degraded = Some(3);
+    app.handle_msg(Msg::FleetRow {
+        generation: app.generation,
+        row: Box::new(row),
+    });
+
+    app.fleet_state.select(Some(0));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    let query = app
+        .pending_resource_query
+        .as_ref()
+        .expect("degraded row defers a query behind the context switch");
+    assert_eq!(query.resource, "applications");
+    assert_eq!(query.namespace.as_deref(), Some("*"));
+    assert_eq!(query.context.as_deref(), Some("prod"));
+
+    land_context(&mut app, "prod");
+    assert_eq!(app.kind_plural, "applications");
+    assert_eq!(
+        app.namespace, "",
+        "all namespaces, not whatever was active before"
+    );
+    assert_eq!(
+        app.filter,
+        "sync=OutOfSync||health=Degraded||health=Missing||health=Unknown"
+    );
+}
+
+/// A context with nothing degraded keeps the plain switch: no forced kind, no
+/// filter left behind on whatever view comes up next.
+#[tokio::test]
+async fn entering_a_healthy_argocd_fleet_row_switches_context_plainly() {
+    let (mut app, _rx) = test_app();
+    app.fleet_cfg = crate::config::FleetConfig {
+        contexts: vec!["prod".into()],
+    };
+    app.open_fleet();
+    let mut row = crate::fleet::FleetRow::connecting("prod".into(), false);
+    row.status = crate::fleet::FleetStatus::Ok;
+    row.argocd_degraded = Some(0);
+    app.handle_msg(Msg::FleetRow {
+        generation: app.generation,
+        row: Box::new(row),
+    });
+
+    app.fleet_state.select(Some(0));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.pending_resource_query.is_none());
+
+    land_context(&mut app, "prod");
+    assert_ne!(app.kind_plural, "applications");
+    assert!(app.filter.is_empty());
+}
+
 #[tokio::test]
 async fn fleet_command_counts_terminating_pods_as_unhealthy() {
     use ratatui::{Terminal, backend::TestBackend};

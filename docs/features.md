@@ -560,7 +560,11 @@ concurrent drains, and full kubectl drain parity are outside this feature.
   side by side: node readiness, unhealthy pods, Flux failures, and Argo CD
   Applications that are `OutOfSync` or not `Healthy`. A cluster without the Flux
   or Argo CD CRDs shows `—` rather than a zero. Contexts come from config or
-  `space` in the `:ctx` switcher. See
+  `space` in the `:ctx` switcher. `⏎` on a row with a non-zero Argo CD count
+  switches to that context and lands straight on the Applications behind it,
+  filtered to the same `OutOfSync` / not-`Healthy` criteria the count itself
+  used - across every namespace, not whichever one was active before the
+  switch. A row with nothing degraded still lands on its default view. See
   [Providers](providers.md#fleet-dashboard).
 - **YAML view** (`y`), **describe** (`d`, via `kubectl`), **events**
   (`:events` / `E`, filtered by UID when available), and **diff** (`:diff`), with

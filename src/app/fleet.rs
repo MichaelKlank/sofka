@@ -9,6 +9,12 @@ const FLEET_CONCURRENCY: usize = 4;
 /// hanging the row (the others are unaffected).
 const FLEET_TIMEOUT_SECS: u64 = 8;
 
+/// The same criteria `argocd_degraded` counts, as a row filter: an
+/// `OutOfSync` sync status or a non-`Healthy`, non-transient health status.
+/// Kept in one place so the count and the drill-in can never disagree.
+const DEGRADED_APPLICATIONS_FILTER: &str =
+    "sync=OutOfSync||health=Degraded||health=Missing||health=Unknown";
+
 impl App {
     /// The fleet contexts in effect: the `[fleet] contexts` config list plus
     /// contexts marked with `space` in the context switcher, minus config
@@ -173,16 +179,32 @@ impl App {
                 self.spawn_fleet_gathers();
             }
             // Enter switches to the highlighted context via the normal
-            // context-switch path, landing on its default view.
+            // context-switch path, landing on its default view — unless the
+            // row is the reason to look, in which case it lands straight on
+            // the Applications dragging the count down, filtered the same
+            // way the count itself was computed.
             (Some(Action::Accept), _) => {
-                if let Some(ctx) = self
+                if let Some(row) = self
                     .fleet_state
                     .selected()
                     .and_then(|i| self.fleet_rows.get(i))
-                    .map(|r| r.context.clone())
                 {
+                    let ctx = row.context.clone();
                     self.mode = Mode::Table;
-                    self.switch_context(ctx);
+                    if row.argocd_degraded.unwrap_or(0) > 0 {
+                        // The count is a cluster-wide tally (`Api::all_with`),
+                        // so the drill-in must land on every namespace too,
+                        // not whatever the previous context happened to be
+                        // scoped to.
+                        self.apply_resource_query(crate::filter::ResourceQuery {
+                            resource: "applications".into(),
+                            namespace: Some("*".into()),
+                            context: Some(ctx),
+                            filter: DEGRADED_APPLICATIONS_FILTER.into(),
+                        });
+                    } else {
+                        self.switch_context(ctx);
+                    }
                 }
             }
             _ => {}
