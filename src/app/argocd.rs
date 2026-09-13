@@ -175,7 +175,7 @@ impl App {
                     resources,
                     app,
                 };
-                let findings = argocd::describe(&ev);
+                let findings = argocd::describe(&ev, crate::columns::now_secs());
                 Ok((selection, findings, destination, ev.resources))
             }
             .await;
