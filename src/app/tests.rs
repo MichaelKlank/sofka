@@ -22639,6 +22639,76 @@ async fn receive_argocd_children(app: &mut App, rx: &mut Receiver<Msg>) {
     .expect("argocd children did not arrive");
 }
 
+/// The job controller marks the outcome with `SuccessCriteriaMet` or
+/// `FailureTarget` before it sets the terminal condition, so the tree must read
+/// a Job's outcome by condition type rather than taking whichever is true first.
+#[tokio::test]
+async fn argocd_tree_reads_a_failed_job_behind_a_newer_condition() {
+    let mut root = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                             "namespace": "default"}));
+    root["status"]["resources"] = json!([
+        {"group": "batch", "version": "v1", "kind": "CronJob", "namespace": "default",
+         "name": "backup", "status": "Synced"}
+    ]);
+    let (mut app, mut rx, responses, _) = health_report_app("applications", root.clone());
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/applications/web",
+        kind.ar.api_version
+    );
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(path, (200, root));
+        replies.insert(
+            "/apis/batch/v1/namespaces/default/cronjobs/backup".into(),
+            (
+                200,
+                json!({"apiVersion": "batch/v1", "kind": "CronJob",
+                       "metadata": {"name": "backup", "namespace": "default", "uid": "cj"}}),
+            ),
+        );
+        // The condition order the job controller actually writes.
+        replies.insert(
+            "/apis/batch/v1/namespaces/default/jobs".into(),
+            (
+                200,
+                json!({"apiVersion": "batch/v1", "kind": "JobList", "metadata": {},
+                       "items": [{"metadata": {"name": "backup-1", "namespace": "default",
+                                               "uid": "job", "ownerReferences": [
+                                                 {"apiVersion": "batch/v1", "kind": "CronJob",
+                                                  "name": "backup", "uid": "cj"}]},
+                                  "status": {"conditions": [
+                                      {"type": "FailureTarget", "status": "True"},
+                                      {"type": "Failed", "status": "True"}]}}]}),
+            ),
+        );
+        replies.insert(
+            "/api/v1/namespaces/default/pods".into(),
+            (
+                200,
+                json!({"apiVersion": "v1", "kind": "PodList", "metadata": {}, "items": []}),
+            ),
+        );
+    }
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+    let row = app
+        .argocd_items
+        .iter()
+        .position(|f| f.text.starts_with("CronJob/backup"))
+        .expect("managed resource row");
+    app.argocd_state.select(Some(row));
+    app.handle_key(press(KeyCode::Char('c'))).unwrap();
+    receive_argocd_children(&mut app, &mut rx).await;
+
+    let texts: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(
+        texts.contains(&"Job/backup-1: Failed"),
+        "the job's outcome is missing: {texts:?}"
+    );
+}
+
 /// Children arriving above the cursor must not slide the selection onto a
 /// different line; results land while the user is still moving around.
 #[tokio::test]

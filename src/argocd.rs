@@ -464,14 +464,36 @@ fn waiting_reason(obj: &DynamicObject) -> Option<&str> {
 }
 
 /// `Complete` or `Failed` from a Job's conditions.
+///
+/// Searched by type rather than by position: the job controller holds the
+/// terminal condition back until every pod is gone and marks the outcome with
+/// `SuccessCriteriaMet` or `FailureTarget` meanwhile, so on any supported
+/// Kubernetes the first true condition is not the one that says how it ended.
+///
+/// `FailureTarget` and `SuccessCriteriaMet` are surfaced too, mapped the same
+/// way `col_job_status` maps them for the Jobs table: a Job can sit in that
+/// delay for a while, and the search must see a failure the moment the
+/// controller commits to it rather than wait for pod cleanup to finish.
 fn job_state(obj: &DynamicObject) -> Option<&str> {
-    obj.data
+    let conditions = obj
+        .data
         .pointer("/status/conditions")
-        .and_then(Value::as_array)?
-        .iter()
-        .find(|c| c.get("status").and_then(Value::as_str) == Some("True"))
-        .and_then(|c| c.get("type").and_then(Value::as_str))
-        .filter(|t| matches!(*t, "Complete" | "Failed"))
+        .and_then(Value::as_array)?;
+    let is_true = |kind: &str| {
+        conditions.iter().any(|c| {
+            c.get("type").and_then(Value::as_str) == Some(kind)
+                && c.get("status").and_then(Value::as_str) == Some("True")
+        })
+    };
+    if is_true("Failed") || is_true("FailureTarget") {
+        Some("Failed")
+    } else if is_true("Complete") {
+        Some("Complete")
+    } else if is_true("SuccessCriteriaMet") {
+        Some("Completing")
+    } else {
+        None
+    }
 }
 
 /// Whether `app` lists this object in `status.resources[]`.
@@ -1619,5 +1641,61 @@ mod tests {
         obj.data["status"]["resources"] = json!(many);
         let out = describe(&evidence(obj, Destination::Current));
         assert!(texts(&out).iter().any(|t| t == "… and 3 more"));
+    }
+
+    /// A Job carries its terminal condition after the newer staging one, and
+    /// both are true at once.
+    #[test]
+    fn a_jobs_outcome_is_read_by_condition_type_not_by_order() {
+        let failed = app(json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "backup-1", "namespace": "default"},
+            "status": {"conditions": [
+                {"type": "FailureTarget", "status": "True"},
+                {"type": "Failed", "status": "True"}]}
+        }));
+        assert_eq!(descendant_state(&failed), "Failed");
+
+        let complete = app(json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "backup-2", "namespace": "default"},
+            "status": {"conditions": [
+                {"type": "SuccessCriteriaMet", "status": "True"},
+                {"type": "Complete", "status": "True"}]}
+        }));
+        assert_eq!(descendant_state(&complete), "Complete");
+    }
+
+    /// The controller commits to `FailureTarget` or `SuccessCriteriaMet` before
+    /// it terminates the pods, and that delay can last a while. The search must
+    /// not wait for cleanup to finish before it sees the outcome.
+    #[test]
+    fn a_jobs_interim_condition_is_read_before_the_terminal_one_lands() {
+        let failing = app(json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "backup-3", "namespace": "default"},
+            "status": {"conditions": [{"type": "FailureTarget", "status": "True"}]}
+        }));
+        assert_eq!(descendant_state(&failing), "Failed");
+
+        let succeeding = app(json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "backup-4", "namespace": "default"},
+            "status": {"conditions": [{"type": "SuccessCriteriaMet", "status": "True"},
+                                      {"type": "Complete", "status": "False"}]}
+        }));
+        assert_eq!(descendant_state(&succeeding), "Completing");
+    }
+
+    /// A job with no interim or terminal condition yet has nothing worth
+    /// summarising.
+    #[test]
+    fn a_job_without_a_terminal_condition_has_no_state() {
+        let running = app(json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "backup-5", "namespace": "default"},
+            "status": {"active": 1}
+        }));
+        assert_eq!(descendant_state(&running), "");
     }
 }
