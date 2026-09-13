@@ -18,6 +18,14 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         let action = self.keymap.action(self.key_scope(), &key);
+        if action == Some(Action::PluginActivity) {
+            self.toggle_plugin_activity();
+            return Ok(());
+        }
+        if self.plugin_activity_visible() {
+            self.key_plugin_activity(key);
+            return Ok(());
+        }
         self.handle_input(KeyInput::new(action, key))
     }
 
@@ -725,8 +733,13 @@ impl App {
 
     /// Run a built-in palette action.
     pub(super) fn run_action(&mut self, action: PaletteAction) {
+        if matches!(action, PaletteAction::PluginActivity) {
+            self.open_plugin_activity();
+            return;
+        }
         self.stop_plugins();
         match action {
+            PaletteAction::PluginActivity => unreachable!(),
             PaletteAction::Quit => self.should_quit = true,
             PaletteAction::Ctx => self.open_contexts(),
             PaletteAction::Pulse => self.open_pulse(),

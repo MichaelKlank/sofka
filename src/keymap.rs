@@ -99,6 +99,7 @@ actions! {
     PageDown => ("page_down", "page down"),
     PageUp => ("page_up", "page up"),
     Parent => ("parent", "parent"),
+    PluginActivity => ("plugin_activity", "toggle plugin activity popup"),
     PortForward => ("port_forward", "port forward"),
     PreviousLogs => ("previous_logs", "previous logs"),
     PreviousMatch => ("previous_match", "previous match"),
@@ -195,7 +196,11 @@ pub(crate) const LEGACY_PALETTE_KEYS: &[(&str, Action)] = &[
     ("palette_accept", Action::Accept),
 ];
 
-const GLOBAL: &[(Action, &[&str])] = &[(Action::Quit, &["ctrl-c"]), (Action::Compact, &["ctrl-e"])];
+const GLOBAL: &[(Action, &[&str])] = &[
+    (Action::Quit, &["ctrl-c"]),
+    (Action::Compact, &["ctrl-e"]),
+    (Action::PluginActivity, &["ctrl-alt-t"]),
+];
 const INPUT: &[(Action, &[&str])] = &[
     (Action::Back, &["esc"]),
     (Action::Backspace, &["backspace"]),

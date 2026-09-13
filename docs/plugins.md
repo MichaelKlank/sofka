@@ -7,6 +7,38 @@ To create a package, see [Create a plugin package](plugin-authoring.md).
 Packages support named commands, validated inputs, JSON reports, and managed port-forwards.
 Enter `:plugin-cancel` to stop the active plugin run.
 
+Popup and report runs immediately show a floating activity panel, even for silent
+adapters. It displays a spinner, elapsed time, and live stderr diagnostics; stdout
+remains the final text or JSON report, not a progress protocol. `Esc` hides the
+panel without cancelling. `Ctrl+Alt+T` toggles the panel without restarting or
+cancelling the job, including while typing in the palette. It also restores
+retained diagnostics after completion; `Enter` then opens the report.
+`:plugin-activity` reopens the current run, or its completed report.
+Rebind or disable the toggle with `[keys.global].plugin_activity`. `Ctrl+C` cancels the run and its process group while the panel
+is focused; outside the panel it still quits sofka. Use arrows or `hjkl`,
+`PgUp`/`PgDn`, and `Home`/`End` to scroll; `G` resumes following. `:` hides the
+panel and opens the palette.
+
+Completion opens the normal report if the panel is visible. When hidden, it only
+notifies; your current focus and typed command stay intact. The latest run is
+retained in memory until navigation cancels/clears it or another run replaces it.
+Failures (including timeout, capture limits, and invalid reports) include the
+sanitized diagnostic tail. A cancelled panel keeps its diagnostics until cleared.
+Background and interactive terminal modes do not open activity panels.
+
+The compact activity panel is capped at 100 columns and 18 rows, shrinking for
+small terminals. The tail keeps at most 64 KiB and 256 lines across the run,
+clipping each long line at 2048 bytes rather than wrapping progress bars. Older lines are discarded even while scrolling is
+paused. Bulk diagnostics include the namespace for namespaced targets and use
+separate stream identities even when names match. They may interleave; final
+results retain marked order and eight-job concurrency. UTF-8
+is decoded across chunks, invalid bytes are replaced, terminal escapes and
+controls are stripped. A bare carriage return replaces the current transient
+line; CRLF commits a normal newline, including across read boundaries. Repeated
+progress redraws therefore replace the bar instead of filling the log history. This is display sanitization, not secret redaction: adapters must not print
+credentials. Existing 1 MiB per-pipe capture limits still cancel excessive output;
+activity does not permit unlimited stderr. No manifest changes are needed.
+
 ### Official catalog
 
 The [official catalog](https://github.com/nklmilojevic/sofka-plugins) contains

@@ -346,7 +346,15 @@ The adapter must translate this value into the tool's namespace arguments.
 ## Report format
 
 With `output = "report"`, the adapter writes one JSON report to standard output.
-Use standard error for diagnostic messages.
+Use standard error for diagnostic messages. Sofka shows stderr live in the
+activity popup for `popup` and `report` commands. Flush messages when you write
+them. An adapter can report its current phase or relay useful child-process
+diagnostics. Keep stdout reserved for the final result and do not print secrets.
+Newlines append log lines; carriage returns replace the current progress line.
+Normalize tool-specific progress output in the adapter when it lacks separators.
+This is optional and requires no new manifest field or report schema version.
+Silent adapters still get a spinner and elapsed time.
+
 Return exit code `0` for a complete report.
 Return a nonzero exit code for an execution error.
 

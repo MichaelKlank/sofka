@@ -51,16 +51,17 @@ impl App {
     /// release too. A wheel burst can split one of those escape sequences
     /// mid-read; `crate::altscroll` reassembles them before they reach us.
     pub fn wants_mouse_capture(&self) -> bool {
-        !matches!(
-            self.mode,
-            Mode::Detail
-                | Mode::Diff
-                | Mode::Events
-                | Mode::Logs
-                | Mode::Help
-                | Mode::DocFilter
-                | Mode::LogFilter
-        )
+        !self.plugin_activity_visible()
+            && !matches!(
+                self.mode,
+                Mode::Detail
+                    | Mode::Diff
+                    | Mode::Events
+                    | Mode::Logs
+                    | Mode::Help
+                    | Mode::DocFilter
+                    | Mode::LogFilter
+            )
     }
 
     /// Route a mouse event. The wheel is synthesized into the mode's own
@@ -68,6 +69,17 @@ impl App {
     /// logs, documents, pickers) without a second navigation code path;
     /// clicks are table-specific (select a row, sort by a header).
     pub fn handle_mouse(&mut self, m: MouseEvent) -> Result<()> {
+        if self.plugin_activity_visible() {
+            let code = match m.kind {
+                MouseEventKind::ScrollUp => KeyCode::Up,
+                MouseEventKind::ScrollDown => KeyCode::Down,
+                _ => return Ok(()),
+            };
+            for _ in 0..self.mouse_scroll_lines {
+                self.handle_key(KeyEvent::new(code, KeyModifiers::NONE))?;
+            }
+            return Ok(());
+        }
         match m.kind {
             MouseEventKind::ScrollUp => self.wheel(KeyCode::Up),
             MouseEventKind::ScrollDown => self.wheel(KeyCode::Down),

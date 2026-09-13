@@ -30,7 +30,7 @@ the line.
   the default keys in the array if you want to keep them.
 - An omitted action keeps its inherited bindings. An empty array (`[]`)
   disables all keyboard bindings for that action.
-- `[keys.global]` sets `quit` and `compact` in every mode.
+- `[keys.global]` sets `quit`, `compact`, and `plugin_activity` in every mode.
 - `[keys.navigation]` sets shared navigation actions in modes that support them.
   It does not affect text input modes. The shared actions are `up`, `down`,
   `first`, `last`, `page_up`, `page_down`, `left`, `right`, `back`, `close`,
@@ -172,7 +172,10 @@ Key sequences such as `gg`, macros, and new movement actions are not supported.
 ## Action reference
 
 The tables below list local defaults without the shifted navigation aliases. Every mode also has `quit = "ctrl-c"` and
-`compact = "ctrl-e"`. Each text input mode also has `clear_line = "ctrl-u"` and
+`compact = "ctrl-e"`, plus `plugin_activity = "ctrl-alt-t"` to toggle the
+plugin activity popup without cancelling its job. Override these under
+`[keys.global]`; an empty list disables a binding.
+Each text input mode also has `clear_line = "ctrl-u"` and
 `delete_word = ["ctrl-w", "alt-backspace", "ctrl-backspace"]`.
 
 Navigation screens also have `command = ":"` and `help = "?"`. These are the
