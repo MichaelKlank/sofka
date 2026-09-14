@@ -55,6 +55,15 @@ impl App {
         self.spawn_argocd();
     }
 
+    /// The kubeconfig as seen now, for resolving destinations.
+    fn context_index(&self) -> crate::k8s::ContextIndex {
+        #[cfg(test)]
+        if let Some(index) = &self.context_index_override {
+            return index.clone();
+        }
+        crate::k8s::ContextIndex::read()
+    }
+
     /// `r` in the Argo CD view: re-gather for the same selection.
     pub(super) fn refresh_argocd(&mut self) {
         if self.argocd_source.is_some() {
@@ -83,7 +92,7 @@ impl App {
         let current_server = self.cluster.cluster_url.clone();
         // Read here, not in the gather: parsing the kubeconfig is blocking file
         // I/O and has no business on a tokio worker.
-        let contexts = crate::k8s::ContextIndex::read();
+        let contexts = self.context_index();
         let client = self.cluster.client.clone();
         let tx = self.tx.clone();
         let genr = self.generation;

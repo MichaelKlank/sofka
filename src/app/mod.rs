@@ -1863,6 +1863,11 @@ pub struct App {
     applied_filter_labels: Option<String>,
     applied_filter_fields: Option<String>,
     pending_resource_query: Option<crate::filter::ResourceQuery>,
+    /// A kubeconfig snapshot for Argo CD destination resolution, in place of
+    /// reading the file — tests set it, so resolution does not depend on the
+    /// developer's kubeconfig.
+    #[cfg(test)]
+    pub(super) context_index_override: Option<crate::k8s::ContextIndex>,
     pub command: String,
     pub cmd_suggestions: Vec<Suggestion>,
     pub cmd_sel: usize,
@@ -2343,6 +2348,8 @@ impl App {
             applied_filter_labels: None,
             applied_filter_fields: None,
             pending_resource_query: None,
+            #[cfg(test)]
+            context_index_override: None,
             command: String::new(),
             cmd_suggestions: Vec::new(),
             cmd_sel: 0,

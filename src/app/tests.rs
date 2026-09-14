@@ -24077,6 +24077,72 @@ async fn argocd_expansion_on_a_heading_does_nothing() {
     );
 }
 
+/// A destination registered under Argo's spelling resolves, through the
+/// kubeconfig, to the context that actually serves it — an alias when that is
+/// what the kubeconfig has — and `⏎` names that alias. A stale context named
+/// exactly like the destination but pointing at a missing cluster must not
+/// win over it.
+#[tokio::test]
+async fn argocd_view_enter_names_the_alias_context_for_a_remote_name() {
+    let root = argocd_application(json!({"name": "eks-prod-general", "namespace": "default"}));
+    let (mut app, mut rx, responses, _) = health_report_app("applications", root.clone());
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/applications/web",
+        kind.ar.api_version
+    );
+    responses.lock().unwrap().insert(path, (200, root));
+
+    let kubeconfig = |stale: bool| {
+        let stale = if stale {
+            "  - name: eks-prod-general\n    context: { cluster: deleted-cluster }\n"
+        } else {
+            ""
+        };
+        let yaml = format!(
+            r#"
+contexts:
+{stale}  - name: prod
+    context: {{ cluster: "arn:aws:eks:us-east-1:1:cluster/eks-prod-general" }}
+clusters:
+  - name: "arn:aws:eks:us-east-1:1:cluster/eks-prod-general"
+    cluster: {{ server: https://prod.example }}
+"#
+        );
+        crate::k8s::ContextIndex::from_kubeconfig(&serde_yaml::from_str(&yaml).unwrap())
+    };
+
+    for stale in [false, true] {
+        app.context_index_override = Some(kubeconfig(stale));
+        if stale {
+            app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        } else {
+            open_argocd_view(&mut app);
+        }
+        receive_argocd_report(&mut app, &mut rx).await;
+
+        let row = app
+            .argocd_items
+            .iter()
+            .position(|f| f.text.starts_with("Service/web:"))
+            .expect("managed resource row");
+        app.argocd_state.select(Some(row));
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.mode, Mode::Argocd);
+        assert!(
+            app.flash.contains("switch with :ctx prod"),
+            "stale={stale}: {}",
+            app.flash
+        );
+        assert!(!app.flash.contains("eks-prod-general"), "{}", app.flash);
+        assert!(
+            !app.flash.contains("no kubeconfig context serves"),
+            "{}",
+            app.flash
+        );
+    }
+}
+
 /// A remote destination has no jump targets, so there is nothing to walk —
 /// pressing `c` must say where the resources are rather than list this
 /// cluster's workloads.
