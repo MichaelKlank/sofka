@@ -33,20 +33,36 @@ The archive check compares the packaged binary with the input binary and checks
 the required notice files. The upload job generates checksums and build
 attestations after packaging.
 
+Keep future release asset names in the form `sofka-v<version>-<target>.tar.gz`,
+with checksums in `SHA256SUMS`. Aqua and mise's Aqua backend use these names.
+License files go inside the archive and do not change its filename.
+
 For old releases, use each tag's manifest and lockfile. Repackage the existing
 binaries without compiling them again. Keep the original archive hashes and
 binary hashes in the correction record. Publish corrected archives with new
-checksums and attestations before removing the incomplete downloads. Update
-package manager checksums and URLs when their archive changes.
+checksums and attestations before removing the incomplete downloads. Keep the
+standard download names available with corrected bytes and current checksums.
 
-The `Repair release licenses` workflow accepts one release tag or `all`. It
-publishes `-licenses.tar.gz` archives, `SHA256SUMS-licenses`, and a
+The one-time repair covered all 90 releases from v0.1.0 through v0.27.2. It
+published `-licenses.tar.gz` archives, `SHA256SUMS-licenses`, and a
 `LICENSE-CORRECTION.json` record for each release. Its attestation records the
 archive correction process. It does not claim to rebuild the old binary.
-It identifies the Rust compiler commit in each binary and obtains the standard
-library notices from the matching, checksum-verified Rust distribution.
+The repair identified the Rust compiler commit in each binary and obtained the
+standard library notices from the matching, checksum-verified Rust distribution.
 The historical v0.13.4 Linux archives keep their musl target names and include
 the musl 1.2.5 copyright file from the source selected by that tag's Nix lockfile.
-Original downloads remain available until their replacements are verified and
-package managers use the corrected URLs. The separate `retire` command checks
-the remote hashes before it removes each original binary archive.
+The incomplete archives were removed. The standard archive names were then
+restored with the same bytes as the corrected archives, with updated
+`SHA256SUMS` files. Aqua and other package managers need these standard names.
+Lockfiles that pin the old archive hashes need updated checksums. The correction
+records retain the hashes of the incomplete archives for reference.
+After the standard downloads and Homebrew URLs were verified, the temporary
+`-licenses.tar.gz` archives and `SHA256SUMS-licenses` files were removed. The
+corrected archive hashes in the records apply to the standard download names.
+
+The completed repair workflow was removed. Its run history and attestations
+remain available. The repair scripts remain for reference and recovery.
+The retained `restore-names` command checks local and published corrected archive
+hashes and refuses to replace an asset with different bytes. It depends on the
+temporary correction assets and cannot be rerun after their removal. Do not run
+`retire` against the restored downloads.

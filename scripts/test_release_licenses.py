@@ -259,6 +259,53 @@ class ReleaseLicensesTests(unittest.TestCase):
             self.assertEqual(len(deletions), 5)
             self.assertEqual(len(remote), 6)
 
+            with patch.object(repair_release_licenses, "gh", side_effect=github):
+                changed = destination / record["assets"][0]["corrected_name"]
+                saved = changed.read_bytes()
+                changed.write_bytes(b"changed archive")
+                with self.assertRaisesRegex(ValueError, "Changed correction archive"):
+                    repair_release_licenses.restore_names(root)
+                self.assertEqual(len(uploads), 1)
+                changed.write_bytes(saved)
+                correction = remote[changed.name]
+                saved_digest = correction["digest"]
+                correction["digest"] = "sha256:wrong"
+                with self.assertRaisesRegex(ValueError, "Missing verified correction"):
+                    repair_release_licenses.restore_names(root)
+                correction["digest"] = saved_digest
+                original_name = record["assets"][0]["original_name"]
+                remote[original_name] = {"name": original_name, "digest": "sha256:old"}
+                with self.assertRaisesRegex(
+                    ValueError, "Existing asset has different bytes"
+                ):
+                    repair_release_licenses.restore_names(root)
+                self.assertEqual(len(uploads), 1)
+                del remote[original_name]
+                repair_release_licenses.restore_names(root, "v1.0.0")
+                repair_release_licenses.restore_names(root, "v1.0.0")
+                self.assertEqual(len(uploads), 2)
+                self.assertEqual(len(remote), 11)
+                self.assertEqual(
+                    body.count("<!-- release-license-compatibility -->"), 1
+                )
+                self.assertTrue(body.startswith("Original release notes"))
+                for asset in record["assets"]:
+                    self.assertEqual(
+                        remote[asset["original_name"]]["digest"],
+                        "sha256:" + asset["corrected_sha256"],
+                    )
+                expected_sums = "".join(
+                    f"{a['corrected_sha256']}  {a['original_name']}\n"
+                    for a in record["assets"]
+                )
+                self.assertEqual(
+                    remote["SHA256SUMS"]["digest"],
+                    "sha256:" + hashlib.sha256(expected_sums.encode()).hexdigest(),
+                )
+                with self.assertRaisesRegex(ValueError, "Original asset changed"):
+                    repair_release_licenses.retire(root)
+                self.assertEqual(len(deletions), 5)
+
 
 if __name__ == "__main__":
     unittest.main()

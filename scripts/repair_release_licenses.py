@@ -344,9 +344,86 @@ def retire(directory):
         print(f"{record['tag']}: retired incomplete binary archives", flush=True)
 
 
+def restore_names(directory, tag="all"):
+    records = sorted(directory.glob("v*/LICENSE-CORRECTION.json"))
+    if tag != "all":
+        records = [path for path in records if path.parent.name == tag]
+    if not records:
+        raise ValueError("No matching correction records")
+    for record_path in records:
+        record = json.loads(record_path.read_text())
+        release = json.loads(gh("api", f"repos/{REPO}/releases/tags/{record['tag']}"))
+        remote = {a["name"]: a for a in release["assets"]}
+        with tempfile.TemporaryDirectory(dir=record_path.parent) as temporary:
+            staging = Path(temporary)
+            for asset in record["assets"]:
+                source = record_path.with_name(asset["corrected_name"])
+                if digest(source) != asset["corrected_sha256"]:
+                    raise ValueError(f"Changed correction archive: {source}")
+                if (
+                    remote.get(asset["corrected_name"], {}).get("digest")
+                    != "sha256:" + asset["corrected_sha256"]
+                ):
+                    raise ValueError(f"Missing verified correction: {source.name}")
+                (staging / asset["original_name"]).hardlink_to(source)
+            (staging / "SHA256SUMS").write_text(
+                "".join(
+                    f"{a['corrected_sha256']}  {a['original_name']}\n"
+                    for a in record["assets"]
+                )
+            )
+            files = sorted(staging.iterdir())
+            upload = []
+            for path in files:
+                if path.name in remote:
+                    if remote[path.name].get("digest") != "sha256:" + digest(path):
+                        raise ValueError(
+                            f"Existing asset has different bytes: {path.name}"
+                        )
+                else:
+                    upload.append(str(path))
+            if upload:
+                gh("release", "upload", record["tag"], "--repo", REPO, *upload)
+            verified = json.loads(
+                gh("api", f"repos/{REPO}/releases/tags/{record['tag']}")
+            )
+            remote = {a["name"]: a for a in verified["assets"]}
+            for path in files:
+                if remote[path.name].get("digest") != "sha256:" + digest(path):
+                    raise ValueError(f"Uploaded asset checksum mismatch: {path.name}")
+        marker = "<!-- release-license-compatibility -->"
+        body = verified.get("body") or ""
+        if marker not in body:
+            body += (
+                f"\n\n{marker}\n"
+                "Package manager compatibility: the standard archive names are "
+                "available again. They contain the same corrected bytes as the "
+                "`-licenses.tar.gz` files. `SHA256SUMS` lists their current hashes. "
+                "The program binaries are unchanged. Lockfiles with archive hashes "
+                "from before the license correction need updated checksums.\n"
+            )
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as notes:
+                json.dump({"body": body}, notes)
+                notes.flush()
+                gh(
+                    "api",
+                    f"repos/{REPO}/releases/{verified['id']}",
+                    "--method",
+                    "PATCH",
+                    "--input",
+                    notes.name,
+                )
+        print(
+            f"{record['tag']}: restored and verified standard download names",
+            flush=True,
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("prepare", "publish", "retire"))
+    parser.add_argument(
+        "command", choices=("prepare", "publish", "retire", "restore-names")
+    )
     parser.add_argument("--directory", type=Path, required=True)
     parser.add_argument("--tag", default="all")
     parser.add_argument("--cargo-about", default="cargo-about")
@@ -367,6 +444,8 @@ def main():
                 result.result()
     elif args.command == "publish":
         publish(args.directory)
+    elif args.command == "restore-names":
+        restore_names(args.directory, args.tag)
     else:
         retire(args.directory)
 
