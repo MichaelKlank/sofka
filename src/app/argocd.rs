@@ -83,8 +83,7 @@ impl App {
         let current_server = self.cluster.cluster_url.clone();
         // Read here, not in the gather: parsing the kubeconfig is blocking file
         // I/O and has no business on a tokio worker.
-        let contexts = crate::k8s::Cluster::context_servers();
-        let context_clusters = crate::k8s::Cluster::context_clusters();
+        let contexts = crate::k8s::ContextIndex::read();
         let client = self.cluster.client.clone();
         let tx = self.tx.clone();
         let genr = self.generation;
@@ -152,7 +151,7 @@ impl App {
                 };
                 let destination = app
                     .as_ref()
-                    .map(|a| resolve_destination(a, &current_server, &contexts, &context_clusters))
+                    .map(|a| resolve_destination(a, &current_server, &contexts))
                     .unwrap_or(Destination::Current);
                 let mut resources = app
                     .as_ref()
@@ -376,16 +375,20 @@ async fn claimed_by_prefix(
 fn resolve_destination(
     app: &DynamicObject,
     current_server: &str,
-    contexts: &HashMap<String, String>,
-    context_clusters: &[(String, String)],
+    contexts: &crate::k8s::ContextIndex,
 ) -> Destination {
     let (server, name) = argocd::destination_ref(app);
     classify_destination(
         server,
         name,
         current_server,
-        |s| contexts.get(&crate::k8s::normalize_server(s)).cloned(),
-        |n| argocd::context_for_name(n, context_clusters),
+        |s| {
+            contexts
+                .by_server
+                .get(&crate::k8s::normalize_server(s))
+                .cloned()
+        },
+        |n| argocd::context_for_name(n, &contexts.clusters),
     )
 }
 

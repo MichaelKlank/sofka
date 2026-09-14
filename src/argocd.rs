@@ -530,6 +530,12 @@ pub fn destination_ref(app: &DynamicObject) -> (&str, &str) {
 /// (`arn:aws:eks:…:cluster/eks-dev-general`) while Argo holds the bare
 /// cluster name. Within a tier the first context in file order wins, so a
 /// short alias and the full name pointing at one cluster both resolve.
+///
+/// Two guards. The ARN tail is only trusted when exactly one cluster entry
+/// carries it — the same bare name in two accounts or regions is ambiguous,
+/// and guessing would send `:ctx` to the wrong cluster. And Argo's reserved
+/// `in-cluster` is matched by an exact context name only: a cluster entry
+/// that happens to be called that must not turn the local Application remote.
 pub fn context_for_name(name: &str, contexts: &[(String, String)]) -> Option<String> {
     if name.is_empty() {
         return None;
@@ -540,9 +546,21 @@ pub fn context_for_name(name: &str, contexts: &[(String, String)]) -> Option<Str
             .find(|(ctx, cluster)| pred(ctx, cluster))
             .map(|(ctx, _)| ctx.clone())
     };
-    first(&|ctx, _| ctx == name)
-        .or_else(|| first(&|_, cluster| cluster == name))
-        .or_else(|| first(&|_, cluster| cluster.rsplit('/').next() == Some(name)))
+    let exact = first(&|ctx, _| ctx == name);
+    if exact.is_some() || name == "in-cluster" {
+        return exact;
+    }
+    first(&|_, cluster| cluster == name).or_else(|| {
+        let mut tails = contexts
+            .iter()
+            .filter(|(_, cluster)| cluster.rsplit('/').next() == Some(name))
+            .map(|(_, cluster)| cluster.as_str());
+        let only = tails.next()?;
+        if tails.any(|c| c != only) {
+            return None;
+        }
+        first(&|_, cluster| cluster == only)
+    })
 }
 
 /// `spec.destination.namespace`.
@@ -1516,6 +1534,53 @@ mod tests {
         assert_eq!(resolve("general"), None);
         assert_eq!(resolve("nowhere"), None);
         assert_eq!(resolve(""), None);
+    }
+
+    /// The same bare cluster name in two accounts is not a match: guessing
+    /// would switch to the wrong cluster. Two contexts on one entry are fine.
+    #[test]
+    fn ambiguous_arn_tail_does_not_resolve() {
+        let contexts = vec![
+            (
+                "acct-a".to_string(),
+                "arn:aws:eks:us-east-1:111:cluster/eks-general".to_string(),
+            ),
+            (
+                "acct-b".to_string(),
+                "arn:aws:eks:eu-west-1:222:cluster/eks-general".to_string(),
+            ),
+            (
+                "acct-a-alias".to_string(),
+                "arn:aws:eks:us-east-1:111:cluster/eks-general".to_string(),
+            ),
+        ];
+        assert_eq!(context_for_name("eks-general", &contexts), None);
+        // Drop the second account and the tail is unique again, with the
+        // first of the two contexts on that entry.
+        let unique = vec![contexts[0].clone(), contexts[2].clone()];
+        assert_eq!(
+            context_for_name("eks-general", &unique).as_deref(),
+            Some("acct-a")
+        );
+    }
+
+    /// Argo's reserved local name is only claimed by a context called exactly
+    /// that; a cluster entry called `in-cluster` under another context name
+    /// leaves the convention to decide.
+    #[test]
+    fn in_cluster_matches_an_exact_context_only() {
+        let by_entry = vec![("local".to_string(), "in-cluster".to_string())];
+        assert_eq!(context_for_name("in-cluster", &by_entry), None);
+        let by_context = vec![("in-cluster".to_string(), "kind-local".to_string())];
+        assert_eq!(
+            context_for_name("in-cluster", &by_context).as_deref(),
+            Some("in-cluster")
+        );
+        // Other names still match through the entry.
+        assert_eq!(
+            context_for_name("kind-local", &by_context).as_deref(),
+            Some("in-cluster")
+        );
     }
 
     /// The whole point of [`Destination`]: a managed resource in another

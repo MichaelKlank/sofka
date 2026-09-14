@@ -322,6 +322,51 @@ fn sanitize_server_version(version: &str) -> String {
     crate::text::ellipsize(&visible, SERVER_VERSION_MAX_CHARS)
 }
 
+/// What the kubeconfig says about contexts, from one read: every context by
+/// the normalized server URL it talks to, and every context with its cluster
+/// entry name in file order. The two answer different questions — a
+/// server-URL destination and a name destination — and must come from the
+/// same snapshot of the file, so they are built together.
+///
+/// Two contexts may point at one cluster (a short alias next to the full
+/// name). `by_server` keeps whichever came last; `clusters` keeps both.
+#[derive(Debug, Default)]
+pub struct ContextIndex {
+    pub by_server: HashMap<String, String>,
+    pub clusters: Vec<(String, String)>,
+}
+
+impl ContextIndex {
+    /// Read once by callers that resolve several destinations, so the file is
+    /// not parsed per lookup and never on a worker thread mid-gather.
+    pub fn read() -> Self {
+        let Ok(config) = Kubeconfig::read() else {
+            return Self::default();
+        };
+        let servers: HashMap<&str, String> = config
+            .clusters
+            .iter()
+            .filter_map(|c| {
+                let server = c.cluster.as_ref()?.server.as_deref()?;
+                Some((c.name.as_str(), normalize_server(server)))
+            })
+            .collect();
+        let mut index = Self::default();
+        for c in &config.contexts {
+            let Some(cluster) = c.context.as_ref().map(|ctx| ctx.cluster.clone()) else {
+                continue;
+            };
+            if let Some(server) = servers.get(cluster.as_str())
+                && !server.is_empty()
+            {
+                index.by_server.insert(server.clone(), c.name.clone());
+            }
+            index.clusters.push((c.name.clone(), cluster));
+        }
+        index
+    }
+}
+
 /// An API-server URL reduced to a comparable form, so the same cluster written
 /// with a stray trailing slash or in mixed case still matches.
 pub(crate) fn normalize_server(server: &str) -> String {
@@ -521,49 +566,9 @@ impl Cluster {
     /// can be matched directly — no Argo CD cluster Secret needs reading, and
     /// no credentials are involved.
     pub fn context_for_server(server: &str) -> Option<String> {
-        Self::context_servers().remove(&normalize_server(server))
-    }
-
-    /// Every kubeconfig context keyed by the normalized server URL it talks to.
-    ///
-    /// Read once by callers that resolve several servers, so the file is not
-    /// parsed per lookup and never on a worker thread mid-gather.
-    pub fn context_servers() -> HashMap<String, String> {
-        let Ok(config) = Kubeconfig::read() else {
-            return HashMap::new();
-        };
-        let servers: HashMap<&str, String> = config
-            .clusters
-            .iter()
-            .filter_map(|c| {
-                let server = c.cluster.as_ref()?.server.as_deref()?;
-                Some((c.name.as_str(), normalize_server(server)))
-            })
-            .collect();
-        config
-            .contexts
-            .iter()
-            .filter_map(|c| {
-                let cluster = &c.context.as_ref()?.cluster;
-                let server = servers.get(cluster.as_str())?;
-                (!server.is_empty()).then(|| (server.clone(), c.name.clone()))
-            })
-            .collect()
-    }
-
-    /// Every kubeconfig context as `(context name, cluster entry name)`, in
-    /// file order. Two contexts may point at one cluster (a short alias next to
-    /// the full name); this keeps both, where [`Self::context_servers`] keeps
-    /// whichever came last.
-    pub fn context_clusters() -> Vec<(String, String)> {
-        Kubeconfig::read()
-            .map(|k| {
-                k.contexts
-                    .into_iter()
-                    .filter_map(|c| Some((c.name, c.context?.cluster)))
-                    .collect()
-            })
-            .unwrap_or_default()
+        ContextIndex::read()
+            .by_server
+            .remove(&normalize_server(server))
     }
 
     /// Merge user-defined aliases (alias -> canonical) into the registry.

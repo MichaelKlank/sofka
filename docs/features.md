@@ -463,7 +463,9 @@ concurrent drains, and full kubectl drain parity are outside this feature.
   matches a context named the same, then a context whose cluster entry is named
   the same, then one whose cluster entry ends in `/<name>` - so an EKS entry
   `aws eks update-kubeconfig` named by ARN resolves for an Argo cluster
-  registered as `eks-dev-general`. A short alias and the full name pointing at
+  registered as `eks-dev-general`. The tail only counts when exactly one
+  cluster entry carries it; the same bare name in two accounts stays
+  unresolved rather than guessing. A short alias and the full name pointing at
   one cluster both resolve. `c` on a managed resource
   expands what it owns, indented underneath - Deployment to ReplicaSet to Pod,
   CronJob to Job to Pod - read from the children's own `ownerReferences`. Child
