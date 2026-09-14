@@ -67,18 +67,15 @@ impl App {
         tokio::spawn(async move {
             let gathered: Result<_, String> = async {
                 let obj = report_source(&client, &kind.ar, kind.namespaced, &obj).await?;
-                // The selection is itself the owner (a Kustomization/HelmRelease), or
-                // it's a managed object naming its owner via toolkit labels.
-                let self_is_owner = gitops::is_owner_plural(&plural);
-                let owner_ref = if self_is_owner {
-                    Some(FluxRef {
-                        kind: kind.ar.kind.clone(),
-                        name,
-                        namespace: ns,
-                    })
-                } else {
-                    gitops::owner_ref(&obj)
+                // Use the label reference first. Flux resources can have an owner too.
+                let selection_ref = FluxRef {
+                    kind: kind.ar.kind.clone(),
+                    name,
+                    namespace: ns,
                 };
+                let owner_ref = gitops::owner_ref(&obj)
+                    .or_else(|| gitops::is_owner_plural(&plural).then(|| selection_ref.clone()));
+                let self_is_owner = owner_ref.as_ref() == Some(&selection_ref);
                 let owner_inline = self_is_owner.then(|| obj.clone());
                 let owner_plural_inline = self_is_owner.then(|| plural.clone());
 

@@ -22391,6 +22391,203 @@ async fn explain_refresh_reads_current_resource_without_watch_updates() {
 }
 
 #[tokio::test]
+async fn gitops_flux_resources_follow_owner_labels() {
+    for (plural, kind, parent_plural, parent_kind, label, parent_name, parent_ns) in [
+        (
+            "helmreleases",
+            "HelmRelease",
+            "kustomizations",
+            "Kustomization",
+            "kustomize",
+            "web",
+            "default",
+        ),
+        (
+            "kustomizations",
+            "Kustomization",
+            "kustomizations",
+            "Kustomization",
+            "kustomize",
+            "parent",
+            "default",
+        ),
+        (
+            "kustomizations",
+            "Kustomization",
+            "kustomizations",
+            "Kustomization",
+            "kustomize",
+            "web",
+            "flux-system",
+        ),
+        (
+            "kustomizations",
+            "Kustomization",
+            "helmreleases",
+            "HelmRelease",
+            "helm",
+            "web",
+            "default",
+        ),
+    ] {
+        let root = json!({"apiVersion":"test/v1","kind":kind,
+        "metadata":{"name":"web","namespace":"default","uid":"child-uid",
+            "labels":{
+                format!("{label}.toolkit.fluxcd.io/name"):parent_name,
+                format!("{label}.toolkit.fluxcd.io/namespace"):parent_ns
+            }}});
+        let (mut app, mut rx, responses, requests) = health_report_app(plural, root.clone());
+        let root_path = format!(
+            "/apis/{}/namespaces/default/{plural}/web",
+            app.kind.as_ref().unwrap().ar.api_version
+        );
+        let parent_version = app
+            .cluster
+            .resolve(parent_plural)
+            .unwrap()
+            .ar
+            .api_version
+            .clone();
+        let parent_path =
+            format!("/apis/{parent_version}/namespaces/{parent_ns}/{parent_plural}/{parent_name}");
+        app.cluster.register_kind(
+            "source.toolkit.fluxcd.io",
+            "GitRepository",
+            "gitrepositories",
+            true,
+        );
+        let source_version = app
+            .cluster
+            .resolve("gitrepositories")
+            .unwrap()
+            .ar
+            .api_version
+            .clone();
+        let source_path =
+            format!("/apis/{source_version}/namespaces/{parent_ns}/gitrepositories/parent-source");
+        {
+            let mut replies = responses.lock().unwrap();
+            replies.insert(root_path, (200, root));
+            replies.insert(
+                parent_path.clone(),
+                (
+                    200,
+                    json!({"apiVersion":parent_version,"kind":parent_kind,
+                "metadata":{"name":parent_name,"namespace":parent_ns},
+                "spec":{"sourceRef":{"kind":"GitRepository","name":"parent-source"}},
+                "status":{"conditions":[{"type":"Ready","status":"True"}]}}),
+                ),
+            );
+            replies.insert(
+                source_path.clone(),
+                (
+                    200,
+                    json!({"apiVersion":source_version,"kind":"GitRepository",
+                "metadata":{"name":"parent-source","namespace":parent_ns},
+                "status":{"conditions":[{"type":"Ready","status":"True"}]}}),
+                ),
+            );
+        }
+
+        open_health_report_key(&mut app, true);
+        receive_health_report(&mut app, &mut rx, true).await;
+
+        assert_eq!(app.mode, Mode::Gitops);
+        assert_eq!(
+            app.gitops_items[0].text,
+            format!("{kind}/web is managed by {parent_kind}/{parent_name}")
+        );
+        let owner_index = app
+            .gitops_items
+            .iter()
+            .position(|f| f.text == format!("{parent_kind}/{parent_name}"))
+            .unwrap();
+        let target = app.gitops_items[owner_index].target.as_ref().unwrap();
+        assert_eq!(target.plural, parent_plural);
+        assert_eq!(target.namespace.as_deref(), Some(parent_ns));
+        assert_eq!(target.name, parent_name);
+        assert!(
+            app.gitops_items
+                .iter()
+                .any(|f| f.target.as_ref().is_some_and(|t| t.name == "parent-source"))
+        );
+        {
+            let seen = requests.lock().unwrap();
+            assert!(seen.contains(&parent_path));
+            assert!(seen.contains(&source_path));
+        }
+
+        responses.lock().unwrap().insert(
+            parent_path,
+            (
+                404,
+                json!({
+                    "apiVersion":"v1","kind":"Status","status":"Failure",
+                    "reason":"NotFound","message":"owner missing","code":404
+                }),
+            ),
+        );
+        app.handle_key(press(KeyCode::Char('r'))).unwrap();
+        receive_health_report(&mut app, &mut rx, true).await;
+        assert_eq!(
+            app.gitops_items[0].text,
+            format!("{kind}/web is managed by {parent_kind}/{parent_name}")
+        );
+        assert!(
+            app.gitops_items
+                .iter()
+                .any(|f| f.text == "owner not found in cluster")
+        );
+    }
+}
+
+#[tokio::test]
+async fn gitops_flux_resources_without_parent_use_the_selection() {
+    for (plural, kind, label) in [
+        ("helmreleases", "HelmRelease", "helm"),
+        ("kustomizations", "Kustomization", "kustomize"),
+    ] {
+        for self_label in [false, true] {
+            let mut root = json!({"apiVersion":"test/v1","kind":kind,
+                "metadata":{"name":"web","namespace":"default","uid":"owner-uid"},
+                "status":{"conditions":[{"type":"Ready","status":"True"}]}});
+            if self_label {
+                root["metadata"]["labels"] = json!({
+                    format!("{label}.toolkit.fluxcd.io/name"):"web",
+                    format!("{label}.toolkit.fluxcd.io/namespace"):"default"
+                });
+            }
+            let (mut app, mut rx, responses, requests) = health_report_app(plural, root.clone());
+            let path = format!(
+                "/apis/{}/namespaces/default/{plural}/web",
+                app.kind.as_ref().unwrap().ar.api_version
+            );
+            responses.lock().unwrap().insert(path.clone(), (200, root));
+
+            open_health_report_key(&mut app, true);
+            receive_health_report(&mut app, &mut rx, true).await;
+
+            let owner = app
+                .gitops_items
+                .iter()
+                .find(|f| f.text == format!("{kind}/web"))
+                .unwrap();
+            assert!(owner.target.is_none());
+            assert!(app.gitops_items.iter().any(|f| f.text == "Ready: True"));
+            assert_eq!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|r| **r == path)
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn gitops_refresh_reads_current_owner_and_source_reference() {
     let root = json!({"apiVersion":"kustomize.toolkit.fluxcd.io/v1","kind":"Kustomization",
         "metadata":{"name":"web","namespace":"default","uid":"owner-uid"},
