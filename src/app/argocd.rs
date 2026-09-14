@@ -55,6 +55,15 @@ impl App {
         self.spawn_argocd();
     }
 
+    /// The kubeconfig as seen now, for resolving destinations.
+    fn context_index(&self) -> crate::k8s::ContextIndex {
+        #[cfg(test)]
+        if let Some(index) = &self.context_index_override {
+            return index.clone();
+        }
+        crate::k8s::ContextIndex::read()
+    }
+
     /// `r` in the Argo CD view: re-gather for the same selection.
     pub(super) fn refresh_argocd(&mut self) {
         if self.argocd_source.is_some() {
@@ -83,7 +92,7 @@ impl App {
         let current_server = self.cluster.cluster_url.clone();
         // Read here, not in the gather: parsing the kubeconfig is blocking file
         // I/O and has no business on a tokio worker.
-        let contexts = crate::k8s::Cluster::context_servers();
+        let contexts = self.context_index();
         let client = self.cluster.client.clone();
         let tx = self.tx.clone();
         let genr = self.generation;
@@ -375,15 +384,20 @@ async fn claimed_by_prefix(
 fn resolve_destination(
     app: &DynamicObject,
     current_server: &str,
-    contexts: &HashMap<String, String>,
+    contexts: &crate::k8s::ContextIndex,
 ) -> Destination {
     let (server, name) = argocd::destination_ref(app);
     classify_destination(
         server,
         name,
         current_server,
-        |s| contexts.get(&crate::k8s::normalize_server(s)).cloned(),
-        |n| contexts.values().any(|c| c == n),
+        |s| {
+            contexts
+                .by_server
+                .get(&crate::k8s::normalize_server(s))
+                .cloned()
+        },
+        |n| argocd::context_for_name(n, &contexts.clusters),
     )
 }
 
@@ -394,7 +408,7 @@ pub(super) fn classify_destination(
     name: &str,
     current_server: &str,
     context_for_server: impl Fn(&str) -> Option<String>,
-    is_known_context: impl Fn(&str) -> bool,
+    context_for_name: impl Fn(&str) -> Option<String>,
 ) -> Destination {
     if !server.is_empty() {
         let normalized = crate::k8s::normalize_server(server);
@@ -419,8 +433,8 @@ pub(super) fn classify_destination(
     // Try the kubeconfig first. A context of that name is concrete, and taking
     // it over the `in-cluster` convention stops a cluster registered under that
     // name from passing as the local one.
-    if is_known_context(name) {
-        return Destination::Context(name.to_string());
+    if let Some(ctx) = context_for_name(name) {
+        return Destination::Context(ctx);
     }
     if name == "in-cluster" {
         return Destination::Current;

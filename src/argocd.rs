@@ -519,6 +519,50 @@ pub fn destination_ref(app: &DynamicObject) -> (&str, &str) {
     )
 }
 
+/// The kubeconfig context serving a `spec.destination.name`, from
+/// `(context name, cluster entry name)` pairs in kubeconfig order.
+///
+/// Argo registers a cluster under a free-form name, and a kubeconfig rarely
+/// spells the context the same way. Three tiers, first hit wins: a context
+/// named exactly `name`; a context whose cluster entry is named `name`; a
+/// context whose cluster entry ends in `/name` — the EKS shape, where
+/// `aws eks update-kubeconfig` names the entry by ARN
+/// (`arn:aws:eks:…:cluster/eks-dev-general`) while Argo holds the bare
+/// cluster name. Within a tier the first context in file order wins, so a
+/// short alias and the full name pointing at one cluster both resolve.
+///
+/// Two guards. The ARN tail is only trusted when exactly one cluster entry
+/// carries it — the same bare name in two accounts or regions is ambiguous,
+/// and guessing would send `:ctx` to the wrong cluster. And Argo's reserved
+/// `in-cluster` is matched by an exact context name only: a cluster entry
+/// that happens to be called that must not turn the local Application remote.
+pub fn context_for_name(name: &str, contexts: &[(String, String)]) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    let first = |pred: &dyn Fn(&str, &str) -> bool| {
+        contexts
+            .iter()
+            .find(|(ctx, cluster)| pred(ctx, cluster))
+            .map(|(ctx, _)| ctx.clone())
+    };
+    let exact = first(&|ctx, _| ctx == name);
+    if exact.is_some() || name == "in-cluster" {
+        return exact;
+    }
+    first(&|_, cluster| cluster == name).or_else(|| {
+        let mut tails = contexts
+            .iter()
+            .filter(|(_, cluster)| cluster.rsplit('/').next() == Some(name))
+            .map(|(_, cluster)| cluster.as_str());
+        let only = tails.next()?;
+        if tails.any(|c| c != only) {
+            return None;
+        }
+        first(&|_, cluster| cluster == only)
+    })
+}
+
 /// `spec.destination.namespace`.
 pub fn destination_namespace(app: &DynamicObject) -> &str {
     str_at(&app.data, "/spec/destination/namespace")
@@ -1450,6 +1494,92 @@ mod tests {
             texts(&out)
                 .iter()
                 .any(|t| t == "last sync Failed — one or more objects failed")
+        );
+    }
+
+    /// A destination name matches a context by its own name, by its cluster
+    /// entry, or by the last `/` segment of that entry (the EKS ARN shape).
+    #[test]
+    fn destination_name_resolves_by_context_cluster_or_arn_tail() {
+        let arn = |c: &str| format!("arn:aws:eks:us-east-1:1:cluster/{c}");
+        let contexts = vec![
+            ("dev".to_string(), arn("eks-dev-general")),
+            ("eks-dev-general".to_string(), arn("eks-dev-general")),
+            ("eks-prod-general".to_string(), arn("eks-prod-general")),
+            ("prod".to_string(), arn("eks-prod-general")),
+            ("staging".to_string(), "staging-cluster".to_string()),
+        ];
+        let resolve = |n: &str| context_for_name(n, &contexts);
+
+        // An exact context name wins over an alias sharing the cluster,
+        // whichever of the two the kubeconfig lists first.
+        assert_eq!(
+            resolve("eks-dev-general").as_deref(),
+            Some("eks-dev-general")
+        );
+        assert_eq!(
+            resolve("eks-prod-general").as_deref(),
+            Some("eks-prod-general")
+        );
+        assert_eq!(resolve("prod").as_deref(), Some("prod"));
+        // The cluster entry name.
+        assert_eq!(resolve("staging-cluster").as_deref(), Some("staging"));
+        // The ARN tail, when only an alias serves the cluster.
+        let alias_only = vec![("prod".to_string(), arn("eks-prod-general"))];
+        assert_eq!(
+            context_for_name("eks-prod-general", &alias_only).as_deref(),
+            Some("prod")
+        );
+        // Not a suffix match: `general` is not the tail of the ARN.
+        assert_eq!(resolve("general"), None);
+        assert_eq!(resolve("nowhere"), None);
+        assert_eq!(resolve(""), None);
+    }
+
+    /// The same bare cluster name in two accounts is not a match: guessing
+    /// would switch to the wrong cluster. Two contexts on one entry are fine.
+    #[test]
+    fn ambiguous_arn_tail_does_not_resolve() {
+        let contexts = vec![
+            (
+                "acct-a".to_string(),
+                "arn:aws:eks:us-east-1:111:cluster/eks-general".to_string(),
+            ),
+            (
+                "acct-b".to_string(),
+                "arn:aws:eks:eu-west-1:222:cluster/eks-general".to_string(),
+            ),
+            (
+                "acct-a-alias".to_string(),
+                "arn:aws:eks:us-east-1:111:cluster/eks-general".to_string(),
+            ),
+        ];
+        assert_eq!(context_for_name("eks-general", &contexts), None);
+        // Drop the second account and the tail is unique again, with the
+        // first of the two contexts on that entry.
+        let unique = vec![contexts[0].clone(), contexts[2].clone()];
+        assert_eq!(
+            context_for_name("eks-general", &unique).as_deref(),
+            Some("acct-a")
+        );
+    }
+
+    /// Argo's reserved local name is only claimed by a context called exactly
+    /// that; a cluster entry called `in-cluster` under another context name
+    /// leaves the convention to decide.
+    #[test]
+    fn in_cluster_matches_an_exact_context_only() {
+        let by_entry = vec![("local".to_string(), "in-cluster".to_string())];
+        assert_eq!(context_for_name("in-cluster", &by_entry), None);
+        let by_context = vec![("in-cluster".to_string(), "kind-local".to_string())];
+        assert_eq!(
+            context_for_name("in-cluster", &by_context).as_deref(),
+            Some("in-cluster")
+        );
+        // Other names still match through the entry.
+        assert_eq!(
+            context_for_name("kind-local", &by_context).as_deref(),
+            Some("in-cluster")
         );
     }
 

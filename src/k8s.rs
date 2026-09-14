@@ -322,6 +322,57 @@ fn sanitize_server_version(version: &str) -> String {
     crate::text::ellipsize(&visible, SERVER_VERSION_MAX_CHARS)
 }
 
+/// What the kubeconfig says about contexts, from one read: every context by
+/// the normalized server URL it talks to, and every context with its cluster
+/// entry name in file order. The two answer different questions — a
+/// server-URL destination and a name destination — and must come from the
+/// same snapshot of the file, so they are built together.
+///
+/// Two contexts may point at one cluster (a short alias next to the full
+/// name). `by_server` keeps whichever came last; `clusters` keeps both.
+///
+/// Only contexts that can connect are in either: a context whose cluster
+/// entry is missing or has no server is left out, so a stale
+/// `eks-prod-general` context does not outrank a working `prod` alias.
+#[derive(Debug, Clone, Default)]
+pub struct ContextIndex {
+    pub by_server: HashMap<String, String>,
+    pub clusters: Vec<(String, String)>,
+}
+
+impl ContextIndex {
+    /// Read once by callers that resolve several destinations, so the file is
+    /// not parsed per lookup and never on a worker thread mid-gather.
+    pub fn read() -> Self {
+        Kubeconfig::read()
+            .map(|config| Self::from_kubeconfig(&config))
+            .unwrap_or_default()
+    }
+
+    pub fn from_kubeconfig(config: &Kubeconfig) -> Self {
+        let servers: HashMap<&str, String> = config
+            .clusters
+            .iter()
+            .filter_map(|c| {
+                let server = c.cluster.as_ref()?.server.as_deref()?;
+                Some((c.name.as_str(), normalize_server(server)))
+            })
+            .collect();
+        let mut index = Self::default();
+        for c in &config.contexts {
+            let Some(cluster) = c.context.as_ref().map(|ctx| ctx.cluster.clone()) else {
+                continue;
+            };
+            let Some(server) = servers.get(cluster.as_str()).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            index.by_server.insert(server.clone(), c.name.clone());
+            index.clusters.push((c.name.clone(), cluster));
+        }
+        index
+    }
+}
+
 /// An API-server URL reduced to a comparable form, so the same cluster written
 /// with a stray trailing slash or in mixed case still matches.
 pub(crate) fn normalize_server(server: &str) -> String {
@@ -521,34 +572,9 @@ impl Cluster {
     /// can be matched directly — no Argo CD cluster Secret needs reading, and
     /// no credentials are involved.
     pub fn context_for_server(server: &str) -> Option<String> {
-        Self::context_servers().remove(&normalize_server(server))
-    }
-
-    /// Every kubeconfig context keyed by the normalized server URL it talks to.
-    ///
-    /// Read once by callers that resolve several servers, so the file is not
-    /// parsed per lookup and never on a worker thread mid-gather.
-    pub fn context_servers() -> HashMap<String, String> {
-        let Ok(config) = Kubeconfig::read() else {
-            return HashMap::new();
-        };
-        let servers: HashMap<&str, String> = config
-            .clusters
-            .iter()
-            .filter_map(|c| {
-                let server = c.cluster.as_ref()?.server.as_deref()?;
-                Some((c.name.as_str(), normalize_server(server)))
-            })
-            .collect();
-        config
-            .contexts
-            .iter()
-            .filter_map(|c| {
-                let cluster = &c.context.as_ref()?.cluster;
-                let server = servers.get(cluster.as_str())?;
-                (!server.is_empty()).then(|| (server.clone(), c.name.clone()))
-            })
-            .collect()
+        ContextIndex::read()
+            .by_server
+            .remove(&normalize_server(server))
     }
 
     /// Merge user-defined aliases (alias -> canonical) into the registry.
@@ -1444,6 +1470,59 @@ pub(crate) mod tests {
         assert_eq!(after_cancelled.0, after_completed.0 + 1);
         assert_eq!(after_cancelled.1, after_completed.1 + 1);
         assert!(after_cancelled.2 >= 1.0, "max {}", after_cancelled.2);
+    }
+
+    /// A context whose cluster entry is missing, or has no server, cannot
+    /// connect and must not be offered as a destination — while every alias
+    /// that can connect stays, both by server and by name.
+    #[test]
+    fn context_index_skips_contexts_without_a_server() {
+        let kubeconfig: Kubeconfig = serde_yaml::from_str(
+            r#"
+contexts:
+  - name: eks-prod-general
+    context: { cluster: deleted-cluster }
+  - name: prod
+    context: { cluster: "arn:aws:eks:us-east-1:1:cluster/eks-prod-general" }
+  - name: prod-alias
+    context: { cluster: "arn:aws:eks:us-east-1:1:cluster/eks-prod-general" }
+  - name: empty
+    context: { cluster: no-server }
+  - name: blank
+    context: { cluster: blank-server }
+clusters:
+  - name: "arn:aws:eks:us-east-1:1:cluster/eks-prod-general"
+    cluster: { server: https://prod.example }
+  - name: no-server
+    cluster: {}
+  - name: blank-server
+    cluster: { server: "" }
+"#,
+        )
+        .unwrap();
+        let index = ContextIndex::from_kubeconfig(&kubeconfig);
+        assert_eq!(
+            index.clusters,
+            vec![
+                (
+                    "prod".to_string(),
+                    "arn:aws:eks:us-east-1:1:cluster/eks-prod-general".to_string()
+                ),
+                (
+                    "prod-alias".to_string(),
+                    "arn:aws:eks:us-east-1:1:cluster/eks-prod-general".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            index
+                .by_server
+                .get("https://prod.example")
+                .map(String::as_str),
+            Some("prod-alias"),
+            "last alias on the server wins the server map"
+        );
+        assert_eq!(index.by_server.len(), 1);
     }
 
     #[test]
