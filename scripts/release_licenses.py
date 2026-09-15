@@ -13,8 +13,6 @@ import tempfile
 import urllib.error
 from pathlib import Path
 
-import tomllib
-
 ROOT = Path(__file__).resolve().parents[1]
 LICENSE_NAMES = ("LICENSE", "LICENCE", "COPYING", "COPYRIGHT", "NOTICE")
 REQUIRED = ("LICENSE-MIT", "LICENSE-APACHE", "THIRD-PARTY-LICENSES.txt")
@@ -115,6 +113,8 @@ def repository_notices(package, cache):
 
 
 def generate(manifest, output, cargo_about, cache, targets=None):
+    import tomllib
+
     manifest = manifest.resolve()
     output.mkdir(parents=True, exist_ok=True)
     lock = manifest.with_name("Cargo.lock")
