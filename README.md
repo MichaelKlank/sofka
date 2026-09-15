@@ -194,6 +194,11 @@ be read-only in a light skin while everything else stays as is. See the
 | [Debugging](docs/debugging.md)                 | explain, timeline, diff, notifications, debug pods, bundles |
 | [Architecture](docs/architecture.md)           | module layout, data flow, dev loop, release process         |
 
+## Contributing
+
+Read the [contribution guide](CONTRIBUTING.md) for feature discussions, bug
+reports, development setup, and pull request checks.
+
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
