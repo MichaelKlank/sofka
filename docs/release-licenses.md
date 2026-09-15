@@ -8,7 +8,7 @@ under MPL 2.0. The notice file also gives exact source download URLs.
 
 The release workflow uses cargo-about 0.9.2 and the release tag's `Cargo.lock`.
 It collects licenses for the default build on all four supported targets.
-It excludes dependencies used only for tests or build scripts. The Python
+It excludes dependencies used only for tests or build scripts. The Rust
 collector adds license and notice files from bundled native source trees.
 Cargo downloads the locked sources first. License analysis then runs offline;
 source archives and omitted notices use explicit source URLs.
@@ -25,9 +25,14 @@ To check the release notices locally:
 
 ```sh
 cargo install cargo-about --version 0.9.2 --features cli --locked
-python3 scripts/release_licenses.py generate --output target/release-notices
-python3 -m unittest discover -s scripts -p 'test_release_licenses.py'
+cargo run --locked --example release-licenses -- generate --output target/release-notices
+cargo test --locked --example release-licenses
 ```
+
+Use an empty output directory. The release tools use Rust, cargo-about, and curl.
+Python is not required. Downloads retry connection errors, including TLS errors,
+and temporary server errors up to three times. A failed download reports its URL
+and the curl error. Only successful responses and HTTP 404 results are cached.
 
 The archive check compares the packaged binary with the input binary and checks
 the required notice files. The upload job generates checksums and build
@@ -60,9 +65,7 @@ After the standard downloads and Homebrew URLs were verified, the temporary
 `-licenses.tar.gz` archives and `SHA256SUMS-licenses` files were removed. The
 corrected archive hashes in the records apply to the standard download names.
 
-The completed repair workflow was removed. Its run history and attestations
-remain available. The repair scripts remain for reference and recovery.
-The retained `restore-names` command checks local and published corrected archive
-hashes and refuses to replace an asset with different bytes. It depends on the
-temporary correction assets and cannot be rerun after their removal. Do not run
-`retire` against the restored downloads.
+The completed repair workflow and Python repair scripts were removed. Their Git
+history, run history, and attestations remain available for reference. The old
+`restore-names` command depends on temporary correction assets that were removed.
+Do not run the old `retire` command against the restored downloads.
