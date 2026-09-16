@@ -97,14 +97,14 @@ impl App {
         ok_message: String,
         error_message: F,
     ) where
-        F: Fn(&str, kube::Error) -> String + Send + 'static,
+        F: Fn(&str, &str, kube::Error) -> String + Send + 'static,
     {
         let patch = patch.into();
         let client = self.cluster.client.clone();
         let tx = self.tx.clone();
         let genr = self.generation;
         tokio::spawn(async move {
-            let mut failed = false;
+            let mut errors = Vec::new();
             for (name, ns) in targets {
                 let api: Api<DynamicObject> = if kind.namespaced && !ns.is_empty() {
                     Api::namespaced_with(client.clone(), &ns, &kind.ar)
@@ -122,27 +122,19 @@ impl App {
                         .map(|_| ()),
                 };
                 if let Err(e) = result {
-                    failed = true;
-                    let _ = tx
-                        .send(Msg::Flash {
-                            generation: genr,
-                            claim,
-                            message: error_message(&name, e),
-                            err: true,
-                        })
-                        .await;
+                    errors.push(error_message(&name, &ns, e));
                 }
             }
-            if !failed {
-                let _ = tx
-                    .send(Msg::Flash {
-                        generation: genr,
-                        claim,
-                        message: ok_message,
-                        err: false,
-                    })
-                    .await;
-            }
+            let err = !errors.is_empty();
+            let message = if err { errors.join("; ") } else { ok_message };
+            let _ = tx
+                .send(Msg::Flash {
+                    generation: genr,
+                    claim,
+                    message,
+                    err,
+                })
+                .await;
         });
     }
 
@@ -266,7 +258,7 @@ impl App {
             Patch::Merge(node_unschedulable_patch(unschedulable)),
             claim,
             ok_message,
-            move |name, e| format!("{verb} {name} failed: {e}"),
+            move |name, _, e| format!("{verb} {name} failed: {e}"),
         );
     }
 
@@ -518,50 +510,49 @@ impl App {
         if self.deny_readonly() {
             return;
         }
-        let Some(obj) = self.selected_ref() else {
+        let targets = self.action_targets();
+        if targets.is_empty() {
             return;
-        };
+        }
         let Some(kind) = self.kind.clone() else {
             return;
         };
-        let name = obj.metadata.name.clone().unwrap_or_default();
-        let ns = obj.metadata.namespace.clone().unwrap_or_default();
         let plural = self.kind_plural.clone();
-        let Some(level) = self.guard(
-            "restart",
-            &plural,
-            &[(name.clone(), ns.clone())],
-            ConfirmLevel::Plain,
-        ) else {
+        let Some(level) = self.guard("restart", &plural, &targets, ConfirmLevel::Plain) else {
             return;
         };
-        let label = format!("Restart {name} in {ns}?");
+        let (label, name_hint) = match targets.as_slice() {
+            [(name, ns)] => (format!("Restart {name} in {ns}?"), name.clone()),
+            many => (
+                format!("Restart {} {plural}?", many.len()),
+                many.len().to_string(),
+            ),
+        };
         self.begin_guarded(
-            ConfirmAction::Restart {
-                kind,
-                name: name.clone(),
-                ns,
-            },
+            ConfirmAction::Restart { kind, targets },
             label,
             level,
-            name,
+            name_hint,
         );
     }
 
-    /// Stamp the pod template's `restartedAt` annotation to trigger a rollout
-    /// restart. Runs once the [`request_restart`] confirmation is satisfied.
-    pub(super) fn do_restart(&mut self, kind: Kind, name: String, ns: String) {
+    /// Apply the restart annotation to each confirmed workload.
+    pub(super) fn do_restart(&mut self, kind: Kind, targets: Vec<(String, String)>) {
         let now = k8s_openapi::jiff::Timestamp::now().to_string();
-        self.note_action("restart", format!("{name} in {ns}"));
-        let claim = self.claim_status(format!("restarting {name}…"));
-        let ok_message = format!("restarted {name}");
+        let label = match targets.as_slice() {
+            [(name, ns)] => format!("{name} in {ns}"),
+            many => format!("{} {}", many.len(), kind.ar.plural),
+        };
+        self.note_action("restart", label.clone());
+        let claim = self.claim_status(format!("restarting {label}…"));
+        let ok_message = format!("restarted {label}");
         self.spawn_patch_action(
             kind,
-            vec![(name, ns)],
+            targets,
             Patch::Strategic(restart_patch(&now)),
             claim,
             ok_message,
-            |_, e| format!("restart failed: {e}"),
+            |name, ns, e| format!("restart {name} in {ns} failed: {e}"),
         );
     }
 
@@ -676,7 +667,7 @@ impl App {
             Patch::Strategic(set_image_patch(&plural, &container, &image)),
             claim,
             ok_message,
-            |_, e| format!("set image failed: {e}"),
+            |_, _, e| format!("set image failed: {e}"),
         );
     }
 
@@ -1621,7 +1612,7 @@ impl App {
             ActionPatch::Scale(scale_patch(replicas)),
             claim,
             ok_message,
-            |name, e| format!("scale {name} failed: {e}"),
+            |name, _, e| format!("scale {name} failed: {e}"),
         );
     }
 
@@ -1966,7 +1957,7 @@ impl App {
             Patch::Merge(suspend_patch(suspend)),
             claim,
             ok_message,
-            move |name, e| format!("{verb} {name} failed: {e}"),
+            move |name, _, e| format!("{verb} {name} failed: {e}"),
         );
     }
 
@@ -2010,7 +2001,7 @@ impl App {
             Patch::Merge(reconcile_patch(&now, force)),
             claim,
             ok_message,
-            move |name, e| format!("{action} {name} failed: {e}"),
+            move |name, _, e| format!("{action} {name} failed: {e}"),
         );
     }
 
@@ -2130,7 +2121,7 @@ impl App {
             Patch::Merge(argocd_sync_patch()),
             claim,
             ok_message,
-            |name, e| format!("sync {name} failed: {e}"),
+            |name, _, e| format!("sync {name} failed: {e}"),
         );
     }
 
@@ -2278,7 +2269,7 @@ impl App {
             Patch::Merge(external_secret_refresh_patch(&now)),
             claim,
             ok_message,
-            |name, e| format!("refresh {name} failed: {e}"),
+            |name, _, e| format!("refresh {name} failed: {e}"),
         );
     }
 
