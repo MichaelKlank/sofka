@@ -69,6 +69,9 @@ impl App {
     /// logs, documents, pickers) without a second navigation code path;
     /// clicks are table-specific (select a row, sort by a header).
     pub fn handle_mouse(&mut self, m: MouseEvent) -> Result<()> {
+        if self.command_failure_visible() {
+            return Ok(());
+        }
         if self.plugin_activity_visible() {
             let code = match m.kind {
                 MouseEventKind::ScrollUp => KeyCode::Up,

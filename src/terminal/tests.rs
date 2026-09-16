@@ -150,7 +150,14 @@ impl Drop for Session {
 
 #[test]
 fn terminal_plugin_restores_tui_after_exit_interrupt_quit_and_spawn_error() {
-    for case in ["exit", "interrupt", "quit", "missing"] {
+    for case in [
+        "exit",
+        "failure",
+        "descendant",
+        "interrupt",
+        "quit",
+        "missing",
+    ] {
         let mut session = Session::start(case);
         for _ in 0..2 {
             session.expect("TUI_READY");
@@ -202,10 +209,24 @@ fn terminal_plugin_command() {
     }
     println!("PLUGIN_READY");
     io::stdout().flush().unwrap();
-    if case == "exit" {
+    if matches!(case.as_str(), "exit" | "failure" | "descendant") {
         let mut answer = String::new();
         io::stdin().read_line(&mut answer).unwrap();
         assert_eq!(answer.trim_end(), "done");
+        if case == "descendant" {
+            let _child = Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            eprintln!("descendant still has stderr open");
+            std::process::exit(7);
+        }
+        if case == "failure" {
+            eprintln!("exec: \"sh\": executable file not found in $PATH");
+            std::process::exit(7);
+        }
     } else {
         std::thread::sleep(Duration::from_secs(30));
         panic!("terminal interrupt did not stop the command");
@@ -247,7 +268,12 @@ async fn terminal_plugin_child() {
             panic!("plugin did not queue a terminal command: {}", app.flash);
         };
         let result = suspend_and_run(&mut terminal, &argv, captured);
-        assert_eq!(result.is_err(), case == "missing");
+        assert_eq!(result.is_err(), case != "exit");
+        if case == "failure" {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("executable file not found"), "{error}");
+            assert!(error.contains("7"), "{error}");
+        }
         app.after_suspend();
         assert!(crossterm::terminal::is_raw_mode_enabled().unwrap());
         for (signal, previous) in [libc::SIGINT, libc::SIGQUIT].into_iter().zip(&before) {
@@ -281,4 +307,53 @@ async fn terminal_plugin_child() {
     crossterm::execute!(io::stdout(), DisableMouseCapture).unwrap();
     ratatui::restore();
     println!("ALL_DONE");
+}
+
+#[tokio::test]
+async fn stderr_drain_keeps_ready_tail_after_deadline() {
+    let final_error = b"exec: \"sh\": executable file not found in $PATH\n";
+    let mut bytes = vec![b'x'; ERROR_LIMIT * 4];
+    bytes.extend_from_slice(final_error);
+    let mut reader = bytes.as_slice();
+    let mut tail = Vec::new();
+    let mut output = Vec::new();
+    drain_stderr(
+        &mut reader,
+        &mut tail,
+        &mut output,
+        tokio::time::Instant::now(),
+    )
+    .await;
+    assert_eq!(output, bytes);
+    assert_eq!(tail.len(), ERROR_LIMIT);
+    assert!(tail.ends_with(final_error));
+}
+
+#[tokio::test]
+async fn stderr_drain_stops_for_idle_or_continuously_writing_descendants() {
+    let (mut reader, _held_open) = tokio::io::duplex(4096);
+    let mut tail = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        drain_stderr(
+            &mut reader,
+            &mut tail,
+            &mut io::sink(),
+            tokio::time::Instant::now(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(tail.is_empty());
+    let mut reader = tokio::io::repeat(b'x');
+    let mut output = Vec::new();
+    drain_stderr(
+        &mut reader,
+        &mut tail,
+        &mut output,
+        tokio::time::Instant::now(),
+    )
+    .await;
+    assert_eq!(output.len(), 1024 * 1024);
+    assert_eq!(tail.len(), ERROR_LIMIT);
 }

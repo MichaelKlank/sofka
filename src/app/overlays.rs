@@ -146,6 +146,13 @@ impl App {
             } => {
                 self.do_node_debug(node, image, namespace, profile);
             }
+            ConfirmAction::Debug {
+                ns,
+                pod,
+                target,
+                image,
+                recovery,
+            } => self.do_debug(ns, pod, target, image, recovery),
             ConfirmAction::CleanupDebuggers => {
                 self.do_cleanup_debuggers();
             }
@@ -337,11 +344,16 @@ impl App {
                             self.do_set_image(ns, name, plural, container, input);
                         }
                     }
-                    Some(PromptKind::Debug { ns, pod, target }) => {
+                    Some(PromptKind::Debug {
+                        ns,
+                        pod,
+                        target,
+                        recovery,
+                    }) => {
                         if input.is_empty() {
                             self.flash_warn("no debug image given");
                         } else {
-                            self.do_debug(ns, pod, target, input);
+                            self.confirm_debug(ns, pod, target, input, recovery);
                         }
                     }
                     // The transfer prompts chain: source path first, then the

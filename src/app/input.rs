@@ -17,6 +17,10 @@ impl App {
     // ----- key handling --------------------------------------------------
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        if self.command_failure_visible() {
+            self.key_command_failure(key);
+            return Ok(());
+        }
         let action = self.keymap.action(self.key_scope(), &key);
         if action == Some(Action::PluginActivity) {
             self.toggle_plugin_activity();

@@ -114,6 +114,9 @@ pub fn resize<B: ratatui::backend::Backend>(
 pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_base(frame, app);
     draw_plugin_activity(frame, app);
+    if app.command_failure_visible() {
+        draw_text_popup(frame, app, false);
+    }
 }
 
 fn draw_plugin_activity(frame: &mut Frame, app: &mut App) {
@@ -2803,6 +2806,10 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
         "session-local log of the mutating actions you've taken",
     ));
     lines.push(bind(
+        "Command error",
+        "esc dismiss · PgUp/PgDn scroll · d debug if shell is missing",
+    ));
+    lines.push(bind(
         ":debug",
         "pod: ephemeral debug container · node: privileged debug pod",
     ));
@@ -4210,7 +4217,19 @@ fn draw_text_popup(frame: &mut Frame, app: &mut App, input: bool) {
         centered_rect_with_min(50, 20, 56, 7, bounds)
     };
     let color = if input { theme::peach() } else { theme::red() };
-    let (label, scope, title, hint) = if input {
+    let (label, scope, title, hint) = if app.command_failure_visible() {
+        let failure = app.command_failure.as_ref().unwrap();
+        (
+            &failure.message,
+            "confirm",
+            " Command failed ",
+            if failure.target.is_some() {
+                "d Start debug container · esc/enter dismiss · PgUp/PgDn scroll".into()
+            } else {
+                "esc/enter dismiss · PgUp/PgDn scroll".into()
+            },
+        )
+    } else if input {
         (
             &app.prompt_label,
             "prompt",

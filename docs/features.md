@@ -535,6 +535,9 @@ concurrent drains, and full kubectl drain parity are outside this feature.
 - **PVC explore** (`x` on a PVC, or `:pvc-explore`) - a two-pane browser over a
   volume's contents, with `s` for a shell inside it. See
   [PVC explore](#pvc-explore).
+- **Shell failure recovery** keeps command errors visible until dismissed.
+  A missing shell offers the built-in debug image prompt for the same target,
+  without plugins. Creation requires explicit acceptance and obeys guardrails.
 - **Ephemeral debug containers** and **node debug pods** (`:debug`). See
   [Debug containers and pods](debugging.md#debug-containers-and-pods).
 - **Logs** (`l`) - combined logs for marked pods, per-container on a pod, or aggregated across all matching

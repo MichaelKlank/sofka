@@ -326,3 +326,11 @@ See [Create a plugin package](plugin-authoring.md).
 
 `PgUp` and `PgDn` scroll text that does not fit in the popup. The action keys stay
 visible. In an input popup, typing moves the view to the cursor.
+
+## Command failures
+
+A failed interactive command opens an error dialog. `esc` or `enter` dismisses
+it; `PgUp` and `PgDn` scroll the output. If a pod shell failed because `sh` is
+missing, `d` opens the debug image prompt for the same pod and container.
+Accept the image to start the debug container, subject to the configured
+guardrails. Canceling the prompt returns to the original error.

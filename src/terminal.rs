@@ -1,4 +1,5 @@
-use std::io;
+use std::io::{self, Write};
+use std::process::Stdio;
 
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::terminal::{
@@ -23,9 +24,7 @@ pub fn suspend_and_run(
     }
     let _ = disable_raw_mode();
     let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
-    let result = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .status();
+    let result = run_command(argv);
     // Set the modes directly. ratatui::init would install another panic hook.
     let _ = enable_raw_mode();
     let _ = crossterm::execute!(io::stdout(), EnterAlternateScreen);
@@ -33,7 +32,108 @@ pub fn suspend_and_run(
         let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
     }
     let _ = terminal.clear();
-    result.map(|_| ())
+    result
+}
+
+const ERROR_LIMIT: usize = 16 * 1024;
+
+fn run_command(argv: &[String]) -> io::Result<()> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(run_command_async(argv))
+            })
+            .join()
+            .map_err(|_| io::Error::other("Command runner failed."))?
+    })
+}
+
+async fn run_command_async(argv: &[String]) -> io::Result<()> {
+    use tokio::io::AsyncReadExt;
+    let mut child = tokio::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let mut tail = Vec::new();
+    let mut buffer = [0; 4096];
+    let mut closed = false;
+    let status = loop {
+        tokio::select! {
+            biased;
+            result = child.wait() => break result?,
+            result = stderr.read(&mut buffer), if !closed => {
+                match result {
+                    Ok(0) => closed = true,
+                    Ok(n) => record_stderr(&mut tail, &mut io::stderr(), &buffer[..n]),
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
+                    Err(_) => closed = true,
+                }
+            }
+        }
+    };
+    if !closed {
+        drain_stderr(
+            &mut stderr,
+            &mut tail,
+            &mut io::stderr(),
+            tokio::time::Instant::now() + std::time::Duration::from_millis(100),
+        )
+        .await;
+    }
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "Command failed ({status}).\n{}",
+            String::from_utf8_lossy(&tail).trim()
+        )))
+    }
+}
+
+fn record_stderr(tail: &mut Vec<u8>, output: &mut impl Write, bytes: &[u8]) {
+    let _ = output.write_all(bytes);
+    tail.extend_from_slice(bytes);
+    if tail.len() > ERROR_LIMIT {
+        tail.drain(..tail.len() - ERROR_LIMIT);
+    }
+}
+
+async fn drain_stderr(
+    stderr: &mut (impl tokio::io::AsyncRead + Unpin),
+    tail: &mut Vec<u8>,
+    output: &mut impl Write,
+    deadline: tokio::time::Instant,
+) {
+    use tokio::io::AsyncReadExt;
+    let mut buffer = [0; 4096];
+    // Also bound descendants that keep writing after the command exits.
+    let mut remaining: usize = 1024 * 1024;
+    while remaining > 0 {
+        let capacity = remaining.min(buffer.len());
+        tokio::select! {
+            biased;
+            // Read available bytes before an expired timer. Cooperative task
+            // budgets must not make a ready pipe appear empty during this drain.
+            result = tokio::task::unconstrained(stderr.read(&mut buffer[..capacity])) => {
+                match result {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        record_stderr(tail, output, &buffer[..n]);
+                        remaining -= n;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
+                    Err(_) => break,
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+    }
 }
 
 #[cfg(unix)]

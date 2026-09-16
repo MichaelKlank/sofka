@@ -239,6 +239,10 @@ pub enum Mode {
 /// command (exec, edit, port-forward), then resume.
 pub enum Suspend {
     Shell(Vec<String>),
+    Recovery {
+        argv: Vec<String>,
+        failure: Box<CommandFailure>,
+    },
 }
 
 /// A `kubectl port-forward` running in the background (not `Suspend::Shell`
@@ -373,6 +377,13 @@ enum ConfirmAction {
     },
     /// Delete the node debugger pods sofka launched this session (`:debug-clean`).
     CleanupDebuggers,
+    Debug {
+        ns: String,
+        pod: String,
+        target: Option<String>,
+        image: String,
+        recovery: Option<Box<CommandFailure>>,
+    },
     /// Create a temporary pod that mounts a PVC nothing else mounts, so it can
     /// be browsed or shelled into.
     PvcHelper {
@@ -483,6 +494,7 @@ enum PromptKind {
         ns: String,
         pod: String,
         target: Option<String>,
+        recovery: Option<Box<CommandFailure>>,
     },
     /// File-transfer path prompts (`t` on a pod), asked in two steps: the
     /// source path first (`src` is `None`), then the destination with the
@@ -2260,6 +2272,8 @@ pub struct App {
     event_task: Option<JoinHandle<()>>,
 
     pub pending: Option<Suspend>,
+    pub shell_target: Option<ShellTarget>,
+    pub command_failure: Option<CommandFailure>,
     /// Mode to return to when leaving a transient view (logs/detail/diff).
     return_mode: Mode,
     /// Row key (ns/name) selected when a transient view was opened, restored on
@@ -2546,6 +2560,8 @@ impl App {
             event_gen: 0,
             event_task: None,
             pending: None,
+            shell_target: None,
+            command_failure: None,
             return_mode: Mode::Table,
             return_selection: None,
             should_quit: false,
@@ -2625,6 +2641,8 @@ impl App {
 }
 
 mod actions;
+mod command_failure;
+pub use command_failure::{CommandFailure, ShellTarget};
 mod adjacent;
 mod argocd;
 mod authz;
