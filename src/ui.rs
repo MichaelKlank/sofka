@@ -4773,10 +4773,14 @@ fn pvc_pane_items(
     use crate::pvcexplore::EntryKind;
 
     if let Some(e) = error {
-        return vec![ListItem::new(Line::from(Span::styled(
-            e.to_string(),
-            Style::default().fg(theme::red()),
-        )))];
+        let lines: Vec<_> = Text::from(e.to_string())
+            .lines
+            .into_iter()
+            .flat_map(|line| wrap_line(line, usize::from(width.saturating_sub(4)).max(1)))
+            .collect();
+        return vec![ListItem::new(
+            Text::from(lines).style(Style::default().fg(theme::red())),
+        )];
     }
     if entries.is_empty() {
         return vec![ListItem::new(Line::from(Span::styled(

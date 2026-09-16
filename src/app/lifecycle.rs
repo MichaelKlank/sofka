@@ -1697,6 +1697,17 @@ impl App {
                     self.discard_pvc_target(namespace, context, result);
                 }
             }
+            Msg::PvcRecovery {
+                generation,
+                run,
+                result,
+            } => {
+                if generation == self.generation {
+                    self.handle_pvc_recovery(run, result);
+                } else if run == self.pvc.run {
+                    self.pvc.loading = false;
+                }
+            }
             Msg::PvcListing {
                 generation,
                 run,

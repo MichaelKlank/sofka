@@ -19008,6 +19008,334 @@ async fn faults_watch_changes_preserve_pod_identity_or_clear_selection() {
 
 // ----- PVC explore -------------------------------------------------------
 
+fn fail_pvc_tools(app: &mut App, error: &str) {
+    app.handle_msg(Msg::PvcListing {
+        generation: app.generation,
+        run: app.pvc.run,
+        path: app.pvc.remote_path.clone(),
+        result: Err(error.into()),
+    });
+}
+
+fn pvc_recovery_plan(
+    app: &mut App,
+    candidates: Vec<crate::pvcexplore::Mount>,
+    helper: Result<crate::pvcexplore::HelperOptions, String>,
+) {
+    app.handle_msg(Msg::PvcRecovery {
+        generation: app.generation,
+        run: app.pvc.run,
+        result: Ok(crate::pvcexplore::RecoveryPlan { candidates, helper }),
+    });
+}
+
+fn recovery_helper() -> crate::pvcexplore::HelperOptions {
+    crate::pvcexplore::HelperOptions {
+        node: Some("worker-a".into()),
+        sub_path: String::new(),
+        read_only: false,
+    }
+}
+
+#[tokio::test]
+async fn pvc_missing_tools_tries_another_container_before_offering_a_helper() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    fail_pvc_tools(&mut app, "missing browsing tool: ls");
+    assert!(app.pvc.loading);
+    let alternate = crate::pvcexplore::Mount {
+        container: "tools".into(),
+        path: "/data".into(),
+        ..pvc_mount()
+    };
+    pvc_recovery_plan(&mut app, vec![alternate.clone()], Ok(recovery_helper()));
+    assert_eq!(app.pvc.mount, Some(alternate));
+    assert_eq!(app.mode, Mode::PvcExplore);
+    list_pvc(
+        &mut app,
+        "/data",
+        vec![pvc_entry("folder", crate::pvcexplore::EntryKind::Dir, 0)],
+    );
+    assert!(app.pvc.remote_error.is_none());
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    fail_pvc_tools(&mut app, "permission denied");
+    assert_eq!(app.pvc.remote_path, "/data");
+    assert_eq!(app.pvc.remote[0].name, "folder");
+    assert!(app.pvc.recovery.is_none());
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(!app.pvc.active);
+}
+
+#[tokio::test]
+async fn pvc_missing_tools_offers_helper_once_and_cancel_keeps_the_error() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    fail_pvc_tools(&mut app, "missing browsing tool: ls");
+    pvc_recovery_plan(
+        &mut app,
+        vec![crate::pvcexplore::Mount {
+            container: "tools".into(),
+            ..pvc_mount()
+        }],
+        Ok(recovery_helper()),
+    );
+    assert_eq!(app.mode, Mode::PvcExplore);
+    fail_pvc_tools(&mut app, "missing browsing tool: head");
+    assert_eq!(app.mode, Mode::Confirm);
+    assert!(app.confirm_label.contains("Browse with helper pod"));
+    assert!(app.confirm_label.contains(&app.pvc_cfg.image));
+    assert!(app.confirm_label.contains("default"));
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::PvcExplore);
+    assert!(
+        app.pvc
+            .remote_error
+            .as_ref()
+            .unwrap()
+            .contains("missing browsing tool")
+    );
+    assert!(!app.pvc.mount.as_ref().unwrap().helper);
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    fail_pvc_tools(&mut app, "missing browsing tool: ls");
+    assert_eq!(app.mode, Mode::PvcExplore);
+    assert!(
+        app.pvc
+            .remote_error
+            .as_ref()
+            .unwrap()
+            .contains("No further recovery")
+    );
+}
+
+#[tokio::test]
+async fn pvc_recovery_obeys_readonly_guardrails_and_exclusive_access() {
+    for restriction in ["readonly", "guardrail", "exclusive"] {
+        let (mut app, _rx) = app_with_pvc("Bound");
+        app.handle_key(press(KeyCode::Char('x'))).unwrap();
+        resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+        fail_pvc_tools(&mut app, "missing browsing tool: ls");
+        if restriction == "readonly" {
+            app.readonly = true;
+        }
+        if restriction == "guardrail" {
+            app.guardrails = vec![crate::config::Guardrail {
+                actions: vec!["pvc-explore".into()],
+                deny: true,
+                ..Default::default()
+            }];
+        }
+        let helper = if restriction == "exclusive" {
+            Err("ReadWriteOncePod is already in use".into())
+        } else {
+            Ok(recovery_helper())
+        };
+        pvc_recovery_plan(&mut app, vec![], helper);
+        assert_eq!(app.mode, Mode::PvcExplore);
+        let error = app.pvc.remote_error.as_ref().unwrap();
+        assert!(error.contains("missing browsing tool: ls"));
+        assert!(
+            error.contains(match restriction {
+                "readonly" => "read-only",
+                "guardrail" => "guardrail",
+                _ => "ReadWriteOncePod",
+            }),
+            "{error}"
+        );
+        assert!(app.pending.is_none());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("missing browsing tool: ls"), "{screen}");
+        assert!(
+            screen.contains(match restriction {
+                "readonly" => "read-only",
+                "guardrail" => "guardrail",
+                _ => "ReadWriteOncePod",
+            }),
+            "{screen}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pvc_recovery_does_not_retry_permissions_or_stale_results() {
+    for error in [
+        "permission denied",
+        "connection refused",
+        "not a directory",
+        "listing failed (exit 127)",
+    ] {
+        let (mut app, _rx) = app_with_pvc("Bound");
+        app.handle_key(press(KeyCode::Char('x'))).unwrap();
+        resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+        fail_pvc_tools(&mut app, error);
+        assert!(app.pvc.recovery.is_none());
+        assert_eq!(app.mode, Mode::PvcExplore);
+        assert_eq!(app.pvc.remote_error.as_deref(), Some(error));
+    }
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    fail_pvc_tools(&mut app, "missing browsing tool: ls");
+    let run = app.pvc.run;
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_msg(Msg::PvcRecovery {
+        generation: app.generation,
+        run,
+        result: Ok(crate::pvcexplore::RecoveryPlan {
+            candidates: vec![],
+            helper: Ok(recovery_helper()),
+        }),
+    });
+    assert_eq!(app.mode, Mode::Table);
+    assert!(!app.pvc.active);
+}
+
+#[tokio::test]
+async fn pvc_recovery_stops_on_non_tool_error_in_an_alternate_container() {
+    let (mut app, _rx) = app_with_pvc("Bound");
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    resolve_pvc(&mut app, Ok(Some(pvc_mount())));
+    fail_pvc_tools(&mut app, "missing browsing tool: ls");
+    pvc_recovery_plan(
+        &mut app,
+        vec![crate::pvcexplore::Mount {
+            container: "tools".into(),
+            ..pvc_mount()
+        }],
+        Ok(recovery_helper()),
+    );
+    fail_pvc_tools(&mut app, "permission denied");
+    assert_eq!(app.mode, Mode::PvcExplore);
+    let error = app.pvc.remote_error.as_ref().unwrap();
+    assert!(error.contains("missing browsing tool: ls") && error.contains("permission denied"));
+}
+
+#[tokio::test]
+async fn pvc_helper_rechecks_access_after_confirmation_and_cleans_up() {
+    use http_body_util::BodyExt;
+    for exclusive_after_offer in [false, true] {
+        let (mut app, mut rx) = app_with_pvc("Bound");
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<(String, String, Value)>::new()));
+        let recorded = requests.clone();
+        let exclusive = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let access = exclusive.clone();
+        app.cluster.client = kube::Client::new(
+            tower::service_fn(move |request: http::Request<kube::client::Body>| {
+                let recorded = recorded.clone();
+                let access = access.clone();
+                async move {
+                    let method = request.method().to_string();
+                    let path = request.uri().path().to_owned();
+                    let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push((method.clone(), path.clone(), body));
+                    let response = if path.ends_with("/persistentvolumeclaims/data") {
+                        json!({"apiVersion":"v1", "kind":"PersistentVolumeClaim", "metadata":{"name":"data"},
+                        "spec":{"accessModes":[if access.load(std::sync::atomic::Ordering::SeqCst) {"ReadWriteOncePod"} else {"ReadWriteOnce"}]}})
+                    } else if path.ends_with("/pods") && method == "GET" {
+                        json!({"apiVersion":"v1", "kind":"PodList", "metadata":{}, "items":[{
+                        "apiVersion":"v1", "kind":"Pod", "metadata":{"name":"api-0", "namespace":"default"},
+                        "spec":{"nodeName":"worker-a", "volumes":[{"name":"data", "persistentVolumeClaim":{"claimName":"data"}}],
+                            "containers":[{"name":"app", "volumeMounts":[{"name":"data", "mountPath":"/srv", "subPath":"tenant", "readOnly":true}]}]},
+                        "status":{"phase":"Running", "containerStatuses":[{"name":"app", "state":{"running":{}}}]}}]})
+                    } else {
+                        json!({"apiVersion":"v1", "kind":"Pod", "metadata":{"name":"sofka-pvc-explore-test", "namespace":"default"}, "status":{"phase":"Running"}})
+                    };
+                    Ok::<_, std::convert::Infallible>(http::Response::new(
+                        http_body_util::Full::new(hyper::body::Bytes::from(response.to_string())),
+                    ))
+                }
+            }),
+            "default",
+        );
+        app.handle_key(press(KeyCode::Char('x'))).unwrap();
+        resolve_pvc(
+            &mut app,
+            Ok(Some(crate::pvcexplore::Mount {
+                sub_path: Some("tenant".into()),
+                read_only: true,
+                ..pvc_mount()
+            })),
+        );
+        fail_pvc_tools(&mut app, "missing browsing tool: ls");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while app.mode != Mode::Confirm {
+                app.handle_msg(rx.recv().await.unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!requests.lock().unwrap().iter().any(|r| r.0 == "POST"));
+        exclusive.store(exclusive_after_offer, std::sync::atomic::Ordering::SeqCst);
+        app.handle_key(press(KeyCode::Char('y'))).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let message = rx.recv().await.unwrap();
+                let completed =
+                    matches!(&message, Msg::PvcTarget { run, .. } if *run == app.pvc.run);
+                app.handle_msg(message);
+                if completed {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        if exclusive_after_offer {
+            assert!(!requests.lock().unwrap().iter().any(|r| r.0 == "POST"));
+            let error = app.pvc.remote_error.as_ref().unwrap();
+            assert!(error.contains("ReadWriteOncePod") && error.contains("missing browsing tool"));
+        } else {
+            let created = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.0 == "POST")
+                .unwrap()
+                .2
+                .clone();
+            assert_eq!(
+                created.pointer("/spec/containers/0/volumeMounts/0/subPath"),
+                Some(&json!("tenant"))
+            );
+            assert_eq!(
+                created.pointer("/spec/containers/0/volumeMounts/0/readOnly"),
+                Some(&json!(true))
+            );
+            assert!(created.pointer("/spec/affinity/nodeAffinity").is_some());
+            let mount = app.pvc.mount.as_ref().unwrap();
+            assert!(mount.helper && mount.read_only);
+            app.handle_key(press(KeyCode::Esc)).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.0 == "DELETE" && r.1.ends_with("/sofka-pvc-explore-test"))
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+}
+
 /// A PVC view with one bound claim selected. PVCs aren't in `Cluster::fake`'s
 /// standing registry, so the fixture declares the kind itself.
 fn app_with_pvc(phase: &str) -> (App, Receiver<Msg>) {
@@ -19030,6 +19358,7 @@ fn pvc_mount() -> crate::pvcexplore::Mount {
         pod: "api-0".into(),
         container: "app".into(),
         path: "/srv".into(),
+        sub_path: Some(String::new()),
         read_only: false,
         helper: false,
     }
@@ -19932,6 +20261,7 @@ async fn a_shell_from_a_pvc_row_keeps_its_pod_until_the_shell_returns() {
         pod: "sofka-pvc-explore-abc".into(),
         container: "explore".into(),
         path: "/pvc".into(),
+        sub_path: Some(String::new()),
         read_only: false,
         helper: true,
     };
@@ -19954,6 +20284,7 @@ async fn a_shell_from_inside_the_browser_keeps_the_browser_and_its_pod() {
         pod: "sofka-pvc-explore-abc".into(),
         container: "explore".into(),
         path: "/pvc".into(),
+        sub_path: Some(String::new()),
         read_only: false,
         helper: true,
     };
@@ -20096,6 +20427,7 @@ async fn a_helper_pod_that_lands_after_a_generation_bump_is_not_stranded() {
         pod: "sofka-pvc-explore-xyz".into(),
         container: "explore".into(),
         path: "/pvc".into(),
+        sub_path: Some(String::new()),
         read_only: false,
         helper: true,
     };
@@ -20145,6 +20477,7 @@ async fn a_helper_pod_from_another_cluster_is_left_alone() {
             pod: "sofka-pvc-explore-xyz".into(),
             container: "explore".into(),
             path: "/pvc".into(),
+            sub_path: Some(String::new()),
             read_only: false,
             helper: true,
         })),
@@ -20290,6 +20623,7 @@ async fn escaping_a_pvc_shell_dialog_with_the_palette_releases_its_pod() {
             pod: "sofka-pvc-explore-xyz".into(),
             container: "explore".into(),
             path: "/pvc".into(),
+            sub_path: Some(String::new()),
             read_only: false,
             helper: true,
         })),

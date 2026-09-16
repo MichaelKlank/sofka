@@ -152,6 +152,9 @@ pub fn list_probe(root: &str) -> ListingProbe {
         script: format!(
             r#"[ -n "$1" ] && [ -n "$2" ] || exit {EXIT_NOT_A_DIRECTORY}
 unset TIME_STYLE QUOTING_STYLE BLOCK_SIZE LS_BLOCK_SIZE
+for tool in ls head; do
+    command -v "$tool" >/dev/null 2>&1 || {{ echo "missing browsing tool: $tool" >&2; exit 127; }}
+done
 root=$(cd -- "$2" 2>/dev/null && pwd -P) || exit {EXIT_NOT_A_DIRECTORY}
 cd -- "$1" 2>/dev/null || exit {EXIT_NOT_A_DIRECTORY}
 case "$(pwd -P)/" in "${{root%/}}/"*) ;; *) exit {EXIT_OUTSIDE_MOUNT} ;; esac
@@ -359,6 +362,8 @@ pub struct Mount {
     pub pod: String,
     pub container: String,
     pub path: String,
+    /// None means that subPathExpr cannot be resolved from the pod specification.
+    pub sub_path: Option<String>,
     /// The mount is `readOnly` in the pod spec: writes will fail, so an upload
     /// is refused up front instead of failing halfway through a `kubectl cp`.
     pub read_only: bool,
@@ -373,25 +378,18 @@ pub struct Mount {
 /// `None` means nothing running mounts the claim — the caller's cue to offer a
 /// helper pod ([`helper_pod`]).
 pub fn find_mount(pods: &[DynamicObject], claim: &str) -> Option<Mount> {
-    let mut best: Option<Mount> = None;
+    find_mounts(pods, claim).into_iter().next()
+}
+
+pub fn find_mounts(pods: &[DynamicObject], claim: &str) -> Vec<Mount> {
+    let mut mounts = Vec::new();
     for pod in pods {
-        if phase(pod) != "Running" {
-            continue;
+        if phase(pod) == "Running" && pod.metadata.deletion_timestamp.is_none() {
+            mounts.extend(mounts_in(pod, claim));
         }
-        // A pod on its way out will take the exec with it, and its volume is
-        // about to be released.
-        if pod.metadata.deletion_timestamp.is_some() {
-            continue;
-        }
-        let Some(mount) = mount_in(pod, claim) else {
-            continue;
-        };
-        if !mount.read_only {
-            return Some(mount);
-        }
-        best.get_or_insert(mount);
     }
-    best
+    mounts.sort_by_key(|m| m.read_only);
+    mounts
 }
 
 /// Names of the pod's containers that are in the `running` state right now,
@@ -422,87 +420,203 @@ fn phase(pod: &DynamicObject) -> &str {
         .unwrap_or_default()
 }
 
-/// The first container in `pod` that mounts `claim`, with its mount path.
-fn mount_in(pod: &DynamicObject, claim: &str) -> Option<Mount> {
-    let spec = pod.data.get("spec")?;
-    // Volume names are unique within a pod, so the claim resolves to at most
-    // one of them.
-    let volume = spec
-        .get("volumes")?
-        .as_array()?
-        .iter()
-        .find(|v| {
-            v.get("persistentVolumeClaim")
-                .and_then(|p| p.get("claimName"))
+fn mounts_in(pod: &DynamicObject, claim: &str) -> Vec<Mount> {
+    let Some(spec) = pod.data.get("spec") else {
+        return Vec::new();
+    };
+    let volumes: Vec<_> = spec
+        .get("volumes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|v| {
+            v.pointer("/persistentVolumeClaim/claimName")
                 .and_then(Value::as_str)
                 == Some(claim)
         })
-        .and_then(|v| v.get("name"))
-        .and_then(Value::as_str)?;
-
-    let mut best: Option<Mount> = None;
+        .collect();
     let running = running_containers(pod);
-    // Sidecars (init containers with `restartPolicy: Always`, GA since 1.29)
-    // and debug containers run alongside the app and mount the same volumes;
-    // skipping them would report a claim as unmounted and offer a helper pod
-    // for a volume that is already attached — which, for ReadWriteOnce, would
-    // then never schedule.
-    //
-    // `status.phase == "Running"` is not enough on its own to exec into any
-    // one of them: a pod in CrashLoopBackOff is `Running` with nothing to
-    // enter, and a *completed* init container is in the spec forever. Picking
-    // either would report the claim as reachable and suppress the helper-pod
-    // offer, leaving the user in a dead end — so each candidate is checked
-    // against its own status.
-    let candidates = [
-        ("containers", false),
-        ("initContainers", true),
-        ("ephemeralContainers", false),
-    ]
-    .into_iter()
-    .filter_map(|(key, sidecar_only)| Some((spec.get(key)?.as_array()?, sidecar_only)))
-    .flat_map(|(list, sidecar_only)| list.iter().map(move |c| (c, sidecar_only)));
-    for (c, sidecar_only) in candidates {
-        let Some(name) = c.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        if !running.contains(name) {
-            continue;
-        }
-        // A plain init container that happens to be running right now is
-        // mid-initialisation and about to exit; only a native sidecar stays.
-        if sidecar_only && c.get("restartPolicy").and_then(Value::as_str) != Some("Always") {
-            continue;
-        }
-        let mounts = c
-            .get("volumeMounts")
+    let mut mounts = Vec::new();
+    for key in ["containers", "initContainers", "ephemeralContainers"] {
+        for c in spec
+            .get(key)
             .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        for m in mounts {
-            if m.get("name").and_then(Value::as_str) != Some(volume) {
-                continue;
-            }
-            let Some(path) = m.get("mountPath").and_then(Value::as_str) else {
+            .into_iter()
+            .flatten()
+        {
+            let Some(name) = c.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            // A subPath mount shows only part of the volume, but it is still
-            // the only view that container has of it — browsing it is correct,
-            // and the alternative is refusing to browse at all.
-            let mount = Mount {
-                pod: pod.metadata.name.clone().unwrap_or_default(),
-                container: name.to_string(),
-                path: path.to_string(),
-                read_only: m.get("readOnly").and_then(Value::as_bool).unwrap_or(false),
-                helper: false,
-            };
-            if !mount.read_only {
-                return Some(mount);
+            if !running.contains(name)
+                || (key == "initContainers"
+                    && c.get("restartPolicy").and_then(Value::as_str) != Some("Always"))
+            {
+                continue;
             }
-            best.get_or_insert(mount);
+            for m in c
+                .get("volumeMounts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(volume) = volumes.iter().find(|v| v.get("name") == m.get("name")) else {
+                    continue;
+                };
+                let Some(path) = m.get("mountPath").and_then(Value::as_str) else {
+                    continue;
+                };
+                mounts.push(Mount {
+                    pod: pod.metadata.name.clone().unwrap_or_default(),
+                    container: name.to_owned(),
+                    path: path.to_owned(),
+                    sub_path: if m
+                        .get("subPathExpr")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.is_empty())
+                    {
+                        None
+                    } else {
+                        Some(
+                            m.get("subPath")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                        )
+                    },
+                    read_only: m.get("readOnly").and_then(Value::as_bool).unwrap_or(false)
+                        || volume
+                            .pointer("/persistentVolumeClaim/readOnly")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    helper: false,
+                });
+            }
         }
     }
-    best
+    mounts
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelperOptions {
+    pub node: Option<String>,
+    pub sub_path: String,
+    pub read_only: bool,
+}
+
+#[derive(Debug)]
+pub struct RecoveryPlan {
+    pub candidates: Vec<Mount>,
+    pub helper: Result<HelperOptions, String>,
+}
+
+pub fn recovery_plan(
+    pods: &[DynamicObject],
+    claim: &DynamicObject,
+    original: &Mount,
+) -> RecoveryPlan {
+    let name = claim.metadata.name.as_deref().unwrap_or_default();
+    let candidates = find_mounts(pods, name)
+        .into_iter()
+        .filter(|m| {
+            (m.pod != original.pod || m.container != original.container || m.path != original.path)
+                && original.sub_path.is_some()
+                && m.sub_path == original.sub_path
+        })
+        .take(16)
+        .map(|mut m| {
+            m.read_only |= original.read_only;
+            m
+        })
+        .collect();
+    RecoveryPlan {
+        candidates,
+        helper: helper_options(pods, claim, original),
+    }
+}
+
+pub fn helper_options(
+    pods: &[DynamicObject],
+    claim: &DynamicObject,
+    original: &Mount,
+) -> Result<HelperOptions, String> {
+    let Some(sub_path) = &original.sub_path else {
+        return Err("Cannot recover a subPathExpr mount without changing its boundaries.".into());
+    };
+    let name = claim.metadata.name.as_deref().unwrap_or_default();
+    let consumers: Vec<_> = pods
+        .iter()
+        .filter(|p| !matches!(phase(p), "Succeeded" | "Failed"))
+        .filter(|p| {
+            p.data
+                .pointer("/spec/volumes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|v| {
+                    v.pointer("/persistentVolumeClaim/claimName")
+                        .and_then(Value::as_str)
+                        == Some(name)
+                })
+        })
+        .collect();
+    let modes: Vec<_> = claim
+        .data
+        .pointer("/spec/accessModes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if modes.is_empty() {
+        return Err("Cannot determine the volume access modes. No helper was created.".into());
+    }
+    if modes.contains(&"ReadWriteOncePod") && !consumers.is_empty() {
+        return Err(
+            "ReadWriteOncePod is already in use. A second pod cannot mount this claim.".into(),
+        );
+    }
+    let mut node = None;
+    if modes.contains(&"ReadWriteOnce") && !consumers.is_empty() {
+        let nodes: std::collections::BTreeSet<_> = consumers
+            .iter()
+            .filter_map(|p| p.data.pointer("/spec/nodeName").and_then(Value::as_str))
+            .filter(|n| !n.is_empty())
+            .collect();
+        if nodes.len() != 1 {
+            return Err("Cannot select one consumer node for this ReadWriteOnce claim.".into());
+        }
+        node = nodes.first().map(|s| (*s).to_owned());
+    }
+    Ok(HelperOptions {
+        node,
+        sub_path: sub_path.clone(),
+        read_only: original.read_only || modes == ["ReadOnlyMany"],
+    })
+}
+
+pub fn apply_helper_options(manifest: &mut Value, options: &HelperOptions) {
+    if let Some(node) = &options.node {
+        manifest["spec"]["affinity"] = json!({"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {
+            "nodeSelectorTerms": [{"matchFields": [{"key":"metadata.name", "operator":"In", "values":[node]}]}]
+        }}});
+    }
+    manifest["spec"]["containers"][0]["volumeMounts"][0]["readOnly"] = json!(options.read_only);
+    manifest["spec"]["volumes"][0]["persistentVolumeClaim"]["readOnly"] = json!(options.read_only);
+    if !options.sub_path.is_empty() {
+        manifest["spec"]["containers"][0]["volumeMounts"][0]["subPath"] = json!(options.sub_path);
+    }
+}
+
+pub fn missing_listing_tools(error: &str) -> bool {
+    error.lines().any(|line| {
+        let line = line.to_ascii_lowercase();
+        (["sh", "/bin/sh"]
+            .iter()
+            .any(|tool| line.contains(&format!("exec: \"{tool}\"")))
+            && (line.contains("executable file not found")
+                || line.contains("no such file or directory")))
+            || line.starts_with("missing browsing tool: ")
+    })
 }
 
 /// The helper pod sofka creates when nothing mounts the claim: one sleeping
@@ -2283,5 +2397,149 @@ mod tests {
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
         std::fs::set_permissions(dir.join("locked"), perms).unwrap();
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    fn consumer() -> DynamicObject {
+        serde_json::from_value(json!({
+            "apiVersion":"v1", "kind":"Pod", "metadata":{"name":"app", "namespace":"default"},
+            "spec":{"nodeName":"worker-a", "volumes":[{"name":"data", "persistentVolumeClaim":{"claimName":"data"}}],
+                "containers":[
+                    {"name":"app", "volumeMounts":[{"name":"data", "mountPath":"/data", "subPath":"tenant", "readOnly":true}]},
+                    {"name":"tools", "volumeMounts":[{"name":"data", "mountPath":"/tools", "subPath":"tenant"}]},
+                    {"name":"broad", "volumeMounts":[{"name":"data", "mountPath":"/all"}]}]},
+            "status":{"phase":"Running", "containerStatuses":[
+                {"name":"app", "state":{"running":{}}},
+                {"name":"tools", "state":{"running":{}}},
+                {"name":"broad", "state":{"running":{}}}]}
+        })).unwrap()
+    }
+
+    fn claim(mode: &str) -> DynamicObject {
+        serde_json::from_value(json!({"apiVersion":"v1", "kind":"PersistentVolumeClaim",
+            "metadata":{"name":"data"}, "spec":{"accessModes":[mode]}, "status":{"phase":"Bound"}}))
+        .unwrap()
+    }
+
+    fn original(pod: &DynamicObject) -> Mount {
+        find_mounts(std::slice::from_ref(pod), "data")
+            .into_iter()
+            .find(|m| m.container == "app")
+            .unwrap()
+    }
+
+    #[test]
+    fn recovery_preserves_subpath_and_readonly_and_uses_consumer_node() {
+        let pod = consumer();
+        let original = original(&pod);
+        let plan = recovery_plan(&[pod], &claim("ReadWriteOnce"), &original);
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates[0].container, "tools");
+        assert!(plan.candidates[0].read_only);
+        let options = plan.helper.unwrap();
+        assert_eq!(options.node.as_deref(), Some("worker-a"));
+        assert_eq!(options.sub_path, "tenant");
+        assert!(options.read_only);
+        let mut manifest = helper_pod("data", "busybox:1.37", 900);
+        apply_helper_options(&mut manifest, &options);
+        assert_eq!(manifest.pointer("/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchFields/0/values/0"), Some(&json!("worker-a")));
+        assert_eq!(
+            manifest.pointer("/spec/containers/0/volumeMounts/0/subPath"),
+            Some(&json!("tenant"))
+        );
+        assert_eq!(
+            manifest.pointer("/spec/containers/0/volumeMounts/0/readOnly"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            manifest.pointer("/spec/volumes/0/persistentVolumeClaim/readOnly"),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn recovery_blocks_occupied_rwop_but_allows_existing_container() {
+        let pod = consumer();
+        let original = original(&pod);
+        let plan = recovery_plan(&[pod], &claim("ReadWriteOncePod"), &original);
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(plan.helper.unwrap_err().contains("ReadWriteOncePod"));
+        assert!(helper_options(&[], &claim("ReadWriteOncePod"), &original).is_ok());
+    }
+
+    #[test]
+    fn recovery_refuses_unknown_subpath_or_ambiguous_rwo_node() {
+        let mut pod = consumer();
+        let mut original = original(&pod);
+        original.sub_path = None;
+        let plan = recovery_plan(&[pod.clone()], &claim("ReadWriteMany"), &original);
+        assert!(plan.candidates.is_empty());
+        assert!(plan.helper.unwrap_err().contains("subPathExpr"));
+        original.sub_path = Some("tenant".into());
+        pod.data["spec"].as_object_mut().unwrap().remove("nodeName");
+        assert!(helper_options(&[pod.clone()], &claim("ReadWriteOnce"), &original).is_err());
+        pod.data["spec"]["nodeName"] = json!("worker-b");
+        assert!(helper_options(&[pod, consumer()], &claim("ReadWriteOnce"), &original).is_err());
+    }
+
+    #[test]
+    fn recovery_limits_candidates_and_honors_claim_mount_readonly() {
+        let mut pod = consumer();
+        pod.data["spec"]["volumes"][0]["persistentVolumeClaim"]["readOnly"] = json!(true);
+        assert!(
+            find_mounts(&[pod.clone()], "data")
+                .iter()
+                .all(|m| m.read_only)
+        );
+        let original = original(&pod);
+        let pods: Vec<_> = (0..30)
+            .map(|i| {
+                let mut p = pod.clone();
+                p.metadata.name = Some(format!("pod-{i}"));
+                p
+            })
+            .collect();
+        assert_eq!(
+            recovery_plan(&pods, &claim("ReadWriteMany"), &original)
+                .candidates
+                .len(),
+            16
+        );
+    }
+
+    #[test]
+    fn missing_tool_checks_are_specific_and_report_before_listing() {
+        for error in [
+            "exec: \"sh\": executable file not found in $PATH",
+            "missing browsing tool: ls",
+            "missing browsing tool: head",
+        ] {
+            assert!(missing_listing_tools(error), "{error}");
+        }
+        for error in [
+            "permission denied",
+            "connection refused",
+            "listing failed (exit 127)",
+            "ls: file not found",
+        ] {
+            assert!(!missing_listing_tools(error), "{error}");
+        }
+        let probe = list_probe("/");
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", &probe.script, "sh", "/", "/"])
+            .env("PATH", "/sofka-test-no-tools")
+            .output()
+            .unwrap();
+        let result = interpret_listing(
+            &probe.nonce,
+            out.status.code(),
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
+        );
+        assert_eq!(result.unwrap_err(), "missing browsing tool: ls");
     }
 }

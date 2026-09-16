@@ -335,6 +335,11 @@ pub enum Msg {
         claim: StatusClaim,
         result: Result<Option<crate::pvcexplore::Mount>, String>,
     },
+    PvcRecovery {
+        generation: u64,
+        run: u64,
+        result: Result<crate::pvcexplore::RecoveryPlan, String>,
+    },
     /// One directory listing for the remote pane of the PVC browser.
     PvcListing {
         generation: u64,

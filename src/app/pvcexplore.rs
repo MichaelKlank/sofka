@@ -85,6 +85,15 @@ pub struct PvcExplore {
     /// Bumped on every navigation so a slow listing for a directory the user
     /// has already left is discarded instead of replacing the current one.
     pub run: u64,
+    pub(super) recovery: Option<RecoveryState>,
+    listed: bool,
+}
+
+pub(super) struct RecoveryState {
+    pub error: String,
+    pub original: Mount,
+    candidates: std::collections::VecDeque<Mount>,
+    helper: Option<Result<pvc::HelperOptions, String>>,
 }
 
 impl Default for PvcExplore {
@@ -111,6 +120,8 @@ impl Default for PvcExplore {
             focus: Pane::Remote,
             shell_pending: false,
             run: 0,
+            recovery: None,
+            listed: false,
         }
     }
 }
@@ -285,7 +296,12 @@ impl App {
             return;
         }
         match result {
-            Err(e) => self.set_claimed_status(status, e, true),
+            Err(e) => {
+                self.set_claimed_status(status, e.clone(), true);
+                if self.pvc.recovery.is_some() {
+                    self.pvc_recovery_error(&e);
+                }
+            }
             Ok(Some(mount)) => {
                 self.clear_claimed_status(status);
                 self.enter_pvc_target(namespace, mount);
@@ -337,7 +353,9 @@ impl App {
                 }
             }
             PvcIntent::Browse => {
-                self.set_return_mode();
+                if !self.pvc.active {
+                    self.set_return_mode();
+                }
                 self.pvc.active = true;
                 self.pvc.focus = Pane::Remote;
                 // Seeded, not left empty: a first listing that fails restores
@@ -345,7 +363,7 @@ impl App {
                 // make `⌫` and `r` both misbehave.
                 self.pvc.displayed_path = path.clone();
                 self.pvc.remote.clear();
-                self.pvc.remote_error = None;
+                self.pvc.remote_error = self.pvc.recovery.as_ref().map(|r| r.error.clone());
                 self.pvc.truncated = false;
                 self.mode = Mode::PvcExplore;
                 self.reload_local();
@@ -361,7 +379,7 @@ impl App {
     fn offer_pvc_helper(&mut self) {
         if self.readonly {
             self.flash_warn(&format!(
-                "nothing mounts {} — browsing it needs a helper pod, which read-only mode blocks",
+                "browsing {} needs a helper pod, which read-only mode blocks",
                 self.pvc.claim
             ));
             return;
@@ -390,8 +408,14 @@ impl App {
             return;
         };
         let image = self.pvc_cfg.image.clone();
-        let label =
-            format!("Nothing mounts {claim}. Create a temporary {image} pod in {ns} to mount it?");
+        let label = if let Some(recovery) = &self.pvc.recovery {
+            format!(
+                "{}\n\nBrowse with helper pod? Create a temporary {image} pod in {ns} for {claim}.",
+                recovery.error
+            )
+        } else {
+            format!("Nothing mounts {claim}. Create a temporary {image} pod in {ns} to mount it?")
+        };
         self.begin_guarded(
             ConfirmAction::PvcHelper {
                 ns,
@@ -407,11 +431,28 @@ impl App {
     /// Create the helper pod and wait for it to run. `generateName` means two
     /// sessions browsing the same claim never collide on a name.
     pub(super) fn create_pvc_helper(&mut self, ns: String, claim: String, intent: PvcIntent) {
+        if self.deny_readonly()
+            || self
+                .guard(
+                    "pvc-explore",
+                    "persistentvolumeclaims",
+                    &[(claim.clone(), ns.clone())],
+                    ConfirmLevel::None,
+                )
+                .is_none()
+        {
+            if self.pvc.recovery.is_some() {
+                let reason = self.flash.clone();
+                self.pvc_recovery_error(&reason);
+            }
+            return;
+        }
         self.pvc.intent = intent;
         self.pvc.run += 1;
         let run = self.pvc.run;
         let ttl = self.pvc_ttl_secs();
-        let manifest = pvc::helper_pod(&claim, &self.pvc_cfg.image, ttl);
+        let mut manifest = pvc::helper_pod(&claim, &self.pvc_cfg.image, ttl);
+        let original = self.pvc.recovery.as_ref().map(|r| r.original.clone());
         self.note_action("pvc-explore helper pod", format!("{claim} in {ns}"));
         let status = self.claim_status(format!("starting a helper pod for {claim}…"));
         let context = self.cluster.context.clone();
@@ -419,7 +460,14 @@ impl App {
         let tx = self.tx.clone();
         let genr = self.generation;
         tokio::spawn(async move {
-            let result = start_helper(client, &ns, manifest).await;
+            let result = async {
+                if let Some(original) = original {
+                    let plan = load_recovery_plan(client.clone(), &ns, &claim, &original).await?;
+                    pvc::apply_helper_options(&mut manifest, &plan.helper?);
+                }
+                start_helper(client, &ns, manifest).await
+            }
+            .await;
             let _ = tx
                 .send(Msg::PvcTarget {
                     generation: genr,
@@ -431,6 +479,98 @@ impl App {
                 })
                 .await;
         });
+    }
+
+    fn start_pvc_recovery(&mut self, error: String) {
+        let Some(original) = self.pvc.mount.clone() else {
+            return;
+        };
+        self.pvc.remote_error = Some(error.clone());
+        self.pvc.loading = true;
+        self.pvc.recovery = Some(RecoveryState {
+            error,
+            original: original.clone(),
+            candidates: Default::default(),
+            helper: None,
+        });
+        self.pvc.run += 1;
+        let run = self.pvc.run;
+        let generation = self.generation;
+        let client = self.cluster.client.clone();
+        let namespace = self.pvc.namespace.clone();
+        let claim = self.pvc.claim.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = load_recovery_plan(client, &namespace, &claim, &original).await;
+            let _ = tx
+                .send(Msg::PvcRecovery {
+                    generation,
+                    run,
+                    result,
+                })
+                .await;
+        });
+    }
+
+    pub(super) fn handle_pvc_recovery(
+        &mut self,
+        run: u64,
+        result: Result<pvc::RecoveryPlan, String>,
+    ) {
+        if run != self.pvc.run || !self.pvc.active {
+            return;
+        }
+        self.pvc.loading = false;
+        if self.mode != Mode::PvcExplore {
+            self.pvc_recovery_error("Recovery canceled because another view or dialog is open.");
+            return;
+        }
+        match result {
+            Ok(plan) => {
+                let Some(recovery) = &mut self.pvc.recovery else {
+                    return;
+                };
+                recovery.candidates = plan.candidates.into();
+                recovery.helper = Some(plan.helper);
+                self.next_pvc_candidate();
+            }
+            Err(error) => self.pvc_recovery_error(&error),
+        }
+    }
+
+    fn next_pvc_candidate(&mut self) {
+        let Some(recovery) = &mut self.pvc.recovery else {
+            return;
+        };
+        if let Some(mount) = recovery.candidates.pop_front() {
+            self.enter_pvc_target(self.pvc.namespace.clone(), mount);
+            return;
+        }
+        let helper = recovery.helper.take();
+        self.pvc.loading = false;
+        match helper {
+            Some(Ok(_)) => {
+                self.offer_pvc_helper();
+                if self.mode == Mode::PvcExplore {
+                    let reason = self.flash.clone();
+                    self.pvc_recovery_error(&reason);
+                }
+            }
+            Some(Err(error)) => self.pvc_recovery_error(&error),
+            None => self.pvc_recovery_error(
+                "No further recovery targets are available. Reopen the claim to retry.",
+            ),
+        }
+    }
+
+    fn pvc_recovery_error(&mut self, reason: &str) {
+        let message = match &self.pvc.recovery {
+            Some(recovery) => format!("{}\n\n{reason}", recovery.error),
+            None => reason.to_owned(),
+        };
+        self.pvc.loading = false;
+        self.pvc.remote_error = Some(message.clone());
+        self.flash_warn(&message);
     }
 
     /// `[pvc_explore] ttl`, already validated at load; a value that slipped
@@ -489,6 +629,8 @@ impl App {
         self.pvc.remote_path = path.clone();
         match result {
             Ok((listing, warn)) => {
+                self.pvc.listed = true;
+                self.pvc.recovery = None;
                 self.pvc.truncated = listing.truncated;
                 // Re-listing the same directory keeps the cursor; stepping
                 // into a new one starts at the top, unless we stepped *out* of
@@ -517,6 +659,26 @@ impl App {
             // directory, so leaving the title pointing somewhere else would
             // mislabel them.
             Err(e) => {
+                if !self.pvc.listed
+                    && self.mode == Mode::PvcExplore
+                    && self
+                        .pvc
+                        .mount
+                        .as_ref()
+                        .is_some_and(|m| !m.helper && path == m.path)
+                    && pvc::missing_listing_tools(&e)
+                {
+                    if self.pvc.recovery.is_some() {
+                        self.next_pvc_candidate();
+                    } else {
+                        self.start_pvc_recovery(e);
+                    }
+                    return;
+                }
+                if self.pvc.recovery.is_some() {
+                    self.pvc_recovery_error(&e);
+                    return;
+                }
                 self.pvc.remote_path = self.pvc.displayed_path.clone();
                 self.pvc.want_select = None;
                 // Only when the failure is about the directory still on
@@ -846,6 +1008,8 @@ impl App {
         self.pvc.remote_path.clear();
         self.pvc.displayed_path.clear();
         self.pvc.want_select = None;
+        self.pvc.recovery = None;
+        self.pvc.listed = false;
     }
 
     /// Delete the helper pod, if this session created one. Best effort and
@@ -1203,10 +1367,47 @@ fn pod_resource() -> kube::discovery::ApiResource {
     kube::discovery::ApiResource::erase::<Pod>(&())
 }
 
+async fn load_recovery_plan(
+    client: Client,
+    ns: &str,
+    claim: &str,
+    original: &Mount,
+) -> Result<pvc::RecoveryPlan, String> {
+    let read = async {
+        let pods: Api<DynamicObject> = Api::namespaced_with(client.clone(), ns, &pod_resource());
+        let pods = pods
+            .list(&ListParams::default())
+            .await
+            .map_err(|e| format!("Cannot list recovery pods: {e}"))?;
+        let resource = kube::discovery::ApiResource::erase::<
+            k8s_openapi::api::core::v1::PersistentVolumeClaim,
+        >(&());
+        let claims: Api<DynamicObject> = Api::namespaced_with(client, ns, &resource);
+        let claim = claims
+            .get(claim)
+            .await
+            .map_err(|e| format!("Cannot check volume access modes: {e}"))?;
+        Ok(pvc::recovery_plan(&pods.items, &claim, original))
+    };
+    tokio::time::timeout(LIST_TIMEOUT, read)
+        .await
+        .map_err(|_| "Recovery checks timed out.".to_owned())?
+}
+
 /// Create the helper pod and poll until it is `Running` (or fails), returning
 /// the mount to browse it through.
 async fn start_helper(client: Client, ns: &str, manifest: Value) -> Result<Mount, String> {
     let spec: Pod = serde_json::from_value(manifest).map_err(|e| e.to_string())?;
+    let volume_mount = spec
+        .spec
+        .as_ref()
+        .and_then(|s| s.containers.first())
+        .and_then(|c| c.volume_mounts.as_ref())
+        .and_then(|m| m.first());
+    let read_only = volume_mount.and_then(|m| m.read_only).unwrap_or(false);
+    let sub_path = volume_mount
+        .and_then(|m| m.sub_path.clone())
+        .unwrap_or_default();
     let pods: Api<Pod> = Api::namespaced(client, ns);
     let created = pods
         .create(&PostParams::default(), &spec)
@@ -1223,7 +1424,8 @@ async fn start_helper(client: Client, ns: &str, manifest: Value) -> Result<Mount
                         pod: name,
                         container: "explore".into(),
                         path: HELPER_MOUNT.into(),
-                        read_only: false,
+                        sub_path: Some(sub_path),
+                        read_only,
                         helper: true,
                     });
                 }

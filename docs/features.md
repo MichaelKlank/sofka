@@ -665,6 +665,19 @@ right - so a download or an upload is one keystroke rather than a hand-written
     through right now, so the confirmation says so. Deleting pods is a mutation
     like any other: blocked in read-only mode, matched by the `pvc-explore`
     guardrail, recorded in `:journal`.
+- **Missing tools trigger built-in recovery.** If the first listing fails
+  because `sh`, `ls`, or `head` is missing, sofka tries up to 16 other running
+  containers that mount the same part of the claim. Read-only restrictions
+  remain in force. If none works, it offers a helper pod and asks before
+  creating it. Read-only mode and the `pvc-explore` guardrail still apply.
+  For an in-use `ReadWriteOnce` claim, the helper is scheduled on the consumer's
+  node. An occupied `ReadWriteOncePod` claim cannot use a second pod. Recovery
+  reports that restriction without creating a helper. A static `subPath` is
+  preserved; a `subPathExpr` mount cannot recover automatically because its
+  boundary cannot be determined from the pod specification. Permission errors,
+  connection failures, and invalid paths retain their specific messages.
+  Canceling recovery leaves the original error in the browser. Reopen the claim
+  to start a new recovery attempt.
 - **Navigation is confined to the mount.** `⌫` stops at the mount point, and
   every listing verifies with `pwd -P` that it actually landed inside the
   volume - so a symlink on the volume pointing at `/` is refused rather than
@@ -732,7 +745,7 @@ right - so a download or an upload is one keystroke rather than a hand-written
   than after.
 
 Listings are read with `ls -A -l` over `kubectl exec`, so the pod's image needs
-a shell and `ls`; transfers additionally need `tar`, as `kubectl cp` always
+a shell, `ls`, and `head`; transfers additionally need `tar`, as `kubectl cp` always
 does. An entry `ls` cannot stat still appears, with an unknown size and a
 warning, rather than blanking the whole directory. The helper-pod image and
 lifetime are configurable:

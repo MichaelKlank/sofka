@@ -297,6 +297,11 @@ Interactive actions (`e`, `s` for shell, `a`) suspend the TUI and shell out to
 `kubectl`. Delete, scale, restart, set-image, suspend, resume, reconcile, and
 port-forward go through the kube API (or a backgrounded process) directly.
 
+If the first PVC listing fails because required tools are missing, sofka tries
+other suitable containers, then offers a helper pod. Accept or cancel the
+existing confirmation dialog. Volume access restrictions, read-only mode, and
+guardrails still apply. Canceling keeps the original error visible.
+
 ## Plugin commands
 
 | Command                            | Action                                                       |
