@@ -1873,7 +1873,7 @@ impl App {
             return;
         }
         if !self.flux_suspendable() && !self.cronjob_kind() && !self.argocd_kind() {
-            self.flash_warn("suspend/resume only applies to CronJobs, Flux resources (ks/hr/git-, helm-, oci-repos, buckets, image automation, alerts, receivers), and ArgoCD Applications/ApplicationSets");
+            self.flash_warn("suspend/resume only applies to CronJobs, Flux resources (ks/hr/HelmCharts/git-, helm-, oci-repos, buckets, image automation, alerts, receivers), and ArgoCD Applications/ApplicationSets");
             return;
         }
         if self.action_targets().is_empty() {

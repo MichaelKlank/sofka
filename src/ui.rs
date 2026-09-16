@@ -2716,7 +2716,7 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
         } else if scope == "table" && action == Action::Logs {
             "logs (marked pods, or current row)"
         } else if scope == "table" && action == Action::ActionMenu {
-            "action menu: Flux suspend/resume/reconcile (HelmRelease: + force reconcile); Argo CD suspend/resume (Application: + sync); CronJobs trigger/suspend/resume; pods file transfer"
+            "action menu: Flux suspend/resume/reconcile (includes HelmChart; HelmRelease: + force reconcile); Argo CD suspend/resume (Application: + sync); CronJobs trigger/suspend/resume; pods file transfer"
         } else if scope == "port_forward_picker" && action == Action::Edit {
             "edit local port of the selected mapping"
         } else if action == Action::LogMarker {

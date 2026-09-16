@@ -400,7 +400,7 @@ concurrent drains, and full kubectl drain parity are outside this feature.
 ## GitOps and Helm
 
 - **Flux CD controls** (`t`) - a suspend/resume/reconcile-now menu built on
-  native Kubernetes API patches, for Kustomizations, HelmReleases, git/helm/oci
+  native Kubernetes API patches, for Kustomizations, HelmReleases, HelmCharts, git/helm/oci
   repositories, buckets, image automation, and notification alerts and
   receivers. No `flux` binary needed. Works with bulk multiselect. For
   HelmRelease resources, **Force reconcile** requests a Helm install or upgrade

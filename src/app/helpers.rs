@@ -407,7 +407,26 @@ pub(super) fn xray_pool_plurals(root_kind: &str) -> &'static [&'static str] {
 impl App {
     /// Whether the current kind supports the Flux suspend/resume menu (`t`).
     pub fn flux_suspendable(&self) -> bool {
-        FLUX_SUSPENDABLE_KINDS.contains(&self.kind_plural.as_str())
+        self.kind.as_ref().is_some_and(|kind| {
+            matches!(
+                (kind.ar.group.as_str(), kind.ar.plural.as_str()),
+                ("kustomize.toolkit.fluxcd.io", "kustomizations")
+                    | ("helm.toolkit.fluxcd.io", "helmreleases")
+                    | (
+                        "source.toolkit.fluxcd.io",
+                        "gitrepositories"
+                            | "helmrepositories"
+                            | "helmcharts"
+                            | "ocirepositories"
+                            | "buckets"
+                    )
+                    | (
+                        "image.toolkit.fluxcd.io",
+                        "imagerepositories" | "imageupdateautomations"
+                    )
+                    | ("notification.toolkit.fluxcd.io", "alerts" | "receivers")
+            )
+        })
     }
 
     /// Whether the current kind is an ArgoCD CRD (Application or
