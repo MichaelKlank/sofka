@@ -165,18 +165,20 @@ pub fn inventory_findings(
     }
     const MAX_LISTED: usize = 500;
     for entry in entries.iter().take(MAX_LISTED) {
-        let parts: Vec<_> = entry
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .split('_')
-            .collect();
+        let id = entry.get("id").and_then(Value::as_str).unwrap_or_default();
+        let fields = id.split_once('_').and_then(|(namespace, rest)| {
+            let (rest, kind) = rest.rsplit_once('_')?;
+            let (name, group) = rest.rsplit_once('_')?;
+            Some((namespace, name, group, kind))
+        });
         let version = entry.get("v").and_then(Value::as_str).unwrap_or_default();
-        if parts.len() != 4 || parts[1].is_empty() || parts[3].is_empty() || version.is_empty() {
+        let Some((namespace, name, group, kind)) = fields.filter(|(_, name, _, kind)| {
+            !name.is_empty() && !kind.is_empty() && !version.is_empty()
+        }) else {
             out.push(finding(1, Level::Warn, "invalid inventory entry"));
             continue;
-        }
-        let (namespace, name, group, kind) = (parts[0], parts[1], parts[2], parts[3]);
+        };
+        let name = name.replace("__", ":");
         let qualified = if group.is_empty() {
             kind.to_string()
         } else {

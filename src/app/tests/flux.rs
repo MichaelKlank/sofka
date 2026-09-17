@@ -420,15 +420,44 @@ async fn gitops_inventory_navigation_uses_group_and_scope_without_resource_reads
         ("kustomizations", "Kustomization"),
         ("helmreleases", "HelmRelease"),
     ] {
-        for (id, target_plural, group, namespace) in [
-            ("default_web__Service", "services", "", "default"),
+        for (id, target_plural, group, namespace, name) in [
+            ("default_web__Service", "services", "", "default", "web"),
             (
                 "default_web_serving.knative.dev_Service",
                 "services.serving.knative.dev",
                 "serving.knative.dev",
                 "default",
+                "web",
             ),
-            ("_web__Namespace", "namespaces", "", ""),
+            ("_web__Namespace", "namespaces", "", "", "web"),
+            (
+                "default_system__controller__web_rbac.authorization.k8s.io_Role",
+                "roles.rbac.authorization.k8s.io",
+                "rbac.authorization.k8s.io",
+                "default",
+                "system:controller:web",
+            ),
+            (
+                "default_system__web_rbac.authorization.k8s.io_RoleBinding",
+                "rolebindings.rbac.authorization.k8s.io",
+                "rbac.authorization.k8s.io",
+                "default",
+                "system:web",
+            ),
+            (
+                "_system__controller__web_rbac.authorization.k8s.io_ClusterRole",
+                "clusterroles.rbac.authorization.k8s.io",
+                "rbac.authorization.k8s.io",
+                "",
+                "system:controller:web",
+            ),
+            (
+                "_system__web_rbac.authorization.k8s.io_ClusterRoleBinding",
+                "clusterrolebindings.rbac.authorization.k8s.io",
+                "rbac.authorization.k8s.io",
+                "",
+                "system:web",
+            ),
         ] {
             let root = json!({"apiVersion":"test/v1", "kind":owner_kind,
                 "metadata":{"name":"web", "namespace":"default"},
@@ -437,6 +466,15 @@ async fn gitops_inventory_navigation_uses_group_and_scope_without_resource_reads
             app.cluster
                 .register_kind("serving.knative.dev", "Service", "services", true);
             app.cluster.register_kind("", "Service", "services", true);
+            for (kind, plural, namespaced) in [
+                ("Role", "roles", true),
+                ("RoleBinding", "rolebindings", true),
+                ("ClusterRole", "clusterroles", false),
+                ("ClusterRoleBinding", "clusterrolebindings", false),
+            ] {
+                app.cluster
+                    .register_kind("rbac.authorization.k8s.io", kind, plural, namespaced);
+            }
             let path = format!(
                 "/apis/{}/namespaces/default/{plural}/web",
                 app.kind.as_ref().unwrap().ar.api_version
@@ -449,6 +487,7 @@ async fn gitops_inventory_navigation_uses_group_and_scope_without_resource_reads
                 .iter()
                 .position(|f| f.target.as_ref().is_some_and(|t| t.plural == target_plural))
                 .unwrap();
+            assert!(app.gitops_items[index].text.contains(&format!("/{name} (")));
             assert_eq!(
                 requests
                     .lock()
@@ -464,7 +503,7 @@ async fn gitops_inventory_navigation_uses_group_and_scope_without_resource_reads
             assert_eq!(app.mode, Mode::Table);
             assert_eq!(app.kind.as_ref().unwrap().ar.group, group);
             assert_eq!(app.namespace, namespace);
-            assert_eq!(app.fields.as_deref(), Some("metadata.name=web"));
+            assert_eq!(app.fields, Some(format!("metadata.name={name}")));
         }
     }
 }
