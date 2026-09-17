@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 use crate::diagnostics::Op;
 use crate::store::{Msg, row_key};
 
+pub mod completion;
 mod discovery;
 mod proxy;
 mod table;

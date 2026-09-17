@@ -3,10 +3,40 @@
 Run `sofka completion <shell>` to print a completion script. Supported shells
 are `bash`, `zsh`, `fish`, `elvish`, and `powershell`.
 
-The scripts complete CLI options, subcommands, and fixed option values. They
-use the same definitions as `sofka --help`. They do not query Kubernetes for
-resource names, namespaces, or contexts. Script generation does not load the
-sofka configuration or connect to a cluster.
+The scripts complete CLI options, subcommands, and fixed option values from the
+CLI definitions. They also complete these values when you press Tab:
+
+- `--context`: context names from kubeconfig. This uses `KUBECONFIG`, or
+  `~/.kube/config` when the variable is not set. An earlier `--kubeconfig` option
+  selects a different file.
+- `-n`, `--namespace`: namespaces from the cluster selected by an earlier
+  `--context` option, or the current kubeconfig context.
+- The resource argument and `--resource`: built-in aliases, configured aliases,
+  and resource types from API discovery, including custom resources, short names,
+  and names with an API group suffix. `ctx` and `contexts` are also available.
+- `--kubeconfig` and `--validate-plugin-report`: local paths.
+- `--validate-plugin`: local directories.
+- `plugin describe` and `plugin install`: plugin IDs and `ID@VERSION` values from
+  the cached catalog. Install suggestions exclude withdrawn releases and releases
+  that do not support the current sofka version or platform. Describe suggestions
+  include all cached versions. Run `sofka plugin search` to populate or refresh
+  that cache.
+- `plugin update` and `plugin remove`: installed, managed plugin IDs.
+
+Plugin completion does not download or install packages. Free text, such as a
+plugin search query, has no value suggestions. The CLI has no object-name argument,
+so resource completion suggests resource types only.
+
+Completion uses arguments before the cursor. Both `--context NAME` and
+`--context=NAME` are supported. Cluster queries use the selected kubeconfig and
+TLS options. They can run credential helpers configured in kubeconfig, but do
+not allow interactive input. Each completion request has a two-second limit;
+unavailable data produces no error output. Cluster access must permit namespace
+listing or API discovery to complete those values.
+
+Script generation does not load the sofka configuration or connect to a cluster.
+The generated scripts call `sofka` when you press Tab. Generate them again after
+an update, as shown below.
 
 Use the instructions for your shell below. Make sure `sofka` is on `PATH` when
 the shell starts. These commands generate the script at shell startup, so

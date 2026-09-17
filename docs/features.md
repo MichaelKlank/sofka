@@ -5,7 +5,9 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 ## Shell completion
 
 `sofka completion <shell>` generates CLI completion scripts for Bash, Zsh,
-Fish, Elvish, and PowerShell. Generation does not need a cluster connection.
+Fish, Elvish, and PowerShell. Tab completes contexts, namespaces, resource types,
+local paths, and plugin IDs and versions. Cluster queries use earlier CLI options
+and have a time limit. Generation does not need a cluster connection.
 See [shell setup instructions](shell-completion.md).
 
 ## Node drain options

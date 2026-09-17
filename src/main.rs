@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use clap::{CommandFactory, Parser};
+use clap::Parser;
 use crossterm::event::{Event, KeyEventKind};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
@@ -18,6 +18,7 @@ use sofka::{
     terminal, theme, thresholds, ui, views,
 };
 
+mod completion;
 mod terminal_title;
 
 const EVENT_CHANNEL_CAP: usize = 4096;
@@ -93,7 +94,7 @@ struct Args {
     snapshot: bool,
 
     /// Validate a plugin package without executing it or connecting to a cluster.
-    #[arg(long, value_name = "DIR", conflicts_with_all = ["check", "snapshot", "info", "validate_plugin_report"])]
+    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, conflicts_with_all = ["check", "snapshot", "info", "validate_plugin_report"])]
     validate_plugin: Option<PathBuf>,
 
     /// Validate and render a versioned plugin JSON report without a cluster.
@@ -147,6 +148,9 @@ struct InfoArgs {
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 fn main() -> Result<()> {
+    if completion::try_complete() {
+        return Ok(());
+    }
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
@@ -155,7 +159,7 @@ fn main() -> Result<()> {
         use std::io::Write;
 
         let mut script = Vec::new();
-        clap_complete::generate(*shell, &mut Args::command(), "sofka", &mut script);
+        completion::write_registration(*shell, &mut script)?;
         return std::io::stdout()
             .lock()
             .write_all(&script)

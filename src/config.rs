@@ -1445,6 +1445,15 @@ impl ConfigLoader {
     /// base config. Either name may be empty (e.g. in-cluster, no kubeconfig
     /// context) — its level is simply skipped.
     pub fn resolve(&self, context: &str, cluster: &str) -> Resolved {
+        self.resolve_inner(context, cluster, true)
+    }
+
+    /// Read effective settings without writing key migrations to disk.
+    pub fn resolve_read_only(&self, context: &str, cluster: &str) -> Resolved {
+        self.resolve_inner(context, cluster, false)
+    }
+
+    fn resolve_inner(&self, context: &str, cluster: &str, migrate: bool) -> Resolved {
         let mut warnings = Vec::new();
         let mut merged = self
             .base
@@ -1504,7 +1513,7 @@ impl ConfigLoader {
             warnings.push(format!("ignoring drop-in and cluster overrides: {e}"));
             base.try_into().unwrap_or_default()
         });
-        if !migrations.is_empty() {
+        if migrate && !migrations.is_empty() {
             key_migration::finish(
                 migrations,
                 valid_config && crate::keymap::Keymap::compile(&config.keys).is_ok(),
