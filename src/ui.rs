@@ -527,7 +527,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let ns = if app.all_namespaces() {
         "<all>".to_string()
     } else {
-        app.namespace.clone()
+        app.namespace_label()
     };
     let mut kind = app.resource_title();
     if let Some(scope) = &app.scope_label {
@@ -679,7 +679,7 @@ fn draw_compact_header(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.namespace.is_empty() {
         "<none>".to_string()
     } else {
-        app.namespace.clone()
+        app.namespace_label()
     };
     let mut kind = app.resource_title();
     if let Some(scope) = &app.scope_label {
@@ -2775,7 +2775,7 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
     ));
     lines.push(bind(
         ":ns <name>",
-        "change namespace, keep resource (all/* = all); from Namespaces, return or open Pods",
+        "change namespace, keep resource (all/* = all; *-crons = wildcard); from Namespaces, return or open Pods",
     ));
     lines.push(bind(
         ":ctx · :pulse",
