@@ -7338,6 +7338,65 @@ fn cronjob_manual_job_requires_a_job_template() {
 }
 
 #[tokio::test]
+async fn custom_ctrl_h_binding_keeps_namespace_navigation_and_other_bindings() {
+    let (mut app, _rx) = test_app();
+    let config: crate::config::Config =
+        toml::from_str("[keys.namespaces]\ndown = 'ctrl-h'\n[keys.table]\nnamespaces = 'f8'")
+            .unwrap();
+    app.keymap = Keymap::compile(&config.keys).unwrap();
+    app.ns_list = vec!["<all>".into(), "default".into(), "kube-system".into()];
+    app.handle_key(press(KeyCode::F(8))).unwrap();
+    assert_eq!(app.mode, Mode::Namespaces);
+    app.ns_state.select(Some(0));
+    app.handle_key(ctrl(KeyCode::Char('h'))).unwrap();
+    assert_eq!(app.ns_state.selected(), Some(1));
+    assert!(app.ns_filter.is_empty());
+    app.handle_key(press(KeyCode::Char('h'))).unwrap();
+    assert_eq!(app.ns_filter, "h");
+    app.handle_key(press(KeyCode::Backspace)).unwrap();
+    assert!(app.ns_filter.is_empty());
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    app.handle_key(press(KeyCode::Char('h'))).unwrap();
+    app.handle_key(ctrl(KeyCode::Char('h'))).unwrap();
+    assert_eq!(app.mode, Mode::Filter);
+    assert!(app.filter.is_empty());
+}
+
+#[tokio::test]
+async fn text_inputs_accept_ctrl_h_as_backspace() {
+    for (entry, mode) in [
+        (':', Mode::Command),
+        ('/', Mode::Filter),
+        ('n', Mode::Namespaces),
+    ] {
+        for backspace in [press(KeyCode::Backspace), ctrl(KeyCode::Char('h'))] {
+            let (mut app, _rx) = test_app();
+            app.switch_kind("pods");
+            app.handle_key(press(KeyCode::Char(entry))).unwrap();
+            assert_eq!(app.mode, mode);
+            let text = |app: &App| match mode {
+                Mode::Command => app.command.clone(),
+                Mode::Filter => app.filter.clone(),
+                Mode::Namespaces => app.ns_filter.clone(),
+                _ => unreachable!(),
+            };
+            for c in "hé".chars() {
+                app.handle_key(press(KeyCode::Char(c))).unwrap();
+            }
+            assert_eq!(text(&app), "hé");
+            app.handle_key(backspace).unwrap();
+            assert_eq!(text(&app), "h");
+            app.handle_key(backspace).unwrap();
+            assert_eq!(text(&app), "");
+            app.handle_key(backspace).unwrap();
+            assert_eq!(text(&app), "");
+            assert_eq!(app.mode, mode);
+        }
+    }
+}
+
+#[tokio::test]
 async fn filter_edit_chords_delete_word_and_clear_line() {
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
