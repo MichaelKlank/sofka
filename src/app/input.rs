@@ -411,7 +411,7 @@ impl App {
             (Some(Action::Exit), _) => self.should_quit = true,
             (Some(Action::Back), _) => {
                 if !self.marked.is_empty() {
-                    self.marked.clear();
+                    self.clear_marks();
                 } else if !self.filter.is_empty() {
                     self.filter.clear();
                     self.invalidate_rows();
@@ -447,6 +447,7 @@ impl App {
                 self.toggle_mark();
                 self.move_selection(1);
             }
+            (Some(Action::MarkRange), _) => self.mark_range(),
             (Some(Action::Open), _) => self.drill(),
             (Some(Action::Yaml), _) => self.open_detail(),
             (Some(Action::Describe), _) => self.describe(),
