@@ -514,62 +514,95 @@ pub fn accent() -> Style {
 /// (healthy, pending, error) keep a distinct pop color so they stand out
 /// against the row tint.
 pub fn status_color(s: &str) -> Color {
-    if s == "Ready,SchedulingDisabled" {
-        return yellow();
-    }
-    match s.strip_suffix(",SchedulingDisabled").unwrap_or(s) {
-        s if failure_status(s) => red(),
-        s if s.starts_with("Init:") => yellow(),
-        "Running" | "Ready" | "Active" | "Bound" | "True" | "deployed" | "Synced" | "Healthy" => {
-            green()
+    with_lowercase(s, |s| {
+        if s == "ready,schedulingdisabled" {
+            return yellow();
         }
-        // Faded, not "healthy green" — a finished pod isn't running, and a
-        // scaled-to-zero workload isn't serving.
-        "Succeeded" | "Completed" | "superseded" | "uninstalled" | "ScaledDown" => overlay0(),
-        "Pending" | "Suspended" | "Completing" | "ContainerCreating" | "PodInitializing"
-        | "SchedulingGated" | "Progressing" | "pending-install" | "pending-upgrade"
-        | "pending-rollback" | "OutOfSync" => yellow(),
-        // Matches row_color's killColor — a distinct "on its way out" hue,
-        // not the same bucket as Pending.
-        "Terminating" | "uninstalling" => mauve(),
-        "Unknown" | "" | "unknown" => overlay1(),
-        _ => text(),
+        match s.strip_suffix(",schedulingdisabled").unwrap_or(s) {
+            s if failure_status(s) => red(),
+            s if s.starts_with("init:") => yellow(),
+            "running" | "ready" | "active" | "bound" | "true" | "deployed" | "synced"
+            | "healthy" => green(),
+            // Faded, not "healthy green" — a finished pod isn't running, and a
+            // scaled-to-zero workload isn't serving.
+            "succeeded" | "completed" | "superseded" | "uninstalled" | "scaleddown" => overlay0(),
+            s if pending_status(s) || s == "outofsync" => yellow(),
+            // Matches row_color's killColor — a distinct "on its way out" hue,
+            // not the same bucket as Pending.
+            "terminating" | "uninstalling" => mauve(),
+            "unknown" | "" => overlay1(),
+            _ => text(),
+        }
+    })
+}
+
+/// Runs `f` on the ASCII-lowercased `s`. Both colorers run for every visible
+/// row on every frame, so status-sized strings are lowered on the stack.
+fn with_lowercase<R>(s: &str, f: impl FnOnce(&str) -> R) -> R {
+    let mut buf = [0u8; 48];
+    match buf.get_mut(..s.len()) {
+        Some(lower) => {
+            lower.copy_from_slice(s.as_bytes());
+            lower.make_ascii_lowercase();
+            f(std::str::from_utf8(lower).expect("ASCII lowercasing keeps UTF-8 valid"))
+        }
+        None => f(&s.to_ascii_lowercase()),
     }
 }
 
-fn failure_status(status: &str) -> bool {
-    let status = status.strip_prefix("Init:").unwrap_or(status);
+/// `status` must already be lowercase: CRDs spell the same state as
+/// `Healthy`, `healthy` or `HEALTHY`.
+fn pending_status(status: &str) -> bool {
     matches!(
         status,
-        "Failed"
-            | "Error"
-            | "CrashLoopBackOff"
-            | "ImagePullBackOff"
-            | "ErrImagePull"
-            | "Evicted"
-            | "OOMKilled"
-            | "NotReady"
-            | "Unhealthy"
-            | "False"
-            | "failed"
-            | "Degraded"
-            | "Missing"
-            | "Unavailable"
-            | "Stalled"
-            | "CreateContainerConfigError"
-            | "CreateContainerError"
-            | "InvalidImageName"
-            | "ContainerCannotRun"
-            | "RunContainerError"
-            | "ErrImageNeverPull"
-            | "StartError"
-            | "DeadlineExceeded"
-            | "Lost"
-            | "ContainerStatusUnknown"
-    ) || status.starts_with("NotReady")
+        "pending"
+            | "suspended"
+            | "completing"
+            | "containercreating"
+            | "podinitializing"
+            | "schedulinggated"
+            | "progressing"
+            | "processing"
+            | "reconciling"
+            | "pending-install"
+            | "pending-upgrade"
+            | "pending-rollback"
+    )
+}
+
+/// `status` must already be lowercase, like [`pending_status`].
+fn failure_status(status: &str) -> bool {
+    let status = status.strip_prefix("init:").unwrap_or(status);
+    matches!(
+        status,
+        "failed"
+            | "error"
+            | "crashloopbackoff"
+            | "imagepullbackoff"
+            | "errimagepull"
+            | "evicted"
+            | "oomkilled"
+            | "notready"
+            | "unhealthy"
+            | "false"
+            | "degraded"
+            | "missing"
+            | "unavailable"
+            | "stalled"
+            | "createcontainerconfigerror"
+            | "createcontainererror"
+            | "invalidimagename"
+            | "containercannotrun"
+            | "runcontainererror"
+            | "errimageneverpull"
+            | "starterror"
+            | "deadlineexceeded"
+            | "lost"
+            | "containerstatusunknown"
+    ) || status.starts_with("notready")
         || status
-            .strip_prefix("Signal:")
-            .or_else(|| status.strip_prefix("ExitCode:"))
+            .strip_prefix("signal:")
+            .or_else(|| status.strip_prefix("exitcode:"))
             .and_then(|n| n.parse::<i64>().ok())
             .is_some_and(|n| n != 0)
 }
@@ -585,17 +618,17 @@ fn failure_status(status: &str) -> bool {
 /// - everything healthy (Running/Ready/Bound/…) **or without a status** → the
 ///   standard row color (blue), so healthy rows read blue like k9s, not white.
 pub fn row_color(s: &str) -> Color {
-    match s.strip_suffix(",SchedulingDisabled").unwrap_or(s) {
-        s if failure_status(s) => red(),
-        s if s.starts_with("Init:") => peach(),
-        "Pending" | "Suspended" | "Completing" | "ContainerCreating" | "PodInitializing"
-        | "SchedulingGated" | "Progressing" | "pending-install" | "pending-upgrade"
-        | "pending-rollback" => peach(),
-        "Completed" | "Succeeded" | "superseded" | "uninstalled" | "ScaledDown" => overlay0(),
-        // k9s killColor — terminating/deleting rows.
-        "Terminating" | "uninstalling" => mauve(),
-        _ => blue(),
-    }
+    with_lowercase(s, |s| {
+        match s.strip_suffix(",schedulingdisabled").unwrap_or(s) {
+            s if failure_status(s) => red(),
+            s if s.starts_with("init:") => peach(),
+            s if pending_status(s) => peach(),
+            "completed" | "succeeded" | "superseded" | "uninstalled" | "scaleddown" => overlay0(),
+            // k9s killColor — terminating/deleting rows.
+            "terminating" | "uninstalling" => mauve(),
+            _ => blue(),
+        }
+    })
 }
 
 /// Foreground tint for a threshold [`Severity`](crate::thresholds::Severity):
@@ -737,6 +770,27 @@ mod tests {
         assert_eq!(row_color("superseded"), overlay0());
         assert_eq!(row_color("pending-upgrade"), peach());
         assert_eq!(status_color("pending-upgrade"), yellow());
+    }
+
+    #[test]
+    fn status_words_match_in_any_case() {
+        assert_eq!(status_color("healthy"), green());
+        assert_eq!(status_color("HEALTHY"), green());
+        assert_eq!(status_color("unhealthy"), red());
+        assert_eq!(row_color("unhealthy"), red());
+        assert_eq!(status_color("crashloopbackoff"), red());
+        assert_eq!(status_color("init:0/1"), yellow());
+        assert_eq!(status_color("exitcode:1"), red());
+        assert_eq!(status_color("ready,schedulingdisabled"), yellow());
+        assert_eq!(status_color("Processing"), yellow());
+        assert_eq!(row_color("processing"), peach());
+        assert_eq!(status_color("Reconciling"), yellow());
+        assert_eq!(row_color("Reconciling"), peach());
+        assert_eq!(status_color("SUCCEEDED"), overlay0());
+        assert_eq!(status_color("Somethingelse"), text());
+        let long = format!("NotReady,{}", "X".repeat(60));
+        assert_eq!(status_color(&long), red());
+        assert_eq!(row_color(&long), red());
     }
 
     #[test]
