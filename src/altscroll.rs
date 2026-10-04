@@ -85,7 +85,11 @@ impl Repair {
                 vec![esc, key]
             }
             State::Intro(esc) => {
-                if plain && let Some(code) = final_byte(key.code) {
+                // crossterm reports the final letter as an uppercase char,
+                // which carries SHIFT, so SHIFT alone still counts as plain.
+                if (key.modifiers - KeyModifiers::SHIFT).is_empty()
+                    && let Some(code) = final_byte(key.code)
+                {
                     return vec![KeyEvent::new(code, KeyModifiers::NONE)];
                 }
                 // Not a sequence after all: replay what was swallowed. The
@@ -166,10 +170,12 @@ mod tests {
     fn a_burst_of_split_scrolls_never_yields_an_esc() {
         let mut r = Repair::default();
         let mut out = Vec::new();
+        // What crossterm actually emits for the tail `[B`: `B` carries SHIFT.
+        let b = KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT);
         for _ in 0..50 {
-            for code in [KeyCode::Esc, KeyCode::Char('['), KeyCode::Char('B')] {
-                out.extend(codes(r.push(press(code))));
-            }
+            out.extend(codes(r.push(press(KeyCode::Esc))));
+            out.extend(codes(r.push(press(KeyCode::Char('[')))));
+            out.extend(codes(r.push(b)));
         }
         assert_eq!(out, vec![KeyCode::Down; 50]);
         assert!(!r.pending());
