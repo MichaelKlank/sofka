@@ -1937,6 +1937,10 @@ pub struct App {
     pub native_describe_override: bool,
     pub refresh_task: Option<tokio::task::JoinHandle<()>>,
     managed_fields_task: Option<JoinHandle<()>>,
+    document_reload_task: Option<JoinHandle<()>>,
+    document_edit_task: Option<JoinHandle<()>>,
+    document_edit_request: u64,
+    reload_after_suspend: bool,
     pub(super) refresh_generation: u64,
     document_source: Option<refresh::RefreshSource>,
     describe_task: Option<JoinHandle<()>>,
@@ -2432,6 +2436,10 @@ impl App {
             native_describe_override: false,
             refresh_task: None,
             managed_fields_task: None,
+            document_reload_task: None,
+            document_edit_task: None,
+            document_edit_request: 0,
+            reload_after_suspend: false,
             refresh_generation: 0,
             document_source: None,
             describe_task: None,
@@ -2666,6 +2674,8 @@ impl App {
     pub(super) fn overlay_return(&self) -> Mode {
         if self.confirm_return == Mode::PvcExplore && self.pvc.active {
             Mode::PvcExplore
+        } else if self.confirm_over_document() {
+            Mode::Detail
         } else {
             Mode::Table
         }

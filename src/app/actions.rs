@@ -682,6 +682,68 @@ impl App {
         let Some(obj) = self.selected_ref() else {
             return;
         };
+        let obj = obj.clone();
+        let resource = self.kubectl_resource();
+        self.edit_object(resource, &obj);
+    }
+
+    /// `e` in a YAML or describe view edits the object the document shows,
+    /// not the table row, which can move while the watch is still filling.
+    /// `kubectl edit` goes by name, so the object is read first to make sure
+    /// it was not replaced under the same name while the document was open.
+    pub(super) fn request_document_edit(&mut self) {
+        if !self.document_editable() || self.deny_readonly() || self.document_edit_task.is_some() {
+            return;
+        }
+        let Some(source) = self.document_source.clone() else {
+            return;
+        };
+        self.document_edit_request = self.document_edit_request.wrapping_add(1);
+        let request = self.document_edit_request;
+        let generation = self.generation;
+        let tx = self.tx.clone();
+        self.document_edit_task = Some(tokio::spawn(async move {
+            let result = source.read().await.map(Box::new);
+            let _ = tx
+                .send(Msg::DocumentEditRead {
+                    generation,
+                    request,
+                    result,
+                })
+                .await;
+        }));
+    }
+
+    /// The identity check for [`Self::request_document_edit`] came back.
+    pub(super) fn edit_document_object(&mut self, result: Result<Box<DynamicObject>, String>) {
+        if self.mode != Mode::Detail || !self.document_editable() {
+            return;
+        }
+        let fresh = match result {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                self.flash_warn(&format!("cannot edit: {error}"));
+                return;
+            }
+        };
+        let Some(source) = self.document_source.as_ref() else {
+            return;
+        };
+        let ar = &source.kind.ar;
+        let resource = if ar.group.is_empty() {
+            ar.plural.clone()
+        } else {
+            format!("{}.{}.{}", ar.plural, ar.version, ar.group)
+        };
+        self.edit_object(resource, &fresh);
+        if self.mode == Mode::Confirm {
+            self.confirm_return = Mode::Detail;
+        } else {
+            self.reload_after_suspend = true;
+        }
+    }
+
+    fn edit_object(&mut self, resource: String, obj: &DynamicObject) {
         let name = obj.metadata.name.clone().unwrap_or_default();
         let ns = obj.metadata.namespace.clone().unwrap_or_default();
         let edit_label = if ns.is_empty() {
@@ -693,7 +755,7 @@ impl App {
         // warn (and confirm) before opening the editor.
         let flux = flux_managed_by(obj);
         let mut argv = self.kubectl_base();
-        argv.extend(["edit".into(), self.kubectl_resource(), name]);
+        argv.extend(["edit".into(), resource, name]);
         if !ns.is_empty() {
             argv.push("-n".into());
             argv.push(ns);
