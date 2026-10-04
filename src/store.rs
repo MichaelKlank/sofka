@@ -28,6 +28,19 @@ pub enum RefreshContent {
     },
 }
 
+/// What a failed watch request ran into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchFailure {
+    /// The server refused the client's credentials: an Unauthorized
+    /// response, or a TLS alert against its certificate.
+    CredentialsRefused,
+    /// No API response arrived, as when the connection or TLS handshake
+    /// fails.
+    NoResponse,
+    /// The API server answered with an error, such as a forbidden resource.
+    Response,
+}
+
 /// Messages flowing from watch tasks to the UI loop. Tagged with a
 /// `generation` so messages from a superseded watch can be discarded.
 pub enum Msg {
@@ -60,6 +73,7 @@ pub enum Msg {
     WatchError {
         generation: u64,
         error: String,
+        failure: WatchFailure,
     },
     WatchRecovered {
         generation: u64,
@@ -309,6 +323,12 @@ pub enum Msg {
         generation: u64,
         name: String,
         result: Result<Box<crate::k8s::Cluster>, String>,
+    },
+    /// Result of re-running the exec plugin for an expiring client
+    /// certificate, for renewal `attempt`.
+    CredentialsRenewed {
+        attempt: u64,
+        result: Result<Box<crate::k8s::ExecClient>, String>,
     },
     /// Result of an off-thread `kubectl config rename-context` (`r` in the
     /// context switcher).

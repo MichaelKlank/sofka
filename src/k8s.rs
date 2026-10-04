@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
+use k8s_openapi::jiff::Timestamp;
 use kube::api::{Api, ListParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::core::{DynamicObject, GroupVersionResource};
@@ -22,7 +23,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 
 use crate::diagnostics::Op;
-use crate::store::{Msg, row_key};
+use crate::store::{Msg, WatchFailure, row_key};
 
 pub mod completion;
 mod discovery;
@@ -31,10 +32,47 @@ mod proxy;
 mod table;
 
 pub(crate) fn build_client(
-    mut config: Config,
+    config: Config,
     allow_v1_client_cert: bool,
     no_tls_resumption: bool,
 ) -> Result<Client> {
+    build_exec_client(config, allow_v1_client_cert, no_tls_resumption).map(|built| built.client)
+}
+
+/// A client and the certificate an exec plugin issued for it.
+pub struct ExecClient {
+    pub client: Client,
+    /// DER leaf of the exec-issued certificate. Two clients carry the same
+    /// identity only when these match; expiry alone cannot tell.
+    certificate: Option<Vec<u8>>,
+}
+
+#[cfg(test)]
+impl ExecClient {
+    pub fn new(client: Client, certificate: &[u8]) -> Self {
+        Self {
+            client,
+            certificate: Some(certificate.to_vec()),
+        }
+    }
+
+    pub fn token(client: Client) -> Self {
+        Self {
+            client,
+            certificate: None,
+        }
+    }
+
+    pub fn has_certificate(&self) -> bool {
+        self.certificate.is_some()
+    }
+}
+
+pub(crate) fn build_exec_client(
+    mut config: Config,
+    allow_v1_client_cert: bool,
+    no_tls_resumption: bool,
+) -> Result<ExecClient> {
     config.auth_info.token = config
         .auth_info
         .token
@@ -43,12 +81,15 @@ pub(crate) fn build_client(
         // Authentication commands must not read from or write to the TUI terminal.
         exec.interactive_mode = Some(kube::config::ExecInteractiveMode::Never);
     }
-    let builder =
-        crate::legacy_tls::client_builder(config, allow_v1_client_cert, no_tls_resumption)
-            .map_err(|error| match exec_auth_message(error.as_ref()) {
-                Some(message) => anyhow::anyhow!(message),
-                None => error,
-            })?;
+    let (builder, certificate) = crate::legacy_tls::client_builder_with_certificate(
+        config,
+        allow_v1_client_cert,
+        no_tls_resumption,
+    )
+    .map_err(|error| match exec_auth_message(error.as_ref()) {
+        Some(message) => anyhow::anyhow!(message),
+        None => error,
+    })?;
     let layer =
         tower::util::MapRequestLayer::new(|mut request: http::Request<kube::client::Body>| {
             let watch = request.uri().query().is_some_and(|query| {
@@ -70,11 +111,15 @@ pub(crate) fn build_client(
             None => error,
         }
     });
-    Ok(builder
+    let client = builder
         .with_layer(&layer)
         .with_layer(&auth_errors)
         .with_layer(&MeterLayer)
-        .build())
+        .build();
+    Ok(ExecClient {
+        client,
+        certificate,
+    })
 }
 
 fn exec_auth_message(error: &(dyn std::error::Error + 'static)) -> Option<String> {
@@ -95,6 +140,77 @@ fn exec_auth_message(error: &(dyn std::error::Error + 'static)) -> Option<String
         source = error.source();
     }
     None
+}
+
+/// What a failed watch request ran into, judged from the error's source
+/// chain rather than its text.
+fn watch_failure(error: &watcher::Error) -> WatchFailure {
+    if credentials_refused(error) {
+        return WatchFailure::CredentialsRefused;
+    }
+    if matches!(
+        error,
+        watcher::Error::WatchError(_) | watcher::Error::NoResourceVersion
+    ) {
+        return WatchFailure::Response;
+    }
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = source {
+        if matches!(
+            error.downcast_ref::<kube::Error>(),
+            Some(kube::Error::Api(_))
+        ) {
+            return WatchFailure::Response;
+        }
+        source = error.source();
+    }
+    WatchFailure::NoResponse
+}
+
+/// Whether the server refused the client's credentials: an Unauthorized
+/// status, or a TLS alert rejecting the client certificate. An outage or a
+/// forbidden resource is something else, and renewing would not help.
+pub(crate) fn credentials_refused(error: &(dyn std::error::Error + 'static)) -> bool {
+    use rustls::AlertDescription as Alert;
+    let mut source = Some(error);
+    while let Some(error) = source {
+        // Both carry the status boxed, so it never shows up on its own in
+        // the source chain.
+        let status = match error.downcast_ref::<kube::Error>() {
+            Some(kube::Error::Api(status)) => Some(status),
+            _ => match error.downcast_ref::<watcher::Error>() {
+                Some(watcher::Error::WatchError(status)) => Some(status),
+                _ => None,
+            },
+        };
+        if status.is_some_and(|status| status.code == 401) {
+            return true;
+        }
+        if let Some(rustls::Error::AlertReceived(alert)) = error.downcast_ref::<rustls::Error>()
+            && matches!(
+                alert,
+                Alert::BadCertificate
+                    | Alert::UnsupportedCertificate
+                    | Alert::CertificateRevoked
+                    | Alert::CertificateExpired
+                    | Alert::CertificateUnknown
+                    | Alert::CertificateRequired
+            )
+        {
+            return true;
+        }
+        // rustls reports through `io::Error`, whose `source` skips the
+        // error it wraps.
+        if let Some(inner) = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io| io.get_ref())
+            && credentials_refused(inner)
+        {
+            return true;
+        }
+        source = error.source();
+    }
+    false
 }
 
 /// Times every Kubernetes API request into [`crate::diagnostics`] and, at
@@ -312,6 +428,11 @@ pub struct Cluster {
     pub child_kinds: Vec<Kind>,
     pub discovery_warnings: Vec<String>,
     pub discovery_fallback: Option<String>,
+    /// Config the client was built from, kept while the client holds an
+    /// exec-issued certificate so the plugin can issue the next one.
+    credential_source: Option<Config>,
+    /// DER leaf of the client's exec-issued certificate.
+    exec_certificate: Option<Vec<u8>>,
 }
 
 const STREAMING_UNKNOWN: u8 = 0;
@@ -494,8 +615,13 @@ impl Cluster {
     ) -> Result<Self> {
         let cluster_url = config.cluster_url.to_string();
         let default_namespace = config.default_namespace.clone();
-        let client = build_client(config, allow_v1_client_cert, no_tls_resumption)
+        let source = config.clone();
+        let ExecClient {
+            client,
+            certificate: exec_certificate,
+        } = build_exec_client(config, allow_v1_client_cert, no_tls_resumption)
             .context("building kube client")?;
+        let credential_source = client.valid_until().is_some().then_some(source);
         let version_client = client.clone();
 
         let cluster_name = cluster_name_for(&context).unwrap_or_default();
@@ -517,6 +643,8 @@ impl Cluster {
             child_kinds: Vec::new(),
             discovery_warnings: Vec::new(),
             discovery_fallback: None,
+            credential_source,
+            exec_certificate,
         };
         // Version is useful metadata, not a connectivity prerequisite. Fetch
         // it alongside discovery so it adds no serial startup latency, and
@@ -604,7 +732,43 @@ impl Cluster {
             child_kinds: Vec::new(),
             discovery_warnings: Vec::new(),
             discovery_fallback: None,
+            credential_source: None,
+            exec_certificate: None,
         }
+    }
+
+    /// When the client's exec-issued certificate expires. kube-rs records the
+    /// expiry but leaves renewal to the caller.
+    pub fn credential_expiry(&self) -> Option<Timestamp> {
+        *self.client.valid_until()
+    }
+
+    /// A job that runs the exec plugin again and builds a client with the
+    /// certificate it returns, or `None` when the client has none to renew.
+    /// The plugin is a blocking subprocess, so run the job off the event loop.
+    pub fn credential_renewal(
+        &self,
+    ) -> Option<impl FnOnce() -> Result<ExecClient> + Send + 'static> {
+        let config = self.credential_source.clone()?;
+        let allow_v1_client_cert = self.allow_v1_client_cert;
+        let no_tls_resumption = self.no_tls_resumption;
+        Some(move || build_exec_client(config, allow_v1_client_cert, no_tls_resumption))
+    }
+
+    /// Whether `renewed` presents the certificate this client already sends.
+    pub fn has_certificate_of(&self, renewed: &ExecClient) -> bool {
+        renewed.certificate.is_some() && renewed.certificate == self.exec_certificate
+    }
+
+    /// Whether the client came from an exec plugin that can issue a new one.
+    pub fn renews_credentials(&self) -> bool {
+        self.credential_source.is_some()
+    }
+
+    /// Switch to a client built with a renewed exec certificate.
+    pub fn install_exec_client(&mut self, renewed: ExecClient) {
+        self.client = renewed.client;
+        self.exec_certificate = renewed.certificate;
     }
 
     /// Context name to pass to `kubectl` (`--context`), when known. Keeps
@@ -1118,6 +1282,7 @@ fn spawn_watch_task(
                     Msg::WatchError {
                         generation,
                         error: e.to_string(),
+                        failure: watch_failure(&e),
                     }
                 }
             };
@@ -1256,6 +1421,13 @@ pub const ALIASES: &[(&str, &str)] = &[
 
 #[cfg(any(test, feature = "bench"))]
 impl Cluster {
+    /// Keep `config` for credential renewal, as a connect does when the
+    /// client holds an exec-issued certificate.
+    pub fn keep_credential_source(&mut self, config: Config, certificate: &[u8]) {
+        self.credential_source = Some(config);
+        self.exec_certificate = Some(certificate.to_vec());
+    }
+
     /// A connectionless cluster for unit tests: the client points at a dummy
     /// URL (no I/O happens until a request is actually made) and the registry
     /// is a small hand-built set of common kinds.
@@ -1283,6 +1455,8 @@ impl Cluster {
             child_kinds: Vec::new(),
             discovery_warnings: Vec::new(),
             discovery_fallback: None,
+            credential_source: None,
+            exec_certificate: None,
         };
         cluster.register_kind("", "Pod", "pods", true);
         cluster.register_kind("apps", "Deployment", "deployments", true);
@@ -1402,6 +1576,77 @@ impl Cluster {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    fn status(code: u16) -> kube::Error {
+        kube::Error::Api(Box::new(kube::core::Status {
+            code,
+            ..Default::default()
+        }))
+    }
+
+    fn alert(alert: rustls::AlertDescription) -> std::io::Error {
+        std::io::Error::other(rustls::Error::AlertReceived(alert))
+    }
+
+    #[test]
+    fn credentials_are_refused_by_unauthorized_and_certificate_alerts() {
+        use super::{credentials_refused, watcher};
+        use rustls::AlertDescription as Alert;
+        let refused = |error: &(dyn std::error::Error + 'static)| credentials_refused(error);
+        assert!(refused(&watcher::Error::WatchStartFailed(status(401))));
+        assert!(refused(&watcher::Error::WatchError(Box::new(
+            kube::core::Status {
+                code: 401,
+                ..Default::default()
+            }
+        ))));
+        assert!(!refused(&watcher::Error::WatchStartFailed(status(403))));
+        for certificate in [
+            Alert::BadCertificate,
+            Alert::CertificateExpired,
+            Alert::CertificateRevoked,
+            Alert::CertificateUnknown,
+        ] {
+            assert!(refused(&alert(certificate)), "{certificate:?}");
+        }
+        assert!(!refused(&alert(Alert::HandshakeFailure)));
+        assert!(!refused(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+        let wrapped = kube::Error::Service(Box::new(alert(Alert::CertificateExpired)));
+        assert!(refused(&watcher::Error::WatchFailed(wrapped)));
+    }
+
+    #[test]
+    fn watch_failures_tell_refusals_outages_and_api_errors_apart() {
+        use super::{WatchFailure, watch_failure, watcher};
+        use rustls::AlertDescription as Alert;
+        let service = |error: std::io::Error| kube::Error::Service(Box::new(error));
+        assert_eq!(
+            watch_failure(&watcher::Error::WatchStartFailed(status(401))),
+            WatchFailure::CredentialsRefused
+        );
+        assert_eq!(
+            watch_failure(&watcher::Error::WatchFailed(service(alert(
+                Alert::CertificateRevoked
+            )))),
+            WatchFailure::CredentialsRefused
+        );
+        assert_eq!(
+            watch_failure(&watcher::Error::WatchStartFailed(status(403))),
+            WatchFailure::Response
+        );
+        assert_eq!(
+            watch_failure(&watcher::Error::WatchError(Box::default())),
+            WatchFailure::Response
+        );
+        assert_eq!(
+            watch_failure(&watcher::Error::WatchStartFailed(service(
+                std::io::Error::from(std::io::ErrorKind::ConnectionReset)
+            ))),
+            WatchFailure::NoResponse
+        );
+    }
+
     #[test]
     fn missing_current_context_has_selection_instructions() {
         for current_context in [None, Some(String::new())] {

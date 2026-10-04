@@ -31,7 +31,9 @@ use tokio::task::JoinHandle;
 use unicode_width::UnicodeWidthStr;
 
 use crate::k8s::{Cluster, Kind};
-use crate::store::{Msg, Pulse, RowKey, StatusClaim, Store, StoreMutation, XrayItem, row_key};
+use crate::store::{
+    Msg, Pulse, RowKey, StatusClaim, Store, StoreMutation, WatchFailure, XrayItem, row_key,
+};
 
 pub(crate) use guardrails::ConfirmLevel;
 pub use pvcexplore::{Pane, PvcExplore, PvcIntent};
@@ -1860,7 +1862,8 @@ pub struct App {
     pub namespace: String,
     namespace_patterns: HashMap<String, Vec<String>>,
     namespace_request: u64,
-    namespace_errors: HashMap<String, String>,
+    /// Each failing namespace's watch error and what its request ran into.
+    namespace_errors: HashMap<String, (String, WatchFailure)>,
     pub labels: Option<String>,
     pub fields: Option<String>,
     pub owner: Option<OwnerScope>,
@@ -1871,8 +1874,25 @@ pub struct App {
     gen_flag: Arc<AtomicU64>,
     /// Clock readings from the previous tick, compared to spot a wake.
     resume_clock: Option<resume::Clock>,
-    /// A wake was seen while an overlay was open; restart on return.
-    resume_pending: bool,
+    /// Why the watch must restart once the table is showing: a wake, or a
+    /// renewed client.
+    resume_pending: Option<&'static str>,
+    /// The renewal in flight. Its result applies only while this is still
+    /// set; a context switch clears it.
+    credential_attempt: Option<u64>,
+    /// Renewals started this session, numbering each attempt.
+    credential_attempts: u64,
+    /// The server refused the exec-issued credentials; renew on the next
+    /// tick whatever the certificate's expiry says.
+    credential_rejected: bool,
+    /// The renewal in flight is for an expiring certificate, which a
+    /// recovered watch does not make unnecessary.
+    credential_attempt_for_expiry: bool,
+    /// No renewal attempt before this time.
+    credential_retry_at: Option<k8s_openapi::jiff::Timestamp>,
+    /// Why the last renewal failed. Watch failures show it instead of the
+    /// transport error, which never names the expired certificate.
+    credential_error: Option<String>,
     /// Context currently being connected to, paired with the generation that
     /// owns its eventual result.
     context_switch_target: Option<(u64, String)>,
@@ -2428,7 +2448,13 @@ impl App {
             generation: 0,
             gen_flag: Arc::new(AtomicU64::new(0)),
             resume_clock: None,
-            resume_pending: false,
+            resume_pending: None,
+            credential_attempt: None,
+            credential_attempts: 0,
+            credential_rejected: false,
+            credential_attempt_for_expiry: false,
+            credential_retry_at: None,
+            credential_error: None,
             context_switch_target: None,
             launch_namespace: None,
             tasks: Vec::new(),
@@ -2771,6 +2797,7 @@ mod authz;
 mod bookmarks;
 mod bundle;
 mod containers;
+mod credentials;
 mod dashboards;
 mod details;
 mod diagnostics;
