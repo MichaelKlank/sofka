@@ -64,6 +64,14 @@ impl App {
             // A Flux HelmRelease bridges into the same native inspector:
             // enter opens the history of the Helm release it manages.
             "helmreleases" => self.drill_into_helmrelease(&obj),
+            // Argo CD: sync, health and what's blocking, rather than raw YAML
+            // that never says which managed resource drifted. A configured
+            // drill still wins, so this is not in `views::BUILTIN_DRILLS`.
+            "applications" | "applicationsets"
+                if self.argocd_kind() && self.configured_drill().is_none() =>
+            {
+                self.show_argocd(obj)
+            }
             // Everything else is configuration: a `[views."…"].drill` opens
             // another kind scoped to this row; failing that, anything that
             // names a node (`[views."…"].node`) drills into it. Pods name one
@@ -102,13 +110,13 @@ impl App {
     }
 
     /// The JSON Pointer holding the current kind's node name, if it has one.
-    pub(super) fn node_pointer(&self) -> Option<String> {
+    pub(crate) fn node_pointer(&self) -> Option<String> {
         let ar = &self.kind.as_ref()?.ar;
         crate::views::node_pointer(&self.user_views, ar, self.view_namespace()).map(str::to_string)
     }
 
     /// The `[views."…"].drill` for the current kind, if one is configured.
-    fn configured_drill(&self) -> Option<crate::views::Drill> {
+    pub(crate) fn configured_drill(&self) -> Option<crate::views::Drill> {
         let ar = &self.kind.as_ref()?.ar;
         crate::views::drill_for(&self.user_views, ar, self.view_namespace()).cloned()
     }

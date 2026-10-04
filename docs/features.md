@@ -242,7 +242,8 @@ include those conditions. Row filters can search the route paths.
   [Views and thresholds](views.md).
 - **Drill-down navigation** with a breadcrumb stack: workload/service → pods,
   cronjob → its jobs, node → its pods, pod → containers, namespace → re-scope,
-  CRD → its custom resources. `esc` goes back.
+  CRD → its custom resources, Argo CD Application or ApplicationSet → the Argo
+  CD view, unless a `[views."applications"].drill` is configured. `esc` goes back.
   Workload pod selection includes both `matchLabels` and `matchExpressions`.
   Drill-down, logs, Explain, and diagnostic bundles apply all requirements,
   including `In`, `NotIn`, `Exists`, and `DoesNotExist`. Services use their
@@ -540,7 +541,13 @@ include those conditions. Row filters can search the route paths.
   the revision actually deployed from that source, every object in
   `status.resources[]` with its own sync and health, and a summary of what is
   blocking - a suspended sync policy, a `ComparisonError`, a failed sync
-  operation, degraded or missing objects, or drift. Each managed resource is a finding you can `⏎` into. Read entirely from
+  operation, degraded or missing objects, or drift. Each drifted object says
+  whether it is in git but not the cluster, in the cluster but no longer in git
+  (`requiresPruning`), or differs from git, in which case the view points at
+  `argocd app diff` for the fields: Argo CD never writes the diff to the
+  Application. Telling a missing object from a differing one needs per-resource
+  health, which Argo CD only persists with `controller.resource.health.persist`;
+  without it the view says it is one or the other. `⏎` on an Application row opens this view. Each managed resource is a finding you can `⏎` into. Read entirely from
   the Application CRD: no Argo CD API server, no token, no `argocd` binary.
   The headline names how long the current health has held, from
   `status.health.lastTransitionTime` - "Degraded (since 4m)" is a different

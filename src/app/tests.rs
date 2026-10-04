@@ -25295,6 +25295,98 @@ async fn receive_argocd_report(app: &mut App, rx: &mut Receiver<Msg>) {
     .expect("argocd report did not finish");
 }
 
+/// `⏎` on an Application row opens the Argo CD view, which names what drifted,
+/// instead of its YAML; `esc` returns to the Application list.
+#[tokio::test]
+async fn enter_on_an_argocd_application_opens_the_argocd_view() {
+    let root = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                         "namespace": "default"}));
+    let (mut app, mut rx, responses, _) = health_report_app("applications", root.clone());
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/applications/web",
+        kind.ar.api_version
+    );
+    responses.lock().unwrap().insert(path, (200, root));
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Argocd);
+    receive_argocd_report(&mut app, &mut rx).await;
+    let texts: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(
+        texts.contains(&"Service/web is OutOfSync: live object differs from git"),
+        "{texts:?}"
+    );
+
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.kind_plural, "applications");
+}
+
+/// A drill configured for `applications` wins over the Argo CD view, whichever
+/// group's kind the row is, so a config written before the view existed is
+/// never silently ignored.
+#[tokio::test]
+async fn enter_on_an_argocd_application_follows_a_configured_drill() {
+    let (mut app, _rx) = test_app();
+    app.user_views = views_for(
+        "applications",
+        crate::config::ViewConfig {
+            drill: Some(crate::config::DrillConfig {
+                kind: "secrets".to_string(),
+                labels: None,
+                fields: Some("metadata.name={name}".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+    app.switch_kind("applications");
+    assert!(app.argocd_kind());
+    apply(
+        &mut app,
+        argocd_application(json!({"server": "https://kubernetes.default.svc"})),
+    );
+    app.table_state.select(Some(0));
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.kind_plural, "secrets");
+    assert_eq!(app.fields.as_deref(), Some("metadata.name=web"));
+}
+
+/// Another API group's `applications` kind is not Argo's, so `⏎` follows a
+/// drill configured under the bare `applications` key instead of opening the
+/// Argo CD view.
+#[tokio::test]
+async fn enter_on_a_non_argocd_application_keeps_its_configured_drill() {
+    let (mut app, _rx) = test_app();
+    app.cluster
+        .register_kind("example.com", "Application", "applications", true);
+    app.user_views = views_for(
+        "applications",
+        crate::config::ViewConfig {
+            drill: Some(crate::config::DrillConfig {
+                kind: "secrets".to_string(),
+                labels: None,
+                fields: Some("metadata.name={name}".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+    app.switch_kind("applications.example.com");
+    assert_eq!(app.kind.as_ref().unwrap().ar.group, "example.com");
+    apply(
+        &mut app,
+        json!({"apiVersion": "example.com/v1", "kind": "Application",
+               "metadata": {"name": "a", "namespace": "default"}}),
+    );
+    app.table_state.select(Some(0));
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_ne!(app.mode, Mode::Argocd);
+    assert_eq!(app.kind_plural, "secrets");
+    assert_eq!(app.fields.as_deref(), Some("metadata.name=a"));
+}
+
 /// An Application deploying into the cluster we are connected to lists what it
 /// manages, and `⏎` opens the managed object.
 #[tokio::test]
@@ -25317,7 +25409,7 @@ async fn argocd_view_lists_managed_resources_and_jumps_to_one() {
     assert!(texts.contains(&"Application/web: OutOfSync / Healthy"));
     assert!(texts.contains(&"Managed resources (1)"));
     assert!(texts.contains(&"Service/web: OutOfSync / Healthy"));
-    assert!(texts.contains(&"Service/web is OutOfSync"));
+    assert!(texts.contains(&"Service/web is OutOfSync: live object differs from git"));
     assert!(texts.contains(&"destination this cluster/default"));
 
     app.handle_key(press(KeyCode::Enter)).unwrap();
@@ -25376,6 +25468,30 @@ async fn argocd_view_on_an_applicationset_lists_generators_and_produced_apps() {
     assert_eq!(app.mode, Mode::Table);
     assert_eq!(app.kind_plural, "applications");
     assert_eq!(app.fields.as_deref(), Some("metadata.name=team-a-dev"));
+}
+
+/// An ApplicationSet report never fetches an Application, so `⏎` on one still
+/// opens it on a cluster that serves ApplicationSets without Applications.
+#[tokio::test]
+async fn enter_on_an_applicationset_without_the_application_crd_opens_it() {
+    let root = argocd_applicationset();
+    let (mut app, mut rx, responses, _) = health_report_app("applicationsets", root.clone());
+    app.cluster.unregister_kind("argoproj.io", "Application");
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/argocd/applicationsets/team-a",
+        kind.ar.api_version
+    );
+    responses.lock().unwrap().insert(path, (200, root));
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Argocd);
+    receive_argocd_report(&mut app, &mut rx).await;
+    let texts: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(
+        texts.contains(&"ApplicationSet/team-a: Synced"),
+        "{texts:?}"
+    );
 }
 
 /// The correctness guarantee: an Application deploying somewhere else must not
@@ -26059,7 +26175,10 @@ async fn argocd_cause_search_does_not_move_the_cursor_off_a_drift_line() {
     let drift_row = app
         .argocd_items
         .iter()
-        .position(|f| f.text == "ConfigMap/settings is OutOfSync")
+        .position(|f| {
+            f.text
+                == "ConfigMap/settings is OutOfSync: missing from the cluster or differs from git"
+        })
         .expect("drift row");
     app.argocd_state.select(Some(drift_row));
 
@@ -26068,7 +26187,10 @@ async fn argocd_cause_search_does_not_move_the_cursor_off_a_drift_line() {
     let after = app
         .argocd_items
         .iter()
-        .position(|f| f.text == "ConfigMap/settings is OutOfSync")
+        .position(|f| {
+            f.text
+                == "ConfigMap/settings is OutOfSync: missing from the cluster or differs from git"
+        })
         .expect("drift row still present");
     assert_eq!(
         app.argocd_state.selected(),
