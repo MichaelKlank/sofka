@@ -270,11 +270,22 @@ impl App {
                     self.restore_selection();
                 }
             }
-            (Some(Action::Down), _) => list_step(&mut self.argocd_state, len, true),
-            (Some(Action::Up), _) => list_step(&mut self.argocd_state, len, false),
+            (Some(Action::Down), _) => findings_step(
+                &mut self.argocd_state,
+                &self.argocd_items,
+                &mut self.findings_scroll,
+                true,
+            ),
+            (Some(Action::Up), _) => findings_step(
+                &mut self.argocd_state,
+                &self.argocd_items,
+                &mut self.findings_scroll,
+                false,
+            ),
             (Some(Action::First), _) if len > 0 => self.argocd_state.select(Some(0)),
             (Some(Action::Last), _) if len > 0 => self.argocd_state.select(Some(len - 1)),
             (Some(Action::Refresh), _) => self.refresh_argocd(),
+            (Some(Action::Wrap), _) => self.toggle_findings_wrap(),
             (Some(Action::DiscoverChildren), _) => self.toggle_argocd_children(),
             (Some(Action::Accept), _) => {
                 let selected = self

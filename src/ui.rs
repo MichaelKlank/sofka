@@ -4801,11 +4801,15 @@ fn draw_fleet(frame: &mut Frame, app: &mut App, area: Rect) {
 /// GitOps views): coloured by level, indented, with a `→` on lines that carry
 /// a jump target — `jumps` says which rows have one, since a view may know of
 /// jumps its findings do not carry. Shows `empty_msg` while the findings are
-/// still gathering.
+/// still gathering. With `wrap`, a finding wider than the list folds onto
+/// further rows indented under its first, so the selection still covers the
+/// whole finding.
 #[allow(clippy::too_many_arguments)]
 fn draw_findings(
     frame: &mut Frame,
     show_scrollbars: bool,
+    wrap: bool,
+    scroll: &mut crate::app::FindingsScroll,
     area: Rect,
     title: String,
     findings: &[crate::explain::Finding],
@@ -4823,40 +4827,80 @@ fn draw_findings(
         Level::Evidence => theme::subtext0(),
     };
 
-    let items: Vec<ListItem> = if findings.is_empty() {
-        vec![ListItem::new(Line::from(Span::styled(
+    // Inside the border and the two-column highlight gutter.
+    let text_width = usize::from(area.width.saturating_sub(4));
+    let visible = usize::from(area.height.saturating_sub(2)).max(1);
+    let rows: Vec<Vec<Line>> = if findings.is_empty() {
+        vec![vec![Line::from(Span::styled(
             empty_msg.to_string(),
             theme::dim(),
-        )))]
+        ))]]
     } else {
         findings
             .iter()
             .enumerate()
             .map(|(i, f)| {
                 let indent = "  ".repeat(f.indent as usize);
-                let mut spans = vec![Span::raw(indent)];
                 let style = match f.level {
                     Level::Heading => Style::default()
                         .fg(color(f.level))
                         .add_modifier(Modifier::BOLD),
                     _ => Style::default().fg(color(f.level)),
                 };
-                spans.push(Span::styled(f.text.clone(), style));
+                let mut spans = vec![Span::styled(f.text.clone(), style)];
                 if jumps(i, f) {
                     spans.push(Span::styled("  →", theme::dim()));
                 }
-                ListItem::new(Line::from(spans))
+                if !wrap {
+                    spans.insert(0, Span::raw(indent));
+                    return vec![Line::from(spans)];
+                }
+                let hanging = format!("{indent}  ");
+                let rows = wrap_line(Line::from(spans), text_width.saturating_sub(hanging.len()));
+                rows.into_iter()
+                    .enumerate()
+                    .map(|(row, mut line)| {
+                        let prefix = if row == 0 { &indent } else { &hanging };
+                        line.spans.insert(0, Span::raw(prefix.clone()));
+                        line
+                    })
+                    .collect()
             })
             .collect()
     };
+    // A finding taller than the list shows the window `j`/`k` scrolled to;
+    // the list itself only scrolls between findings.
+    scroll.heights = rows.iter().map(Vec::len).collect();
+    scroll.visible = visible;
+    let selected = state.selected();
+    let skip = scroll.skip_for(selected, findings);
+    let items: Vec<ListItem> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, lines)| {
+            if Some(i) == selected && lines.len() > visible {
+                ListItem::new(
+                    lines
+                        .into_iter()
+                        .skip(skip)
+                        .take(visible)
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                ListItem::new(lines)
+            }
+        })
+        .collect();
 
-    render_framed_list(
+    render_framed_list_rows(
         frame,
         show_scrollbars,
         area,
         items,
         Span::styled(title, theme::title()),
         state,
+        &scroll.heights,
+        skip,
     );
 }
 
@@ -4874,6 +4918,8 @@ fn draw_explain(frame: &mut Frame, app: &mut App, area: Rect) {
     draw_findings(
         frame,
         show_scrollbars,
+        app.findings_wrap,
+        &mut app.findings_scroll,
         area,
         title,
         &app.explain_items,
@@ -4894,6 +4940,8 @@ fn draw_argocd(frame: &mut Frame, app: &mut App, area: Rect) {
     draw_findings(
         frame,
         show_scrollbars,
+        app.findings_wrap,
+        &mut app.findings_scroll,
         area,
         title,
         &app.argocd_items,
@@ -4909,6 +4957,8 @@ fn draw_gitops(frame: &mut Frame, app: &mut App, area: Rect) {
     draw_findings(
         frame,
         show_scrollbars,
+        app.findings_wrap,
+        &mut app.findings_scroll,
         area,
         title,
         &app.gitops_items,
@@ -5792,6 +5842,35 @@ fn render_framed_list<'a, T>(
     T: Into<Line<'a>>,
 {
     let heights: Vec<_> = items.iter().map(ListItem::height).collect();
+    render_framed_list_rows(
+        frame,
+        show_scrollbars,
+        area,
+        items,
+        title,
+        state,
+        &heights,
+        0,
+    );
+}
+
+/// [`render_framed_list`] with the scrollbar measured from `heights`, the full
+/// row count of each item, plus `skip` rows already scrolled inside the item at
+/// the top. A findings view shortens a tall finding to the rows on screen, so
+/// the items alone would hide how much of it is left.
+#[allow(clippy::too_many_arguments)]
+fn render_framed_list_rows<'a, T>(
+    frame: &mut Frame,
+    show_scrollbars: bool,
+    area: Rect,
+    items: Vec<ListItem<'a>>,
+    title: T,
+    state: &mut ListState,
+    heights: &[usize],
+    skip: usize,
+) where
+    T: Into<Line<'a>>,
+{
     let total: usize = heights.iter().sum();
     let list = List::new(items)
         .highlight_style(theme::selected_row())
@@ -5806,7 +5885,7 @@ fn render_framed_list<'a, T>(
         );
     frame.render_stateful_widget(list, area, state);
     let visible = usize::from(area.height.saturating_sub(2));
-    let position = heights.iter().take(state.offset()).sum();
+    let position = heights.iter().take(state.offset()).sum::<usize>() + skip;
     draw_border_scrollbar(
         frame,
         show_scrollbars,

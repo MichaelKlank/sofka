@@ -276,6 +276,11 @@ its events, `l` its logs, `r` gathers again, `esc` goes back. After opening
 logs or events, one `esc` returns to Explain and another returns to the table. A
 finding you can drill into has a trailing `→`.
 
+Long findings wrap onto more rows. `w` toggles between wrapped and clipped
+findings here and in the GitOps (`:gitops`) and Argo CD (`:argocd`) views. When
+a finding is taller than the list, `j` / `k` scroll through its rows before
+moving to the next or previous finding.
+
 ## Adjacent view (`u`)
 
 Every object directly connected to the selection: what owns it, what it owns,

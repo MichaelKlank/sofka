@@ -126,8 +126,18 @@ impl App {
                     self.restore_selection();
                 }
             }
-            (Some(Action::Down), _) => list_step(&mut self.explain_state, len, true),
-            (Some(Action::Up), _) => list_step(&mut self.explain_state, len, false),
+            (Some(Action::Down), _) => findings_step(
+                &mut self.explain_state,
+                &self.explain_items,
+                &mut self.findings_scroll,
+                true,
+            ),
+            (Some(Action::Up), _) => findings_step(
+                &mut self.explain_state,
+                &self.explain_items,
+                &mut self.findings_scroll,
+                false,
+            ),
             (Some(Action::First), _) => {
                 if len > 0 {
                     self.explain_state.select(Some(0));
@@ -140,6 +150,7 @@ impl App {
             }
             (Some(Action::Refresh), _) => self.refresh_explain(),
             (Some(Action::AutoRefresh), _) => self.toggle_resource_refresh(),
+            (Some(Action::Wrap), _) => self.toggle_findings_wrap(),
             // Direct evidence navigation: jump to the resource behind the
             // selected finding (⏎), or open its events (E) / logs (l). With no
             // target on the current line, E/l fall back to the object being
@@ -152,6 +163,14 @@ impl App {
         if !matches!(self.mode, Mode::Explain | Mode::Events | Mode::Logs) {
             self.cancel_explain_request();
         }
+    }
+
+    /// `w` in a findings view: fold long findings onto more rows, or clip them
+    /// at the right edge for a denser overview.
+    pub(super) fn toggle_findings_wrap(&mut self) {
+        self.findings_wrap = !self.findings_wrap;
+        self.flash = format!("wrap: {}", if self.findings_wrap { "on" } else { "off" });
+        self.flash_err = false;
     }
 
     /// The navigation target of the highlighted finding, if any.

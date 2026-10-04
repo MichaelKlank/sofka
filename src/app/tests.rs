@@ -23955,6 +23955,230 @@ async fn explain_key_shows_reported_daemonset_availability() {
     assert_eq!(app.mode, Mode::Table);
 }
 
+#[tokio::test]
+async fn explain_shows_a_long_failure_message_in_full_and_w_clips_it() {
+    let message = "pods \"hello-00001-deployment-7d9f-x2k4\" is forbidden: failed quota: \
+        team-quota: must specify limits.cpu for: queue-proxy; limits.memory for: queue-proxy; \
+        requests.memory for: queue-proxy";
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    apply(
+        &mut app,
+        json!({"apiVersion": "apps/v1", "kind": "Deployment",
+        "metadata": {"name": "hello", "namespace": "default"},
+        "spec": {"replicas": 1},
+        "status": {"replicas": 0, "conditions": [{"type": "ReplicaFailure",
+            "status": "True", "reason": "FailedCreate", "message": message}]}}),
+    );
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    explain_selected_with_pure_evidence(&mut app);
+    assert!(
+        app.explain_items
+            .iter()
+            .any(|f| f.text.ends_with("requests.memory for: queue-proxy")),
+        "the message is never cut: {:?}",
+        app.explain_items
+    );
+
+    // Compare without whitespace or borders: wrapped rows split the message
+    // and indent its continuation.
+    let squash = |s: &str| {
+        s.chars()
+            .filter(|c| !c.is_whitespace() && *c != '│')
+            .collect::<String>()
+    };
+    let tail = squash("requests.memory for: queue-proxy");
+    assert!(squash(&screen_text(&mut app, 80, 30)).contains(&tail));
+
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.flash, "wrap: off");
+    assert!(!squash(&screen_text(&mut app, 80, 30)).contains(&tail));
+
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.flash, "wrap: on");
+    assert!(squash(&screen_text(&mut app, 80, 30)).contains(&tail));
+}
+
+#[tokio::test]
+async fn j_and_k_scroll_through_a_finding_taller_than_the_list() {
+    let message = format!(
+        "{}TAILMARK",
+        "admission webhook denied the request ".repeat(80)
+    );
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    apply(
+        &mut app,
+        json!({"apiVersion": "apps/v1", "kind": "Deployment",
+        "metadata": {"name": "hello", "namespace": "default"},
+        "spec": {"replicas": 1},
+        "status": {"replicas": 0, "conditions": [{"type": "ReplicaFailure",
+            "status": "True", "reason": "FailedCreate", "message": message}]}}),
+    );
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    explain_selected_with_pure_evidence(&mut app);
+    let tall = app
+        .explain_items
+        .iter()
+        .position(|f| f.text.ends_with("TAILMARK"))
+        .unwrap();
+    let shows_tail = |app: &mut App| screen_text(app, 80, 24).contains("TAILMARK");
+
+    app.handle_key(press(KeyCode::Char('g'))).unwrap();
+    while app.explain_state.selected() != Some(tall) {
+        screen_text(&mut app, 80, 24);
+        app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    }
+    assert!(!shows_tail(&mut app), "the finding is taller than the list");
+
+    let mut steps = 0;
+    while !shows_tail(&mut app) {
+        app.handle_key(press(KeyCode::Char('j'))).unwrap();
+        assert_eq!(
+            app.explain_state.selected(),
+            Some(tall),
+            "j scrolls within the finding"
+        );
+        steps += 1;
+        assert!(steps < 200, "the tail must become reachable");
+    }
+
+    app.handle_key(press(KeyCode::Char('k'))).unwrap();
+    assert!(
+        !shows_tail(&mut app),
+        "k scrolls back up within the finding"
+    );
+    assert_eq!(app.explain_state.selected(), Some(tall));
+    for _ in 0..steps {
+        app.handle_key(press(KeyCode::Char('k'))).unwrap();
+        screen_text(&mut app, 80, 24);
+    }
+    assert!(
+        app.explain_state.selected() < Some(tall),
+        "past the top row, k moves to the previous finding"
+    );
+}
+
+fn tall_finding_deployment(message: &str) -> Value {
+    json!({"apiVersion": "apps/v1", "kind": "Deployment",
+        "metadata": {"name": "web", "namespace": "default", "uid": "workload-uid"},
+        "spec": {"replicas": 1, "selector": {"matchLabels": {"app": "web"}}},
+        "status": {"replicas": 0, "conditions": [{"type": "ReplicaFailure",
+            "status": "True", "reason": "FailedCreate", "message": message}]}})
+}
+
+/// Open explain on a deployment whose condition message is taller than an
+/// 80x24 screen, select that finding, and scroll `rows` rows into it.
+async fn explain_scrolled_into_tall_finding(message: &str, rows: usize) -> (App, Receiver<Msg>) {
+    let root = tall_finding_deployment(message);
+    let (mut app, mut rx, responses, _) = health_report_app("deployments", root.clone());
+    responses.lock().unwrap().insert(
+        "/apis/apps/v1/namespaces/default/deployments/web".into(),
+        (200, root),
+    );
+    app.handle_key(press(KeyCode::Char('X'))).unwrap();
+    receive_health_report(&mut app, &mut rx, false).await;
+    let tall = app
+        .explain_items
+        .iter()
+        .position(|f| f.text.contains(message.trim()))
+        .unwrap();
+    app.handle_key(press(KeyCode::Char('g'))).unwrap();
+    while app.explain_state.selected() != Some(tall) {
+        screen_text(&mut app, 80, 24);
+        app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    }
+    for _ in 0..rows {
+        screen_text(&mut app, 80, 24);
+        app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    }
+    assert_eq!(app.explain_state.selected(), Some(tall));
+    (app, rx)
+}
+
+#[tokio::test]
+async fn the_scrollbar_follows_scrolling_inside_a_tall_finding() {
+    let message = "admission webhook denied the request ".repeat(80);
+    let (mut app, _rx) = explain_scrolled_into_tall_finding(&message, 1).await;
+    let thumb_rows = |app: &mut App| -> Vec<u16> {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..24)
+            .filter(|&y| {
+                buffer[(79, y)].symbol() == "│" && buffer[(79, y)].fg == crate::theme::text()
+            })
+            .collect()
+    };
+    let near_top = thumb_rows(&mut app);
+    assert!(!near_top.is_empty(), "the hidden rows show a scrollbar");
+    for _ in 0..15 {
+        app.handle_key(press(KeyCode::Char('j'))).unwrap();
+        thumb_rows(&mut app);
+    }
+    let further_down = thumb_rows(&mut app);
+    assert!(
+        further_down[0] > near_top[0],
+        "the thumb moves with the rows"
+    );
+}
+
+#[tokio::test]
+async fn a_new_report_at_the_scrolled_position_shows_its_finding_from_the_top() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    apply(&mut app, tall_finding_deployment("short"));
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    let report = |app: &mut App, text: String| {
+        app.handle_msg(Msg::Explain {
+            generation: app.generation,
+            claim: current_claim(app),
+            title: app.explain_title.clone(),
+            request: app.explain_request,
+            source: None,
+            findings: vec![crate::explain::Finding {
+                indent: 0,
+                level: crate::explain::Level::Critical,
+                text,
+                target: None,
+            }],
+        });
+    };
+    let body = "admission webhook denied the request ".repeat(80);
+
+    app.handle_key(press(KeyCode::Char('X'))).unwrap();
+    report(&mut app, format!("OLDHEAD {body}"));
+    screen_text(&mut app, 80, 24);
+    for _ in 0..10 {
+        app.handle_key(press(KeyCode::Char('j'))).unwrap();
+        screen_text(&mut app, 80, 24);
+    }
+    assert!(!screen_text(&mut app, 80, 24).contains("OLDHEAD"));
+
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+    report(&mut app, format!("NEWHEAD {body}"));
+    assert_eq!(app.explain_state.selected(), Some(0));
+    assert!(
+        screen_text(&mut app, 80, 24).contains("NEWHEAD"),
+        "a different finding at the same position starts at its first row"
+    );
+}
+
+#[tokio::test]
+async fn w_toggles_wrap_in_the_gitops_and_argocd_views() {
+    let (mut app, _rx) = test_app();
+    for mode in [Mode::Gitops, Mode::Argocd] {
+        app.mode = mode;
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        assert_eq!(app.flash, "wrap: off");
+        assert!(!app.findings_wrap);
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        assert_eq!(app.flash, "wrap: on");
+        assert!(app.findings_wrap);
+    }
+}
+
 fn expression_workload(include_labels: bool) -> serde_json::Value {
     let mut workload = json!({"apiVersion":"apps/v1","kind":"Deployment",
         "metadata":{"name":"web","namespace":"default","uid":"workload-uid"},
