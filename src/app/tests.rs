@@ -13303,29 +13303,340 @@ async fn edit_from_document_view_respects_read_only_mode() {
 }
 
 #[tokio::test]
-async fn edit_is_unavailable_in_decoded_secret_and_other_documents() {
-    let (mut app, _rx) = test_app();
-    app.switch_kind("secrets");
-    apply(
-        &mut app,
-        json!({"apiVersion": "v1", "kind": "Secret",
-               "metadata": {"name": "creds", "namespace": "default"},
-               "data": {"token": "c2VjcmV0"}}),
-    );
-    app.table_state.select(Some(0));
-    app.handle_key(press(KeyCode::Char('y'))).unwrap();
-    app.handle_key(press(KeyCode::Char('x'))).unwrap();
-    assert!(app.detail.title.contains("decoded"));
-    app.readonly = true;
-    app.handle_key(press(KeyCode::Char('e'))).unwrap();
-    assert!(app.pending.is_none());
-    assert!(!app.flash.contains("read-only"), "{}", app.flash);
-    assert_eq!(app.mode, Mode::Detail);
-
+async fn edit_is_unavailable_in_journal_and_other_documents() {
+    let (mut app, _rx) = app_with_pod();
     app.open_journal();
     app.handle_key(press(KeyCode::Char('e'))).unwrap();
     assert!(app.pending.is_none());
     assert_eq!(app.mode, Mode::Detail);
+}
+
+/// The decoded view of a Secret with a text value, a multiline value, and a
+/// value that is not text.
+fn decoded_secret_app() -> (App, Receiver<Msg>) {
+    use base64::Engine;
+    let b64 = |v: &[u8]| base64::engine::general_purpose::STANDARD.encode(v);
+    let (mut app, rx) = test_app();
+    app.switch_kind("secrets");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Secret",
+               "metadata": {"name": "creds", "namespace": "default", "resourceVersion": "7"},
+               "data": {"token": b64(b"hunter2"), "cert": b64(b"a\nb\n"),
+                        "der": b64(&[0xff, 0x00])}}),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('x'))).unwrap();
+    assert!(app.detail.title.contains("decoded"));
+    (app, rx)
+}
+
+/// Press `e` in the decoded view and return the file the editor was given.
+fn open_secret_editor(app: &mut App) -> std::path::PathBuf {
+    press_document_edit(app);
+    std::path::PathBuf::from(edit_argv(app).last().unwrap())
+}
+
+/// Stand in for the editor: replace the file, then return from the suspend.
+fn close_secret_editor(app: &mut App, path: &std::path::Path, text: &str) {
+    if !text.is_empty() {
+        std::fs::write(path, text).unwrap();
+    }
+    app.handle_command_result(None, Ok(()), None);
+    app.after_suspend();
+}
+
+#[tokio::test]
+async fn decoded_secret_edit_opens_the_text_values_as_string_data() {
+    let (mut app, _rx) = decoded_secret_app();
+    let path = open_secret_editor(&mut app);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("stringData:"), "{text}");
+    assert!(text.contains("token: hunter2"), "{text}");
+    assert!(text.contains("cert: |"), "{text}");
+    assert!(!text.contains("der:"), "{text}");
+    assert!(text.contains("left unchanged: der"), "{text}");
+    assert_eq!(app.mode, Mode::Detail);
+
+    close_secret_editor(&mut app, &path, "");
+    assert!(!path.exists(), "the decoded values must not stay on disk");
+    assert!(!path.parent().unwrap().exists());
+    assert_eq!(app.flash, "secret not changed");
+    assert!(app.journal.is_empty());
+}
+
+#[tokio::test]
+async fn decoded_secret_edit_confirms_the_changed_keys_then_patches() {
+    let (mut app, _rx) = decoded_secret_app();
+    let path = open_secret_editor(&mut app);
+    close_secret_editor(
+        &mut app,
+        &path,
+        "stringData:\n  token: s3cret\n  cert: |\n    a\n    b\n  extra: x\n",
+    );
+    assert!(!path.exists());
+    assert_eq!(app.mode, Mode::Confirm);
+    assert!(app.confirm_over_document());
+    assert_eq!(
+        app.confirm_label,
+        "Update secret creds in default: change token · add extra?"
+    );
+    let Some(ConfirmAction::SecretEdit { patch, .. }) = &app.confirm_action else {
+        panic!("expected the secret patch");
+    };
+    assert_eq!(
+        patch,
+        &json!({"metadata": {"resourceVersion": "7"},
+                "data": {"token": "czNjcmV0", "extra": "eA=="}})
+    );
+    let screen = screen_text(&mut app, 120, 30);
+    assert!(screen.contains("creds - decoded"), "{screen}");
+
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    assert_eq!(app.mode, Mode::Detail);
+    assert!(app.detail.title.contains("decoded"));
+    assert_eq!(app.journal.len(), 1);
+    assert!(app.flash.contains("updating secret creds"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn decoded_secret_edit_reopens_a_document_that_does_not_parse() {
+    let (mut app, _rx) = decoded_secret_app();
+    let path = open_secret_editor(&mut app);
+    close_secret_editor(&mut app, &path, "stringData:\n  port: 8080\n");
+    assert!(app.flash_err);
+    let Some(Suspend::Shell(argv)) = app.pending.take() else {
+        panic!("expected the editor to reopen");
+    };
+    assert_eq!(std::path::Path::new(argv.last().unwrap()), path);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with("# error:"), "{text}");
+    assert!(text.contains("port: 8080"), "{text}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the retry file stays private");
+    }
+
+    // Saving the error document unchanged gives up.
+    close_secret_editor(&mut app, &path, "");
+    assert!(app.pending.is_none());
+    assert_eq!(app.flash, "secret not changed");
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn decoded_secret_edit_will_not_overwrite_a_value_that_is_not_text() {
+    let (mut app, _rx) = decoded_secret_app();
+    let path = open_secret_editor(&mut app);
+    close_secret_editor(
+        &mut app,
+        &path,
+        "stringData:\n  token: hunter2\n  der: text\n",
+    );
+    assert!(app.confirm_action.is_none());
+    assert!(matches!(app.pending.take(), Some(Suspend::Shell(_))));
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with("# error: der not text"), "{text}");
+    close_secret_editor(&mut app, &path, "");
+    assert!(app.confirm_action.is_none());
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn decoded_secret_edit_refuses_an_emptied_string_data_block() {
+    let (mut app, _rx) = decoded_secret_app();
+    let path = open_secret_editor(&mut app);
+    close_secret_editor(&mut app, &path, "stringData:\n");
+    assert!(app.confirm_action.is_none());
+    assert!(matches!(app.pending.take(), Some(Suspend::Shell(_))));
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("use {} to remove every key"), "{text}");
+
+    // An explicit {} is how every key goes.
+    close_secret_editor(&mut app, &path, "stringData: {}\n");
+    assert_eq!(
+        app.confirm_label,
+        "Update secret creds in default: remove cert, token?"
+    );
+}
+
+#[tokio::test]
+async fn decoded_secret_edit_reopens_a_file_that_is_not_utf8() {
+    let (mut app, _rx) = decoded_secret_app();
+    let path = open_secret_editor(&mut app);
+    std::fs::write(&path, b"stringData:\n  token: \xff\n").unwrap();
+    close_secret_editor(&mut app, &path, "");
+    assert!(matches!(app.pending.take(), Some(Suspend::Shell(_))));
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.starts_with("# error: the file is not valid UTF-8"),
+        "{text}"
+    );
+    assert!(text.contains("token:"), "{text}");
+    close_secret_editor(&mut app, &path, "");
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn decoded_secret_edit_is_dropped_when_the_editor_fails() {
+    let (mut app, _rx) = decoded_secret_app();
+    let path = open_secret_editor(&mut app);
+    std::fs::write(&path, "stringData:\n  token: changed\n").unwrap();
+    app.handle_command_result(None, Err(std::io::Error::other("exit status 1")), None);
+    app.after_suspend();
+    assert!(!path.parent().unwrap().exists());
+    assert!(app.confirm_action.is_none());
+    assert!(app.journal.is_empty());
+}
+
+#[tokio::test]
+async fn decoded_secret_edit_respects_read_only_and_guardrails() {
+    let (mut app, _rx) = decoded_secret_app();
+    app.readonly = true;
+    app.handle_key(press(KeyCode::Char('e'))).unwrap();
+    assert!(app.flash.contains("read-only"));
+    assert!(app.document_edit_task.is_none());
+    app.readonly = false;
+
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["secret-edit".into()],
+        resources: vec!["secrets".into()],
+        deny: true,
+        ..Default::default()
+    }];
+    press_document_edit(&mut app);
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("blocked by guardrail"), "{}", app.flash);
+
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["secret-edit".into()],
+        confirmation: Some("type-resource-name".into()),
+        ..Default::default()
+    }];
+    let path = open_secret_editor(&mut app);
+    close_secret_editor(&mut app, &path, "stringData:\n  token: rotated\n");
+    assert_eq!(app.mode, Mode::Prompt);
+    assert!(app.prompt_over_document());
+    assert!(
+        app.prompt_label
+            .starts_with("Update secret creds in default: change token · remove cert?\n\n")
+            && app.prompt_label.ends_with("type 'creds' to confirm:"),
+        "{}",
+        app.prompt_label
+    );
+    assert_eq!(app.popup_scroll, usize::MAX, "opens on the input");
+    for c in "creds".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Detail);
+    assert_eq!(app.journal.len(), 1);
+}
+
+#[tokio::test]
+async fn typed_secret_edit_prompt_keeps_the_input_in_view_with_many_keys() {
+    let (mut app, _rx) = decoded_secret_app();
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["secret-edit".into()],
+        confirmation: Some("type-resource-name".into()),
+        ..Default::default()
+    }];
+    let path = open_secret_editor(&mut app);
+    let mut doc = String::from("stringData:\n  token: hunter2\n  cert: |\n    a\n    b\n");
+    for i in 0..60 {
+        doc.push_str(&format!("  a-rather-long-key-name-number-{i}: v\n"));
+    }
+    close_secret_editor(&mut app, &path, &doc);
+    assert_eq!(app.mode, Mode::Prompt);
+    assert!(
+        app.prompt_label
+            .contains("a-rather-long-key-name-number-59")
+    );
+    let screen = screen_text(&mut app, 80, 24);
+    assert!(screen.contains("type 'creds' to confirm"), "{screen}");
+    assert!(screen.contains('█'), "{screen}");
+    assert!(screen.contains("apply"), "{screen}");
+}
+
+/// Many long key names on a Flux-managed copy of the decoded Secret.
+fn many_keys_on_a_managed_secret(app: &mut App) {
+    let source = app.document_source.as_mut().unwrap();
+    source.object.metadata.labels = Some(
+        [
+            ("kustomize.toolkit.fluxcd.io/name", "apps"),
+            ("kustomize.toolkit.fluxcd.io/namespace", "flux-system"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+    );
+    let path = open_secret_editor(app);
+    let mut doc = String::from("stringData:\n  token: hunter2\n  cert: |\n    a\n    b\n");
+    for i in 0..60 {
+        doc.push_str(&format!("  a-rather-long-key-name-number-{i}: v\n"));
+    }
+    close_secret_editor(app, &path, &doc);
+}
+
+#[tokio::test]
+async fn managed_warning_is_in_view_on_a_long_secret_confirmation() {
+    let (mut app, _rx) = decoded_secret_app();
+    many_keys_on_a_managed_secret(&mut app);
+    assert_eq!(app.mode, Mode::Confirm);
+    let screen = screen_text(&mut app, 80, 24);
+    assert!(screen.contains("Managed by Flux"), "{screen}");
+
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["secret-edit".into()],
+        confirmation: Some("type-resource-name".into()),
+        ..Default::default()
+    }];
+    many_keys_on_a_managed_secret(&mut app);
+    assert_eq!(app.mode, Mode::Prompt);
+    let screen = screen_text(&mut app, 80, 24);
+    assert!(screen.contains("Managed by Flux"), "{screen}");
+    assert!(screen.contains("type 'creds' to confirm"), "{screen}");
+    assert!(screen.contains('█'), "{screen}");
+}
+
+#[tokio::test]
+async fn decoded_secret_edit_refuses_an_immutable_secret() {
+    let (mut app, _rx) = decoded_secret_app();
+    app.handle_key(press(KeyCode::Char('e'))).unwrap();
+    let mut object = app.document_source.as_ref().unwrap().object.clone();
+    object.data["immutable"] = json!(true);
+    app.document_edit_task.as_ref().unwrap().abort();
+    app.handle_msg(Msg::DocumentEditRead {
+        generation: app.generation,
+        request: app.document_edit_request,
+        result: Ok(Box::new(object)),
+    });
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("immutable"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn decoded_secret_reloads_after_the_update_lands() {
+    let (mut app, _rx) = decoded_secret_app();
+    let claim = app.claim_status("updating secret creds…");
+    app.handle_msg(Msg::SecretEditApplied {
+        generation: app.generation,
+        claim,
+        result: Ok("secret creds updated".into()),
+    });
+    assert_eq!(app.flash, "secret creds updated");
+    assert!(app.document_reload_task.is_some());
+
+    let claim = app.claim_status("updating secret creds…");
+    app.handle_msg(Msg::SecretEditApplied {
+        generation: app.generation,
+        claim,
+        result: Err("secret creds changed since it was read".into()),
+    });
+    assert!(app.flash_err);
 }
 
 #[tokio::test]

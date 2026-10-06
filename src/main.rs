@@ -389,6 +389,8 @@ async fn run_main(args: Args) -> Result<()> {
     theme::init(theme::resolve_skin(Some(&initial_skin), &cfg.skin.colors));
     theme::set_background(cfg.skin.background);
 
+    // Decoded Secret values a crashed session left in the temp directory.
+    std::thread::spawn(app::sweep_abandoned_secret_edits);
     let (tx, mut rx) = mpsc::channel(EVENT_CHANNEL_CAP);
     let panic_tx = tx.clone();
     let mut app = App::new(cluster, tx);
@@ -1050,9 +1052,10 @@ fn dispatch(
 /// every path that can queue one — a keystroke, a mouse click, and a background
 /// message (the PVC browser resolves which pod to exec into asynchronously, so
 /// its shell is requested from a message, not from the keystroke that asked
-/// for it).
+/// for it). A command can queue another as it finishes: the decoded Secret
+/// editor reopens on a document that does not parse.
 fn take_suspend(terminal: &mut ratatui::DefaultTerminal, app: &mut App, captured: bool) {
-    if let Some(command) = app.pending.take() {
+    while let Some(command) = app.pending.take() {
         let (argv, recovery) = match command {
             app::Suspend::Shell(argv) => (argv, None),
             app::Suspend::Recovery { argv, failure } => (argv, Some(failure)),
