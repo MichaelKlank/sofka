@@ -2286,6 +2286,10 @@ pub struct App {
     pub explain_source: Option<DynamicObject>,
     /// Latest Explain request, independent of the table watch generation.
     explain_request: u64,
+    /// Latest namespace-list fetch issued.
+    ns_list_request: u64,
+    /// Newest namespace-list fetch applied; answers older than it are dropped.
+    ns_list_applied: u64,
     explain_claim: Option<StatusClaim>,
     /// Parent of the explain view. Kept separately because an evidence view
     /// (logs/events) temporarily uses `return_mode` to return to Explain.
@@ -2649,6 +2653,8 @@ impl App {
             findings_scroll: FindingsScroll::default(),
             explain_source: None,
             explain_request: 0,
+            ns_list_request: 0,
+            ns_list_applied: 0,
             explain_claim: None,
             explain_return: Mode::Table,
             rbac: rbac::State::default(),

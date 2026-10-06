@@ -1989,7 +1989,12 @@ impl App {
                     self.set_claimed_status(claim, failure, true);
                 }
             }
-            Msg::Namespaces { generation, list } if generation == self.generation => {
+            Msg::Namespaces {
+                generation,
+                request,
+                list,
+            } if generation == self.generation && request >= self.ns_list_applied => {
+                self.ns_list_applied = request;
                 let names = self.filtered_namespaces();
                 let keep = self.ns_state.selected().unwrap_or(0);
                 let selected = names.get(keep);
@@ -1999,6 +2004,9 @@ impl App {
                     .and_then(|selected| names.iter().position(|n| n == selected))
                     .unwrap_or_else(|| keep.min(names.len().saturating_sub(1)));
                 self.ns_state.select(Some(index));
+                if self.mode == Mode::Command && !self.cmd_navigated {
+                    self.update_suggestions();
+                }
             }
             Msg::Contexts { generation, list } if generation == self.generation => {
                 self.all_contexts = list.clone();

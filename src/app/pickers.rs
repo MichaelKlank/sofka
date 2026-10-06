@@ -24,8 +24,12 @@ impl App {
 
     /// Fetch the namespace list off-thread; it arrives as `Msg::Namespaces` and
     /// refreshes `ns_list`, which backs both the switcher popup and `:<kind>
-    /// <ns>` palette completion.
-    pub(super) fn spawn_namespace_fetch(&self) {
+    /// <ns>` palette completion. An answer older than the last applied one is
+    /// dropped, so a slow earlier fetch can't overwrite a fresher list, but it
+    /// still lands when a later fetch fails.
+    pub(super) fn spawn_namespace_fetch(&mut self) {
+        self.ns_list_request += 1;
+        let request = self.ns_list_request;
         let client = self.cluster.client.clone();
         let kind = self.cluster.resolve("namespaces").map(|k| k.ar);
         let tx = self.tx.clone();
@@ -44,21 +48,12 @@ impl App {
                 let _ = tx
                     .send(Msg::Namespaces {
                         generation: genr,
+                        request,
                         list: names,
                     })
                     .await;
             }
         });
-    }
-
-    /// Warm the namespace cache when the command palette opens, so `:<kind>
-    /// <ns>` can offer completions without waiting for the switcher popup. A
-    /// no-op once real namespaces are cached (the `<all>` sentinel doesn't
-    /// count).
-    pub(super) fn ensure_namespace_cache(&mut self) {
-        if !self.ns_list.iter().any(|n| n != "<all>") {
-            self.spawn_namespace_fetch();
-        }
     }
 
     /// Namespaces for the switcher: `<all>` is always pinned first. When
