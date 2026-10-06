@@ -1548,6 +1548,16 @@ impl ConfigLoader {
         self.base.is_some()
     }
 
+    /// The parsed base config, when one is active.
+    pub fn base_value(&self) -> Option<&toml::Value> {
+        self.base.as_ref()
+    }
+
+    /// The `sofka` directory that holds the base config, `conf.d/`, and `clusters/`.
+    pub fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
+    }
+
     pub fn dropin_paths(&self) -> Vec<PathBuf> {
         let Some(dir) = &self.dir else {
             return Vec::new();
@@ -1833,6 +1843,30 @@ fn validate_file(path: &Path, text: &str) -> Result<toml::Value, String> {
     Ok(value)
 }
 
+/// Read one drop-in file as a config layer; `None` when it does not exist.
+pub fn read_layer(path: &Path) -> Result<Option<toml::Value>, String> {
+    read_dropin(path)
+}
+
+/// Merge config layers in order, with the same rules as drop-in files.
+/// A layer that does not merge is skipped.
+pub fn merge_layers(layers: impl IntoIterator<Item = toml::Value>) -> toml::Value {
+    let mut merged = toml::Value::Table(toml::Table::new());
+    for layer in layers {
+        let mut next = merged.clone();
+        if merge_config(&mut next, layer).is_ok() {
+            merged = next;
+        }
+    }
+    merged
+}
+
+/// Parse and type-check YAML config text as a config file would be read.
+pub fn parse_yaml(text: &str) -> Result<Config, String> {
+    let value = document::parse(Path::new("config.yaml"), text)?;
+    value.try_into().map_err(|e: toml::de::Error| e.to_string())
+}
+
 /// Parse a TOML *document* into a `Value::Table` (a bare `Value` parse would
 /// expect a single TOML value, not a document).
 fn parse_doc(text: &str) -> Result<toml::Value, toml::de::Error> {
@@ -1842,7 +1876,7 @@ fn parse_doc(text: &str) -> Result<toml::Value, toml::de::Error> {
 /// Map a kubeconfig cluster/context name onto a safe directory name: any
 /// character outside `[A-Za-z0-9._-]` becomes `-` (EKS ARNs contain `:` and
 /// `/`). All-dot results (`.`, `..`) would be path navigation, not names.
-fn sanitize(name: &str) -> String {
+pub(crate) fn sanitize(name: &str) -> String {
     let s: String = name
         .chars()
         .map(|c| {
