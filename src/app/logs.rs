@@ -320,6 +320,7 @@ impl App {
                 .map(|obj| PodLogTarget {
                     ns: obj.metadata.namespace.clone().unwrap_or_default(),
                     name: obj.metadata.name.clone().unwrap_or_default(),
+                    uid: obj.metadata.uid.clone(),
                     containers: container_names(obj),
                 })
                 .collect();
@@ -344,6 +345,7 @@ impl App {
                     LogSource::Pod {
                         ns,
                         name: name.clone(),
+                        uid: obj.metadata.uid.clone(),
                         containers,
                     },
                     format!("{name} — logs"),
@@ -551,16 +553,29 @@ impl App {
                 for PodLogTarget {
                     ns,
                     name,
+                    uid,
                     containers,
                 } in pods
                 {
+                    // The marked set is fixed, so a replacement is not followed.
+                    let instance = || match &uid {
+                        Some(uid) => log_follow::Instance::Only(uid.clone()),
+                        None => log_follow::Instance::Named(None),
+                    };
                     if containers.is_empty() {
                         let prefix = format!("[{ns}/{name}] ");
-                        self.spawn_one_log(ns, name, None, prefix, false);
+                        self.spawn_one_log(ns, name, instance(), None, prefix, false);
                     } else {
                         for c in containers {
                             let prefix = format!("[{ns}/{name}:{c}] ");
-                            self.spawn_one_log(ns.clone(), name.clone(), Some(c), prefix, false);
+                            self.spawn_one_log(
+                                ns.clone(),
+                                name.clone(),
+                                instance(),
+                                Some(c),
+                                prefix,
+                                false,
+                            );
                         }
                     }
                 }
@@ -568,11 +583,13 @@ impl App {
             Some(LogSource::Pod {
                 ns,
                 name,
+                uid,
                 containers,
             }) => {
                 if containers.is_empty() {
                     // Unknown container set (e.g. from xray) — stream the default.
-                    self.spawn_one_log(ns, name, None, String::new(), false);
+                    let instance = log_follow::Instance::Named(uid);
+                    self.spawn_one_log(ns, name, instance, None, String::new(), false);
                 } else {
                     let multi = containers.len() > 1;
                     for c in containers {
@@ -581,7 +598,14 @@ impl App {
                         } else {
                             String::new()
                         };
-                        self.spawn_one_log(ns.clone(), name.clone(), Some(c), prefix, false);
+                        self.spawn_one_log(
+                            ns.clone(),
+                            name.clone(),
+                            log_follow::Instance::Named(uid.clone()),
+                            Some(c),
+                            prefix,
+                            false,
+                        );
                     }
                 }
             }
@@ -591,7 +615,14 @@ impl App {
                 pod,
                 container,
                 previous,
-            }) => self.spawn_one_log(ns, pod, container, String::new(), previous),
+            }) => self.spawn_one_log(
+                ns,
+                pod,
+                log_follow::Instance::Named(None),
+                container,
+                String::new(),
+                previous,
+            ),
             Some(LogSource::Provider { request }) => self.spawn_provider_logs(request),
             None => {}
         }
@@ -674,6 +705,7 @@ impl App {
         &mut self,
         ns: String,
         pod: String,
+        instance: log_follow::Instance,
         container: Option<String>,
         prefix: String,
         previous: bool,
@@ -683,16 +715,18 @@ impl App {
         let genr = self.log_gen;
         let flag = self.log_flag.clone();
         let (tail, since) = self.log_tail_and_since();
-        let handle = tokio::spawn(async move {
-            let api: Api<Pod> = Api::namespaced(client, &ns);
-            // The API applies the tail limit within the lookback window.
-            // Previous-container logs retain their full history.
-            let (tail_lines, since_seconds) = if previous {
-                (None, None)
-            } else {
-                (Some(tail), since)
-            };
-            let lp = LogParams {
+        // The API applies the tail limit within the lookback window.
+        // Previous-container logs retain their full history.
+        let (tail_lines, since_seconds) = if previous {
+            (None, None)
+        } else {
+            (Some(tail), since)
+        };
+        let stream = log_follow::LogStream {
+            api: Api::namespaced(client, &ns),
+            pod,
+            instance,
+            params: LogParams {
                 follow: !previous,
                 previous,
                 container,
@@ -701,10 +735,14 @@ impl App {
                 tail_lines,
                 since_seconds,
                 ..Default::default()
-            };
-            forward_log_stream(api, pod, lp, prefix, tx, genr, flag).await;
-        });
-        self.log_tasks.push(handle);
+            },
+            prefix,
+            tx,
+            generation: genr,
+            flag,
+            wake: self.log_wake.subscribe(),
+        };
+        self.log_tasks.push(tokio::spawn(stream.run()));
     }
 
     /// The configured initial `tail` line count and optional `since` lookback
@@ -790,72 +828,18 @@ impl App {
         let (tail, since) = self.log_tail_and_since();
         // Bound the per-pod tail so an aggregate over many pods stays sane; the
         // follow buffer trims the total anyway.
-        let per_pod_tail = tail.min(100);
-        let handle = tokio::spawn(async move {
-            let list_api: Api<Pod> = if ns.is_empty() {
-                Api::all(client.clone())
-            } else {
-                Api::namespaced(client.clone(), &ns)
-            };
-            let pods = match list_api.list(&ListParams::default().labels(&labels)).await {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = tx
-                        .send(Msg::LogLines {
-                            generation: genr,
-                            lines: vec![format!("[error] {e}")],
-                        })
-                        .await;
-                    return;
-                }
-            };
-            if pods.items.is_empty() {
-                let _ = tx
-                    .send(Msg::LogLines {
-                        generation: genr,
-                        lines: vec!["(no matching pods)".into()],
-                    })
-                    .await;
-            }
-            let mut streams = tokio::task::JoinSet::new();
-            for p in pods {
-                let pod_ns = p.metadata.namespace.clone().unwrap_or_default();
-                let pod_name = p.metadata.name.clone().unwrap_or_default();
-                let containers: Vec<String> = p
-                    .spec
-                    .as_ref()
-                    .map(|s| s.containers.iter().map(|c| c.name.clone()).collect())
-                    .unwrap_or_default();
-                let multi = containers.len() > 1;
-                for c in containers {
-                    let prefix = if multi {
-                        format!("[{pod_name}:{c}] ")
-                    } else {
-                        format!("[{pod_name}] ")
-                    };
-                    let (client, tx, flag) = (client.clone(), tx.clone(), flag.clone());
-                    let (pn, pns) = (pod_name.clone(), pod_ns.clone());
-                    streams.spawn(async move {
-                        let api: Api<Pod> = Api::namespaced(client, &pns);
-                        let lp = LogParams {
-                            follow: true,
-                            container: Some(c),
-                            timestamps: true,
-                            tail_lines: Some(per_pod_tail),
-                            since_seconds: since,
-                            ..Default::default()
-                        };
-                        forward_log_stream(api, pn, lp, prefix, tx, genr, flag).await;
-                    });
-                }
-            }
-            while streams.join_next().await.is_some() {
-                if flag.load(Ordering::SeqCst) != genr {
-                    break;
-                }
-            }
-        });
-        self.log_tasks.push(handle);
+        let follow = log_follow::SelectorLogs {
+            client,
+            ns,
+            labels,
+            tail: tail.min(100),
+            since,
+            tx,
+            generation: genr,
+            flag,
+            wake: self.log_wake.subscribe(),
+        };
+        self.log_tasks.push(tokio::spawn(follow.run()));
     }
 }
 
