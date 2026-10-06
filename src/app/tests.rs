@@ -24883,6 +24883,10 @@ fn explain_selected_with_pure_evidence(app: &mut App) {
         plural: &app.kind_plural,
         obj: source,
         pods: &[],
+        pods_listed: true,
+        related: &[],
+        related_listed: true,
+        storage_classes: None,
         events: &[],
         events_v1: false,
     });
@@ -25322,26 +25326,41 @@ fn health_report_app_with(
         tower::service_fn(move |request: http::Request<kube::client::Body>| {
             assert_eq!(request.method(), http::Method::GET);
             let path = request.uri().path().to_owned();
+            let query = request.uri().query().unwrap_or_default().to_owned();
             seen.lock().unwrap().push(path.clone());
-            let (code, response) = replies.lock().unwrap().get(&path).cloned().unwrap_or_else(
-                || {
-                    if path.ends_with("/namespaces") {
-                        (200, json!({"apiVersion":"v1","kind":"NamespaceList","metadata":{},"items":[]}))
-                    } else if path.ends_with("/events") {
-                        (
-                            200,
-                            json!({"apiVersion":"v1","kind":"EventList","metadata":{},"items":[]}),
-                        )
-                    } else if path.ends_with("/pods") {
-                        (
-                            200,
-                            json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":[]}),
-                        )
-                    } else {
-                        panic!("unexpected report GET {path}")
-                    }
-                },
-            );
+            // A `path?query` key answers only requests whose query contains
+            // that part, ahead of a plain `path` key.
+            let reply = {
+                let replies = replies.lock().unwrap();
+                replies
+                    .iter()
+                    .find(|(key, _)| {
+                        key.split_once('?')
+                            .is_some_and(|(p, q)| p == path && query.contains(q))
+                    })
+                    .map(|(_, reply)| reply.clone())
+                    .or_else(|| replies.get(&path).cloned())
+            };
+            let (code, response) = reply.unwrap_or_else(|| {
+                if path.ends_with("/namespaces") {
+                    (
+                        200,
+                        json!({"apiVersion":"v1","kind":"NamespaceList","metadata":{},"items":[]}),
+                    )
+                } else if path.ends_with("/events") {
+                    (
+                        200,
+                        json!({"apiVersion":"v1","kind":"EventList","metadata":{},"items":[]}),
+                    )
+                } else if path.ends_with("/pods") {
+                    (
+                        200,
+                        json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":[]}),
+                    )
+                } else {
+                    panic!("unexpected report GET {path}")
+                }
+            });
             async move {
                 Ok::<_, std::convert::Infallible>(
                     http::Response::builder()
@@ -38366,4 +38385,261 @@ async fn httproute_paths_render_and_filter_through_keys() {
     let cache = app.table_cell_cache();
     let (cells, _) = cache.get(&row_key(rows[0])).unwrap();
     assert_eq!(cells[2], "Prefix /api, Exact /health, Prefix /billing");
+}
+
+async fn explain_with(
+    plural: &str,
+    resource: serde_json::Value,
+    read_path: &str,
+    replies: Vec<(&str, serde_json::Value)>,
+) -> App {
+    let (mut app, rx) = test_app();
+    app.cluster
+        .register_kind("", "PersistentVolumeClaim", "persistentvolumeclaims", true);
+    let (mut app, mut rx, responses, _) = health_report_app_with(app, rx, plural, resource.clone());
+    {
+        let mut responses = responses.lock().unwrap();
+        responses.insert(read_path.into(), (200, resource));
+        for (path, body) in replies {
+            responses.insert(path.into(), (200, body));
+        }
+    }
+    app.handle_key(press(KeyCode::Char('X'))).unwrap();
+    receive_health_report(&mut app, &mut rx, false).await;
+    app
+}
+
+fn explain_texts(app: &App) -> Vec<String> {
+    app.explain_items.iter().map(|f| f.text.clone()).collect()
+}
+
+#[tokio::test]
+async fn explain_on_a_pending_claim_reads_its_class_and_the_pods_that_use_it() {
+    let pvc = json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "data", "namespace": "default", "uid": "pvc-uid"},
+        "spec": {"storageClassName": "local", "accessModes": ["ReadWriteOnce"]},
+        "status": {"phase": "Pending"}});
+    let pod = |name: &str, claim: &str| {
+        json!({"apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": name, "namespace": "default"},
+            "spec": {"volumes": [{"name": "v", "persistentVolumeClaim": {"claimName": claim}}]},
+            "status": {"phase": "Pending", "conditions": [{"type": "PodScheduled",
+                "status": "False", "reason": "Unschedulable"}]}})
+    };
+    let app = explain_with(
+        "persistentvolumeclaims",
+        pvc,
+        "/api/v1/namespaces/default/persistentvolumeclaims/data",
+        vec![
+            (
+                "/apis/storage.k8s.io/v1/storageclasses",
+                json!({"apiVersion": "storage.k8s.io/v1", "kind": "StorageClassList",
+                    "metadata": {}, "items": [{"metadata": {"name": "local"},
+                    "provisioner": "rancher.io/local-path",
+                    "volumeBindingMode": "WaitForFirstConsumer"}]}),
+            ),
+            (
+                "/api/v1/namespaces/default/pods",
+                json!({"apiVersion": "v1", "kind": "PodList", "metadata": {},
+                    "items": [pod("db-0", "data"), pod("other", "logs")]}),
+            ),
+        ],
+    )
+    .await;
+    let texts = explain_texts(&app);
+    assert_eq!(texts[0], "PersistentVolumeClaim/data is Pending");
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("pod that uses it to be scheduled"))
+    );
+    assert!(texts.iter().any(|t| t.starts_with("Pod/db-0")));
+    assert!(!texts.iter().any(|t| t.starts_with("Pod/other")));
+}
+
+#[tokio::test]
+async fn explain_on_a_cronjob_reads_the_jobs_it_owns() {
+    let cron = json!({"apiVersion": "batch/v1", "kind": "CronJob",
+        "metadata": {"name": "report", "namespace": "default", "uid": "cron-uid"},
+        "spec": {"schedule": "@hourly"}});
+    let job = |name: &str, owner: &str, created: &str| {
+        json!({"apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": name, "namespace": "default", "creationTimestamp": created,
+                "ownerReferences": [{"apiVersion": "batch/v1", "kind": "CronJob",
+                    "name": "x", "uid": owner}]},
+            "spec": {"selector": {"matchLabels": {"job-name": name}}},
+            "status": {"conditions": [{"type": "Failed", "status": "True",
+                "reason": "BackoffLimitExceeded"}]}})
+    };
+    let app = explain_with(
+        "cronjobs",
+        cron,
+        "/apis/batch/v1/namespaces/default/cronjobs/report",
+        vec![(
+            "/apis/batch/v1/namespaces/default/jobs",
+            json!({"apiVersion": "batch/v1", "kind": "JobList", "metadata": {},
+                "items": [job("report-1", "cron-uid", "2026-10-06T10:00:00Z"),
+                          job("unrelated", "other-uid", "2026-10-06T11:00:00Z")]}),
+        )],
+    )
+    .await;
+    let texts = explain_texts(&app);
+    assert_eq!(texts[0], "CronJob/report: the last run failed");
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.starts_with("Job/report-1") && t.contains("BackoffLimitExceeded"))
+    );
+    assert!(!texts.iter().any(|t| t.contains("unrelated")));
+}
+
+#[tokio::test]
+async fn explain_on_a_node_lists_its_unhealthy_pods() {
+    let node = json!({"apiVersion": "v1", "kind": "Node",
+        "metadata": {"name": "worker", "uid": "node-uid"},
+        "spec": {"unschedulable": true},
+        "status": {"conditions": [{"type": "Ready", "status": "True"}]}});
+    let pod = |name: &str, node: &str| {
+        json!({"metadata": {"name": name, "namespace": "apps"}, "spec": {"nodeName": node},
+            "status": {"phase": "Running", "containerStatuses": [{"name": "app",
+                "ready": false, "restartCount": 4,
+                "state": {"waiting": {"reason": "CrashLoopBackOff"}}}]}})
+    };
+    let list = |pod: serde_json::Value| json!({"apiVersion": "v1", "kind": "PodList", "metadata": {}, "items": [pod]});
+    let app = explain_with(
+        "nodes",
+        node,
+        "/api/v1/nodes/worker",
+        vec![
+            // Only a query scoped to this node gets this node's pods.
+            (
+                "/api/v1/pods?fieldSelector=spec.nodeName%3Dworker",
+                list(pod("crashy", "worker")),
+            ),
+            ("/api/v1/pods", list(pod("elsewhere", "other"))),
+        ],
+    )
+    .await;
+    let texts = explain_texts(&app);
+    assert_eq!(texts[0], "Node/worker is Ready");
+    assert!(
+        texts
+            .iter()
+            .any(|t| t == "cordoned: new pods are not scheduled here")
+    );
+    assert!(texts.iter().any(|t| t.starts_with("Pod/crashy")));
+    assert!(!texts.iter().any(|t| t.contains("elsewhere")));
+}
+
+#[tokio::test]
+async fn explain_on_a_job_ignores_pods_it_does_not_own() {
+    let job = json!({"apiVersion": "batch/v1", "kind": "Job",
+        "metadata": {"name": "migrate", "namespace": "default", "uid": "job-uid"},
+        "spec": {"manualSelector": true, "selector": {"matchLabels": {"app": "db"}}},
+        "status": {"active": 1}});
+    let pod = |name: &str, owner: &str| {
+        json!({"metadata": {"name": name, "namespace": "default",
+                "ownerReferences": [{"apiVersion": "batch/v1", "kind": "Job",
+                    "name": "x", "uid": owner}]},
+            "status": {"phase": "Running", "containerStatuses": [{"name": "app",
+                "ready": false, "restartCount": 0,
+                "state": {"waiting": {"reason": "ImagePullBackOff"}}}]}})
+    };
+    let app = explain_with(
+        "jobs",
+        job,
+        "/apis/batch/v1/namespaces/default/jobs/migrate",
+        vec![(
+            "/api/v1/namespaces/default/pods",
+            json!({"apiVersion": "v1", "kind": "PodList", "metadata": {},
+                "items": [pod("migrate-a", "job-uid"), pod("db-0", "sts-uid")]}),
+        )],
+    )
+    .await;
+    let texts = explain_texts(&app);
+    assert!(texts.iter().any(|t| t.starts_with("Pod/migrate-a")));
+    assert!(!texts.iter().any(|t| t.contains("db-0")));
+}
+
+#[test]
+fn events_without_a_uid_match_the_namespace_too() {
+    let pod = obj(json!({"metadata": {"name": "web", "namespace": "apps"}}));
+    let node = obj(json!({"metadata": {"name": "worker"}}));
+    let event = |ns: &str| {
+        obj(json!({"metadata": {"name": format!("e-{ns}")},
+            "involvedObject": {"kind": "Pod", "name": "web", "namespace": ns}}))
+    };
+    let all = [event("apps"), event("other")];
+    let kept = super::explain::filter_events(&all, &node, &[pod], false);
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].metadata.name.as_deref(), Some("e-apps"));
+}
+
+#[tokio::test]
+async fn enter_on_a_cronjob_run_opens_that_job() {
+    let cron = json!({"apiVersion": "batch/v1", "kind": "CronJob",
+        "metadata": {"name": "report", "namespace": "default", "uid": "cron-uid"},
+        "spec": {"schedule": "@hourly"}});
+    let mut app = explain_with(
+        "cronjobs",
+        cron,
+        "/apis/batch/v1/namespaces/default/cronjobs/report",
+        vec![(
+            "/apis/batch/v1/namespaces/default/jobs",
+            json!({"apiVersion": "batch/v1", "kind": "JobList", "metadata": {},
+                "items": [{"metadata": {"name": "report-1", "namespace": "default",
+                    "creationTimestamp": "2026-10-06T10:00:00Z",
+                    "ownerReferences": [{"apiVersion": "batch/v1", "kind": "CronJob",
+                        "name": "report", "uid": "cron-uid"}]}}]}),
+        )],
+    )
+    .await;
+    let line = app
+        .explain_items
+        .iter()
+        .position(|f| f.text.starts_with("Job/report-1"))
+        .unwrap();
+    app.explain_state.select(Some(line));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.kind_plural, "jobs");
+    assert_eq!(app.fields.as_deref(), Some("metadata.name=report-1"));
+}
+
+#[tokio::test]
+async fn explain_without_a_pods_kind_does_not_claim_a_claim_is_unused() {
+    let (mut app, rx) = test_app();
+    app.cluster
+        .register_kind("", "PersistentVolumeClaim", "persistentvolumeclaims", true);
+    app.cluster.unregister_kind("", "Pod");
+    let pvc = json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "data", "namespace": "default", "uid": "pvc-uid"},
+        "spec": {"storageClassName": "local"}, "status": {"phase": "Pending"}});
+    let (mut app, mut rx, responses, _) =
+        health_report_app_with(app, rx, "persistentvolumeclaims", pvc.clone());
+    {
+        let mut responses = responses.lock().unwrap();
+        responses.insert(
+            "/api/v1/namespaces/default/persistentvolumeclaims/data".into(),
+            (200, pvc),
+        );
+        responses.insert(
+            "/apis/storage.k8s.io/v1/storageclasses".into(),
+            (
+                200,
+                json!({"apiVersion": "storage.k8s.io/v1", "kind": "StorageClassList",
+                    "metadata": {}, "items": [{"metadata": {"name": "local"},
+                    "provisioner": "rancher.io/local-path",
+                    "volumeBindingMode": "WaitForFirstConsumer"}]}),
+            ),
+        );
+    }
+    app.handle_key(press(KeyCode::Char('X'))).unwrap();
+    receive_health_report(&mut app, &mut rx, false).await;
+    let texts = explain_texts(&app);
+    assert!(
+        texts.iter().any(|t| t.contains("pods could not be listed")),
+        "{texts:?}"
+    );
+    assert!(!texts.iter().any(|t| t.contains("and no pod does")));
 }
