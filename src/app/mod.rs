@@ -240,6 +240,12 @@ pub enum Suspend {
         argv: Vec<String>,
         failure: Box<CommandFailure>,
     },
+    /// Run this context's exec auth plugin on the terminal, then retry
+    /// through [`App::authenticated`].
+    Authenticate {
+        context: String,
+        switch: bool,
+    },
 }
 
 /// A `kubectl port-forward` running in the background (not `Suspend::Shell`
@@ -433,6 +439,10 @@ enum ConfirmAction {
     /// Delete the PVC-explore helper pods left behind by earlier sessions.
     /// `None` sweeps every namespace, matching an all-namespaces view.
     PvcClean { scope: Option<String> },
+    /// Suspend the TUI and run `context`'s exec auth plugin on the terminal,
+    /// because it wants input such as an MFA code. `switch` when a context
+    /// switch asked, which is retried afterwards; otherwise a watch did.
+    Authenticate { context: String, switch: bool },
     /// Run a confirmed plugin (`confirm`/`dangerous`) once accepted — one job
     /// (label, argv) per target, so a bulk run confirms once.
     Plugin {
@@ -2279,6 +2289,9 @@ pub struct App {
     /// the PVC browser sets it away from the table: every other guarded action
     /// is launched from the table and returns there.
     pub(super) confirm_return: Mode,
+    /// The generation that last offered to authenticate an exec plugin that
+    /// needs input, so a retrying watch asks once instead of on every error.
+    auth_offered: Option<u64>,
 
     /// Background `kubectl port-forward` processes started with `f`/`F`.
     /// Viewed/stopped via `:pf`; killed automatically on drop.
@@ -2700,6 +2713,7 @@ impl App {
             pvc: PvcExplore::default(),
             pvc_cfg: crate::config::PvcExploreConfig::default(),
             confirm_return: Mode::Table,
+            auth_offered: None,
             port_forwards: Vec::new(),
             pf_spawner: default_pf_spawner,
             forwards_cfg: Vec::new(),
