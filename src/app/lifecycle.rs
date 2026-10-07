@@ -196,6 +196,7 @@ impl App {
         match self.kind_plural.as_str() {
             "helm" => Some("helm"),
             "helmhistory" => Some("helm history"),
+            crate::rollout::VIEW => Some("rollout history"),
             _ => None,
         }
     }
@@ -317,6 +318,7 @@ impl App {
             labels: self.labels.clone(),
             fields: self.fields.clone(),
             owner: self.owner.clone(),
+            rollout_managed: self.rollout_managed.clone(),
             filter: self.filter.clone(),
             scope_label: self.scope_label.clone(),
             selected: self.table_state.selected(),
@@ -330,6 +332,7 @@ impl App {
         self.labels = f.labels;
         self.fields = f.fields;
         self.owner = f.owner;
+        self.rollout_managed = f.rollout_managed;
         self.filter = f.filter;
         self.scope_label = f.scope_label;
         self.reset_sort();
@@ -1789,6 +1792,34 @@ impl App {
                     None => self.clear_claimed_status(claim),
                 }
             }
+            Msg::Diff {
+                generation,
+                request,
+                claim,
+                title,
+                lines,
+                warn,
+            } if generation == self.generation
+                && request == self.rollout_preview
+                && self.mode == Mode::Table =>
+            {
+                self.stop_resource_refresh();
+                self.clear_document_source();
+                self.detail = Scrollable {
+                    wrap: self.detail.wrap,
+                    title,
+                    lines: lines.into(),
+                    ..Default::default()
+                };
+                self.mode = Mode::Diff;
+                match warn {
+                    Some(w) => self.set_claimed_status(claim, w, false),
+                    None => self.clear_claimed_status(claim),
+                }
+            }
+            // A newer preview, a rollback confirmation, or another view took
+            // over while this one was reading the workload.
+            Msg::Diff { claim, .. } => self.clear_claimed_status(claim),
             Msg::ResourceRefresh { generation, result }
                 if generation == self.refresh_generation
                     && (self.refresh_task.is_some()

@@ -365,6 +365,16 @@ enum ConfirmAction {
         name: String,
         revision: String,
     },
+    /// Roll a workload back to one of its revisions (`kubectl rollout undo
+    /// --to-revision`), from the selected rollout history row.
+    RolloutUndo {
+        kind: Kind,
+        workload: crate::rollout::Workload,
+        name: String,
+        uid: Option<String>,
+        revision: i64,
+        rev: Box<DynamicObject>,
+    },
     /// Sync one or more ArgoCD Applications with pruning, which deletes
     /// resources no longer in Git.
     ArgocdSyncPrune { targets: Vec<(String, String)> },
@@ -712,6 +722,7 @@ enum PaletteAction {
     PvcClean,
     Find,
     Diff,
+    RolloutHistory,
     Events,
     PortForwards,
     ProviderLogs,
@@ -755,6 +766,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         action: PaletteAction::Timeline,
         names: &["timeline", "tl", "history"],
+    },
+    PaletteCommand {
+        action: PaletteAction::RolloutHistory,
+        names: &["rollout-history"],
     },
     PaletteCommand {
         action: PaletteAction::Adjacent,
@@ -1725,6 +1740,9 @@ struct CellCacheEntry {
     cells: Vec<String>,
     status_idx: Option<usize>,
     helm_updated: Option<i64>,
+    /// The revision in effect when a rollout history row was rendered; its
+    /// STATUS cell is stale once that changes.
+    rollout_current: Option<i64>,
     /// Per-cell character-presence masks, and their union across the row.
     /// See [`subseq_mask`]: a cheap necessary condition for a fuzzy
     /// subsequence match, used to skip cells (and whole rows) without paying
@@ -1822,6 +1840,22 @@ pub struct OwnerScope {
 }
 
 impl OwnerScope {
+    /// Like [`Self::owns`], but only through an owner reference carrying this
+    /// scope's UID: no name-prefix fallback for orphans.
+    pub fn owns_strictly(&self, obj: &DynamicObject) -> bool {
+        let Some(uid) = &self.uid else {
+            return false;
+        };
+        obj.metadata
+            .owner_references
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|r| {
+                r.kind.eq_ignore_ascii_case(&self.kind) && r.name == self.name && r.uid == *uid
+            })
+    }
+
     pub fn owns(&self, obj: &DynamicObject) -> bool {
         let refs = obj.metadata.owner_references.as_deref().unwrap_or_default();
         if refs.is_empty() {
@@ -1851,6 +1885,7 @@ struct Frame {
     labels: Option<String>,
     fields: Option<String>,
     owner: Option<OwnerScope>,
+    rollout_managed: Option<String>,
     filter: String,
     scope_label: Option<String>,
     selected: Option<usize>,
@@ -1878,6 +1913,14 @@ pub struct App {
     pub labels: Option<String>,
     pub fields: Option<String>,
     pub owner: Option<OwnerScope>,
+    /// The Flux or Argo CD owner of the workload whose rollout history is
+    /// open, named in the rollback confirmation.
+    rollout_managed: Option<String>,
+    /// The revision in effect, keyed by the watch generation and store
+    /// version it was computed for.
+    rollout_current_cache: std::cell::Cell<Option<(u64, u64, Option<i64>)>>,
+    /// The latest rollback preview request; an older one's diff is dropped.
+    rollout_preview: u64,
     /// Drill-down breadcrumb shown in the header, e.g. "deploy/foo".
     pub scope_label: Option<String>,
 
@@ -2462,6 +2505,9 @@ impl App {
             labels: None,
             fields: None,
             owner: None,
+            rollout_managed: None,
+            rollout_current_cache: std::cell::Cell::new(None),
+            rollout_preview: 0,
             scope_label: None,
             generation: 0,
             gen_flag: Arc::new(AtomicU64::new(0)),
@@ -2858,6 +2904,7 @@ pub mod rbac;
 mod refresh;
 mod resume;
 mod rightsize;
+mod rollout;
 mod rows;
 mod secret_edit;
 mod snapshot;

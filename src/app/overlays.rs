@@ -151,6 +151,16 @@ impl App {
             ConfirmAction::HelmRollback { ns, name, revision } => {
                 self.do_helm_rollback(ns, name, revision);
             }
+            ConfirmAction::RolloutUndo {
+                kind,
+                workload,
+                name,
+                uid,
+                revision,
+                rev,
+            } => {
+                self.do_rollout_undo(kind, workload, name, uid, revision, *rev);
+            }
             ConfirmAction::ArgocdSyncPrune { targets } => {
                 self.do_argocd_sync(targets, true);
             }
