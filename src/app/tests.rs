@@ -1827,6 +1827,129 @@ async fn skin_palette_command_opens_picker() {
 }
 
 #[tokio::test]
+async fn skin_picker_previews_selection_and_restores_on_escape() {
+    let mocha = crate::theme::builtin("catppuccin-mocha").unwrap();
+    let latte = crate::theme::builtin("catppuccin-latte").unwrap();
+    crate::theme::set(mocha);
+    let (mut app, _rx) = test_app();
+    assert_eq!(
+        &app.skin_list[..2],
+        ["catppuccin-mocha", "catppuccin-latte"]
+    );
+    // An alias of the first entry: the picker still starts on its row.
+    app.session_skin = Some("mocha".into());
+    app.active_skin = Some("mocha".into());
+
+    assert!(app.run_palette_command("skin"));
+    assert_eq!(app.mode, Mode::Skins);
+    assert_eq!(
+        app.skin_state.selected(),
+        Some(0),
+        "starts on the active skin"
+    );
+    assert_eq!(crate::theme::snapshot(), mocha);
+
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    assert_eq!(app.mode, Mode::Skins, "moving keeps the picker open");
+    assert_eq!(crate::theme::snapshot(), latte);
+    assert_eq!(app.active_skin.as_deref(), Some("catppuccin-latte"));
+    assert_eq!(app.session_skin.as_deref(), Some("mocha"));
+
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(crate::theme::snapshot(), mocha);
+    assert_eq!(app.active_skin.as_deref(), Some("mocha"));
+    assert_eq!(app.session_skin.as_deref(), Some("mocha"));
+
+    assert!(app.run_palette_command("skin"));
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(crate::theme::snapshot(), latte);
+    assert_eq!(app.active_skin.as_deref(), Some("catppuccin-latte"));
+    assert_eq!(app.session_skin.as_deref(), Some("catppuccin-latte"));
+    assert!(app.skin_preview_origin.is_none());
+}
+
+#[tokio::test]
+async fn skin_preview_survives_palette_visits_and_restores_when_a_command_leaves() {
+    let mocha = crate::theme::builtin("catppuccin-mocha").unwrap();
+    let latte = crate::theme::builtin("catppuccin-latte").unwrap();
+    crate::theme::set(mocha);
+    let (mut app, _rx) = test_app();
+    app.session_skin = Some("catppuccin-mocha".into());
+    app.active_skin = Some("catppuccin-mocha".into());
+
+    assert!(app.run_palette_command("skin"));
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    assert_eq!(crate::theme::snapshot(), latte);
+
+    // `:` then `esc` returns to the picker with the preview intact.
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    assert_eq!(app.mode, Mode::Command);
+    assert_eq!(crate::theme::snapshot(), latte);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Skins);
+    assert_eq!(crate::theme::snapshot(), latte);
+
+    // Reopening `:skin` mid-preview keeps the original to restore.
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "skin".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Skins);
+    assert_eq!(app.skin_state.selected(), Some(1));
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(crate::theme::snapshot(), mocha);
+    assert_eq!(app.active_skin.as_deref(), Some("catppuccin-mocha"));
+
+    // A command that leaves the picker abandons the preview.
+    assert!(app.run_palette_command("skin"));
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "pods".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_ne!(app.mode, Mode::Skins);
+    assert_eq!(crate::theme::snapshot(), mocha);
+    assert_eq!(app.active_skin.as_deref(), Some("catppuccin-mocha"));
+    assert_eq!(app.session_skin.as_deref(), Some("catppuccin-mocha"));
+    assert!(app.skin_preview_origin.is_none());
+}
+
+#[tokio::test]
+async fn reload_with_an_unknown_skin_restores_the_skin_preview() {
+    let mocha = crate::theme::builtin("catppuccin-mocha").unwrap();
+    let latte = crate::theme::builtin("catppuccin-latte").unwrap();
+    crate::theme::set(mocha);
+    let dir =
+        std::env::temp_dir().join(format!("sofka-reload-skin-preview-{}", std::process::id()));
+    write_config(&dir, "[skin]\nname = \"no-such-skin\"\n");
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    app.session_skin = Some("catppuccin-mocha".into());
+    app.active_skin = Some("catppuccin-mocha".into());
+
+    assert!(app.run_palette_command("skin"));
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    assert_eq!(crate::theme::snapshot(), latte);
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "reload".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_ne!(app.mode, Mode::Skins);
+    assert_eq!(crate::theme::snapshot(), mocha);
+    assert_eq!(app.active_skin.as_deref(), Some("catppuccin-mocha"));
+    assert!(app.skin_preview_origin.is_none());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
 async fn diff_falls_back_to_session_previous_revision() {
     let (mut app, _rx) = test_app();
     app.switch_kind("deployments");
