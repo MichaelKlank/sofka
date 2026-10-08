@@ -19452,6 +19452,7 @@ fn install_provider(app: &mut App) {
     let (provider, warnings) = crate::providers::compile(Some(&cfg));
     assert!(warnings.is_empty(), "{warnings:?}");
     app.log_provider = provider;
+    app.log_provider_configured = true;
 }
 
 #[tokio::test]
@@ -19655,6 +19656,202 @@ async fn provider_logs_for_one_container_from_picker() {
         }) => assert_eq!(c, "app"),
         other => panic!("unexpected source: {other:?}"),
     }
+}
+
+fn apply_gke_deployment(app: &mut App) {
+    app.cluster.cluster_name = "gke_shop-prod_asia-southeast1_main".into();
+    app.switch_kind("deployments");
+    apply(
+        app,
+        json!({
+            "apiVersion": "apps/v1", "kind": "Deployment",
+            "metadata": {"name": "api", "namespace": "web"},
+            "spec": {"selector": {"matchLabels": {"app.kubernetes.io/name": "api"}}}
+        }),
+    );
+    app.table_state.select(Some(0));
+}
+
+#[tokio::test]
+async fn provider_logs_open_cloud_logging_on_gke_without_config() {
+    let (mut app, _rx) = test_app();
+    apply_gke_deployment(&mut app);
+    app.handle_key(press(KeyCode::Char('L'))).unwrap();
+
+    assert_eq!(app.mode, Mode::Table);
+    let [url] = app.opened_links.as_slice() else {
+        panic!("{:?}", app.opened_links);
+    };
+    assert!(
+        url.starts_with("https://console.cloud.google.com/logs/query;query="),
+        "{url}"
+    );
+    assert!(url.ends_with(";duration=PT1H?project=shop-prod"), "{url}");
+    assert!(
+        url.contains("labels.%22k8s-pod%2Fapp_kubernetes_io%2Fname%22%3D%22api%22"),
+        "{url}"
+    );
+}
+
+#[tokio::test]
+async fn provider_logs_keep_a_configured_backend_on_gke() {
+    let (mut app, _rx) = test_app();
+    install_provider(&mut app);
+    apply_gke_deployment(&mut app);
+    app.handle_key(press(KeyCode::Char('L'))).unwrap();
+
+    assert_eq!(app.mode, Mode::Logs);
+    assert!(app.opened_links.is_empty());
+}
+
+fn install_link(app: &mut App, url: &str) {
+    let cfg = crate::config::LogProviderConfig {
+        kind: "link".into(),
+        url: url.into(),
+        lookback: Some("30m".into()),
+        ..Default::default()
+    };
+    let (link, warnings) = crate::providers::compile_link(Some(&cfg));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    app.log_link = link;
+    app.log_provider_configured = true;
+}
+
+#[tokio::test]
+async fn provider_logs_do_not_fall_back_to_gke_when_the_config_is_invalid() {
+    let (mut app, _rx) = test_app();
+    let cfg = crate::config::LogProviderConfig {
+        kind: "link".into(),
+        ..Default::default()
+    };
+    let (link, warnings) = crate::providers::compile_link(Some(&cfg));
+    assert!(link.is_none() && !warnings.is_empty());
+    app.log_provider_configured = true;
+    apply_gke_deployment(&mut app);
+    app.handle_key(press(KeyCode::Char('L'))).unwrap();
+
+    assert!(app.opened_links.is_empty(), "{:?}", app.opened_links);
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.logs.source.is_none());
+    assert!(app.flash_err);
+    assert!(
+        app.flash.contains("[providers.logs] is invalid"),
+        "{}",
+        app.flash
+    );
+
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "api-1", "namespace": "web"},
+            "spec": {"containers": [{"name": "app"}, {"name": "istio"}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Containers);
+    app.handle_key(press(KeyCode::Char('L'))).unwrap();
+    assert!(app.opened_links.is_empty(), "{:?}", app.opened_links);
+    assert_ne!(app.mode, Mode::Logs);
+    assert!(app.logs.source.is_none());
+}
+
+#[tokio::test]
+async fn provider_logs_link_a_namespace_row_as_its_own_namespace() {
+    let (mut app, _rx) = test_app();
+    install_link(
+        &mut app,
+        "https://logs.example.com/?ns={namespace}&name={name}",
+    );
+    app.switch_kind("namespaces");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "prod"}}),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('L'))).unwrap();
+
+    assert_eq!(
+        app.opened_links,
+        ["https://logs.example.com/?ns=prod&name=prod"]
+    );
+}
+
+#[tokio::test]
+async fn provider_logs_fill_a_link_template() {
+    let (mut app, _rx) = test_app();
+    install_link(
+        &mut app,
+        "https://logs.example.com/?ns={namespace}&pod={pod}&since={lookback}",
+    );
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "api-1", "namespace": "prod"},
+            "spec": {"containers": [{"name": "app"}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('L'))).unwrap();
+
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(
+        app.opened_links,
+        ["https://logs.example.com/?ns=prod&pod=api-1&since=30m"]
+    );
+}
+
+#[tokio::test]
+async fn provider_logs_link_one_container_from_picker_on_gke() {
+    let (mut app, _rx) = test_app();
+    app.cluster.cluster_name = "gke_shop-prod_asia-southeast1_main".into();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "api-1", "namespace": "prod"},
+            "spec": {"containers": [{"name": "app"}, {"name": "istio"}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Containers);
+    app.handle_key(press(KeyCode::Char('L'))).unwrap();
+
+    let [url] = app.opened_links.as_slice() else {
+        panic!("{:?}", app.opened_links);
+    };
+    assert!(
+        url.contains(
+            "resource.labels.pod_name%3D%22api-1%22%0Aresource.labels.container_name%3D%22app%22"
+        ),
+        "{url}"
+    );
+}
+
+#[tokio::test]
+async fn provider_logs_link_warns_for_kinds_without_logs() {
+    let (mut app, _rx) = test_app();
+    app.cluster.cluster_name = "gke_shop-prod_asia-southeast1_main".into();
+    app.switch_kind("configmaps");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": "settings", "namespace": "prod"}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('L'))).unwrap();
+
+    assert!(app.opened_links.is_empty());
+    assert!(app.flash_err);
+    assert!(app.flash.contains("GCP logs cover"), "{}", app.flash);
 }
 
 #[tokio::test]

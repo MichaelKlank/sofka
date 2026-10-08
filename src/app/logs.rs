@@ -579,6 +579,13 @@ impl App {
     /// Mirrors [`App::open_logs`], but the backend answers instead of the
     /// kubelet — so it also covers restarted and deleted pods.
     pub(super) fn open_provider_logs(&mut self) {
+        if self.log_provider_invalid() {
+            return;
+        }
+        if let Some(link) = self.active_log_link() {
+            self.open_log_link(&link, None);
+            return;
+        }
         let label = format!("victorialogs ({})", self.provider_lookback_label());
         let Some(obj) = self.selected_ref() else {
             return;
@@ -632,6 +639,102 @@ impl App {
         }
     }
 
+    /// The link provider `L` uses: the configured one, else Cloud Logging for
+    /// a GKE cluster without a `[providers.logs]` section. A section that
+    /// failed to compile still counts, so a broken config never falls back
+    /// to a backend the user did not pick.
+    fn active_log_link(&self) -> Option<crate::providers::LogLink> {
+        if self.log_provider_configured {
+            return self.log_link.clone();
+        }
+        crate::providers::LogLink::detect(&self.cluster.cluster_name)
+    }
+
+    /// Warn when `[providers.logs]` is present but did not compile, instead
+    /// of falling back to a backend the user did not pick.
+    fn log_provider_invalid(&mut self) -> bool {
+        let invalid =
+            self.log_provider_configured && self.log_link.is_none() && self.log_provider.is_none();
+        if invalid {
+            self.flash_warn("[providers.logs] is invalid, see :config");
+        }
+        invalid
+    }
+
+    /// Open the log UI link for the selected row, or for one container of a
+    /// pod from the container picker.
+    fn open_log_link(
+        &mut self,
+        link: &crate::providers::LogLink,
+        container: Option<(String, String, String)>,
+    ) {
+        let mut target = crate::providers::LinkTarget {
+            context: self.cluster.context.clone(),
+            cluster: self.cluster.cluster_name.clone(),
+            ..Default::default()
+        };
+        if let Some((ns, pod, container)) = container {
+            target.resource = "pods".into();
+            target.namespace = ns;
+            target.name = pod;
+            target.container = Some(container);
+        } else {
+            let Some(obj) = self.selected_ref() else {
+                return;
+            };
+            target.resource = self.kind_plural.clone();
+            target.name = obj.metadata.name.clone().unwrap_or_default();
+            // A namespace row is its own namespace.
+            target.namespace = if self.kind_plural == "namespaces" {
+                target.name.clone()
+            } else {
+                obj.metadata.namespace.clone().unwrap_or_default()
+            };
+            target.selector =
+                crate::providers::link_selector(&self.kind_plural, &obj.data).unwrap_or_default();
+        }
+        match link.url(&target) {
+            Ok(url) => self.open_url(url),
+            Err(e) => self.flash_warn(&e),
+        }
+    }
+
+    /// Open `url` in the browser. Without one (over SSH, or no opener), copy
+    /// it to the clipboard, and show it when that fails too.
+    fn open_url(&mut self, url: String) {
+        #[cfg(test)]
+        self.opened_links.push(url);
+        #[cfg(not(test))]
+        {
+            let claim = self.claim_status("opening logs in the browser…");
+            let tx = self.tx.clone();
+            let generation = self.generation;
+            tokio::spawn(async move {
+                let failure = format!("log link: {url}");
+                let (copied, success) = tokio::task::spawn_blocking(move || {
+                    if open_in_browser(&url) {
+                        (true, "opened logs in the browser".to_string())
+                    } else if copy_to_clipboard(&url) {
+                        (true, format!("no browser, copied log link: {url}"))
+                    } else {
+                        (false, String::new())
+                    }
+                })
+                .await
+                .unwrap_or((false, String::new()));
+                let _ = tx
+                    .send(Msg::ClipboardCopied {
+                        generation,
+                        claim,
+                        copied,
+                        success,
+                        failure,
+                    })
+                    .await;
+            });
+        }
+    }
+
     /// The lookback window shown in provider-view titles: the configured (or
     /// previously discovered) provider's, else the default an autodiscovered
     /// one will use.
@@ -680,6 +783,13 @@ impl App {
         pod: String,
         container: String,
     ) {
+        if self.log_provider_invalid() {
+            return;
+        }
+        if let Some(link) = self.active_log_link() {
+            self.open_log_link(&link, Some((ns, pod, container)));
+            return;
+        }
         let title = format!(
             "{pod}:{container} — victorialogs ({})",
             self.provider_lookback_label()

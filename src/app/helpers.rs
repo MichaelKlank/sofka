@@ -608,6 +608,34 @@ pub(super) fn copy_to_clipboard(text: &str) -> bool {
     copy_to_clipboard_osc52(text)
 }
 
+/// Open `url` with the desktop's opener. Over SSH the opener would run on
+/// the remote host, so this reports `false` there.
+#[cfg(not(test))]
+pub(super) fn open_in_browser(url: &str) -> bool {
+    use std::process::{Command, Stdio};
+
+    if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
+        return false;
+    }
+    let mut command = if cfg!(target_os = "macos") {
+        Command::new("open")
+    } else if cfg!(windows) {
+        // `cmd /c start` would split the URL at `&`.
+        let mut command = Command::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler");
+        command
+    } else {
+        Command::new("xdg-open")
+    };
+    command
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 fn copy_with_tool(cmd: &str, args: &[&str], input: &[u8]) -> bool {
     use std::io::Write;
     use std::process::{Command, Stdio};

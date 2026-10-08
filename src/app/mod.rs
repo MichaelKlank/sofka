@@ -2500,6 +2500,15 @@ pub struct App {
     /// Compiled log provider from `[providers.logs]`, re-resolved on context
     /// switch and `:reload` so each cluster can point at its own backend.
     pub log_provider: Option<crate::providers::LogProvider>,
+    /// A `type = "gcp"` or `type = "link"` log provider: `L` opens the
+    /// selection in a web log UI instead of the logs view.
+    pub log_link: Option<crate::providers::LogLink>,
+    /// Whether the resolved config has a `[providers.logs]` section, valid
+    /// or not. Only an absent section lets `L` detect Cloud Logging on GKE.
+    pub log_provider_configured: bool,
+    /// Log UI links `L` built, in place of opening a browser.
+    #[cfg(test)]
+    pub(super) opened_links: Vec<String>,
     /// Prometheus/VictoriaMetrics backend for right-sizing (`:rightsize`),
     /// resolved to the API-server proxy on first use when autodiscovered.
     pub metrics_provider: Option<crate::providers::MetricsProvider>,
@@ -2836,6 +2845,10 @@ impl App {
                 helm_latest: None,
             }),
             log_provider: None,
+            log_link: None,
+            log_provider_configured: false,
+            #[cfg(test)]
+            opened_links: Vec::new(),
             metrics_provider: None,
             user_views: HashMap::new(),
             thresholds: crate::thresholds::Compiled::default(),
