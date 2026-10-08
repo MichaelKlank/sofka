@@ -2814,6 +2814,7 @@ clusters:
         pub core_ignores_negotiation: bool,
         pub empty_aggregated_groups: bool,
         pub empty_aggregated_core: bool,
+        pub null_verbs: bool,
     }
 
     pub(crate) async fn mock_apiserver_opts(opts: MockOptions) -> String {
@@ -2849,6 +2850,9 @@ clusters:
             let mixed_legacy = r#",{"name":"mixed.example.com","versions":[{"groupVersion":"mixed.example.com/v1","version":"v1"},{"groupVersion":"mixed.example.com/v1alpha1","version":"v1alpha1"}],"preferredVersion":{"groupVersion":"mixed.example.com/v1","version":"v1"}}"#;
             let capi_legacy = r#",{"name":"cluster.x-k8s.io","versions":[{"groupVersion":"cluster.x-k8s.io/v1beta1","version":"v1beta1"}],"preferredVersion":{"groupVersion":"cluster.x-k8s.io/v1beta1","version":"v1beta1"}}"#;
             let capi_v2 = r#",{"metadata":{"name":"cluster.x-k8s.io"},"versions":[{"version":"v1beta1","freshness":"Current","resources":[{"resource":"machinedeployments","responseKind":{"kind":"MachineDeployment"},"scope":"Namespaced","shortNames":["md","cross"],"verbs":["get","list","watch"]},{"resource":"machinedrainrules","responseKind":{"kind":"MachineDrainRule"},"scope":"Namespaced","verbs":["get","list","watch"]}]}]}"#;
+            // Modeled on KubeVirt: subresources.kubevirt.io sends null verbs and
+            // lists the parent resource that kubevirt.io actually serves.
+            let null_verbs_v2 = r#",{"metadata":{"name":"kubevirt.io"},"versions":[{"version":"v1","resources":[{"resource":"virtualmachineinstances","responseKind":{"group":"kubevirt.io","version":"v1","kind":"VirtualMachineInstance"},"scope":"Namespaced","singularResource":"virtualmachineinstance","shortNames":["vmi"],"verbs":["get","list","watch"]}],"freshness":"Current"}]},{"metadata":{"name":"subresources.kubevirt.io"},"versions":[{"version":"v1","resources":[{"resource":"virtualmachineinstances","responseKind":{"group":"","version":"","kind":""},"scope":"Namespaced","singularResource":"","verbs":null,"subresources":[{"subresource":"console","responseKind":{"group":"","version":"","kind":""},"verbs":null}]}],"freshness":"Current"}]}"#;
             match (path, aggregated) {
                 ("/apis", true) if opts.groups_ignore_negotiation => route(path, false, opts),
                 ("/api", true) if opts.core_ignores_negotiation => route(path, false, opts),
@@ -2875,8 +2879,9 @@ clusters:
                 ("/apis", true) => (
                     "200 OK",
                     format!(
-                        r#"{{"kind":"APIGroupDiscoveryList","apiVersion":"apidiscovery.k8s.io/v2","metadata":{{}},"items":[{{"metadata":{{"name":"apps"}},"versions":[{{"version":"v1","resources":[{{"resource":"deployments","responseKind":{{"group":"apps","version":"v1","kind":"Deployment"}},"scope":"Namespaced","singularResource":"deployment","verbs":["get","list","watch"]}}],"freshness":"Current"}}]}}{mixed_v2}{capi_v2}{}]}}"#,
-                        if include_broken { broken_v2 } else { "" }
+                        r#"{{"kind":"APIGroupDiscoveryList","apiVersion":"apidiscovery.k8s.io/v2","metadata":{{}},"items":[{{"metadata":{{"name":"apps"}},"versions":[{{"version":"v1","resources":[{{"resource":"deployments","responseKind":{{"group":"apps","version":"v1","kind":"Deployment"}},"scope":"Namespaced","singularResource":"deployment","verbs":["get","list","watch"]}}],"freshness":"Current"}}]}}{mixed_v2}{capi_v2}{}{}]}}"#,
+                        if include_broken { broken_v2 } else { "" },
+                        if opts.null_verbs { null_verbs_v2 } else { "" }
                     ),
                 ),
                 ("/api", true) => (
@@ -3188,6 +3193,38 @@ clusters:
         let text = format!("{err:#}");
         assert!(text.contains("reading core API group v1"), "{text}");
         assert!(text.contains("expected v1"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn aggregated_discovery_tolerates_null_verbs() {
+        let (url, requests) = mock_apiserver_with_requests(MockOptions {
+            supports_aggregated: true,
+            serve_version: true,
+            null_verbs: true,
+            ..MockOptions::default()
+        })
+        .await;
+        let cluster = connect_mock(url).await.expect("connect aggregated");
+        assert!(cluster.discovery_fallback.is_none());
+        assert!(cluster.discovery_warnings.is_empty());
+        assert!(cluster.resolve("deployments").is_some());
+        let vmi = cluster
+            .resolve("virtualmachineinstances")
+            .expect("the listable group owns the bare name");
+        assert_eq!(vmi.ar.group, "kubevirt.io");
+        assert!(
+            cluster
+                .resolve("virtualmachineinstances.subresources.kubevirt.io")
+                .is_none()
+        );
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p == "/apis/apps/v1"),
+            "aggregated discovery must not fall back to the per-group walk"
+        );
     }
 
     #[tokio::test]
