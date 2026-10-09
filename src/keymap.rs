@@ -77,6 +77,8 @@ actions! {
     Force => ("force", "force"),
     ForceDelete => ("force_delete", "force delete"),
     Fullscreen => ("fullscreen", "fullscreen"),
+    HalfPageDown => ("half_page_down", "half page down"),
+    HalfPageUp => ("half_page_up", "half page up"),
     Help => ("help", "help"),
     HistoryBack => ("history_back", "history back"),
     HistoryForward => ("history_forward", "history forward"),
@@ -176,6 +178,14 @@ impl Action {
                 "replicationcontrollers",
             ]),
             _ => None,
+        }
+    }
+
+    /// Rows or lines a paging action moves for a full page of `page`.
+    pub fn page_size(self, page: usize) -> usize {
+        match self {
+            Self::HalfPageDown | Self::HalfPageUp => (page / 2).max(1),
+            _ => page,
         }
     }
 
@@ -656,6 +666,8 @@ const NAVIGATION_ACTIONS: &[Action] = &[
     Action::Last,
     Action::PageUp,
     Action::PageDown,
+    Action::HalfPageUp,
+    Action::HalfPageDown,
     Action::Left,
     Action::Right,
     Action::Back,
@@ -680,6 +692,13 @@ impl Default for Keymap {
                 }
                 for &scope in TEXT_SCOPES {
                     bindings.entry(scope).or_default();
+                }
+                // Half-page scrolling is available wherever paging is, unbound.
+                for actions in bindings.values_mut() {
+                    if actions.contains_key(&Action::PageDown) {
+                        actions.insert(Action::HalfPageDown, Vec::new());
+                        actions.insert(Action::HalfPageUp, Vec::new());
+                    }
                 }
                 for (&scope, actions) in &mut bindings {
                     for &(action, chords) in GLOBAL
@@ -817,6 +836,31 @@ impl Keymap {
                     .retain(|c| !chords.iter().any(|other| overlaps(c, other)));
             }
         }
+        // Shared half-page keys never take a key that edits text or that the
+        // mode already uses; a mode setting is used as written.
+        for &scope in TEXT_SCOPES {
+            let bindings = map.bindings.get_mut(scope).unwrap();
+            for action in [Action::HalfPageUp, Action::HalfPageDown] {
+                if overrides.contains_key(&(scope, action.name())) {
+                    continue;
+                }
+                let Some(chords) = bindings.get(&action) else {
+                    continue;
+                };
+                let kept: Vec<_> = chords
+                    .iter()
+                    .filter(|c| {
+                        (c.ctrl || c.alt || !matches!(c.code, KeyCode::Char(_)))
+                            && !bindings.iter().any(|(&other, others)| {
+                                !matches!(other, Action::HalfPageUp | Action::HalfPageDown)
+                                    && others.iter().any(|o| overlaps(c, o))
+                            })
+                    })
+                    .copied()
+                    .collect();
+                bindings.insert(action, kept);
+            }
+        }
         // Keep existing custom Ctrl+H bindings valid when Backspace is inherited.
         let ctrl_h = KeyChord::parse("ctrl-h").unwrap();
         for &scope in TEXT_SCOPES {
@@ -876,7 +920,8 @@ impl Keymap {
                         TEXT_SCOPES.contains(&target) && INPUT.iter().any(|&(a, _)| a == action)
                     }
                     "navigation" => {
-                        !TEXT_SCOPES.contains(&target)
+                        (!TEXT_SCOPES.contains(&target)
+                            || matches!(action, Action::HalfPageUp | Action::HalfPageDown))
                             && NAVIGATION_ACTIONS.contains(&action)
                             && !(target == "confirm" && action == Action::Back)
                     }
