@@ -68,7 +68,7 @@ impl App {
         cells: &mut crate::store::FastMap<RowKey, CellCacheEntry>,
         now: i64,
     ) -> bool {
-        if self.faults_filter_active() && !pod_has_faults(o) {
+        if self.faults_filter_active() && !self.row_has_faults(o) {
             return false;
         }
         if self.filter.is_empty() {
@@ -78,7 +78,28 @@ impl App {
     }
 
     pub fn faults_filter_active(&self) -> bool {
-        self.faults_only && self.kind_plural == "pods"
+        self.faults_only && self.faults_supported()
+    }
+
+    /// Whether `Ctrl+Z` can filter the current kind.
+    pub(super) fn faults_supported(&self) -> bool {
+        // Synthetic views (rollout history over ReplicaSets) list their
+        // backing kind for another purpose; healthy rows there are the point.
+        self.kind.as_ref().is_some_and(|kind| {
+            kind.ar.plural.eq_ignore_ascii_case(&self.kind_plural)
+                && ((kind.ar.group.is_empty() && kind.ar.plural == "pods")
+                    || crate::columns::has_workload_faults(&kind.ar.group, &kind.ar.plural))
+        })
+    }
+
+    fn row_has_faults(&self, o: &DynamicObject) -> bool {
+        match &self.kind {
+            Some(kind) if kind.ar.group.is_empty() && kind.ar.plural == "pods" => pod_has_faults(o),
+            Some(kind) => {
+                crate::columns::workload_faulted(&kind.ar.group, &kind.ar.plural, o).unwrap_or(true)
+            }
+            None => true,
+        }
     }
 
     fn eval_filter(

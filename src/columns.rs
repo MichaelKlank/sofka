@@ -209,6 +209,7 @@ const JOB_COLUMNS: &[Column] = &[
 
 const CRONJOB_COLUMNS: &[Column] = &[
     column("NAME", col_name),
+    status_column("STATUS", col_cronjob_status),
     column("SCHEDULE", col_cronjob_schedule),
     column("SUSPEND", col_cronjob_suspend),
     column("ACTIVE", col_cronjob_active),
@@ -1337,23 +1338,87 @@ fn col_secret_data<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
 }
 
 fn col_job_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
-    let d = ctx.data;
-    if ctx.obj.metadata.deletion_timestamp.is_some() {
-        "Terminating".into()
+    job_status(ctx.obj).into()
+}
+
+fn job_status(obj: &DynamicObject) -> &'static str {
+    let d = &obj.data;
+    if obj.metadata.deletion_timestamp.is_some() {
+        "Terminating"
     } else if condition_is(d, "Failed", "True") || condition_is(d, "FailureTarget", "True") {
-        "Failed".into()
+        "Failed"
     } else if condition_is(d, "Complete", "True") {
-        "Completed".into()
+        "Completed"
     } else if condition_is(d, "SuccessCriteriaMet", "True") {
-        "Completing".into()
+        "Completing"
     } else if d.pointer("/spec/suspend").and_then(Value::as_bool) == Some(true)
         || condition_is(d, "Suspended", "True")
     {
-        "Suspended".into()
+        "Suspended"
     } else if iget(d, &["status", "active"]) > 0 {
-        "Running".into()
+        "Running"
     } else {
-        "Pending".into()
+        "Pending"
+    }
+}
+
+/// Whether [`workload_faulted`] judges this kind.
+pub fn has_workload_faults(group: &str, plural: &str) -> bool {
+    matches!(
+        (group, plural),
+        (
+            "apps" | "extensions",
+            "deployments" | "daemonsets" | "replicasets"
+        ) | ("apps", "statefulsets")
+            | ("batch", "jobs" | "cronjobs")
+    )
+}
+
+/// Whether a workload needs attention, for the `Ctrl+Z` faults filter:
+/// a controller that is not fully ready, a Job that has not run cleanly,
+/// or a CronJob that is suspended or whose last run did not succeed.
+/// `None` for kinds the filter does not cover; pods have their own rules.
+pub fn workload_faulted(group: &str, plural: &str, obj: &DynamicObject) -> Option<bool> {
+    let d = &obj.data;
+    let counts = match (group, plural) {
+        ("apps" | "extensions", "deployments") => WorkloadCounts::deployment(d),
+        ("apps", "statefulsets") => WorkloadCounts::statefulset(d),
+        ("apps" | "extensions", "daemonsets") => WorkloadCounts::daemonset(d),
+        ("apps" | "extensions", "replicasets") => WorkloadCounts::replicaset(d),
+        ("batch", "jobs") => {
+            return Some(!matches!(
+                job_status(obj),
+                "Running" | "Completing" | "Completed"
+            ));
+        }
+        ("batch", "cronjobs") => return Some(cronjob_faulted(obj)),
+        _ => return None,
+    };
+    Some(
+        obj.metadata.deletion_timestamp.is_some()
+            || !matches!(
+                workload_status(obj, counts).as_str(),
+                "Ready" | "ScaledDown"
+            ),
+    )
+}
+
+/// A CronJob is faulted when it is suspended, terminating, or its last
+/// scheduled run finished without succeeding. A run still active is not
+/// judged yet.
+fn cronjob_faulted(obj: &DynamicObject) -> bool {
+    matches!(cronjob_status(obj), "Terminating" | "Suspended" | "Failed")
+}
+
+/// The last scheduled run finished without a success after it.
+fn cronjob_last_run_failed(d: &Value) -> bool {
+    match (
+        timestamp_secs(d, &["status", "lastScheduleTime"]),
+        timestamp_secs(d, &["status", "lastSuccessfulTime"]),
+    ) {
+        (Some(scheduled), Some(succeeded)) => succeeded < scheduled,
+        (Some(_), None) => true,
+        (None, _) => false,
     }
 }
 
@@ -1367,6 +1432,27 @@ fn col_job_completions<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
 
 fn col_job_duration<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     Cow::Owned(job_duration(ctx.data, ctx.now))
+}
+
+fn col_cronjob_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(cronjob_status(ctx.obj))
+}
+
+/// A CronJob's state, from the same evidence as its faults rule, so a row
+/// the faults filter keeps is never tinted healthy.
+fn cronjob_status(obj: &DynamicObject) -> &'static str {
+    let d = &obj.data;
+    if obj.metadata.deletion_timestamp.is_some() {
+        "Terminating"
+    } else if bget(d, &["spec", "suspend"]) {
+        "Suspended"
+    } else if count_arr(d, &["status", "active"]) > 0 {
+        "Running"
+    } else if cronjob_last_run_failed(d) {
+        "Failed"
+    } else {
+        "Scheduled"
+    }
 }
 
 fn col_cronjob_schedule<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
@@ -3257,6 +3343,7 @@ mod tests {
             headers("batch", "cronjobs"),
             vec![
                 "NAME",
+                "STATUS",
                 "SCHEDULE",
                 "SUSPEND",
                 "ACTIVE",
@@ -3264,10 +3351,11 @@ mod tests {
                 "AGE"
             ]
         );
-        assert_eq!(cells[1], "*/15 * * * *");
-        assert_eq!(cells[2], "false");
-        assert_eq!(cells[3], "1");
-        assert_eq!(cells[4], "<none>");
+        assert_eq!(cells[1], "Running");
+        assert_eq!(cells[2], "*/15 * * * *");
+        assert_eq!(cells[3], "false");
+        assert_eq!(cells[4], "1");
+        assert_eq!(cells[5], "<none>");
     }
 
     #[test]
