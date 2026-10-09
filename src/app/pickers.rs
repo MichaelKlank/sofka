@@ -308,7 +308,7 @@ impl App {
                 self.sort_picker_filter.pop();
                 self.select_best_sort_match();
             }
-            (None, KeyCode::Char(c)) => {
+            (None, KeyCode::Char(c)) if key.is_text() => {
                 self.sort_picker_filter.push(c);
                 self.select_best_sort_match();
             }
@@ -465,7 +465,7 @@ impl App {
                 self.copy_picker_filter.pop();
                 self.select_best_copy_match();
             }
-            (None, KeyCode::Char(c)) => {
+            (None, KeyCode::Char(c)) if key.is_text() => {
                 self.copy_picker_filter.push(c);
                 self.select_best_copy_match();
             }
@@ -571,7 +571,7 @@ impl App {
                 self.ns_filter.pop();
                 self.select_best_namespace_match();
             }
-            (None, KeyCode::Char(c)) => {
+            (None, KeyCode::Char(c)) if key.is_text() => {
                 self.ns_filter.push(c);
                 self.select_best_namespace_match();
             }
@@ -734,7 +734,7 @@ impl App {
                     self.ctx_filter.pop();
                     self.select_best_context_match();
                 }
-                (None, KeyCode::Char(c)) => {
+                (None, KeyCode::Char(c)) if key.is_text() => {
                     self.ctx_filter.push(c);
                     self.select_best_context_match();
                 }
@@ -779,7 +779,7 @@ impl App {
                 false,
             ),
             (Some(Action::Accept), _) => self.switch_selected_context(),
-            (None, KeyCode::Char(c)) => {
+            (None, KeyCode::Char(c)) if key.is_text() => {
                 self.ctx_filtering = true;
                 self.ctx_filter.push(c);
                 self.select_best_context_match();
