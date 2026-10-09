@@ -325,6 +325,16 @@ const FLUX_INPUT_PROVIDER_COLUMNS: &[Column] = &[
 
 const DEFAULT_COLUMNS: &[Column] = &[column("NAME", col_name), column("AGE", col_age)];
 
+/// The `:workloads` view lists several kinds at once; each cell reads the
+/// row's own kind from its `kind` field.
+const WORKLOAD_COLUMNS: &[Column] = &[
+    column("NAME", col_name),
+    column("KIND", col_workload_kind),
+    column("READY", col_workload_ready),
+    status_column("STATUS", col_workload_status),
+    column("AGE", col_age),
+];
+
 /// One row per release, at its latest revision — like `helm list`. Backed by
 /// the release storage `Secret`s (see `crate::helm`), not a real discovered
 /// resource kind.
@@ -408,6 +418,7 @@ fn columns_for(group: &str, plural: &str) -> &'static [Column] {
         ("argoproj.io", "applications") => ARGOCD_APP_COLUMNS,
         ("argoproj.io", "applicationsets") => ARGOCD_APPSET_COLUMNS,
         ("", "helm") => HELM_COLUMNS,
+        ("", "workloads") => WORKLOAD_COLUMNS,
         ("", "helmhistory") => HELM_HISTORY_COLUMNS,
         ("apps", crate::rollout::VIEW) => ROLLOUT_HISTORY_COLUMNS,
         _ => DEFAULT_COLUMNS,
@@ -1432,6 +1443,41 @@ fn col_job_completions<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
 
 fn col_job_duration<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     Cow::Owned(job_duration(ctx.data, ctx.now))
+}
+
+fn workload_kind(obj: &DynamicObject) -> &str {
+    obj.types.as_ref().map_or("", |t| t.kind.as_str())
+}
+
+fn col_workload_kind<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(workload_kind(ctx.obj))
+}
+
+fn col_workload_ready<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    let d = ctx.data;
+    match workload_kind(ctx.obj) {
+        "Pod" => Cow::Owned(ctx.pod().0.clone()),
+        "Deployment" | "StatefulSet" => col_deploy_ready(ctx),
+        "DaemonSet" => Cow::Owned(format!(
+            "{}/{}",
+            iget(d, &["status", "numberReady"]),
+            iget(d, &["status", "desiredNumberScheduled"])
+        )),
+        "Job" => col_job_completions(ctx),
+        _ => Cow::Borrowed(""),
+    }
+}
+
+fn col_workload_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    match workload_kind(ctx.obj) {
+        "Pod" => Cow::Owned(ctx.pod().1.clone()),
+        "Deployment" => col_deploy_status(ctx),
+        "StatefulSet" => col_sts_status(ctx),
+        "DaemonSet" => col_ds_status(ctx),
+        "Job" => col_job_status(ctx),
+        "CronJob" => Cow::Borrowed(cronjob_status(ctx.obj)),
+        _ => Cow::Borrowed(""),
+    }
 }
 
 fn col_cronjob_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
