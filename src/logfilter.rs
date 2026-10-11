@@ -249,9 +249,23 @@ fn log_body(mut line: &str) -> &str {
 
 /// Check for a klog level marker at the start of the message.
 fn klog_level(line: &str, level: char) -> bool {
-    let mut it = line.chars();
-    it.next().is_some_and(|c| c.eq_ignore_ascii_case(&level))
-        && it.next().is_some_and(|c| c.is_ascii_digit())
+    // `E0627 12:00:00`: level, MMDD, space, HH:MM:SS.
+    let b = line.as_bytes();
+    let field = |i: usize, range: std::ops::RangeInclusive<u8>| {
+        b[i].is_ascii_digit()
+            && b[i + 1].is_ascii_digit()
+            && range.contains(&((b[i] - b'0') * 10 + b[i + 1] - b'0'))
+    };
+    b.len() >= 14
+        && (b[0] as char).eq_ignore_ascii_case(&level)
+        && field(1, 1..=12)
+        && field(3, 1..=31)
+        && b[5] == b' '
+        && field(6, 0..=23)
+        && b[8] == b':'
+        && field(9, 0..=59)
+        && b[11] == b':'
+        && field(12, 0..=59)
 }
 
 /// A compiled log filter. Cheap to query per line; build once when the filter
