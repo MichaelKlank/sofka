@@ -102,6 +102,29 @@ pub fn input_arg(value: &str, inputs: &BTreeMap<String, String>) -> String {
         .unwrap_or_else(|| value.into())
 }
 
+/// Single pass over `value`, so text inserted for one token is never rescanned.
+/// Earlier entries win when one token is a prefix of another.
+pub fn replace_placeholders(value: &str, tokens: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        match tokens.iter().find(|(token, _)| rest.starts_with(token)) {
+            Some((token, replacement)) => {
+                out.push_str(replacement);
+                rest = &rest[token.len()..];
+            }
+            None => {
+                out.push('$');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn available(plugin: &Plugin) -> Result<(), String> {
     let missing: Vec<_> = plugin
         .requires
@@ -976,6 +999,21 @@ pub async fn execute_with_activity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replace_placeholders_does_not_rescan_inserted_values() {
+        let tokens = [
+            ("$NAMESPACE", "ns"),
+            ("$NS", "ns"),
+            ("$CONTEXT", "prod-$SKIN"),
+            ("$SKIN", "nord"),
+        ];
+        assert_eq!(replace_placeholders("$CONTEXT", &tokens), "prod-$SKIN");
+        assert_eq!(
+            replace_placeholders("$NAMESPACE/$NS/$FOO/$", &tokens),
+            "ns/ns/$FOO/$"
+        );
+    }
 
     #[test]
     fn windows_executable_lookup_adds_a_suffix_only_when_needed() {

@@ -14983,6 +14983,36 @@ async fn shell_plugin_script_is_not_interpolated() {
     );
 }
 
+#[tokio::test]
+async fn plugin_skin_placeholder_follows_skin_switch() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Pod",
+               "metadata": {"name": "a", "namespace": "default"}}),
+    );
+    app.table_state.select(Some(0));
+    app.plugins = vec![crate::config::Plugin {
+        key: "ctrl-g".into(),
+        name: "p".into(),
+        command: "echo".into(),
+        args: vec!["$SKIN".into(), "$CONTEXT".into()],
+        ..Default::default()
+    }];
+    app.cluster.context = "prod-$SKIN".into();
+    app.apply_skin("NORD");
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+        .unwrap();
+    let Some(Suspend::Shell(argv)) = &app.pending else {
+        panic!("plugin did not run");
+    };
+    assert_eq!(
+        argv,
+        &vec!["echo".to_string(), "nord".into(), "prod-$SKIN".into()]
+    );
+}
+
 /// Two marked pods, cursor on the first.
 fn app_with_two_marked_pods() -> (App, Receiver<Msg>) {
     let (mut app, rx) = test_app();

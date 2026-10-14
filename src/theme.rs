@@ -268,6 +268,15 @@ fn detect_terminal_mode() -> Option<ThemeMode> {
     terminal_colorsaurus::theme_mode(QueryOptions::default()).ok()
 }
 
+/// The built-in name of the palette `resolve_skin` draws for `name`.
+pub fn canonical_skin_name(name: &str) -> &'static str {
+    let palette = builtin(&name.trim().to_ascii_lowercase()).unwrap_or_else(catppuccin_mocha);
+    BUILTIN_NAMES
+        .iter()
+        .find(|n| builtin(n) == Some(palette))
+        .expect("every built-in palette is listed in BUILTIN_NAMES")
+}
+
 /// The skin used when config names none: auto-detected from the terminal's
 /// dark/light mode (OSC 11 query — run this before entering the alternate
 /// screen).
@@ -732,6 +741,13 @@ mod tests {
         for name in BUILTIN_NAMES {
             assert!(builtin(name).is_some(), "missing built-in {name}");
         }
+    }
+
+    #[test]
+    fn canonical_skin_name_follows_resolve_skin() {
+        assert_eq!(canonical_skin_name(" Nord "), "nord");
+        assert_eq!(canonical_skin_name("gruvbox"), "gruvbox-dark");
+        assert_eq!(canonical_skin_name("typo"), "catppuccin-mocha");
     }
 
     /// The per-thread palette cache must not outlive a `:skin` change. This is

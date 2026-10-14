@@ -1099,8 +1099,8 @@ pub struct Skin {
 ///
 /// Placeholders are substituted in `command`/`args`, each as one argument (no
 /// implicit shell): `$NAME`, `$NAMESPACE`/`$NS`, `$CONTEXT`, `$CLUSTER`,
-/// `$RESOURCE` (plural), `$GROUP`, `$VERSION`, `$KIND`, and `$FILTER` (the
-/// active row filter).
+/// `$RESOURCE` (plural), `$GROUP`, `$VERSION`, `$KIND`, `$FILTER` (the
+/// active row filter), and `$SKIN` (the active skin name).
 ///
 /// ```toml
 /// [[plugins]]
@@ -1456,6 +1456,7 @@ const PLUGIN_PLACEHOLDERS: &[&str] = &[
     "$VERSION",
     "$KIND",
     "$FILTER",
+    "$SKIN",
 ];
 
 /// Validation warnings for plugins: an unparseable key chord (see
