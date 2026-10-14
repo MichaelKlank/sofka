@@ -55,6 +55,10 @@ impl App {
             self.remember_namespace();
         }
         self.set_root_view(kind);
+        let layout_warning = query
+            .layout
+            .as_deref()
+            .and_then(|layout| self.select_layout(layout).err());
         self.filter = query.filter;
         self.record_history();
         self.start_watch();
@@ -63,6 +67,9 @@ impl App {
             self.kind_plural,
             self.namespace_label()
         ));
+        if let Some(warning) = layout_warning {
+            self.flash_warn(&warning);
+        }
     }
 
     /// Switch the active resource kind by user input. Pushes the current view
@@ -74,6 +81,16 @@ impl App {
     /// Switch kind and (optionally) namespace in one move (`:deploy social`).
     /// `all`/`*` as the namespace selects all namespaces.
     pub fn switch_kind_ns(&mut self, input: &str, ns: Option<&str>) {
+        if let (resource, Some(layout)) = crate::views::split_layout(input) {
+            self.apply_resource_query(crate::filter::ResourceQuery {
+                resource: resource.to_string(),
+                namespace: ns.map(str::to_string),
+                context: None,
+                layout: Some(layout.to_string()),
+                filter: String::new(),
+            });
+            return;
+        }
         if let Some(ns) = ns.filter(|ns| namespace_patterns::is_pattern(&normalize_ns(ns)))
             && (self.cluster.resolve(input).is_some()
                 || workloads::NAMES.contains(&input.trim().to_lowercase().as_str()))
@@ -239,12 +256,14 @@ impl App {
 
     pub(super) fn save_history_filter(&mut self) {
         let view = self.view_plural().to_string();
+        let layout = self.active_layout().map(str::to_string);
         if self.stack.is_empty()
             && let Some(entry) = self.history.get_mut(self.history_pos)
             && entry.kind_plural == view
             && entry.namespace == self.namespace
         {
             entry.filter = self.filter.clone();
+            entry.layout = layout;
         }
     }
 
@@ -259,6 +278,7 @@ impl App {
             kind_plural: self.kind_plural.clone(),
             namespace: self.namespace.clone(),
             filter: self.filter.clone(),
+            layout: self.active_layout().map(str::to_string),
         };
         if self.history.get(self.history_pos) == Some(&entry) {
             return;
@@ -316,6 +336,12 @@ impl App {
         self.namespace = entry.namespace;
         let title = kind.title();
         self.set_root_view(kind);
+        let layout_warning = self
+            .select_layout(entry.layout.as_deref().unwrap_or("default"))
+            .err();
+        if layout_warning.is_some() {
+            let _ = self.select_layout("default");
+        }
         self.filter = entry.filter;
         self.flash = format!(
             "history {}/{}: {title} in {}",
@@ -325,6 +351,9 @@ impl App {
         );
         self.flash_err = false;
         self.start_watch();
+        if let Some(warning) = layout_warning {
+            self.flash_warn(&warning);
+        }
     }
 
     pub(super) fn push_frame(&mut self) {
@@ -570,7 +599,7 @@ impl App {
     }
 
     /// Read CRD columns first, then try server Tables if no columns are available.
-    fn maybe_fetch_printer_columns(&mut self, kind: &Kind) {
+    pub(super) fn maybe_fetch_printer_columns(&mut self, kind: &Kind) {
         let user_has_columns = self
             .active_user_view()
             .is_some_and(|v| !v.columns.is_empty());

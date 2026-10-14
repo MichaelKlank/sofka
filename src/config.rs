@@ -1196,6 +1196,7 @@ pub struct Plugin {
 /// filter = "status!=Running -l app=api"   # optional: same syntax as `/`
 /// sort = "RESTARTS:desc"       # optional: COLUMN[:asc|:desc]
 /// view = "xray"                # optional: xray | pulse
+/// layout = "images"            # optional: a named layout of the resource
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Bookmark {
@@ -1216,6 +1217,8 @@ pub struct Bookmark {
     pub sort: Option<String>,
     /// A view to open after landing: `xray` or `pulse`.
     pub view: Option<String>,
+    /// Named layout of the resource's columns (`[views."pods:<layout>"]`).
+    pub layout: Option<String>,
 }
 
 /// A task-oriented collection of views — checkout operations, a cluster
@@ -1277,6 +1280,7 @@ impl WorkspaceView {
             filter: self.filter.clone(),
             sort: self.sort.clone(),
             view: self.view.clone(),
+            layout: None,
         }
     }
 }

@@ -716,6 +716,8 @@ pub enum SuggestKind {
     Bookmark,
     /// A saved workspace — Enter opens it (lands on its first view).
     Workspace,
+    /// A named layout for `:layout <name>` or `:<kind> -o <name>`.
+    Layout,
 }
 
 /// A built-in palette action, plus the names/aliases that select it. The first
@@ -767,6 +769,7 @@ enum PaletteAction {
     Workloads,
     Notify,
     Reload,
+    Layout,
     ConfigInfo,
     PluginActivity,
 }
@@ -923,6 +926,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         action: PaletteAction::Reload,
         names: &["reload"],
+    },
+    PaletteCommand {
+        action: PaletteAction::Layout,
+        names: &["layout"],
     },
     PaletteCommand {
         action: PaletteAction::ConfigInfo,
@@ -1903,6 +1910,7 @@ struct ViewEntry {
     kind_plural: String,
     namespace: String,
     filter: String,
+    layout: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2570,6 +2578,8 @@ pub struct App {
     pub metrics_provider: Option<crate::providers::MetricsProvider>,
     /// Compiled custom views from config, re-resolved on context switch.
     pub user_views: HashMap<String, crate::views::View>,
+    /// The named layout chosen per kind (by title) this session.
+    layouts: HashMap<String, String>,
     /// Compiled warning/critical coloring thresholds from config, re-resolved
     /// on context switch and `:reload`.
     pub thresholds: crate::thresholds::Compiled,
@@ -2912,6 +2922,7 @@ impl App {
             opened_links: Vec::new(),
             metrics_provider: None,
             user_views: HashMap::new(),
+            layouts: HashMap::new(),
             thresholds: crate::thresholds::Compiled::default(),
             node_roles: Arc::new(crate::config::NodeRoles::default()),
             crd_views: HashMap::new(),
@@ -3008,6 +3019,7 @@ pub(crate) mod guardrails;
 mod helpers;
 mod input;
 mod journal;
+mod layouts;
 mod lifecycle;
 mod log_follow;
 mod logs;

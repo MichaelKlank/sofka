@@ -316,7 +316,9 @@ include those conditions. Row filters can search the route paths.
   `w` toggles wide-only columns (kubectl `-o wide`), including
   node IP addresses and labels. IP addresses are selected by type, independent
   of array order. Add `@<namespace>` to a view key to select columns for one
-  namespace. See
+  namespace. Add `:<name>` to keep a second layout for the same kind and
+  switch to it with `:pods -o <name>` or `:layout <name>`; bare `:layout`
+  lists the kind's layouts. See
   [Views and thresholds](views.md).
 - **Drill-down navigation** with a breadcrumb stack: workload/service → pods,
   cronjob → its jobs, node → its pods, pod → containers, namespace → re-scope,

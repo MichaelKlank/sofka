@@ -1691,6 +1691,7 @@ impl App {
         let (views, view_warnings) = crate::views::compile(&resolved.config.views);
         self.user_views = views;
         warnings.extend(view_warnings);
+        warnings.extend(self.prune_layouts());
         let (thresholds, threshold_warnings) =
             crate::thresholds::compile(&resolved.config.thresholds);
         self.thresholds = thresholds;

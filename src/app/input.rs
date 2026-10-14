@@ -630,6 +630,7 @@ impl App {
         let slot = match suggestion.kind {
             SuggestKind::Namespace => namespace_word(&self.command).unwrap_or(1),
             SuggestKind::Context => 1,
+            SuggestKind::Layout => layout_word(&self.command).unwrap_or(1),
             _ => 0,
         };
         let span = self.command.split_whitespace().nth(slot).map(|word| {
@@ -658,7 +659,8 @@ impl App {
 
     /// Run the highlighted palette suggestion (or the raw typed text).
     fn palette_accept(&mut self) {
-        let mut typed = self.command.trim().to_string();
+        let raw = self.command.clone();
+        let mut typed = raw.trim().to_string();
         let picked = self.cmd_suggestions.get(self.cmd_sel).cloned();
         let navigated = std::mem::take(&mut self.cmd_navigated) && picked.is_some();
         self.mode = Mode::Table;
@@ -693,10 +695,18 @@ impl App {
                 .any(|p| p.palette.as_deref() == Some(query_head));
         if (self.cluster.resolve(query_head).is_some() || !owns_command)
             && (typed.contains(" /")
-                || typed
-                    .split_whitespace()
-                    .any(|s| s.starts_with('@') || matches!(s, "-n" | "--namespace" | "--context")))
+                || typed.split_whitespace().any(|s| {
+                    s.starts_with('@') || matches!(s, "-n" | "--namespace" | "--context" | "-o")
+                }))
         {
+            if let Some(s) = picked.as_ref().filter(|s| s.kind == SuggestKind::Layout)
+                && let Some(slot) = layout_word(&raw)
+            {
+                let mut words: Vec<&str> = raw.split_whitespace().collect();
+                words.truncate(slot);
+                words.push(&s.label);
+                typed = words.join(" ");
+            }
             if let Some(s) = picked.as_ref().filter(|s| s.kind == SuggestKind::Context)
                 && let Some((head, rest)) = typed.split_once(char::is_whitespace)
                 && rest.trim_start().starts_with('@')
@@ -737,6 +747,11 @@ impl App {
             Some(SuggestKind::Workspace) => {
                 if let Some(s) = picked {
                     self.open_workspace_named(&s.label);
+                }
+            }
+            Some(SuggestKind::Layout) => {
+                if let Some(s) = picked {
+                    self.set_layout(&s.label);
                 }
             }
             // A name owned by a CRD resolves to the CRD even when a
@@ -783,7 +798,8 @@ impl App {
                         SuggestKind::Namespace
                         | SuggestKind::Context
                         | SuggestKind::Bookmark
-                        | SuggestKind::Workspace => {}
+                        | SuggestKind::Workspace
+                        | SuggestKind::Layout => {}
                     }
                 } else if !head.is_empty() {
                     self.switch_kind_ns(&head, ns_arg);
@@ -860,6 +876,7 @@ impl App {
             PaletteAction::Workloads => self.open_workloads(None),
             PaletteAction::Notify => self.toggle_notify(),
             PaletteAction::Reload => self.reload_config(),
+            PaletteAction::Layout => self.open_layout_picker(),
             PaletteAction::ConfigInfo => self.open_config_info(),
         }
     }
@@ -881,6 +898,15 @@ impl App {
             } else {
                 self.apply_skin(&rest);
             }
+            return true;
+        }
+        // `:layout [name]` switches the current kind's layout; bare `:layout`
+        // lists them.
+        let mut parts = cmd.split_whitespace();
+        if parts.next() == Some("layout")
+            && let Some(name) = parts.next()
+        {
+            self.set_layout(name);
             return true;
         }
         // `:snapshot [format]` captures the current view; the optional arg is
@@ -1000,6 +1026,12 @@ impl App {
                 self.suggest_contexts(&arg);
                 return;
             }
+            if head == "layout" && self.cluster.resolve(&head).is_none() {
+                let layouts = self.kind_layouts();
+                self.suggest_layouts(layouts, &arg);
+                return;
+            }
+            let head = crate::views::split_layout(&head).0.to_string();
             if let Some(context) = arg.strip_prefix('@')
                 && (self.cluster.resolve(&head).is_some()
                     || (!PALETTE_COMMANDS
@@ -1022,7 +1054,14 @@ impl App {
                     return;
                 }
             }
-            if self.cluster.resolve(&head).is_some() {
+            if let Some(kind) = self.cluster.resolve(&head) {
+                if let Some(slot) = layout_word(&self.command) {
+                    let arg = self.command.split_whitespace().nth(slot).unwrap_or("");
+                    let arg = arg.to_string();
+                    let layouts = crate::views::layouts_for(&self.user_views, &kind.ar);
+                    self.suggest_layouts(layouts, &arg);
+                    return;
+                }
                 match namespace_word(&self.command) {
                     Some(slot) => {
                         let arg = self.command.split_whitespace().nth(slot).unwrap_or("");
@@ -1188,8 +1227,58 @@ impl App {
             }
         }
 
+        for label in self.layout_entries() {
+            let score = if q.is_empty() {
+                Some(0)
+            } else {
+                self.matcher.score(&label, q)
+            };
+            if let Some(score) = score {
+                scored.push((
+                    score,
+                    Suggestion {
+                        label,
+                        kind: SuggestKind::Resource,
+                    },
+                ));
+            }
+        }
+
         rank_completions(&mut scored, |s| s.label.as_str(), !q.is_empty());
         self.cmd_suggestions = scored.into_iter().take(100).map(|(_, s)| s).collect();
+        self.cmd_sel = 0;
+    }
+
+    /// Palette completions for `:layout <name>` and `-o <name>`: `default`
+    /// pinned first, then the kind's layouts. A partial argument fuzzy-matches
+    /// `default` and the layouts together, with an exact name first.
+    fn suggest_layouts(&mut self, layouts: Vec<String>, arg: &str) {
+        let names: Vec<String> = if arg.is_empty() {
+            std::iter::once("default".to_string())
+                .chain(layouts)
+                .collect()
+        } else {
+            let mut scored: Vec<(i64, String)> = std::iter::once("default".to_string())
+                .chain(layouts)
+                .filter_map(|name| {
+                    let score = if name.eq_ignore_ascii_case(arg) {
+                        i64::MAX
+                    } else {
+                        self.matcher.score(&name, arg)?
+                    };
+                    Some((score, name))
+                })
+                .collect();
+            rank_completions(&mut scored, |s| s.as_str(), true);
+            scored.into_iter().map(|(_, name)| name).collect()
+        };
+        self.cmd_suggestions = names
+            .into_iter()
+            .map(|label| Suggestion {
+                label,
+                kind: SuggestKind::Layout,
+            })
+            .collect();
         self.cmd_sel = 0;
     }
 
@@ -1697,12 +1786,27 @@ fn namespace_word(command: &str) -> Option<usize> {
     let slot = loop {
         match words.get(i).copied() {
             Some("-n" | "--namespace") => break i + 1,
-            Some("--context") => i += 2,
+            Some("--context" | "-o") => i += 2,
             Some(word) if word.starts_with(['-', '@']) => i += 1,
             _ => break i,
         }
     };
     (slot == typing).then_some(slot)
+}
+
+/// Index of the word a `:resource` query reads as its layout: the value after
+/// `-o`. `None` unless that word is the one being typed.
+fn layout_word(command: &str) -> Option<usize> {
+    if command.contains(" /") {
+        return None;
+    }
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let typing = if command.ends_with(char::is_whitespace) {
+        words.len()
+    } else {
+        words.len().checked_sub(1)?
+    };
+    (typing > 1 && words[typing - 1] == "-o").then_some(typing)
 }
 
 /// Order scored palette completions: score descending, then label length,

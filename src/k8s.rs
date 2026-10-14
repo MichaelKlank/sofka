@@ -1836,15 +1836,27 @@ impl Cluster {
     /// Every kind is registered at version `v1`; the fixture has no need for
     /// anything else.
     pub fn register_kind(&mut self, group: &str, kind: &str, plural: &str, namespaced: bool) {
+        self.register_kind_version(group, "v1", kind, plural, namespaced);
+    }
+
+    /// [`Self::register_kind`] at a specific API version.
+    pub fn register_kind_version(
+        &mut self,
+        group: &str,
+        version: &str,
+        kind: &str,
+        plural: &str,
+        namespaced: bool,
+    ) {
         let plural = plural.to_lowercase();
         let k = Kind {
             ar: ApiResource {
                 group: group.to_string(),
-                version: "v1".to_string(),
+                version: version.to_string(),
                 api_version: if group.is_empty() {
-                    "v1".to_string()
+                    version.to_string()
                 } else {
-                    format!("{group}/v1")
+                    format!("{group}/{version}")
                 },
                 kind: kind.to_string(),
                 plural: plural.clone(),

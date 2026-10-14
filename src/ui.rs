@@ -570,6 +570,9 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         app.namespace_label()
     };
     let mut kind = app.resource_title();
+    if let Some(layout) = app.active_layout() {
+        kind = format!("{kind}:{layout}");
+    }
     if let Some(scope) = &app.scope_label {
         kind = format!("{kind}  ‹ {scope}");
     }
@@ -726,6 +729,9 @@ fn draw_compact_header(frame: &mut Frame, app: &App, area: Rect) {
         app.namespace_label()
     };
     let mut kind = app.resource_title();
+    if let Some(layout) = app.active_layout() {
+        kind = format!("{kind}:{layout}");
+    }
     if let Some(scope) = &app.scope_label {
         kind = format!("{kind} ‹ {scope}");
     }
@@ -3122,6 +3128,10 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
         ":resource @context [namespace]",
         "switch context and resource (select to fill context, then add namespace)",
     ));
+    lines.push(bind(
+        ":resource -o layout · :layout [name]",
+        "open with a named column layout · switch the current kind's layout or pick one",
+    ));
     lines.push(bind(":rightsize", "historical right-sizing: P50/P95/P99 usage → suggested requests + patch (needs [providers.metrics])"));
     lines.push(bind(
         ":gitops · :flux",
@@ -4842,6 +4852,10 @@ fn draw_palette(frame: &mut Frame, app: &mut App, area: Rect) {
             SuggestKind::Context => Text::from(Line::from(vec![
                 Span::styled(s.label.clone(), Style::default().fg(theme::mauve())),
                 Span::styled("  ctx", theme::dim()),
+            ])),
+            SuggestKind::Layout => Text::from(Line::from(vec![
+                Span::styled(s.label.clone(), Style::default().fg(theme::peach())),
+                Span::styled("  layout", theme::dim()),
             ])),
             // Saved bookmarks read as a distinct, high-value jump (a ★ tag).
             SuggestKind::Bookmark => Text::from(Line::from(vec![
@@ -6812,6 +6826,39 @@ mod tests {
                 assert_eq!(text.matches("yaml").count(), 1, "{text}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn the_header_names_a_non_default_layout() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut app = App::new(crate::k8s::Cluster::fake(), tx);
+        let cfg: crate::config::Config = toml::from_str(
+            "[views.\"pods:images\"]\ncolumns = [{ name = \"X\", path = \"/x\" }]\n",
+        )
+        .unwrap();
+        app.user_views = crate::views::compile(&cfg.views).0;
+        app.switch_kind("pods");
+        let header = |app: &mut App| {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+            term.draw(|f| draw(f, app)).unwrap();
+            let buffer = term.backend().buffer().clone();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .find(|line| line.contains("Resource:"))
+                .unwrap_or_default()
+        };
+        assert!(!header(&mut app).contains("pods:"), "{}", header(&mut app));
+        app.switch_kind("pods:images");
+        assert!(
+            header(&mut app).contains("pods:images"),
+            "{}",
+            header(&mut app)
+        );
     }
 
     /// With a configured drill, `⏎` runs the drill, so the hint names its

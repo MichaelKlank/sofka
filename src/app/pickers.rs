@@ -1016,6 +1016,7 @@ impl App {
             &cluster.default_namespace,
         );
         self.cluster = *cluster;
+        self.prune_layouts();
         plugin_warnings.extend(self.configure_keys(&resolved.config.keys));
         self.stack.clear();
         // View history references the old cluster's kinds and namespaces.

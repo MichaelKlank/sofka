@@ -975,7 +975,12 @@ impl App {
         if kind.ar.plural.to_lowercase() != self.kind_plural {
             return None;
         }
-        crate::views::lookup(&self.user_views, &kind.ar, self.view_namespace())
+        crate::views::lookup_layout(
+            &self.user_views,
+            &kind.ar,
+            self.view_namespace(),
+            self.active_layout(),
+        )
     }
 
     /// Apply a view's configured initial sort, unless a sort is already

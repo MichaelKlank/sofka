@@ -221,7 +221,11 @@ namespace = "checkout"                   # optional; all/* = all namespaces
 filter = "status!=Running -l app=api"    # optional, same syntax as `/`
 sort = "RESTARTS:desc"                   # optional: COLUMN[:asc|:desc]
 view = "xray"                            # optional: xray | pulse
+layout = "images"                        # optional: a named layout of the resource
 ```
+
+`layout` opens the resource in a [named layout](views.md#named-layouts). If the
+resource has no such layout, the status bar warns and the default layout stays.
 
 ## Workspaces
 

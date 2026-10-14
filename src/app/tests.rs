@@ -41108,3 +41108,493 @@ async fn csr_bulk_approval_warns_before_the_per_request_details() {
     app.handle_key(press(KeyCode::Char('N'))).unwrap();
     assert!(!app.confirm_label.contains('⚠'), "{}", app.confirm_label);
 }
+
+const LAYOUT_VIEWS: &str = r#"
+[views."v1/pods:images"]
+replace = true
+sort = "IMAGE:desc"
+columns = [
+    { name = "NAME", builtin = "NAME" },
+    { name = "IMAGE", path = "/spec/containers/0/image" },
+]
+
+[views."pods:slim"]
+replace = true
+columns = [{ name = "NAME", builtin = "NAME" }]
+
+[views."pods:images@prod"]
+replace = true
+columns = [
+    { name = "NAME", builtin = "NAME" },
+    { name = "PRODIMAGE", path = "/spec/containers/0/image" },
+]
+"#;
+
+fn has_header(app: &App, header: &str) -> bool {
+    app.display_headers().iter().any(|h| h == header)
+}
+
+fn suggestion_labels(app: &App) -> Vec<String> {
+    app.cmd_suggestions
+        .iter()
+        .map(|s| s.label.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn resource_query_output_flag_selects_a_named_layout() {
+    let (mut app, _rx) = test_app();
+    install_views(&mut app, LAYOUT_VIEWS);
+    type_resource_query(&mut app, "pods -o images");
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.active_layout(), Some("images"));
+    assert!(has_header(&app, "IMAGE"));
+    assert!(!has_header(&app, "STATUS"));
+    let image = app.display_headers().iter().position(|h| h == "IMAGE");
+    assert_eq!((app.sort_column, app.sort_desc), (image, true));
+
+    type_resource_query(&mut app, "pods -o default");
+    assert_eq!(app.active_layout(), None);
+    assert!(has_header(&app, "STATUS"));
+    assert!(!has_header(&app, "IMAGE"));
+
+    type_resource_query(&mut app, "pods -o wide");
+    assert!(app.wide);
+    assert_eq!(app.active_layout(), None);
+
+    type_resource_query(&mut app, "pods -o nope");
+    assert!(app.flash_err);
+    assert!(app.flash.contains("no layout 'nope'"), "{}", app.flash);
+    assert_eq!(app.active_layout(), None);
+    assert!(has_header(&app, "STATUS"));
+}
+
+#[tokio::test]
+async fn named_layouts_prefer_the_namespace_variant() {
+    let (mut app, _rx) = test_app();
+    install_views(&mut app, LAYOUT_VIEWS);
+    type_resource_query(&mut app, "pods -n prod -o images");
+    assert_eq!(app.namespace, "prod");
+    assert!(has_header(&app, "PRODIMAGE"));
+    assert!(!has_header(&app, "IMAGE"));
+    type_resource_query(&mut app, "pods -n dev");
+    assert_eq!(app.active_layout(), Some("images"));
+    assert!(has_header(&app, "IMAGE"));
+}
+
+#[tokio::test]
+async fn layout_command_switches_and_lists_the_current_kinds_layouts() {
+    let (mut app, _rx) = test_app();
+    install_views(&mut app, LAYOUT_VIEWS);
+    palette(&mut app, "pods");
+    palette(&mut app, "layout slim");
+    assert_eq!(app.active_layout(), Some("slim"));
+    assert!(!has_header(&app, "STATUS"));
+    assert!(app.flash.contains("pods:slim"), "{}", app.flash);
+
+    palette(&mut app, "layout");
+    assert_eq!(app.mode, Mode::Command);
+    assert_eq!(suggestion_labels(&app), ["default", "images", "slim"]);
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.active_layout(), None);
+
+    palette(&mut app, "layout");
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.active_layout(), Some("images"));
+    assert!(has_header(&app, "IMAGE"));
+
+    palette(&mut app, "layout nope");
+    assert!(app.flash_err);
+    assert_eq!(app.active_layout(), Some("images"));
+
+    palette(&mut app, "deployments");
+    palette(&mut app, "layout");
+    assert_eq!(app.mode, Mode::Command);
+    assert_eq!(suggestion_labels(&app), ["default"]);
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.active_layout(), None);
+    assert!(!app.flash_err, "{}", app.flash);
+}
+
+#[tokio::test]
+async fn palette_completes_layout_names_and_lists_kind_layout_entries() {
+    let (mut app, _rx) = test_app();
+    install_views(&mut app, LAYOUT_VIEWS);
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "pods -o ".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    assert_eq!(suggestion_labels(&app), ["default", "images", "slim"]);
+    for c in "sl".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    assert_eq!(suggestion_labels(&app), ["slim"]);
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.active_layout(), Some("slim"));
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "pods -o images ".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    assert!(
+        app.cmd_suggestions
+            .iter()
+            .all(|s| s.kind == SuggestKind::Namespace),
+        "{:?}",
+        suggestion_labels(&app)
+    );
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "pods:im".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    assert_eq!(
+        suggestion_labels(&app).first().map(String::as_str),
+        Some("pods:images")
+    );
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.active_layout(), Some("images"));
+}
+
+#[tokio::test]
+async fn back_navigation_restores_the_layout_of_each_view() {
+    let (mut app, _rx) = test_app();
+    install_views(&mut app, LAYOUT_VIEWS);
+    type_resource_query(&mut app, "pods -o images");
+    palette(&mut app, "deployments");
+    palette(&mut app, "pods");
+    assert_eq!(app.active_layout(), Some("images"), "remembered per kind");
+    palette(&mut app, "layout default");
+    palette(&mut app, "deployments");
+
+    app.handle_key(press(KeyCode::Char('['))).unwrap();
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.active_layout(), None);
+    app.handle_key(press(KeyCode::Char('['))).unwrap();
+    assert_eq!(app.kind_plural, "deployments");
+    app.handle_key(press(KeyCode::Char('['))).unwrap();
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.active_layout(), Some("images"));
+    assert!(has_header(&app, "IMAGE"));
+    app.handle_key(press(KeyCode::Char(']'))).unwrap();
+    app.handle_key(press(KeyCode::Char(']'))).unwrap();
+    assert_eq!(app.active_layout(), None);
+}
+
+#[tokio::test]
+async fn bookmark_applies_its_layout() {
+    let (mut app, _rx) = test_app();
+    install_views(&mut app, LAYOUT_VIEWS);
+    app.bookmarks = vec![
+        crate::config::Bookmark {
+            key: Some("ctrl-y".into()),
+            name: "pod images".into(),
+            resource: "pods".into(),
+            layout: Some("images".into()),
+            ..Default::default()
+        },
+        crate::config::Bookmark {
+            key: Some("ctrl-u".into()),
+            name: "broken".into(),
+            resource: "deployments".into(),
+            layout: Some("images".into()),
+            ..Default::default()
+        },
+    ];
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.active_layout(), Some("images"));
+    assert!(has_header(&app, "IMAGE"));
+    assert!(!app.flash_err, "{}", app.flash);
+
+    app.handle_key(ctrl(KeyCode::Char('u'))).unwrap();
+    assert_eq!(app.kind_plural, "deployments");
+    assert!(app.flash_err);
+    assert!(
+        app.flash.contains("deployments has no layout 'images'"),
+        "{}",
+        app.flash
+    );
+}
+
+#[tokio::test]
+async fn reload_keeps_an_existing_layout_and_drops_a_removed_one() {
+    let dir = std::env::temp_dir().join(format!("sofka-reload-layout-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write_config(&dir, LAYOUT_VIEWS);
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    palette(&mut app, "reload");
+    type_resource_query(&mut app, "pods -o images");
+    palette(&mut app, "reload");
+    assert_eq!(app.active_layout(), Some("images"));
+    assert!(has_header(&app, "IMAGE"));
+
+    write_config(
+        &dir,
+        "[views.\"pods:slim\"]\ncolumns = [{ name = \"X\", path = \"/x\" }]\n",
+    );
+    palette(&mut app, "reload");
+    assert_eq!(app.active_layout(), None);
+    assert!(!has_header(&app, "IMAGE"));
+    assert!(app.flash_err);
+    assert!(
+        app.config_warnings
+            .iter()
+            .any(|w| w.contains("layout 'images' no longer exists for pods")),
+        "{:?}",
+        app.config_warnings
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn palette_lists_a_layout_for_a_group_qualified_kind_sharing_a_plural() {
+    let (mut app, _rx) = test_app();
+    app.cluster
+        .register_kind("metrics.k8s.io", "PodMetrics", "pods", true);
+    app.cluster.register_kind("", "Pod", "pods", true);
+    install_views(
+        &mut app,
+        "[views.\"metrics.k8s.io/v1/pods:usage\"]\ncolumns = [{ name = \"X\", path = \"/x\" }]\n",
+    );
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "usage".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    assert_eq!(
+        suggestion_labels(&app).first().map(String::as_str),
+        Some("pods.metrics.k8s.io:usage")
+    );
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(
+        app.kind.as_ref().map(|k| k.ar.group.as_str()),
+        Some("metrics.k8s.io")
+    );
+    assert_eq!(app.active_layout(), Some("usage"));
+}
+
+#[tokio::test]
+async fn context_switch_keeps_a_layout_the_destination_version_defines() {
+    let dir = std::env::temp_dir().join(format!("sofka-layout-ctx-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write_config(
+        &dir,
+        "[views.\"example.com/v2/widgets:slim\"]\ncolumns = [{ name = \"X\", path = \"/x\" }]\n",
+    );
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    app.cluster
+        .register_kind("example.com", "Widget", "widgets", true);
+    install_views(
+        &mut app,
+        "[views.\"example.com/v1/widgets:slim\"]\ncolumns = [{ name = \"X\", path = \"/x\" }]\n",
+    );
+    type_resource_query(&mut app, "widgets -o slim");
+    assert_eq!(app.active_layout(), Some("slim"));
+
+    let mut cluster = Cluster::fake();
+    cluster.register_kind_version("example.com", "v2", "Widget", "widgets", true);
+    app.apply_context_switch("prod".into(), Box::new(cluster));
+    assert_eq!(app.kind_plural, "widgets");
+    assert_eq!(app.kind.as_ref().map(|k| k.ar.version.as_str()), Some("v2"));
+    assert_eq!(app.active_layout(), Some("slim"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn output_flag_completion_accepts_the_highlighted_layout() {
+    let (mut app, _rx) = test_app();
+    install_views(&mut app, LAYOUT_VIEWS);
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "pods -o ".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(!app.flash_err, "{}", app.flash);
+    assert_eq!(app.active_layout(), Some("images"));
+}
+
+#[tokio::test]
+async fn an_exact_layout_name_outranks_default() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        "[views.\"pods:def\"]\ncolumns = [{ name = \"X\", path = \"/x\" }]\n",
+    );
+    palette(&mut app, "pods -o def");
+    assert_eq!(app.active_layout(), Some("def"));
+    palette(&mut app, "layout default");
+    assert_eq!(app.active_layout(), None);
+    palette(&mut app, "layout def");
+    assert_eq!(app.active_layout(), Some("def"));
+}
+
+#[tokio::test]
+async fn a_resource_named_layout_keeps_its_namespace_argument() {
+    let (mut app, _rx) = test_app();
+    install_views(&mut app, LAYOUT_VIEWS);
+    app.cluster
+        .register_kind("example.com", "Layout", "layouts", true);
+    palette(&mut app, "pods -o images");
+    palette(&mut app, "layout default");
+    assert_eq!(app.kind_plural, "layouts");
+    assert_eq!(app.namespace, "default");
+}
+
+#[tokio::test]
+async fn switching_to_the_default_layout_loads_printer_columns() {
+    let (mut app, _rx) = test_app();
+    app.cluster
+        .register_kind("example.com", "Widget", "widgets", true);
+    install_views(
+        &mut app,
+        "[views.\"widgets:slim\"]\ncolumns = [{ name = \"X\", path = \"/x\" }]\n",
+    );
+    let resource = app.cluster.resolve("widgets").unwrap().resource_key();
+    palette(&mut app, "widgets -o slim");
+    assert!(!app.crd_views.contains_key(&resource));
+    palette(&mut app, "layout default");
+    assert!(app.crd_views.contains_key(&resource));
+}
+
+#[tokio::test]
+async fn layout_names_ignore_case() {
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        "[views.\"pods:Images\"]\ncolumns = [{ name = \"X\", path = \"/x\" }]\n",
+    );
+    app.bookmarks = vec![crate::config::Bookmark {
+        key: Some("ctrl-y".into()),
+        name: "images".into(),
+        resource: "pods".into(),
+        layout: Some("Images".into()),
+        ..Default::default()
+    }];
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    assert_eq!(app.active_layout(), Some("images"));
+    palette(&mut app, "layout DEFAULT");
+    assert_eq!(app.active_layout(), None);
+    palette(&mut app, "layout IMAGES");
+    assert_eq!(app.active_layout(), Some("images"));
+}
+
+#[tokio::test]
+async fn history_falls_back_to_default_when_its_layout_is_gone() {
+    let dir = std::env::temp_dir().join(format!("sofka-history-layout-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write_config(&dir, LAYOUT_VIEWS);
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    palette(&mut app, "reload");
+    type_resource_query(&mut app, "pods -o images");
+    palette(&mut app, "deployments");
+    write_config(
+        &dir,
+        "[views.\"pods:slim\"]\ncolumns = [{ name = \"X\", path = \"/x\" }]\n",
+    );
+    palette(&mut app, "reload");
+    type_resource_query(&mut app, "pods -o slim");
+    app.handle_key(press(KeyCode::Char('['))).unwrap();
+    app.handle_key(press(KeyCode::Char('['))).unwrap();
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.active_layout(), None);
+    assert!(app.flash_err);
+    assert!(app.flash.contains("no layout 'images'"), "{}", app.flash);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_bookmark_view_keeps_the_missing_layout_warning() {
+    let (mut app, _rx) = test_app();
+    install_views(&mut app, LAYOUT_VIEWS);
+    app.bookmarks = vec![crate::config::Bookmark {
+        key: Some("ctrl-y".into()),
+        name: "deploy pulse".into(),
+        resource: "deployments".into(),
+        layout: Some("images".into()),
+        view: Some("pulse".into()),
+        ..Default::default()
+    }];
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    assert!(app.flash_err);
+    assert!(app.flash.contains("no layout 'images'"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn a_named_layout_keeps_the_base_views_kind_settings() {
+    let (mut app, _rx) = test_app();
+    app.cluster
+        .register_kind("karpenter.sh", "NodePool", "nodepools", false);
+    app.cluster
+        .register_kind("karpenter.sh", "NodeClaim", "nodeclaims", false);
+    install_views(
+        &mut app,
+        r#"
+[views."karpenter.sh/v1/nodepools"]
+node = "/status/node"
+children = ["nodeclaims"]
+refs = [{ path = "/spec/template/spec/nodeClassRef/name", kind = "nodeclaims" }]
+[views."karpenter.sh/v1/nodepools".drill]
+kind = "nodeclaims"
+labels = "karpenter.sh/nodepool={name}"
+
+[views."nodepools:slim"]
+replace = true
+columns = [{ name = "NAME", builtin = "NAME" }]
+"#,
+    );
+    type_resource_query(&mut app, "nodepools -o slim");
+    assert_eq!(app.active_layout(), Some("slim"));
+    assert_eq!(app.node_pointer().as_deref(), Some("/status/node"));
+    let ar = app.kind.as_ref().unwrap().ar.clone();
+    assert_eq!(
+        crate::adjacent::children_for(&app.user_views, &ar, None),
+        ["nodeclaims"]
+    );
+    assert!(
+        crate::adjacent::rules_for(&app.user_views, &ar, None)
+            .iter()
+            .any(|rule| rule.path == "/spec/template/spec/nodeClassRef/name")
+    );
+
+    apply(
+        &mut app,
+        json!({"apiVersion": "karpenter.sh/v1", "kind": "NodePool",
+               "metadata": {"name": "default"}}),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.kind_plural, "nodeclaims");
+    assert_eq!(app.labels.as_deref(), Some("karpenter.sh/nodepool=default"));
+}
+
+#[tokio::test]
+async fn a_bookmark_reports_a_view_that_fails_to_open() {
+    let (mut app, _rx) = test_app();
+    install_views(&mut app, LAYOUT_VIEWS);
+    assert!(app.kind.is_none());
+    app.bookmarks = vec![crate::config::Bookmark {
+        key: Some("ctrl-y".into()),
+        name: "prod xray".into(),
+        resource: "pods".into(),
+        namespace: Some("prod-*".into()),
+        layout: Some("nope".into()),
+        view: Some("xray".into()),
+        ..Default::default()
+    }];
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    assert!(app.flash_err);
+    assert!(
+        app.flash.contains("select a resource first"),
+        "{}",
+        app.flash
+    );
+}
