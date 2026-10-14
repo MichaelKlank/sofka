@@ -5865,11 +5865,14 @@ async fn range_selection_keeps_separate_marks_and_space_ends_range() {
     let (mut app, _rx) = range_app();
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
     app.handle_key(press(KeyCode::Down)).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     range_key(&mut app, KeyCode::Up);
     range_key(&mut app, KeyCode::Down);
     assert_marks(&app, &["a", "c", "d"]);
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     assert_marks(&app, &["a", "c"]);
     assert_eq!(app.table_state.selected(), Some(4));
     range_key(&mut app, KeyCode::Up);
@@ -5932,7 +5935,9 @@ async fn range_selection_handles_empty_single_and_unselected_tables() {
 async fn ctrl_space_marks_from_last_space_mark_to_cursor() {
     let (mut app, _rx) = range_app();
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     app.handle_key(press(KeyCode::End)).unwrap();
     app.handle_key(ctrl(KeyCode::Char(' '))).unwrap();
     assert_marks(&app, &["a", "b", "c", "d", "e"]);
@@ -5940,9 +5945,11 @@ async fn ctrl_space_marks_from_last_space_mark_to_cursor() {
 
     let (mut app, _rx) = range_app();
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     app.handle_key(press(KeyCode::End)).unwrap();
     app.handle_key(press(KeyCode::Up)).unwrap();
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     app.handle_key(ctrl(KeyCode::Char(' '))).unwrap();
     assert_marks(&app, &["a", "d", "e"]);
     app.handle_key(press(KeyCode::Home)).unwrap();
@@ -6119,9 +6126,12 @@ async fn space_marks_rows_for_bulk_delete() {
     assert_eq!(app.rows().len(), 3);
     assert_eq!(app.table_state.selected(), Some(0));
 
-    // Mark the first two rows; each SPACE also advances the cursor.
+    // Mark the first two rows; SPACE leaves the cursor in place, like k9s.
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    assert_eq!(app.table_state.selected(), Some(0));
+    app.handle_key(press(KeyCode::Down)).unwrap();
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     assert_eq!(app.marked.len(), 2);
     assert_eq!(app.table_state.selected(), Some(2));
 
@@ -6150,6 +6160,45 @@ async fn space_marks_rows_for_bulk_delete() {
     app.handle_key(press(KeyCode::Char('y'))).unwrap();
     assert!(app.marked.is_empty());
     assert_eq!(app.mode, Mode::Table);
+}
+
+#[tokio::test]
+async fn cursor_on_a_marked_row_uses_the_mark_color() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for n in ["a", "b"] {
+        apply(
+            &mut app,
+            json!({"apiVersion": "v1", "kind": "Pod",
+                   "metadata": {"name": n, "namespace": "default"}}),
+        );
+    }
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let mut cursor_bgs = |app: &mut App| {
+        term.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        let count = |color| buf.content().iter().filter(|c| c.bg == color).count();
+        (count(crate::theme::lavender()), count(crate::theme::mark()))
+    };
+
+    let (plain, marked) = cursor_bgs(&mut app);
+    assert!(plain > 0 && marked == 0, "{plain} {marked}");
+
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    let (plain, marked) = cursor_bgs(&mut app);
+    assert!(plain == 0 && marked > 0, "{plain} {marked}");
+
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    let (plain, marked) = cursor_bgs(&mut app);
+    assert!(plain > 0 && marked == 0, "{plain} {marked}");
+
+    app.handle_key(press(KeyCode::Up)).unwrap();
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    let (plain, marked) = cursor_bgs(&mut app);
+    assert!(plain > 0 && marked == 0, "{plain} {marked}");
 }
 
 #[tokio::test]
@@ -6263,7 +6312,9 @@ async fn node_drain_key_opens_confirm_for_marked_nodes() {
         );
     }
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
 
     app.handle_key(press(KeyCode::Char('D'))).unwrap();
     assert_eq!(app.mode, Mode::Drain);
@@ -6990,7 +7041,9 @@ async fn scale_prompt_targets_marked_rows() {
         );
     }
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     assert_eq!(app.marked.len(), 2);
 
     app.handle_key(press(KeyCode::Char('s'))).unwrap();
@@ -25005,7 +25058,9 @@ async fn drain_respects_readonly_denial_bulk_limit_and_typed_confirmation() {
         json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"node-b"}}),
     );
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     app.handle_key(press(KeyCode::Char('D'))).unwrap();
     assert_eq!(app.mode, Mode::Table);
     assert!(app.flash.contains("max"));
@@ -25226,7 +25281,9 @@ async fn drain_timeout_covers_waiting_and_stops_before_next_node() {
         json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"node-b"}}),
     );
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     drain_open(&mut app);
     drain_field(&mut app, 5, "1s");
     drain_start(&mut app);
@@ -25256,6 +25313,7 @@ async fn drain_bulk_reports_completed_incomplete_and_unstarted_nodes() {
     }
     for _ in 0..3 {
         app.handle_key(press(KeyCode::Char(' '))).unwrap();
+        app.handle_key(press(KeyCode::Down)).unwrap();
     }
     drain_open(&mut app);
     drain_start(&mut app);
@@ -37651,6 +37709,7 @@ async fn drain_bulk_success_verifies_each_node_before_cordoning_the_next() {
     );
     for _ in 0..2 {
         app.handle_key(press(KeyCode::Char(' '))).unwrap();
+        app.handle_key(press(KeyCode::Down)).unwrap();
     }
     drain_open(&mut app);
     drain_start(&mut app);
@@ -37734,6 +37793,7 @@ async fn drain_review_retries_http_408_for_eviction_and_deletion() {
         );
         for _ in 0..2 {
             app.handle_key(press(KeyCode::Char(' '))).unwrap();
+            app.handle_key(press(KeyCode::Down)).unwrap();
         }
         drain_open(&mut app);
         if deletion {
@@ -40805,7 +40865,9 @@ async fn csr_approve_acts_on_every_marked_row() {
         csr("csr-c", json!([])),
     ]);
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     app.handle_key(press(KeyCode::Char('V'))).unwrap();
     assert!(app.confirm_label.starts_with("Approve 2 CSRs?"));
     let (_, names) = confirmed_csr_names(&app);
@@ -40824,6 +40886,7 @@ async fn csr_decision_skips_requests_that_are_already_decided() {
     ]);
     for _ in 0..4 {
         app.handle_key(press(KeyCode::Char(' '))).unwrap();
+        app.handle_key(press(KeyCode::Down)).unwrap();
     }
     app.handle_key(press(KeyCode::Char('V'))).unwrap();
     assert_eq!(confirmed_csr_names(&app), (true, vec!["csr-new".into()]));
@@ -40875,7 +40938,9 @@ async fn csr_decision_respects_deny_and_max_bulk_guardrails() {
         ..Default::default()
     }];
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     app.handle_key(press(KeyCode::Char('V'))).unwrap();
     assert_eq!(app.mode, Mode::Table);
     assert!(app.flash.contains("exceeds the max"), "{}", app.flash);
@@ -40978,7 +41043,10 @@ async fn csr_confirmation_puts_the_decision_to_the_approval_subresource() {
     );
 
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+
+    app.handle_key(press(KeyCode::Down)).unwrap();
     app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
     app.handle_key(press(KeyCode::Char('N'))).unwrap();
     assert_eq!(app.mode, Mode::Confirm);
     assert!(
@@ -41091,6 +41159,7 @@ async fn csr_bulk_approval_warns_before_the_per_request_details() {
     let mut app = csr_app(&csrs);
     for _ in &names {
         app.handle_key(press(KeyCode::Char(' '))).unwrap();
+        app.handle_key(press(KeyCode::Down)).unwrap();
     }
     app.handle_key(press(KeyCode::Char('V'))).unwrap();
     assert_eq!(app.mode, Mode::Confirm);

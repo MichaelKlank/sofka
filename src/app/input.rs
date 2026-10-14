@@ -429,12 +429,9 @@ impl App {
             // Move the viewport; keep NAMESPACE/NAME in place.
             (Some(Action::Right), _) => self.scroll_columns(1),
             (Some(Action::Left), _) => self.scroll_columns(-1),
-            // k9s: SPACE marks/unmarks the current row for bulk actions, then
-            // advances so a range can be marked with repeated taps.
-            (Some(Action::Mark), _) => {
-                self.toggle_mark();
-                self.move_selection(1);
-            }
+            // k9s: SPACE marks/unmarks the current row for bulk actions and
+            // leaves the cursor in place.
+            (Some(Action::Mark), _) => self.toggle_mark(),
             (Some(Action::MarkRange), _) => self.mark_range(),
             (Some(Action::Open), _) => self.drill(),
             (Some(Action::Yaml), _) => self.open_detail(),

@@ -517,6 +517,42 @@ pub fn selected_row() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// Cursor on a marked row: the mark color as the bar, like k9s, so marking
+/// the row under the cursor shows without moving away from it. The text takes
+/// whichever of `base` and `text` reads better on the mark color, since some
+/// skins (gruvbox-light) put `base` and the mark color close together.
+pub fn selected_marked_row() -> Style {
+    let bg = mark();
+    let fg = if contrast(base(), bg) >= contrast(text(), bg) {
+        base()
+    } else {
+        text()
+    };
+    Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD)
+}
+
+/// WCAG contrast ratio between two colors; 1.0 when either is not RGB.
+fn contrast(a: Color, b: Color) -> f64 {
+    fn luminance(color: Color) -> Option<f64> {
+        let Color::Rgb(r, g, b) = color else {
+            return None;
+        };
+        let channel = |v: u8| {
+            let v = f64::from(v) / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        Some(0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b))
+    }
+    match (luminance(a), luminance(b)) {
+        (Some(a), Some(b)) => (a.max(b) + 0.05) / (a.min(b) + 0.05),
+        _ => 1.0,
+    }
+}
+
 /// Sort-indicator arrow in the header: k9s `header.sorterColor` (sky).
 pub fn sorter() -> Color {
     sky()
@@ -677,6 +713,19 @@ pub fn severity_fg(sev: crate::thresholds::Severity) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marked_cursor_row_text_is_readable_in_every_builtin_skin() {
+        for name in BUILTIN_NAMES {
+            set(builtin(name).unwrap());
+            let style = selected_marked_row();
+            let ratio = contrast(style.fg.unwrap(), style.bg.unwrap());
+            assert!(ratio >= 2.5, "{name}: {ratio:.2}");
+        }
+        // gruvbox-light's `base` is cream on its cream mark color.
+        set(builtin("gruvbox-light").unwrap());
+        assert_eq!(selected_marked_row().fg, Some(text()));
+    }
 
     #[test]
     fn all_builtins_parse() {

@@ -36,13 +36,19 @@ impl RenderCell<'_> {
         self
     }
 
-    fn render(&self, area: Rect, buf: &mut ratatui::buffer::Buffer, row: Style, selected: bool) {
+    fn render(
+        &self,
+        area: Rect,
+        buf: &mut ratatui::buffer::Buffer,
+        row: Style,
+        selected: Option<Style>,
+    ) {
         use ratatui::widgets::Widget;
         buf.set_style(area, row);
         buf.set_style(area, self.style);
         (&self.content).render(area, buf);
-        if selected {
-            buf.set_style(area, theme::selected_row());
+        if let Some(selected) = selected {
+            buf.set_style(area, selected);
         }
     }
 }
@@ -1599,6 +1605,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let render_selected = selected
         .filter(|_| count > 0)
         .map(|i| i.saturating_sub(offset));
+    let selected_marked = render_selected
+        .and_then(|i| visible_objects.get(i))
+        .is_some_and(|obj| app.marked.contains(&app.key_of(obj)));
     app.record_table_hit(
         inner.y,
         inner.y.saturating_add(1),
@@ -1627,6 +1636,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
             viewport,
             offset: col_offset,
             selected: render_selected,
+            selected_marked,
         },
         inner,
     );
@@ -1723,6 +1733,7 @@ struct ScrollingTable<'a> {
     viewport: TableViewport,
     offset: usize,
     selected: Option<usize>,
+    selected_marked: bool,
 }
 
 impl ratatui::widgets::Widget for ScrollingTable<'_> {
@@ -1735,6 +1746,11 @@ impl ratatui::widgets::Widget for ScrollingTable<'_> {
             .unwrap_or(0);
         // Reuse one row of storage. Long values do not allocate a full table.
         let mut source = ratatui::buffer::Buffer::empty(Rect::new(0, 0, max_width, 1));
+        let selected_style = if self.selected_marked {
+            theme::selected_marked_row()
+        } else {
+            theme::selected_row()
+        };
         for (y, cells) in std::iter::once(self.header)
             .chain(self.rows)
             .take(usize::from(area.height))
@@ -1745,7 +1761,7 @@ impl ratatui::widgets::Widget for ScrollingTable<'_> {
             let style = if y == 0 {
                 theme::header_row()
             } else if selected {
-                theme::selected_row()
+                selected_style
             } else {
                 Style::default()
             };
@@ -1759,7 +1775,12 @@ impl ratatui::widgets::Widget for ScrollingTable<'_> {
                     source.set_style(source.area, Style::default().bg(bg));
                 }
                 let cell_area = Rect::new(0, 0, self.widths[index], 1);
-                cells[index].render(cell_area, &mut source, style, selected);
+                cells[index].render(
+                    cell_area,
+                    &mut source,
+                    style,
+                    selected.then_some(selected_style),
+                );
                 let source_end = source_start + (end - start);
                 let mut x = 0;
                 while x < source_end {
@@ -6406,7 +6427,7 @@ mod tests {
                             area,
                             &mut actual,
                             row,
-                            selected,
+                            selected.then(theme::selected_row),
                         );
                         assert_eq!(
                             actual, expected,
