@@ -6369,6 +6369,9 @@ mod tests {
                 }
                 _ => terminal.backend_mut().resize(60, 30),
             }
+            // The scrollbar hides on a timer; a slow run must not let it
+            // vanish between the cached and the fresh draw.
+            app.scrollbar_activity = None;
             let previous_key = app.help_cache.as_ref().unwrap().key;
             terminal.draw(|f| draw(f, &mut app)).unwrap();
             let width = usize::from(terminal.backend().buffer().area.width.saturating_sub(2));
