@@ -305,6 +305,9 @@ pub fn compile(
     let mut views = HashMap::new();
     let mut warnings = Vec::new();
     for (key, cfg) in raw {
+        for field in cfg.unknown_fields.keys() {
+            warnings.push(format!("views.\"{key}\": unknown key '{field}' ignored"));
+        }
         if let Some((resource, namespace)) = key.split_once('@')
             && (resource.is_empty()
                 || namespace.is_empty()
@@ -321,8 +324,18 @@ pub fn compile(
             continue;
         }
         let mut columns = Vec::new();
-        for c in &cfg.columns {
+        for (i, c) in cfg.columns.iter().enumerate() {
             let header = c.name.trim().to_uppercase();
+            let label = if header.is_empty() {
+                format!("#{}", i + 1)
+            } else {
+                header.clone()
+            };
+            for field in c.unknown_fields.keys() {
+                warnings.push(format!(
+                    "views.\"{key}\": column {label}: unknown key '{field}' ignored"
+                ));
+            }
             if header.is_empty() {
                 warnings.push(format!("views.\"{key}\": column with empty name skipped"));
                 continue;
@@ -1549,6 +1562,56 @@ mod tests {
     fn compile_toml(text: &str) -> (HashMap<String, View>, Vec<String>) {
         let cfg: crate::config::Config = toml::from_str(text).unwrap();
         compile(&cfg.views)
+    }
+
+    #[test]
+    fn unknown_view_and_column_keys_warn() {
+        let (views, warnings) = compile_toml(
+            r#"
+            [views."v1/pods"]
+            columns = [{ name = "NODE", path = "/spec/nodeName", fromat = "image-tag" }]
+
+            [views."v1/pods".images]
+            replace = true
+            "#,
+        );
+        assert_eq!(views["v1/pods"].columns.len(), 1);
+        assert_eq!(
+            warnings,
+            [
+                "views.\"v1/pods\": unknown key 'images' ignored",
+                "views.\"v1/pods\": column NODE: unknown key 'fromat' ignored",
+            ]
+        );
+
+        let cfg: crate::config::Config = serde_yaml::from_str(
+            "views:\n  pods:\n    colums: []\n    columns:\n      - name: NODE\n        path: /spec/nodeName\n        width: 12\n",
+        )
+        .unwrap();
+        let (views, warnings) = compile(&cfg.views);
+        assert_eq!(views["pods"].columns.len(), 1);
+        assert_eq!(warnings, ["views.\"pods\": unknown key 'colums' ignored"]);
+    }
+
+    #[test]
+    fn misspelled_column_name_key_is_reported_by_position() {
+        let (views, warnings) = compile_toml(
+            r#"
+            [views.pods]
+            columns = [
+                { name = "NODE", path = "/spec/nodeName" },
+                { naem = "IP", path = "/status/podIP" },
+            ]
+            "#,
+        );
+        assert_eq!(views["pods"].columns.len(), 1);
+        assert_eq!(
+            warnings,
+            [
+                "views.\"pods\": column #2: unknown key 'naem' ignored",
+                "views.\"pods\": column with empty name skipped",
+            ]
+        );
     }
 
     #[test]

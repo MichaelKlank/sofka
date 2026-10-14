@@ -528,6 +528,7 @@ async fn run_main(args: Args) -> Result<()> {
     let (user_views, view_warnings) = views::compile(&cfg.views);
     for w in &view_warnings {
         eprintln!("warning: {w}");
+        config_warnings.push(w.clone());
     }
     app.user_views = user_views;
     let (thresholds, threshold_warnings) = thresholds::compile(&cfg.thresholds);

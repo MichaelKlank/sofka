@@ -15596,6 +15596,36 @@ async fn context_switch_keeps_fallback_message_with_config_warning() {
 }
 
 #[tokio::test]
+async fn context_switch_keeps_every_view_warning_for_config_info() {
+    let (mut app, _rx) = test_app();
+    app.all_contexts = vec!["test".into(), "west".into()];
+    let dir = std::env::temp_dir().join(format!(
+        "sofka-context-view-warnings-{}",
+        std::process::id()
+    ));
+    let context_dir = dir.join("clusters/test-cluster/west");
+    std::fs::create_dir_all(&context_dir).unwrap();
+    std::fs::write(
+        context_dir.join("config.toml"),
+        "[views.\"v1/pods\"]\ncolumns = [{ name = \"NODE\", path = \"/spec/nodeName\", fromat = \"x\" }]\n\n[views.\"v1/pods\".images]\nreplace = true\n",
+    )
+    .unwrap();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    palette(&mut app, "ctx west");
+    land_context(&mut app, "west");
+    assert_eq!(
+        app.config_warnings,
+        [
+            "views.\"v1/pods\": unknown key 'images' ignored",
+            "views.\"v1/pods\": column NODE: unknown key 'fromat' ignored",
+        ]
+    );
+    assert!(app.flash_err);
+    assert!(app.flash.contains(&app.config_warnings[0]), "{}", app.flash);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn context_picker_launch_connects_on_enter_and_opens_default_resource() {
     for (default, current_context) in [None, Some("deployments")]
         .into_iter()

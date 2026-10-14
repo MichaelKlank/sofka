@@ -954,6 +954,8 @@ pub struct ViewConfig {
     /// children by the adjacent view.
     pub children: Vec<String>,
     pub columns: Vec<ViewColumnConfig>,
+    #[serde(flatten)]
+    pub unknown_fields: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
 }
 
 /// One reference in `[[views."…".refs]]`: a field of this kind's objects that
@@ -1052,6 +1054,8 @@ pub struct ViewColumnConfig {
     pub align: Option<String>,
     /// Value used when every path is missing or null.
     pub default: Option<String>,
+    #[serde(flatten)]
+    pub unknown_fields: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
 }
 
 /// Skin selection. `name` picks a built-in palette (see

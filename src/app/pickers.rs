@@ -1049,6 +1049,7 @@ impl App {
             .cloned();
         // Keep `:config` in sync with the layers just resolved for this context.
         self.config_warnings = resolved.warnings;
+        self.config_warnings.extend(view_warnings);
         self.config_warnings.extend(plugin_warnings);
         self.config_warnings.extend(threshold_warnings);
         // Explicit destinations take priority over the previous resource type.
