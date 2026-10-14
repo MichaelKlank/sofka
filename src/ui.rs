@@ -1030,6 +1030,17 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
             ),
             hint_line(app, &[(Action::Delete, "delete")]),
         ],
+        "certificatesigningrequests" => vec![
+            hint_line(
+                app,
+                &[
+                    (Action::Yaml, "yaml"),
+                    (Action::Describe, "describe"),
+                    (Action::Approve, "approve"),
+                ],
+            ),
+            hint_line(app, &[(Action::Deny, "deny"), (Action::Delete, "delete")]),
+        ],
         "namespaces" => vec![
             hint_line(
                 app,
@@ -6769,6 +6780,17 @@ mod tests {
         let text = text.join("\n");
         assert!(text.contains("argo view"), "{text}");
         assert_eq!(text.matches("yaml").count(), 1, "{text}");
+    }
+
+    #[tokio::test]
+    async fn csr_rows_hint_both_approve_and_deny() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut app = App::new(crate::k8s::Cluster::fake(), tx);
+        app.switch_kind("certificatesigningrequests");
+        let text: Vec<String> = header_hints(&app).iter().map(line_text).collect();
+        let text = text.join("\n");
+        assert!(text.contains("V approve"), "{text}");
+        assert!(text.contains("N deny"), "{text}");
     }
 
     /// `⏎` on a ResourceSet or FluxInstance opens the GitOps view; the same

@@ -76,7 +76,7 @@ impl App {
 
     /// The objects targeted by a bulk-or-single action (marked rows, else the
     /// selection), as owned clones.
-    fn action_target_objects(&self) -> Vec<DynamicObject> {
+    pub(super) fn action_target_objects(&self) -> Vec<DynamicObject> {
         if self.marked.is_empty() {
             self.selected_ref().cloned().into_iter().collect()
         } else {
@@ -260,6 +260,117 @@ impl App {
             ok_message,
             move |name, _, e| format!("{verb} {name} failed: {e}"),
         );
+    }
+
+    pub(super) fn request_csr_decision(&mut self, approve: bool) {
+        if self.deny_readonly() {
+            return;
+        }
+        if self.kind_plural != "certificatesigningrequests" {
+            self.flash_warn("approve/deny applies to certificatesigningrequests");
+            return;
+        }
+        let Some(kind) = self.kind.clone() else {
+            return;
+        };
+        let (decided, objs): (Vec<_>, Vec<_>) = self
+            .action_target_objects()
+            .into_iter()
+            .partition(csr_decided);
+        let skipped = decided
+            .iter()
+            .map(|o| o.metadata.name.clone().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if objs.is_empty() {
+            if !skipped.is_empty() {
+                self.flash_warn(&format!("already decided: {skipped}"));
+            }
+            return;
+        }
+        let action = if approve { "approve" } else { "deny" };
+        let targets: Vec<_> = objs
+            .iter()
+            .map(|o| (o.metadata.name.clone().unwrap_or_default(), String::new()))
+            .collect();
+        let plural = self.kind_plural.clone();
+        // CSRs are cluster-scoped and have no namespace to match, so a rule
+        // with a `namespaces` filter applies to them instead of never matching.
+        let Some(level) = self.guard_scope(action, &plural, &targets, ConfirmLevel::Plain, true)
+        else {
+            return;
+        };
+        let mut label = csr_confirm_label(approve, &objs);
+        if !skipped.is_empty() {
+            label.push_str(&format!("\n\nSkipping already decided: {skipped}"));
+        }
+        let name_hint = match targets.as_slice() {
+            [(name, _)] => name.clone(),
+            many => many.len().to_string(),
+        };
+        let details = label.clone();
+        let warning = csr_access_warning(approve, &objs);
+        self.begin_guarded(
+            ConfirmAction::CsrDecision {
+                kind,
+                approve,
+                objs,
+            },
+            label,
+            level,
+            name_hint,
+        );
+        // The typed prompt replaces the confirm popup, so carry the review
+        // text into it. It scrolls to the bottom while typing, so the warning
+        // is repeated right above what to type.
+        if self.mode == Mode::Prompt {
+            let warning = warning.map(|w| format!("{w}\n\n")).unwrap_or_default();
+            self.prompt_label = format!("{details}\n\n{warning}{}", self.prompt_label);
+        }
+    }
+
+    pub(super) fn do_csr_decision(&mut self, kind: Kind, approve: bool, objs: Vec<DynamicObject>) {
+        let (verb, done) = if approve {
+            ("approving", "approved")
+        } else {
+            ("denying", "denied")
+        };
+        let label = match objs.as_slice() {
+            [one] => one.metadata.name.clone().unwrap_or_default(),
+            many => format!("{} CSRs", many.len()),
+        };
+        self.note_action(if approve { "approve" } else { "deny" }, label.clone());
+        let claim = self.claim_status(format!("{verb} {label}…"));
+        let ok_message = format!("{done} {label}");
+        let now = k8s_openapi::jiff::Timestamp::now().to_string();
+        let client = self.cluster.client.clone();
+        let tx = self.tx.clone();
+        let genr = self.generation;
+        tokio::spawn(async move {
+            let api: Api<DynamicObject> = Api::all_with(client, &kind.ar);
+            let mut errors = Vec::new();
+            for obj in objs {
+                let name = obj.metadata.name.clone().unwrap_or_default();
+                let body =
+                    csr_decision_body(&obj, &kind.ar.api_version, &kind.ar.kind, approve, &now);
+                if let Err(e) = api
+                    .replace_subresource("approval", &name, &PostParams::default(), &body)
+                    .await
+                {
+                    errors.push(format!("{verb} {name} failed: {e}"));
+                }
+            }
+            let err = !errors.is_empty();
+            let message = if err { errors.join("; ") } else { ok_message };
+            let _ = tx
+                .send(Msg::Flash {
+                    generation: genr,
+                    claim,
+                    message,
+                    err,
+                })
+                .await;
+        });
     }
 
     pub(super) fn request_attach(&mut self) {

@@ -483,6 +483,8 @@ impl App {
             (Some(Action::Cordon), _) => self.request_cordon(true),
             (Some(Action::Uncordon), _) => self.request_cordon(false),
             (Some(Action::Drain), _) => self.request_drain(),
+            (Some(Action::Approve), _) => self.request_csr_decision(true),
+            (Some(Action::Deny), _) => self.request_csr_decision(false),
             // Sorting: S opens the column picker, I inverts the direction.
             (Some(Action::Sort), _) => self.open_sort_picker(),
             (Some(Action::SortAge), _) => self.sort_by_age(),

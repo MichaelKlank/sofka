@@ -343,6 +343,12 @@ enum ConfirmAction {
         /// Flux or a controller (shown in the dialog).
         managed: Option<String>,
     },
+    /// Approve or deny these CSRs through the `approval` subresource.
+    CsrDecision {
+        kind: Kind,
+        approve: bool,
+        objs: Vec<DynamicObject>,
+    },
     /// Edit a Flux-managed object (`kubectl edit`) after warning that the edit
     /// will be reverted on the next reconcile.
     Edit { argv: Vec<String> },

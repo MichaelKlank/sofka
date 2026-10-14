@@ -67,7 +67,7 @@ pub struct Config {
     pub default_resource: Option<String>,
     /// Disable every action that could modify the cluster (or run arbitrary
     /// commands): delete, edit, scale, restart, set-image, cordon/drain,
-    /// Flux suspend/resume/reconcile, Helm rollback/uninstall, shell/attach,
+    /// CSR approve/deny, Flux suspend/resume/reconcile, Helm rollback/uninstall, shell/attach,
     /// and plugins. Overridden by the `--readonly`/`--write` CLI flags. Set
     /// it in a per-cluster/per-context override file to lock down just prod.
     pub readonly: bool,

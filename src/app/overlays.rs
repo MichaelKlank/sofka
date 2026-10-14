@@ -147,6 +147,14 @@ impl App {
                 self.do_drain_nodes(targets, options);
                 self.clear_marks();
             }
+            ConfirmAction::CsrDecision {
+                kind,
+                approve,
+                objs,
+            } => {
+                self.do_csr_decision(kind, approve, objs);
+                self.clear_marks();
+            }
             ConfirmAction::Restart { kind, targets } => {
                 self.do_restart(kind, targets);
                 self.clear_marks();

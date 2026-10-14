@@ -1762,6 +1762,12 @@ impl Cluster {
         cluster.register_kind("", "Secret", "secrets", true);
         cluster.register_kind("", "Node", "nodes", false);
         cluster.register_kind("", "Namespace", "namespaces", false);
+        cluster.register_kind(
+            "certificates.k8s.io",
+            "CertificateSigningRequest",
+            "certificatesigningrequests",
+            false,
+        );
         cluster.register_kind("", "Event", "events", true);
         cluster.register_kind("batch", "Job", "jobs", true);
         cluster.register_kind("batch", "CronJob", "cronjobs", true);

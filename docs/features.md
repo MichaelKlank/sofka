@@ -775,6 +775,18 @@ include those conditions. Row filters can search the route paths.
 
 ## Actions
 
+- **CSR approve and deny** (`V` / `N` on `:csr`) - approve or deny the marked
+  CertificateSigningRequests, or the current one. The confirm popup lists each
+  request's requester, signer and usages, and warns when approving a `client auth`
+  cert from `kubernetes.io/kube-apiserver-client`, since that grants cluster
+  access. Requests that already have an `Approved`, `Denied` or `Failed`
+  condition are skipped. The decision is written through the `approval`
+  subresource, so it needs the `update` verb on `certificatesigningrequests/approval`
+  and `approve` on the signer; sofka does not check this up front, so a 403 is shown as the error.
+  Blocked in read-only mode and gated by the `approve` and `deny` guardrails.
+  The table shows NAME, SIGNER, REQUESTOR, CONDITION and AGE; CONDITION reads
+  `Pending`, `Approved`, `Denied` or `Failed`, with `,Issued` once the
+  certificate is set.
 - **CronJob controls** (`t`) - trigger now (creates a Job from the jobTemplate,
   like `kubectl create job --from`), suspend, resume.
 - **Background port-forwards** (`f`/`F` to start, `:pf` to manage) plus **saved

@@ -180,6 +180,14 @@ const NODE_COLUMNS: &[Column] = &[
     column("AGE", col_age),
 ];
 
+const CSR_COLUMNS: &[Column] = &[
+    column("NAME", col_name),
+    column("SIGNER", col_csr_signer),
+    column("REQUESTOR", col_csr_requestor),
+    status_column("CONDITION", col_csr_condition),
+    column("AGE", col_age),
+];
+
 const NAMESPACE_COLUMNS: &[Column] = &[
     column("NAME", col_name),
     status_column("STATUS", col_namespace_status),
@@ -395,6 +403,7 @@ fn columns_for(group: &str, plural: &str) -> &'static [Column] {
         ("", "services") => SERVICE_COLUMNS,
         ("", "nodes") => NODE_COLUMNS,
         ("", "namespaces") => NAMESPACE_COLUMNS,
+        ("certificates.k8s.io", "certificatesigningrequests") => CSR_COLUMNS,
         ("", "configmaps") => CONFIGMAP_COLUMNS,
         ("", "secrets") => SECRET_COLUMNS,
         ("batch", "jobs") => JOB_COLUMNS,
@@ -1277,6 +1286,39 @@ fn col_service_ports<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
 
 fn col_node_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     Cow::Borrowed(node_status(ctx.data))
+}
+
+fn col_csr_signer<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["spec", "signerName"]).unwrap_or_default())
+}
+
+fn col_csr_requestor<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["spec", "username"]).unwrap_or_default())
+}
+
+fn col_csr_condition<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(csr_condition(ctx.data))
+}
+
+/// What `kubectl get csr` prints: the condition types in order, `Pending`
+/// when there are none, and `,Issued` once the signer has set a certificate.
+pub(crate) fn csr_condition(data: &Value) -> String {
+    let mut types = csr_condition_types(data).collect::<Vec<_>>().join(",");
+    if types.is_empty() {
+        types.push_str("Pending");
+    }
+    if sget(data, &["status", "certificate"]).is_some_and(|c| !c.is_empty()) {
+        types.push_str(",Issued");
+    }
+    types
+}
+
+pub(crate) fn csr_condition_types(data: &Value) -> impl Iterator<Item = &str> {
+    data.pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c.get("type").and_then(Value::as_str))
 }
 
 fn col_node_roles<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {

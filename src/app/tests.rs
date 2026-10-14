@@ -40702,3 +40702,379 @@ async fn unbound_ctrl_and_alt_chords_do_not_type_into_text_inputs() {
     app.handle_key(press(KeyCode::Char('l'))).unwrap();
     assert_eq!(app.ctx_filter, "al");
 }
+
+fn csr(name: &str, conditions: Value) -> Value {
+    json!({"apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest",
+           "metadata": {"name": name},
+           "spec": {"username": "system:node:n1",
+                    "signerName": "kubernetes.io/kube-apiserver-client",
+                    "usages": ["digital signature", "client auth"]},
+           "status": {"conditions": conditions}})
+}
+
+fn csr_app(csrs: &[Value]) -> App {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("certificatesigningrequests");
+    for c in csrs {
+        apply(&mut app, c.clone());
+    }
+    app
+}
+
+fn confirmed_csr_names(app: &App) -> (bool, Vec<String>) {
+    let Some(ConfirmAction::CsrDecision { approve, objs, .. }) = &app.confirm_action else {
+        panic!(
+            "expected a CSR decision, mode {:?}: {}",
+            app.mode, app.flash
+        );
+    };
+    let mut names: Vec<_> = objs
+        .iter()
+        .filter_map(|o| o.metadata.name.clone())
+        .collect();
+    names.sort();
+    (*approve, names)
+}
+
+#[tokio::test]
+async fn csr_approve_key_confirms_with_requester_signer_usages_and_warning() {
+    let mut app = csr_app(&[csr("csr-a", json!([]))]);
+    app.handle_key(press(KeyCode::Char('V'))).unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+    for part in [
+        "Approve CSR csr-a?",
+        "requester: system:node:n1",
+        "signer: kubernetes.io/kube-apiserver-client",
+        "usages: digital signature, client auth",
+        "grants cluster access",
+    ] {
+        assert!(
+            app.confirm_label.contains(part),
+            "{part}: {}",
+            app.confirm_label
+        );
+    }
+    assert_eq!(confirmed_csr_names(&app), (true, vec!["csr-a".into()]));
+}
+
+#[tokio::test]
+async fn csr_deny_key_confirms_without_the_cluster_access_warning() {
+    let mut app = csr_app(&[csr("csr-a", json!([]))]);
+    app.handle_key(press(KeyCode::Char('N'))).unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+    assert!(app.confirm_label.starts_with("Deny CSR csr-a?"));
+    assert!(!app.confirm_label.contains("grants cluster access"));
+    assert_eq!(confirmed_csr_names(&app), (false, vec!["csr-a".into()]));
+}
+
+#[tokio::test]
+async fn csr_approve_acts_on_every_marked_row() {
+    let mut app = csr_app(&[
+        csr("csr-a", json!([])),
+        csr("csr-b", json!([])),
+        csr("csr-c", json!([])),
+    ]);
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Char('V'))).unwrap();
+    assert!(app.confirm_label.starts_with("Approve 2 CSRs?"));
+    let (_, names) = confirmed_csr_names(&app);
+    assert_eq!(names.len(), 2);
+    assert!(!names.contains(&"csr-c".to_string()));
+}
+
+#[tokio::test]
+async fn csr_decision_skips_requests_that_are_already_decided() {
+    let decided = |t: &str| csr(&format!("csr-{t}"), json!([{"type": t, "status": "True"}]));
+    let mut app = csr_app(&[
+        decided("Approved"),
+        decided("Denied"),
+        decided("Failed"),
+        csr("csr-new", json!([])),
+    ]);
+    for _ in 0..4 {
+        app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Char('V'))).unwrap();
+    assert_eq!(confirmed_csr_names(&app), (true, vec!["csr-new".into()]));
+    assert!(app.confirm_label.contains("Skipping already decided"));
+
+    let mut app = csr_app(&[decided("Denied")]);
+    app.handle_key(press(KeyCode::Char('N'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(
+        app.flash.contains("already decided: csr-Denied"),
+        "{}",
+        app.flash
+    );
+}
+
+#[tokio::test]
+async fn csr_decision_is_blocked_in_read_only_mode() {
+    let mut app = csr_app(&[csr("csr-a", json!([]))]);
+    app.readonly = true;
+    for key in ['V', 'N'] {
+        app.handle_key(press(KeyCode::Char(key))).unwrap();
+        assert_eq!(app.mode, Mode::Table);
+        assert!(app.confirm_action.is_none());
+        assert!(app.flash.contains("read-only"), "{}", app.flash);
+    }
+}
+
+#[tokio::test]
+async fn csr_decision_respects_deny_and_max_bulk_guardrails() {
+    let mut app = csr_app(&[csr("csr-a", json!([])), csr("csr-b", json!([]))]);
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["deny".into()],
+        resources: vec!["certificatesigningrequests".into()],
+        deny: true,
+        reason: Some("no denials".into()),
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char('N'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash.contains("blocked by guardrail"), "{}", app.flash);
+    // The approve action is a different guardrail target and still runs.
+    app.handle_key(press(KeyCode::Char('V'))).unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+
+    let mut app = csr_app(&[csr("csr-a", json!([])), csr("csr-b", json!([]))]);
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["approve".into()],
+        max_bulk: Some(1),
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Char('V'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.flash.contains("exceeds the max"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn csr_keys_fall_through_to_plugins_on_other_kinds() {
+    let (mut app, _rx) = app_with_pod();
+    app.plugins = vec![crate::config::Plugin {
+        name: "pod-cmd".into(),
+        key: "shift-v".into(),
+        command: "true".into(),
+        scopes: vec!["pods".into(), "certificatesigningrequests".into()],
+        mutating: Some(false),
+        ..Default::default()
+    }];
+    let shift_v = KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT);
+    app.handle_key(shift_v).unwrap();
+    assert!(matches!(app.pending, Some(Suspend::Shell(_))));
+    assert!(app.confirm_action.is_none());
+
+    app.pending = None;
+    app.switch_kind("certificatesigningrequests");
+    apply(&mut app, csr("csr-a", json!([])));
+    app.handle_key(shift_v).unwrap();
+    assert!(app.pending.is_none(), "approve keeps its key on CSRs");
+    assert_eq!(app.mode, Mode::Confirm);
+}
+
+#[test]
+fn csr_condition_matches_kubectl() {
+    let cell = |status: Value| crate::columns::csr_condition(&json!({ "status": status }));
+    assert_eq!(cell(json!({})), "Pending");
+    assert_eq!(
+        cell(json!({"conditions": [{"type": "Approved"}]})),
+        "Approved"
+    );
+    assert_eq!(cell(json!({"conditions": [{"type": "Denied"}]})), "Denied");
+    assert_eq!(cell(json!({"conditions": [{"type": "Failed"}]})), "Failed");
+    assert_eq!(
+        cell(json!({"conditions": [{"type": "Approved"}], "certificate": "abc"})),
+        "Approved,Issued"
+    );
+}
+
+#[test]
+fn csr_decision_body_appends_the_condition_to_the_whole_object() {
+    let obj: DynamicObject = serde_json::from_value(csr(
+        "csr-a",
+        json!([{"type": "Approved", "status": "True", "reason": "Earlier"}]),
+    ))
+    .unwrap();
+    let body = csr_decision_body(
+        &obj,
+        "certificates.k8s.io/v1",
+        "CertificateSigningRequest",
+        false,
+        "2026-01-01T00:00:00Z",
+    );
+    assert_eq!(body["metadata"]["name"], "csr-a");
+    assert_eq!(body["spec"]["username"], "system:node:n1");
+    let conditions = body["status"]["conditions"].as_array().unwrap();
+    assert_eq!(conditions.len(), 2);
+    assert_eq!(conditions[1]["type"], "Denied");
+    assert_eq!(conditions[1]["status"], "True");
+    assert_eq!(conditions[1]["lastUpdateTime"], "2026-01-01T00:00:00Z");
+    assert!(conditions[1]["reason"].is_string() && conditions[1]["message"].is_string());
+}
+
+#[tokio::test]
+async fn csr_confirmation_puts_the_decision_to_the_approval_subresource() {
+    use http_body_util::BodyExt;
+    let mut app = csr_app(&[csr("csr-a", json!([])), csr("csr-b", json!([]))]);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    app.tx = tx;
+    let log = PatchLog::default();
+    let shared = log.clone();
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let shared = shared.clone();
+            async move {
+                let method = request.method().to_string();
+                let path = request.uri().path().to_string();
+                let body = request.into_body().collect().await.unwrap().to_bytes();
+                let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                shared
+                    .lock()
+                    .unwrap()
+                    .push(json!({"method": method, "path": path, "body": body.clone()}));
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(body.to_string().into_bytes()))
+                        .unwrap(),
+                )
+            }
+        }),
+        "default",
+    );
+
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    app.handle_key(press(KeyCode::Char('N'))).unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "nothing sent before confirming"
+    );
+
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    drain_until(&mut app, &mut rx, |app| app.flash.contains("denied 2 CSRs")).await;
+    assert!(!app.flash_err, "{}", app.flash);
+    let mut log = log.lock().unwrap().clone();
+    log.sort_by_key(|r| r["path"].as_str().unwrap().to_string());
+    assert_eq!(log.len(), 2);
+    for (entry, name) in log.iter().zip(["csr-a", "csr-b"]) {
+        assert_eq!(entry["method"], "PUT");
+        assert!(
+            entry["path"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("/certificatesigningrequests/{name}/approval")),
+            "{}",
+            entry["path"]
+        );
+        assert_eq!(entry["body"]["metadata"]["name"], name);
+        let last = entry["body"]["status"]["conditions"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            (last["type"].as_str(), last["status"].as_str()),
+            (Some("Denied"), Some("True"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn csr_decision_matches_namespace_scoped_guardrails() {
+    let mut app = csr_app(&[csr("csr-a", json!([]))]);
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["approve".into()],
+        namespaces: vec!["prod-*".into()],
+        deny: true,
+        ..Default::default()
+    }];
+    app.handle_key(press(KeyCode::Char('V'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.confirm_action.is_none());
+    assert!(app.flash.contains("blocked by guardrail"), "{}", app.flash);
+
+    app.guardrails[0].deny = false;
+    app.guardrails[0].max_bulk = Some(0);
+    app.handle_key(press(KeyCode::Char('V'))).unwrap();
+    assert!(app.flash.contains("exceeds the max"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn csr_typed_guardrail_confirmation_shows_the_request_details() {
+    for (level, expected) in [
+        ("type-resource-name", "csr-a"),
+        ("type-context-name", "test"),
+    ] {
+        let mut app = csr_app(&[csr("csr-a", json!([]))]);
+        let expected = if level == "type-context-name" {
+            app.cluster.context.clone()
+        } else {
+            expected.to_string()
+        };
+        app.guardrails = vec![crate::config::Guardrail {
+            actions: vec!["approve".into()],
+            confirmation: Some(level.into()),
+            ..Default::default()
+        }];
+        app.handle_key(press(KeyCode::Char('V'))).unwrap();
+        assert_eq!(app.mode, Mode::Prompt, "{level}");
+        for part in [
+            "Approve CSR csr-a?",
+            "requester: system:node:n1",
+            "signer: kubernetes.io/kube-apiserver-client",
+            "usages: digital signature, client auth",
+            "grants cluster access",
+            &format!("type '{expected}' to confirm"),
+        ] {
+            assert!(
+                app.prompt_label.contains(part),
+                "{level} {part}: {}",
+                app.prompt_label
+            );
+        }
+        let (review, instruction) = app.prompt_label.split_once("⚠ guardrail").unwrap();
+        assert!(
+            review
+                .trim_end()
+                .ends_with("approving grants cluster access"),
+            "{level}: warning not right above the instruction: {review}"
+        );
+        assert!(instruction.contains(&format!("type '{expected}' to confirm")));
+        assert!(matches!(
+            &app.prompt_kind,
+            Some(PromptKind::GuardConfirm { expected: e, .. }) if *e == expected
+        ));
+    }
+}
+
+#[tokio::test]
+async fn csr_bulk_approval_warns_before_the_per_request_details() {
+    let names: Vec<String> = (0..12).map(|i| format!("csr-{i:02}")).collect();
+    let csrs: Vec<Value> = names.iter().map(|n| csr(n, json!([]))).collect();
+    let mut app = csr_app(&csrs);
+    for _ in &names {
+        app.handle_key(press(KeyCode::Char(' '))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Char('V'))).unwrap();
+    assert_eq!(app.mode, Mode::Confirm);
+    let label = &app.confirm_label;
+    let warning = label.find("⚠ 12 client auth cert(s)").expect(label);
+    let first = label.find("csr-00\n").expect(label);
+    assert!(warning < first, "warning must precede the details: {label}");
+    assert!(
+        label.lines().take(4).any(|l| l.starts_with("⚠")),
+        "warning not within the first lines: {label}"
+    );
+
+    // Denying has nothing to warn about.
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Char('N'))).unwrap();
+    assert!(!app.confirm_label.contains('⚠'), "{}", app.confirm_label);
+}
