@@ -203,7 +203,9 @@ Guardrails match plugin actions with `plugin:<palette>`, or `plugin:<name>` when
 
 On an invalid value (a bad chord, an unknown `output`, a malformed `timeout`)
 sofka disables just that plugin or falls back to the default and shows a warning
-in `:config`. Plugins appear in `?` help with their chord and scope.
+in `:config`. Plugins appear in `?` help with their chord and scope, right after
+the table keys. Opened from a table, help lists the plugins for the current kind
+first.
 
 ## Bookmarks
 

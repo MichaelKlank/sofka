@@ -353,7 +353,8 @@ include those conditions. Row filters can search the route paths.
   provided.
 - **Help scrolling** (`?`) - browse all bindings, including plugins, bookmarks,
   and workspaces. Help opens on the section for the view it was opened from,
-  without changing the section order. `j` / `k` and `↑` / `↓` scroll one line.
+  without changing the section order. Plugins follow the table keys; from a
+  table, the plugins for the current kind come first. `j` / `k` and `↑` / `↓` scroll one line.
   `ctrl-f`, `PgDn`, and `space` move forward one page; `ctrl-b` and `PgUp`
   move back one page. Each page uses the visible content height. `g` / `Home`
   go to the top; `G` / `End` go to the bottom. `]` and `[` jump to the next and

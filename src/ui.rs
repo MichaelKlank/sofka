@@ -3040,11 +3040,47 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String, HelpSecti
             Span::styled(d.to_string(), theme::dim()),
         ])
     };
+    // Config-defined plugins, with their (possibly modified) key chords,
+    // follow the table keys they run from. From a table, the plugins for the
+    // current kind come first.
+    let mut plugin_lines = Vec::new();
+    if !app.plugins.is_empty() {
+        plugin_lines.push(Line::from(""));
+        plugin_lines.push(Line::from(Span::styled("  Plugins", theme::title())));
+        let current = |p: &crate::config::Plugin| {
+            app.help_return == Mode::Table
+                && (p.scopes.is_empty() || p.scopes.contains(&app.kind_plural))
+        };
+        let (first, rest): (Vec<_>, Vec<_>) = app.plugins.iter().partition(|p| current(p));
+        for p in first.into_iter().chain(rest) {
+            let mut bindings = Vec::new();
+            if !p.key.is_empty() {
+                bindings.push(
+                    crate::keys::KeyChord::parse(&p.key)
+                        .map(|c| c.label())
+                        .unwrap_or_else(|_| format!("{}?", p.key)),
+                );
+            }
+            if let Some(command) = &p.palette {
+                bindings.push(format!(":{command}"));
+            }
+            let key = bindings.join(" / ");
+            let scope = if p.scopes.is_empty() {
+                "all resources".to_string()
+            } else {
+                p.scopes.join(", ")
+            };
+            plugin_lines.push(bind(&key, &format!("{} ({scope})", p.name)));
+        }
+    }
     let mut lines = Vec::new();
     let mut previous_scope = "";
     for (scope, action, _) in app.keymap.entries() {
         let owned;
         if scope != previous_scope {
+            if previous_scope == "table" {
+                lines.append(&mut plugin_lines);
+            }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!("  Keys: {scope}"),
@@ -3111,6 +3147,7 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String, HelpSecti
     lines.push(Line::from(
         "  Range selection keeps separate marks; other keys end the range.",
     ));
+    lines.append(&mut plugin_lines);
     lines.push(Line::from(Span::styled(
         "  Commands (enter in the command palette)",
         theme::title(),
@@ -3247,31 +3284,6 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String, HelpSecti
         "Esc / Ctrl+C (activity)",
         "hide without cancelling / cancel the focused plugin",
     ));
-    // Config-defined plugins, with their (possibly modified) key chords.
-    if !app.plugins.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("  Plugins", theme::title())));
-        for p in &app.plugins {
-            let mut bindings = Vec::new();
-            if !p.key.is_empty() {
-                bindings.push(
-                    crate::keys::KeyChord::parse(&p.key)
-                        .map(|c| c.label())
-                        .unwrap_or_else(|_| format!("{}?", p.key)),
-                );
-            }
-            if let Some(command) = &p.palette {
-                bindings.push(format!(":{command}"));
-            }
-            let key = bindings.join(" / ");
-            let scope = if p.scopes.is_empty() {
-                "all resources".to_string()
-            } else {
-                p.scopes.join(", ")
-            };
-            lines.push(bind(&key, &format!("{} ({scope})", p.name)));
-        }
-    }
     lines.push(Line::from(Span::styled(
         "  Node drain controls",
         theme::title(),
@@ -3464,6 +3476,7 @@ fn help_cache_key(app: &App, width: usize) -> u64 {
     for (scope, action, _) in app.keymap.entries() {
         (scope, action.name(), app.keymap.label(scope, action)).hash(&mut hash);
     }
+    (app.help_return == Mode::Table, &app.kind_plural).hash(&mut hash);
     app.plugins.len().hash(&mut hash);
     for plugin in &app.plugins {
         (&plugin.key, &plugin.palette, &plugin.scopes, &plugin.name).hash(&mut hash);
