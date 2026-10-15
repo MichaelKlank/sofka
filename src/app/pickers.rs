@@ -594,6 +594,9 @@ impl App {
     }
 
     pub(super) fn set_namespace(&mut self, sel: String) {
+        if self.ns_resources_active() && self.ns_resources_refuses(&sel) {
+            return;
+        }
         let normalized = normalize_ns(&sel);
         if namespace_patterns::is_pattern(&normalized) {
             self.resolve_namespace_pattern(normalized, NamespacePatternAction::Select);

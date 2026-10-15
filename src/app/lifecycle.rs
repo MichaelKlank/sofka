@@ -91,6 +91,16 @@ impl App {
             });
             return;
         }
+        if let Some(ns) = ns
+            && self.ns_resources_active()
+            && self
+                .cluster
+                .resolve(input)
+                .is_some_and(|k| k.ar.plural.eq_ignore_ascii_case("namespaces"))
+            && self.ns_resources_refuses(ns)
+        {
+            return;
+        }
         if let Some(ns) = ns.filter(|ns| namespace_patterns::is_pattern(&normalize_ns(ns)))
             && (self.cluster.resolve(input).is_some()
                 || workloads::NAMES.contains(&input.trim().to_lowercase().as_str()))
@@ -132,6 +142,9 @@ impl App {
             }
             None if workloads::NAMES.contains(&input.trim().to_lowercase().as_str()) => {
                 self.open_workloads(ns);
+            }
+            None if ns_resources::NAMES.contains(&input.trim().to_lowercase().as_str()) => {
+                self.open_ns_resources(ns);
             }
             None => {
                 self.flash = format!("No resource matches '{}'", input.trim());
@@ -329,6 +342,22 @@ impl App {
             self.start_watch();
             return;
         }
+        if entry.kind_plural == ns_resources::VIEW
+            && self.cluster.resolve(ns_resources::VIEW).is_none()
+        {
+            self.namespace = entry.namespace;
+            self.set_ns_resources_root();
+            self.filter = entry.filter;
+            self.flash = format!(
+                "history {}/{}: resources in {}",
+                self.history_pos + 1,
+                self.history.len(),
+                self.namespace_label()
+            );
+            self.flash_err = false;
+            self.start_watch();
+            return;
+        }
         let Some(kind) = self.cluster.resolve(&entry.kind_plural) else {
             self.flash_warn(&format!("cannot resolve '{}' anymore", entry.kind_plural));
             return;
@@ -404,7 +433,12 @@ impl App {
 
     /// Fold one watched object into the store. `partition` names the watch
     /// it came from when the view runs several.
-    fn apply_watched(&mut self, partition: Option<&str>, key: String, obj: DynamicObject) {
+    pub(super) fn apply_watched(
+        &mut self,
+        partition: Option<&str>,
+        key: String,
+        obj: DynamicObject,
+    ) {
         // Record state changes against the previous version before it's
         // overwritten (session-local timeline), and keep that version
         // for the session diff (`:diff` on objects with no
@@ -526,6 +560,8 @@ impl App {
         self.maybe_fetch_printer_columns(&kind);
         if self.workloads.is_some() {
             self.start_workload_watches(watch_labels, watch_fields);
+        } else if self.ns_resources_active() {
+            self.start_ns_resources();
         } else {
             self.start_namespace_watches(&kind, watch_labels, watch_fields);
         }
@@ -1214,6 +1250,11 @@ impl App {
                 key,
                 obj,
             } if generation == self.generation => self.apply_watched(None, key, *obj),
+            Msg::NsResources {
+                generation,
+                claim,
+                update,
+            } if generation == self.generation => self.receive_ns_resources(claim, update),
             Msg::Deleted { generation, key } if generation == self.generation => {
                 self.delete_watched(None, &key);
             }

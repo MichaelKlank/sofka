@@ -1384,6 +1384,13 @@ impl Cluster {
     }
 }
 
+/// Every namespaced kind the cluster serves `list` on, from a fresh API
+/// discovery, with the API groups discovery had to skip.
+pub async fn namespaced_kinds(client: &Client) -> Result<(Vec<Kind>, Vec<String>)> {
+    let discovered = discovery::discover(client).await?;
+    Ok((discovered.child_kinds, discovered.skipped))
+}
+
 /// A watch error the watcher recovers from by itself: the resourceVersion the
 /// watch resumed from was already compacted away by etcd (HTTP 410 Gone,
 /// reason `Expired` — "too old resource version"). Routine on quiet resources

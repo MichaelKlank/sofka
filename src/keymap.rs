@@ -99,6 +99,7 @@ actions! {
     RangeDown => ("range_down", "extend or reduce selection down"),
     RangeUp => ("range_up", "extend or reduce selection up"),
     Namespaces => ("namespaces", "namespaces"),
+    NsResources => ("ns_resources", "kinds with objects in the namespace"),
     NamespaceSelected => ("namespace_selected", "selected resource namespace"),
     NextMatch => ("next_match", "next match"),
     NextSection => ("next_section", "jump to the next section"),
@@ -175,6 +176,7 @@ impl Action {
             Self::Cordon | Self::Uncordon | Self::Drain => Some(&["nodes"]),
             Self::Approve | Self::Deny => Some(&["certificatesigningrequests"]),
             Self::ToggleOwned => Some(&["workloads"]),
+            Self::NsResources => Some(&["namespaces"]),
             Self::SetImage => Some(&[
                 "pods",
                 "deployments",
@@ -621,6 +623,7 @@ const DEFAULTS: &[(&str, Action, &[&str])] = &[
     ("table", Action::Namespaces, &["n"]),
     ("table", Action::NamespaceSelected, &["W"]),
     ("table", Action::NextView, &["tab"]),
+    ("table", Action::NsResources, &["R"]),
     ("table", Action::Node, &["o"]),
     ("table", Action::Open, &["enter"]),
     ("table", Action::Owner, &["J"]),

@@ -16,6 +16,7 @@ mod label_filter;
 mod log_follow;
 mod namespace_patterns;
 mod node_roles;
+mod ns_resources;
 mod oidc;
 mod plugin_form;
 mod popup_wrapping;

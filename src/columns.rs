@@ -343,6 +343,13 @@ const WORKLOAD_COLUMNS: &[Column] = &[
     column("AGE", col_age),
 ];
 
+/// The `:ns-resources` view: one row per kind with objects in the namespace.
+const NS_RESOURCE_COLUMNS: &[Column] = &[
+    column("KIND", col_ns_resource_kind),
+    column("GROUP", col_ns_resource_group),
+    column("COUNT", col_ns_resource_count),
+];
+
 /// One row per release, at its latest revision — like `helm list`. Backed by
 /// the release storage `Secret`s (see `crate::helm`), not a real discovered
 /// resource kind.
@@ -428,6 +435,7 @@ fn columns_for(group: &str, plural: &str) -> &'static [Column] {
         ("argoproj.io", "applicationsets") => ARGOCD_APPSET_COLUMNS,
         ("", "helm") => HELM_COLUMNS,
         ("", "workloads") => WORKLOAD_COLUMNS,
+        ("", "ns-resources") => NS_RESOURCE_COLUMNS,
         ("", "helmhistory") => HELM_HISTORY_COLUMNS,
         ("apps", crate::rollout::VIEW) => ROLLOUT_HISTORY_COLUMNS,
         _ => DEFAULT_COLUMNS,
@@ -966,6 +974,9 @@ fn is_numeric_header(group: &str, plural: &str, header: &str) -> bool {
         .iter()
         .any(|flux| cols.as_ptr() == flux.as_ptr());
     }
+    if header == "COUNT" && plural == "ns-resources" {
+        return true;
+    }
     // Inventory and input counts, named generically enough that only the
     // flux-operator kinds' own columns are known to hold numbers.
     if matches!(header, "RESOURCES" | "INPUTS") {
@@ -1489,6 +1500,22 @@ fn col_job_duration<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
 
 fn workload_kind(obj: &DynamicObject) -> &str {
     obj.types.as_ref().map_or("", |t| t.kind.as_str())
+}
+
+fn ns_resource_field<'a>(ctx: &CellContext<'a>, field: &str) -> Cow<'a, str> {
+    Cow::Borrowed(ctx.data[field].as_str().unwrap_or(""))
+}
+
+fn col_ns_resource_kind<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    ns_resource_field(ctx, "kind")
+}
+
+fn col_ns_resource_group<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    ns_resource_field(ctx, "group")
+}
+
+fn col_ns_resource_count<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    ns_resource_field(ctx, "count")
 }
 
 fn col_workload_kind<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {

@@ -372,6 +372,9 @@ impl App {
             }
             return;
         }
+        if self.ns_resources_blocks(&key) {
+            return;
+        }
         // A kind-specific built-in leaves its key to user bindings on other
         // kinds; with none bound it still runs and says where it applies.
         if key
@@ -401,6 +404,7 @@ impl App {
             (Some(Action::ToggleOwned), _) if self.workloads_active() => {
                 self.toggle_workloads_owned();
             }
+            (Some(Action::NsResources), _) => self.open_ns_resources_for_row(),
             (Some(Action::Filter), _) => self.mode = Mode::Filter,
             (Some(Action::Exit), _) => self.should_quit = true,
             (Some(Action::Back), _) => {
@@ -831,6 +835,10 @@ impl App {
             return;
         }
         self.stop_plugins();
+        if action.acts_on_row() && self.ns_resources_active() {
+            self.flash_warn("ns-resources lists kinds: ⏎ opens one, r counts again");
+            return;
+        }
         if action.acts_on_row() {
             self.focus_workload_row();
         }
@@ -879,6 +887,7 @@ impl App {
             PaletteAction::Skin => self.open_skins(),
             PaletteAction::Helm => self.open_helm_releases(),
             PaletteAction::Workloads => self.open_workloads(None),
+            PaletteAction::NsResources => self.open_ns_resources(None),
             PaletteAction::Notify => self.toggle_notify(),
             PaletteAction::Reload => self.reload_config(),
             PaletteAction::Layout => self.open_layout_picker(),
@@ -940,10 +949,12 @@ impl App {
             }
             return true;
         }
-        // `:workloads [ns]` opens the mixed workloads table.
+        // `:workloads [ns]` opens the mixed workloads table, `:ns-resources
+        // [ns]` the populated kinds.
         let mut parts = cmd.split_whitespace();
         if let Some(first) = parts.next()
-            && workloads::NAMES.contains(&first.to_ascii_lowercase().as_str())
+            && (workloads::NAMES.contains(&first.to_ascii_lowercase().as_str())
+                || ns_resources::NAMES.contains(&first.to_ascii_lowercase().as_str()))
             && self.cluster.resolve(first).is_none()
         {
             self.switch_kind_ns(first, parts.next());
@@ -1080,8 +1091,11 @@ impl App {
                 }
                 return;
             }
-            // `:workloads [ns]` takes its namespace as the bare second word.
-            if workloads::NAMES.contains(&head.to_ascii_lowercase().as_str()) {
+            // `:workloads [ns]` and `:ns-resources [ns]` take their namespace
+            // as the bare second word.
+            if workloads::NAMES.contains(&head.to_ascii_lowercase().as_str())
+                || ns_resources::NAMES.contains(&head.to_ascii_lowercase().as_str())
+            {
                 if namespace_word(&self.command) == Some(1) {
                     self.suggest_namespaces(&arg);
                 } else {

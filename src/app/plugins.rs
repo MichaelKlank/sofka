@@ -189,6 +189,14 @@ impl App {
     /// Resolve placeholders, then run the plugin — after a confirmation prompt
     /// when it's marked `confirm`/`dangerous`.
     pub(super) fn run_plugin(&mut self, plugin: crate::config::Plugin, arguments: &str) {
+        // `:ns-resources` rows are kinds, not objects a plugin could act on.
+        if self.ns_resources_active() && plugin.target.as_deref() != Some("context") {
+            self.flash_warn(&format!(
+                "plugin '{}' acts on objects; ns-resources rows are kinds",
+                plugin.name
+            ));
+            return;
+        }
         if let Err(e) = crate::plugins::available(&plugin) {
             self.flash_warn(&e);
             return;

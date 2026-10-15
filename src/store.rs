@@ -121,6 +121,12 @@ pub enum Msg {
         claim: StatusClaim,
         data: Pulse,
     },
+    /// A count for the `:ns-resources` view, gathered off-thread.
+    NsResources {
+        generation: u64,
+        claim: StatusClaim,
+        update: crate::app::ns_resources::Update,
+    },
     XrayData {
         generation: u64,
         claim: StatusClaim,

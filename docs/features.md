@@ -336,7 +336,7 @@ include those conditions. Row filters can search the route paths.
   view history.
 - **Command palette** (`:`) - fuzzy search over the full resource catalog, your
   saved bookmarks and workspaces, and the built-in commands (`ctx`, `helm`,
-  `workloads`, `pulse`, `xray`, `explain`, `timeline`, `gitops`, `argocd`, `adjacent`, `users`, `groups`, `policy`, `can-i`, `journal`,
+  `workloads`, `ns-resources`, `pulse`, `xray`, `explain`, `timeline`, `gitops`, `argocd`, `adjacent`, `users`, `groups`, `policy`, `can-i`, `journal`,
   `debug`,
   `debug-clean`, `bundle`, `bundle-save`, `snapshot`, `snapshots`, `diff`,
   `events`, `pf`, `notify`, `find`, `vlogs`, `rightsize`, `fleet`, `skin`,
@@ -557,6 +557,20 @@ include those conditions. Row filters can search the route paths.
   are hidden, one `⏎` away from their owner. `O` shows them too. `Ctrl+Z`
   judges each row by its kind's faults rule. Kinds missing from API discovery
   are skipped.
+- **Namespace resources** (`:ns-resources [ns]`, `R` on a namespace row) -
+  every namespaced kind from a fresh API discovery that has objects in the
+  namespace, custom resources included, with KIND, GROUP, and COUNT columns.
+  Defaults to the current namespace; all namespaces counts cluster-wide, and a
+  namespace pattern is refused. The counts are a snapshot, not a watch: one
+  `limit=1` list per kind read off `remainingItemCount` (paging the list when
+  the server leaves it out), eight at a time, with rows filling in as they
+  answer. Kinds with no objects are hidden. A kind you can't list stays as a
+  `no access` row and any other failure shows its error, so neither reads as
+  empty. `⏎` opens the kind's own view in that namespace and `esc` returns,
+  counting again. `r` counts again too, keeping the previous counts on screen
+  until the new ones are in. Filter, sort, and view history work as in any
+  table; keys, commands, and plugins that act on objects are disabled on these
+  rows, while `target = "context"` plugins still run.
 - **Pulse dashboard** (`:pulse`) - cluster-health tiles, refreshed every 5s.
 - **Xray tree** (`:xray`) - a hierarchical view from the current kind down
   through owner references to pods and containers.

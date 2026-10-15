@@ -769,6 +769,7 @@ enum PaletteAction {
     Skin,
     Helm,
     Workloads,
+    NsResources,
     Notify,
     Reload,
     Layout,
@@ -820,6 +821,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         action: PaletteAction::Workloads,
         names: workloads::NAMES,
+    },
+    PaletteCommand {
+        action: PaletteAction::NsResources,
+        names: ns_resources::NAMES,
     },
     PaletteCommand {
         action: PaletteAction::Pulse,
@@ -2082,6 +2087,7 @@ pub struct App {
     pub faults_only: bool,
     /// Set while the `:workloads` view is open.
     workloads: Option<workloads::WorkloadsView>,
+    ns_resources: ns_resources::State,
     /// The kind of the workloads row the running action started on. Dialogs
     /// and prompts it opens act on this kind, never on whatever row the
     /// cursor sits on by the time they are answered.
@@ -2672,6 +2678,7 @@ impl App {
             filter: String::new(),
             faults_only: false,
             workloads: None,
+            ns_resources: ns_resources::State::default(),
             workload_focus: None,
             workload_skipped: 0,
             confirm_note: String::new(),
@@ -3042,6 +3049,7 @@ mod namespace_patterns;
 pub use namespace_patterns::NamespacePatternAction;
 mod navigation;
 mod notify;
+pub mod ns_resources;
 mod overlays;
 mod pickers;
 mod plugins;

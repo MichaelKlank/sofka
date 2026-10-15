@@ -103,7 +103,7 @@ plugins. A released key becomes available to them. `:config` reports keys hidden
 by a built-in action when that action is available. Kind-specific table actions
 only claim their key on the kinds they act on: `cordon`, `uncordon`, and `drain`
 on nodes, `approve` and `deny` on CertificateSigningRequests, `attach` and `previous_logs` on pods, `set_image` on pods and workload
-controllers, and `inspect` on secrets and PVCs. On other kinds, bookmarks,
+controllers, `inspect` on secrets and PVCs, and `ns_resources` on namespaces. On other kinds, bookmarks,
 workspaces, and matching plugins get the key first. Bookmarks, workspaces, and
 matching plugins also take priority over the table's `faults` action.
 
@@ -663,6 +663,7 @@ for those operations.
 | `mark`               | `space`              |
 | `namespaces`         | `n`                  |
 | `next_view`          | `tab`                |
+| `ns_resources`       | `R`                  |
 | `node`               | `o`                  |
 | `open`               | `enter`              |
 | `owner`              | `J`                  |

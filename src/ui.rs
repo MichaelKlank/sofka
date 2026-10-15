@@ -784,6 +784,8 @@ fn draw_compact_header(frame: &mut Frame, app: &App, area: Rect) {
         ("● refresh", theme::sky())
     } else if app.resource_refresh_available() {
         ("○ stopped", theme::overlay1())
+    } else if app.ns_resources_active() && app.mode == Mode::Table && app.store.synced {
+        ("○ snapshot", theme::overlay1())
     } else {
         sync_indicator(app.mode, app.doc_filter_return, app.store.synced)
     };
@@ -3107,6 +3109,10 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String, HelpSecti
     lines.push(bind(
         ":workloads [ns] · :wk",
         "deployments, statefulsets, daemonsets, cronjobs, jobs and pods in one table",
+    ));
+    lines.push(bind(
+        ":ns-resources [ns]",
+        "kinds with objects in the namespace and how many; ⏎ opens one · r counts again",
     ));
     lines.push(bind(
         ":xray · :diff",
@@ -5979,6 +5985,8 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         ("● refresh", theme::sky())
     } else if app.resource_refresh_available() {
         ("○ stopped", theme::overlay1())
+    } else if app.ns_resources_active() && app.mode == Mode::Table && app.store.synced {
+        ("○ snapshot", theme::overlay1())
     } else {
         sync_indicator(app.mode, app.doc_filter_return, app.store.synced)
     };
