@@ -1426,8 +1426,8 @@ fn job_status(obj: &DynamicObject) -> &'static str {
     }
 }
 
-/// Whether [`workload_faulted`] judges this kind.
-pub fn has_workload_faults(group: &str, plural: &str) -> bool {
+/// Whether [`object_faulted`] judges this kind.
+pub fn has_faults_rule(group: &str, plural: &str) -> bool {
     matches!(
         (group, plural),
         (
@@ -1435,15 +1435,29 @@ pub fn has_workload_faults(group: &str, plural: &str) -> bool {
             "deployments" | "daemonsets" | "replicasets"
         ) | ("apps", "statefulsets")
             | ("batch", "jobs" | "cronjobs")
+            | ("kustomize.toolkit.fluxcd.io", "kustomizations")
+            | ("helm.toolkit.fluxcd.io", "helmreleases")
+            | (
+                "source.toolkit.fluxcd.io",
+                "gitrepositories" | "helmrepositories" | "ocirepositories" | "buckets"
+            )
+            | (
+                "fluxcd.controlplane.io",
+                "resourcesets" | "fluxinstances" | "resourcesetinputproviders"
+            )
+            | ("argoproj.io", "applications" | "applicationsets")
     )
 }
 
-/// Whether a workload needs attention, for the `Ctrl+Z` faults filter:
+/// Whether an object needs attention, for the `Ctrl+Z` faults filter:
 /// a controller that is not fully ready, a Job that has not run cleanly,
-/// or a CronJob that is suspended or whose last run did not succeed.
-/// `None` for kinds the filter does not cover; pods have their own rules.
-pub fn workload_faulted(group: &str, plural: &str, obj: &DynamicObject) -> Option<bool> {
+/// a CronJob that is suspended or whose last run did not succeed, a Flux
+/// object that is suspended or not `Ready`, or an Argo CD Application or
+/// ApplicationSet that is not healthy and synced. `None` for kinds the
+/// filter does not cover; pods have their own rules.
+pub fn object_faulted(group: &str, plural: &str, obj: &DynamicObject) -> Option<bool> {
     let d = &obj.data;
+    let terminating = obj.metadata.deletion_timestamp.is_some();
     let counts = match (group, plural) {
         ("apps" | "extensions", "deployments") => WorkloadCounts::deployment(d),
         ("apps", "statefulsets") => WorkloadCounts::statefulset(d),
@@ -1456,10 +1470,32 @@ pub fn workload_faulted(group: &str, plural: &str, obj: &DynamicObject) -> Optio
             ));
         }
         ("batch", "cronjobs") => return Some(cronjob_faulted(obj)),
+        ("kustomize.toolkit.fluxcd.io", _)
+        | ("helm.toolkit.fluxcd.io", _)
+        | ("source.toolkit.fluxcd.io", _) => {
+            return Some(
+                terminating || bget(d, &["spec", "suspend"]) || ready_condition(d).0 != "True",
+            );
+        }
+        ("fluxcd.controlplane.io", _) => {
+            return Some(
+                terminating || flux_operator_disabled(obj) || ready_condition(d).0 != "True",
+            );
+        }
+        ("argoproj.io", "applications") => {
+            return Some(
+                terminating
+                    || sget(d, &["status", "health", "status"]) != Some("Healthy")
+                    || sget(d, &["status", "sync", "status"]) != Some("Synced"),
+            );
+        }
+        ("argoproj.io", "applicationsets") => {
+            return Some(terminating || crate::argocd::applicationset_status(obj) != "Synced");
+        }
         _ => return None,
     };
     Some(
-        obj.metadata.deletion_timestamp.is_some()
+        terminating
             || !matches!(
                 workload_status(obj, counts).as_str(),
                 "Ready" | "ScaledDown"
@@ -1755,14 +1791,15 @@ fn col_flux_exported_inputs<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
 /// flux-operator kinds pause through `fluxcd.controlplane.io/reconcile:
 /// disabled` rather than `spec.suspend`.
 fn col_flux_operator_suspended<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
-    let disabled = ctx
-        .obj
-        .metadata
+    Cow::Owned(flux_operator_disabled(ctx.obj).to_string())
+}
+
+fn flux_operator_disabled(obj: &DynamicObject) -> bool {
+    obj.metadata
         .annotations
         .as_ref()
         .and_then(|a| a.get("fluxcd.controlplane.io/reconcile"))
-        .is_some_and(|v| v == "disabled");
-    Cow::Owned(disabled.to_string())
+        .is_some_and(|v| v == "disabled")
 }
 
 fn col_argocd_sync<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {

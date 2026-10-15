@@ -22663,6 +22663,150 @@ async fn ctrl_z_filters_every_controller_kind_and_extensions_group() {
 }
 
 #[tokio::test]
+async fn ctrl_z_filters_flux_faults() {
+    let (mut app, _rx) = test_app();
+    app.cluster.register_kind(
+        "source.toolkit.fluxcd.io",
+        "OCIRepository",
+        "ocirepositories",
+        true,
+    );
+    app.cluster.register_kind(
+        "fluxcd.controlplane.io",
+        "ResourceSet",
+        "resourcesets",
+        true,
+    );
+    for (group, kind, plural) in [
+        (
+            "kustomize.toolkit.fluxcd.io",
+            "Kustomization",
+            "kustomizations",
+        ),
+        ("helm.toolkit.fluxcd.io", "HelmRelease", "helmreleases"),
+        (
+            "source.toolkit.fluxcd.io",
+            "OCIRepository",
+            "ocirepositories",
+        ),
+        ("fluxcd.controlplane.io", "ResourceSet", "resourcesets"),
+    ] {
+        app.switch_kind(&format!("{plural}.{group}"));
+        let object = |name: &str, ready: Option<&str>| {
+            let conditions = ready
+                .map(|status| json!([{"type": "Ready", "status": status}]))
+                .unwrap_or_else(|| json!([]));
+            json!({
+                "apiVersion": format!("{group}/v1"), "kind": kind,
+                "metadata": {"name": name, "namespace": "default"},
+                "spec": {},
+                "status": {"conditions": conditions}
+            })
+        };
+        apply(&mut app, object("ready", Some("True")));
+        apply(&mut app, object("failed", Some("False")));
+        apply(&mut app, object("reconciling", Some("Unknown")));
+        apply(&mut app, object("no-status", None));
+        let mut suspended = object("suspended", Some("True"));
+        if group == "fluxcd.controlplane.io" {
+            suspended["metadata"]["annotations"] =
+                json!({"fluxcd.controlplane.io/reconcile": "disabled"});
+        } else {
+            suspended["spec"]["suspend"] = json!(true);
+        }
+        apply(&mut app, suspended);
+        let mut terminating = object("terminating", Some("True"));
+        terminating["metadata"]["deletionTimestamp"] = json!("2026-10-15T00:00:00Z");
+        apply(&mut app, terminating);
+        if !app.faults_only {
+            app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+        }
+        assert!(app.faults_filter_active(), "{plural}");
+        let mut names = row_names(&app);
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "failed",
+                "no-status",
+                "reconciling",
+                "suspended",
+                "terminating"
+            ],
+            "{plural}"
+        );
+    }
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(row_names(&app).len(), 6);
+}
+
+#[tokio::test]
+async fn ctrl_z_filters_argocd_faults() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("applications");
+    let application = |name: &str, health: &str, sync: &str| {
+        json!({
+            "apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
+            "metadata": {"name": name, "namespace": "argocd"},
+            "status": {"health": {"status": health}, "sync": {"status": sync}}
+        })
+    };
+    apply(&mut app, application("healthy", "Healthy", "Synced"));
+    apply(&mut app, application("degraded", "Degraded", "Synced"));
+    apply(
+        &mut app,
+        application("progressing", "Progressing", "Synced"),
+    );
+    apply(&mut app, application("out-of-sync", "Healthy", "OutOfSync"));
+    let mut terminating = application("terminating", "Healthy", "Synced");
+    terminating["metadata"]["deletionTimestamp"] = json!("2026-10-15T00:00:00Z");
+    apply(&mut app, terminating);
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert!(app.faults_filter_active());
+    let mut names = row_names(&app);
+    names.sort();
+    assert_eq!(
+        names,
+        ["degraded", "out-of-sync", "progressing", "terminating"]
+    );
+
+    app.switch_kind("applicationsets");
+    let appset = |name: &str, conditions: Value| {
+        json!({
+            "apiVersion": "argoproj.io/v1alpha1", "kind": "ApplicationSet",
+            "metadata": {"name": name, "namespace": "argocd"},
+            "status": {"conditions": conditions}
+        })
+    };
+    apply(
+        &mut app,
+        appset(
+            "synced",
+            json!([{"type": "ResourcesUpToDate", "status": "True"}]),
+        ),
+    );
+    apply(
+        &mut app,
+        appset(
+            "error",
+            json!([{"type": "ErrorOccurred", "status": "True"},
+                   {"type": "ResourcesUpToDate", "status": "True"}]),
+        ),
+    );
+    apply(&mut app, appset("unknown", json!([])));
+    let mut terminating = appset(
+        "terminating",
+        json!([{"type": "ResourcesUpToDate", "status": "True"}]),
+    );
+    terminating["metadata"]["deletionTimestamp"] = json!("2026-10-15T00:00:00Z");
+    apply(&mut app, terminating);
+    assert!(app.faults_filter_active());
+    let mut names = row_names(&app);
+    names.sort();
+    assert_eq!(names, ["error", "terminating", "unknown"]);
+}
+
+#[tokio::test]
 async fn faults_filter_combines_with_text_and_tracks_watch_updates() {
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");

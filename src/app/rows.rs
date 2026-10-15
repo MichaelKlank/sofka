@@ -89,7 +89,7 @@ impl App {
             || self.kind.as_ref().is_some_and(|kind| {
                 kind.ar.plural.eq_ignore_ascii_case(&self.kind_plural)
                     && ((kind.ar.group.is_empty() && kind.ar.plural == "pods")
-                        || crate::columns::has_workload_faults(&kind.ar.group, &kind.ar.plural))
+                        || crate::columns::has_faults_rule(&kind.ar.group, &kind.ar.plural))
             })
     }
 
@@ -108,7 +108,7 @@ impl App {
         if group.is_empty() && plural == "pods" {
             pod_has_faults(o)
         } else {
-            crate::columns::workload_faulted(group, plural, o).unwrap_or(true)
+            crate::columns::object_faulted(group, plural, o).unwrap_or(true)
         }
     }
 
