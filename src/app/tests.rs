@@ -16311,12 +16311,148 @@ async fn help_search_keeps_section_headings_with_matching_bindings() {
         } else if filter == "Keys: detail" {
             assert!(text.contains("/Keys: detail [1]"), "{text}");
             assert!(rows.iter().any(|row| row.contains("  Keys: detail")));
-            assert!(!text.contains("decode secret"), "{text}");
+            assert!(text.contains("decode secret"), "{text}");
+            assert!(!text.contains("Keys: diff"), "{text}");
         } else {
             assert!(text.contains("/no-such-help-entry [0]"), "{text}");
             assert!(!text.contains("Keys:"), "{text}");
         }
     }
+}
+
+#[tokio::test]
+async fn help_search_matching_a_section_heading_keeps_the_whole_section() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, _rx) = test_app();
+    app.handle_key(press(KeyCode::Char('?'))).unwrap();
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "table".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(200, 400)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(
+        app.help_scroll, 0,
+        "a search opened before the first draw starts at the top"
+    );
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("Keys: table"), "{text}");
+    for (scope, action, _) in app.keymap.entries() {
+        if scope == "table" && action == Action::SortAge {
+            assert!(text.contains(action.description()), "{text}");
+        }
+    }
+    assert!(!text.contains("Keys: detail"), "{text}");
+}
+
+#[tokio::test]
+async fn help_opens_on_the_section_of_the_view_it_came_from() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for (source, scope) in [
+        (Mode::Detail, "detail"),
+        (Mode::Logs, "logs"),
+        (Mode::Events, "events"),
+    ] {
+        let (mut app, _rx) = test_app();
+        app.mode = source;
+        app.handle_key(press(KeyCode::Char('?'))).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let heading = format!("Keys: {scope}");
+        let row = app
+            .help_cache
+            .as_ref()
+            .unwrap()
+            .sections()
+            .iter()
+            .find(|(text, _)| *text == heading)
+            .unwrap()
+            .1;
+        assert!(row > 0);
+        assert_eq!(app.help_scroll, row, "{heading}");
+        let rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(120)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let title = rows.iter().position(|row| row.contains(" Help ")).unwrap();
+        assert!(rows[title + 1].contains(&heading), "{}", rows.join("\n"));
+
+        // Scrolling away and reopening finds the section again.
+        app.handle_key(press(KeyCode::Char('g'))).unwrap();
+        app.handle_key(press(KeyCode::Char('q'))).unwrap();
+        assert_eq!(app.mode, source);
+        app.handle_key(press(KeyCode::Char('?'))).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.help_scroll, row);
+    }
+}
+
+#[tokio::test]
+async fn help_jumps_between_sections() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, _rx) = test_app();
+    app.mode = Mode::Detail;
+    app.handle_key(press(KeyCode::Char('?'))).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let rows: Vec<u16> = app
+        .help_cache
+        .as_ref()
+        .unwrap()
+        .sections()
+        .iter()
+        .map(|&(_, row)| row)
+        .collect();
+    let detail = rows.iter().position(|&row| row == app.help_scroll).unwrap();
+
+    app.handle_key(press(KeyCode::Char(']'))).unwrap();
+    assert_eq!(app.help_scroll, rows[detail + 1]);
+    app.handle_key(press(KeyCode::Char('['))).unwrap();
+    assert_eq!(app.help_scroll, rows[detail]);
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    app.handle_key(press(KeyCode::Char('['))).unwrap();
+    assert_eq!(
+        app.help_scroll, rows[detail],
+        "previous returns to the start of the current section"
+    );
+
+    app.handle_key(press(KeyCode::Char('g'))).unwrap();
+    app.handle_key(press(KeyCode::Char('['))).unwrap();
+    assert_eq!(app.help_scroll, 0);
+    app.handle_key(press(KeyCode::Char(']'))).unwrap();
+    assert_eq!(app.help_scroll, rows[0]);
+
+    app.handle_key(press(KeyCode::Char('G'))).unwrap();
+    app.handle_key(press(KeyCode::Char(']'))).unwrap();
+    assert_eq!(app.help_scroll, app.help_max_scroll);
+
+    // Keys queued behind a cleared filter arrive before the next frame.
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "Keys: detail".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.help_cache.as_ref().unwrap().sections().len(), 1);
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::Help);
+    app.handle_key(press(KeyCode::Char(']'))).unwrap();
+    assert_eq!(app.help_scroll, rows[0]);
+    app.handle_key(press(KeyCode::Char(']'))).unwrap();
+    assert_eq!(app.help_scroll, rows[1]);
 }
 
 #[tokio::test]
@@ -16329,6 +16465,7 @@ async fn help_pages_use_the_rendered_height() {
         let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
         term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
         assert_eq!(app.help_viewport_h, page);
+        app.handle_key(press(KeyCode::Char('g'))).unwrap();
         for forward in [
             press(KeyCode::PageDown),
             press(KeyCode::Char(' ')),
@@ -16356,6 +16493,7 @@ async fn help_scrolls_and_resets_on_reopen() {
     let mut term = Terminal::new(TestBackend::new(120, 19)).unwrap();
     term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
     assert!(app.help_max_scroll > app.help_viewport_h);
+    app.handle_key(press(KeyCode::Char('g'))).unwrap();
 
     for (down, up) in [
         (KeyCode::Char('j'), KeyCode::Char('k')),
@@ -16418,7 +16556,17 @@ async fn help_scrolls_and_resets_on_reopen() {
     app.handle_key(press(KeyCode::Esc)).unwrap();
     assert_eq!(app.mode, Mode::Table);
     app.handle_key(press(KeyCode::Char('?'))).unwrap();
-    assert_eq!(app.help_scroll, 0);
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let table = app
+        .help_cache
+        .as_ref()
+        .unwrap()
+        .sections()
+        .iter()
+        .find(|(text, _)| text == "Keys: table")
+        .unwrap()
+        .1;
+    assert_eq!(app.help_scroll, table.min(app.help_max_scroll));
 }
 
 #[tokio::test]
@@ -16430,6 +16578,7 @@ async fn help_pages_use_new_dimensions_immediately_after_resize() {
         app.handle_key(press(KeyCode::Char('?'))).unwrap();
         let mut term = Terminal::new(TestBackend::new(120, before)).unwrap();
         term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.handle_key(press(KeyCode::Char('g'))).unwrap();
 
         term.backend_mut().resize(120, after);
         crate::ui::resize(&mut term, &mut app).unwrap();

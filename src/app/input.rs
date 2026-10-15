@@ -67,6 +67,8 @@ impl App {
                     | Action::RangeDown
                     | Action::NextMatch
                     | Action::PreviousMatch
+                    | Action::NextSection
+                    | Action::PreviousSection
             )
         );
         if self.acts_on_row(&key) {
@@ -257,7 +259,12 @@ impl App {
     }
 
     pub fn key_scope(&self) -> &'static str {
-        match self.mode {
+        self.scope_for(self.mode)
+    }
+
+    /// The keymap scope a view uses, which also names its `Keys:` help section.
+    pub(crate) fn scope_for(&self, mode: Mode) -> &'static str {
+        match mode {
             Mode::Contexts if self.ctx_filtering => "context_filter",
             Mode::Table => "table",
             Mode::Command => "command",
@@ -351,6 +358,7 @@ impl App {
         self.help_return = self.mode;
         self.help_filter.clear();
         self.help_scroll = 0;
+        self.help_find_section = true;
         self.mode = Mode::Help;
     }
 
@@ -1678,6 +1686,7 @@ impl App {
     }
 
     pub(super) fn key_help(&mut self, key: KeyInput) {
+        self.help_find_section = false;
         let page = self.help_viewport_h.max(1);
         match (key.action, key.code) {
             // Esc backs out of an active search first, then closes help.
@@ -1713,6 +1722,22 @@ impl App {
             }
             (Some(Action::First), _) => self.help_scroll = 0,
             (Some(Action::Last), _) => self.help_scroll = self.help_max_scroll,
+            (Some(Action::NextSection), _) => {
+                crate::ui::refresh_help(self);
+                let sections = self.help_cache.as_ref().map_or(&[][..], |c| c.sections());
+                if let Some(&(_, row)) = sections.iter().find(|(_, row)| *row > self.help_scroll) {
+                    self.help_scroll = row.min(self.help_max_scroll);
+                }
+            }
+            (Some(Action::PreviousSection), _) => {
+                crate::ui::refresh_help(self);
+                let sections = self.help_cache.as_ref().map_or(&[][..], |c| c.sections());
+                self.help_scroll = sections
+                    .iter()
+                    .rev()
+                    .find(|(_, row)| *row < self.help_scroll)
+                    .map_or(0, |&(_, row)| row);
+            }
             _ => {}
         }
     }

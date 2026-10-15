@@ -289,14 +289,20 @@ refresh can show later changes. This does not add change highlighting to YAML.
 
 ## Help panel (`?`)
 
+Help opens scrolled to the `Keys:` section of the view it was opened from. The
+section order is the same from every view. A view without a section opens at the
+top.
+
 `j` / `k` and `↑` / `↓` scroll one line. `ctrl-f`, `PgDn`, and `space` move
 forward one page. `ctrl-b` and `PgUp` move back one page. The page size is the
 number of visible content rows. `g` / `Home` go to the top; `G` / `End` go to
-the bottom.
+the bottom. `]` jumps to the next section heading and `[` to the previous one.
 
-`/` filters the bindings. Opening help, starting a filter, and clearing a filter
-reset the scroll position to the top. `esc` clears an active filter first, then
-closes help. `q` or `?` closes help and returns to the previous screen.
+`/` filters the bindings. A binding that matches is shown under its section
+heading. A section heading that matches keeps the whole section, so `/table`
+lists every table binding. Starting a filter and clearing a filter reset the
+scroll position to the top. `esc` clears an active filter first, then closes
+help. `q` or `?` closes help and returns to the previous screen.
 
 ## Explain view (`X`)
 

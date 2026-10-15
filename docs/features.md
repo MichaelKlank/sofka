@@ -352,11 +352,14 @@ include those conditions. Row filters can search the route paths.
   remembered or default namespace. Namespace completion after `@context` is not
   provided.
 - **Help scrolling** (`?`) - browse all bindings, including plugins, bookmarks,
-  and workspaces. `j` / `k` and `↑` / `↓` scroll one line. `ctrl-f`, `PgDn`,
-  and `space` move forward one page; `ctrl-b` and `PgUp` move back one page.
-  Each page uses the visible content height. `g` / `Home` go to the top;
-  `G` / `End` go to the bottom. `/` filters the bindings and resets the scroll
-  position. `esc` clears the filter first, then closes help. `q` or `?` closes
+  and workspaces. Help opens on the section for the view it was opened from,
+  without changing the section order. `j` / `k` and `↑` / `↓` scroll one line.
+  `ctrl-f`, `PgDn`, and `space` move forward one page; `ctrl-b` and `PgUp`
+  move back one page. Each page uses the visible content height. `g` / `Home`
+  go to the top; `G` / `End` go to the bottom. `]` and `[` jump to the next and
+  previous section. `/` filters the bindings and resets the scroll position; a
+  query that matches a section heading, such as `table`, keeps that whole
+  section. `esc` clears the filter first, then closes help. `q` or `?` closes
   help and returns to the previous screen.
 - **Picker paging** - `PgDn` and `PgUp` move one visible page through every
   list picker, including `:ctx` and `:ns`, and keep working while a picker

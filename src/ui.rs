@@ -2996,7 +2996,9 @@ fn wrap_help_span(span: Span<'static>, width: usize, needle: &str) -> Vec<Line<'
     rows
 }
 
-fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
+type HelpSections = Vec<(String, u16)>;
+
+fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String, HelpSections) {
     let bind = |k: &str, d: &str| {
         Line::from(vec![
             Span::styled(k.to_string(), Style::default().fg(theme::yellow())),
@@ -3285,6 +3287,14 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
         app.keymap.label("help", Action::Close),
         "close help and return to the previous screen",
     ));
+    lines.push(bind(
+        &format!(
+            "{} / {}",
+            app.keymap.label("help", Action::NextSection),
+            app.keymap.label("help", Action::PreviousSection)
+        ),
+        "jump to the next / previous section",
+    ));
     let key_width = lines
         .iter()
         .filter(|line| line.spans.len() == 2)
@@ -3293,13 +3303,16 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
         .unwrap_or(14)
         .min(width.saturating_sub(4) / 2)
         .max(1);
-    // Keep section headings with matching entries so each binding has context.
+    let is_section = |line: &Line| line.spans.len() == 1 && line.spans[0].style == theme::title();
+    // Keep section headings with matching entries so each binding has context,
+    // and a whole section when its heading matches.
     let needle = app.help_filter.to_lowercase();
     let (lines, title) = if needle.is_empty() {
         (lines, " Help ".to_string())
     } else {
         let mut shown = Vec::new();
         let mut heading = None;
+        let mut whole_section = false;
         let mut matches = 0;
         for line in lines {
             let text = line_text(&line);
@@ -3307,16 +3320,21 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
                 continue;
             }
             let matched = text.to_lowercase().contains(&needle);
+            if is_section(&line) {
+                whole_section = matched;
+            }
             let binding = if line.spans.len() != 2 {
                 heading = Some(line);
                 None
             } else {
                 Some(line)
             };
-            if matched {
-                matches += 1;
+            if matched || whole_section {
+                if matched {
+                    matches += 1;
+                }
                 if let Some(heading) = heading.take() {
-                    if !shown.is_empty() {
+                    if !shown.is_empty() && (is_section(&heading) || !whole_section) {
                         shown.push(Line::default());
                     }
                     shown.push(heading);
@@ -3329,42 +3347,63 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
         let title = format!(" Help · /{} [{}] ", app.help_filter, matches);
         (shown, title)
     };
-    let lines: Vec<Line> = lines
-        .into_iter()
-        .flat_map(|line| {
-            if line.spans.len() != 2 {
-                return wrap_line(highlight_matches(line, &app.help_filter), width);
+    let mut sections = Vec::new();
+    let mut wrapped: Vec<Line> = Vec::new();
+    for line in lines {
+        if is_section(&line) {
+            let row = u16::try_from(wrapped.len()).unwrap_or(u16::MAX);
+            sections.push((line_text(&line).trim().to_string(), row));
+        }
+        wrapped.extend(help_rows(line, key_width, width, &app.help_filter));
+    }
+    (wrapped, title, sections)
+}
+
+fn help_rows(
+    line: Line<'static>,
+    key_width: usize,
+    width: usize,
+    filter: &str,
+) -> Vec<Line<'static>> {
+    if line.spans.len() != 2 {
+        return wrap_line(highlight_matches(line, filter), width);
+    }
+    let mut spans = line.spans.into_iter();
+    let keys = wrap_help_span(spans.next().unwrap(), key_width, filter);
+    let descriptions = wrap_help_span(
+        spans.next().unwrap(),
+        width.saturating_sub(key_width + 4).max(1),
+        filter,
+    );
+    (0..keys.len().max(descriptions.len()))
+        .map(|i| {
+            let mut row = vec![Span::raw("  ")];
+            let used = keys.get(i).map_or(0, Line::width);
+            if let Some(key) = keys.get(i) {
+                row.extend(key.spans.clone());
             }
-            let mut spans = line.spans.into_iter();
-            let keys = wrap_help_span(spans.next().unwrap(), key_width, &app.help_filter);
-            let descriptions = wrap_help_span(
-                spans.next().unwrap(),
-                width.saturating_sub(key_width + 4).max(1),
-                &app.help_filter,
-            );
-            (0..keys.len().max(descriptions.len()))
-                .map(|i| {
-                    let mut row = vec![Span::raw("  ")];
-                    let used = keys.get(i).map_or(0, Line::width);
-                    if let Some(key) = keys.get(i) {
-                        row.extend(key.spans.clone());
-                    }
-                    row.push(Span::raw(" ".repeat(key_width.saturating_sub(used) + 2)));
-                    if let Some(description) = descriptions.get(i) {
-                        row.extend(description.spans.clone());
-                    }
-                    Line::from(row)
-                })
-                .collect()
+            row.push(Span::raw(" ".repeat(key_width.saturating_sub(used) + 2)));
+            if let Some(description) = descriptions.get(i) {
+                row.extend(description.spans.clone());
+            }
+            Line::from(row)
         })
-        .collect();
-    (lines, title)
+        .collect()
 }
 
 pub(crate) struct HelpCache {
     key: u64,
+    width: usize,
     lines: Vec<Line<'static>>,
     title: String,
+    sections: HelpSections,
+}
+
+impl HelpCache {
+    /// Section headings and the rendered row each one starts on.
+    pub(crate) fn sections(&self) -> &[(String, u16)] {
+        &self.sections
+    }
 }
 
 fn help_cache_key(app: &App, width: usize) -> u64 {
@@ -3397,20 +3436,50 @@ fn help_cache_key(app: &App, width: usize) -> u64 {
     hash.finish()
 }
 
+fn update_help_cache(app: &mut App, width: usize) {
+    let key = help_cache_key(app, width);
+    if app.help_cache.as_ref().is_none_or(|cache| cache.key != key) {
+        let (lines, title, sections) = build_help(app, width);
+        app.help_cache = Some(HelpCache {
+            key,
+            width,
+            lines,
+            title,
+            sections,
+        });
+    }
+}
+
+/// Rebuild help at the last drawn width when its content changed since that
+/// frame. Keys queued behind a filter change are handled before the redraw.
+pub(crate) fn refresh_help(app: &mut App) {
+    let Some(width) = app.help_cache.as_ref().map(|cache| cache.width) else {
+        return;
+    };
+    update_help_cache(app, width);
+    let lines = app.help_cache.as_ref().map_or(0, |cache| cache.lines.len());
+    app.help_max_scroll =
+        (lines.min(usize::from(u16::MAX)) as u16).saturating_sub(app.help_viewport_h);
+}
+
 fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
     let show_scrollbars = app.scrollbars_visible();
     let width = usize::from(area.width.saturating_sub(2)).max(1);
-    let key = help_cache_key(app, width);
-    if app.help_cache.as_ref().is_none_or(|cache| cache.key != key) {
-        let (lines, title) = build_help(app, width);
-        app.help_cache = Some(HelpCache { key, lines, title });
-    }
+    update_help_cache(app, width);
     let cache = app.help_cache.as_ref().expect("help content is ready");
     // Record the content height for paging and clamp the offset after layout changes.
     let inner_h = area.height.saturating_sub(2);
     app.help_viewport_h = inner_h;
     let max_scroll = (cache.lines.len().min(usize::from(u16::MAX)) as u16).saturating_sub(inner_h);
     app.help_max_scroll = max_scroll;
+    if std::mem::take(&mut app.help_find_section) {
+        let heading = format!("Keys: {}", app.scope_for(app.help_return));
+        app.help_scroll = cache
+            .sections
+            .iter()
+            .find(|(text, _)| *text == heading)
+            .map_or(0, |&(_, row)| row);
+    }
     let scroll = app.help_scroll.min(max_scroll);
     app.help_scroll = scroll;
     let title = &cache.title;
@@ -6387,7 +6456,11 @@ mod tests {
             let cache = app.help_cache.as_ref().unwrap();
             assert_ne!(previous_key, cache.key, "step {step}");
             assert_eq!(
-                (cache.lines.clone(), cache.title.clone()),
+                (
+                    cache.lines.clone(),
+                    cache.title.clone(),
+                    cache.sections.clone()
+                ),
                 build_help(&app, width)
             );
             let cached = terminal.backend().buffer().clone();

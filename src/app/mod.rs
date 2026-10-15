@@ -2174,6 +2174,8 @@ pub struct App {
     pub help_return: Mode,
     /// First visible line of the help view (`?`).
     pub help_scroll: u16,
+    /// Scroll to the `help_return` view's section on the next render.
+    pub help_find_section: bool,
     /// Maximum help offset, calculated during rendering.
     pub help_max_scroll: u16,
     /// Number of visible help content rows, recorded during rendering.
@@ -2723,6 +2725,7 @@ impl App {
             help_cache: None,
             help_return: Mode::Table,
             help_scroll: 0,
+            help_find_section: false,
             help_max_scroll: 0,
             help_viewport_h: 0,
             doc_filter_return: Mode::Detail,

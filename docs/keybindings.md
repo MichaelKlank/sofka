@@ -446,19 +446,21 @@ for those operations.
 
 ### `[keys.help]`
 
-| Action           | Default bindings              |
-| ---------------- | ----------------------------- |
-| `back`           | `esc`                         |
-| `close`          | `q`, `?`                      |
-| `down`           | `j`, `down`                   |
-| `filter`         | `/`                           |
-| `first`          | `g`, `home`                   |
-| `half_page_down` | unbound                       |
-| `half_page_up`   | unbound                       |
-| `last`           | `G`, `end`                    |
-| `page_down`      | `pagedown`, `space`, `ctrl-f` |
-| `page_up`        | `pageup`, `ctrl-b`            |
-| `up`             | `k`, `up`                     |
+| Action             | Default bindings              |
+| ------------------ | ----------------------------- |
+| `back`             | `esc`                         |
+| `close`            | `q`, `?`                      |
+| `down`             | `j`, `down`                   |
+| `filter`           | `/`                           |
+| `first`            | `g`, `home`                   |
+| `half_page_down`   | unbound                       |
+| `half_page_up`     | unbound                       |
+| `last`             | `G`, `end`                    |
+| `next_section`     | `]`                           |
+| `page_down`        | `pagedown`, `space`, `ctrl-f` |
+| `page_up`          | `pageup`, `ctrl-b`            |
+| `previous_section` | `[`                           |
+| `up`               | `k`, `up`                     |
 
 ### `[keys.log_filter]`
 
