@@ -956,6 +956,7 @@ impl App {
         self.hide_header = resolved.config.hide_header;
         self.terminal_title = resolved.config.terminal_title.unwrap_or(true);
         self.update_check = resolved.config.update_check.unwrap_or(true);
+        self.save_dir = resolved.config.save_dir;
         self.plugins = resolved.config.plugins;
         self.bookmarks = resolved.config.bookmarks;
         self.workspaces = resolved.config.workspaces;

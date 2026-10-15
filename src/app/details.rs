@@ -45,6 +45,7 @@ impl App {
                     self.detail = Scrollable {
                         wrap: self.detail.wrap,
                         title: format!("{} v{} — manifest", rel.name, rel.revision),
+                        yaml: true,
                         lines: rel.manifest.lines().map(String::from).collect(),
                         ..Default::default()
                     };
@@ -75,6 +76,7 @@ impl App {
         self.detail = Scrollable {
             wrap: self.detail.wrap,
             title: format!("{title} — YAML"),
+            yaml: true,
             lines: self.object_yaml(&object).into(),
             ..Default::default()
         };

@@ -184,7 +184,7 @@ point instead. See [PVC explore](features.md#pvc-explore).
 `/` filter (substring · `/regex/` · `!invert`) · `s`/`f` autoscroll · `w` wrap ·
 `J` JSON view (raw/record/pretty) · `Ctrl+Z` warning/error filter · `m` visual marker · `t` timestamps · `x` stop/resume stream · `z` clear buffer · `c` copy buffer ·
 `a` default/all containers (pods with a default-container annotation) ·
-`ctrl-s` save to file · `F` fullscreen (no chrome, clean text selection) ·
+`ctrl-s` save to a file in `save_dir` · `F` fullscreen (no chrome, clean text selection) ·
 `0`–`5` time anchors (tail · 1m · 5m · 15m · 30m · 1h) · `T` custom lookback (`s`/`m`/`h`/`d`/`w`, compound like `1h30m`, decimal like `1.5h`, or `tail` for kubelet logs)
 (VictoriaLogs views) · `esc` back. The newest line anchors to the bottom of the
 viewport.
@@ -214,7 +214,20 @@ and reload behavior. Helm rows continue to show release notes.
 `ctrl-f` / `ctrl-b` page forward or back, with `PgDn` / `PgUp` as aliases.
 `/` searches like vim: the whole document stays on screen and every match is
 highlighted. `n` / `N` go to the next or previous match. `w` wraps. `c` copies
-the document. `esc` backs out - the first press clears an active search.
+the document. `ctrl-s` saves it to a file. `esc` backs out - the first press
+clears an active search.
+
+`ctrl-s` writes the whole document as rendered, whatever the search or scroll
+position. `managedFields` are included only after `m` shows them, and a Helm
+row saves the rendered manifest or values it shows. The file goes to
+[`save_dir`](configuration.md#base-options), the temp directory by default, as
+`sofka-<view title>-<unix time>.yaml` for YAML and diff views and `.txt` for
+the others. The file is readable only by your user, since a document can hold
+Secret values, and a name that is already taken gets a `-2`, `-3`, … suffix
+instead of replacing the earlier save. Log saves follow the same rules. The
+write happens off the UI thread; the status line shows the path,
+or the error if the directory cannot be created or the file cannot be written.
+An empty document is not saved.
 
 `F` toggles fullscreen for document views and plugin popup output. Fullscreen
 uses the full terminal area without the application header, status line, key

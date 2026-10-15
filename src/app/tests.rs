@@ -24,6 +24,7 @@ mod rbac;
 mod restart;
 mod resume;
 mod rollout;
+mod save;
 mod scale;
 mod server_table;
 mod synchronized_output;
@@ -6924,9 +6925,10 @@ async fn every_async_result_is_scoped_to_its_own_operation() {
     });
     assert_eq!(app.flash, "deleting 3 pods…");
 
-    app.handle_msg(Msg::LogsSaved {
+    app.handle_msg(Msg::Saved {
         generation: app.generation,
         claim: find,
+        what: "logs",
         result: Ok(std::path::PathBuf::from("/tmp/sofka.log")),
     });
     assert_eq!(app.flash, "deleting 3 pods…");
@@ -8937,9 +8939,10 @@ async fn log_save_result_survives_leaving_logs() {
     let claim = app.claim_status("saving logs…");
     // Leaving Logs invalidates its stream but not the independent file write.
     app.log_gen += 1;
-    app.handle_msg(Msg::LogsSaved {
+    app.handle_msg(Msg::Saved {
         generation: app.generation,
         claim,
+        what: "logs",
         result: Ok(std::env::temp_dir().join("sofka-test.log")),
     });
     assert!(app.flash.contains("sofka-test.log"));
@@ -8952,9 +8955,10 @@ async fn stale_log_save_result_is_dropped_after_a_view_generation_change() {
     let stale = app.generation;
     let claim = app.claim_status("saving logs…");
     app.bump_generation();
-    app.handle_msg(Msg::LogsSaved {
+    app.handle_msg(Msg::Saved {
         generation: stale,
         claim,
+        what: "logs",
         result: Err("old write failed".into()),
     });
     assert!(!app.flash.contains("old write failed"));
@@ -36765,7 +36769,7 @@ async fn log_marker_shortcut_exports_only_source_lines() {
     app.handle_key(ctrl(KeyCode::Char('s'))).unwrap();
     let path = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Msg::LogsSaved { result, .. } = rx.recv().await.unwrap() {
+            if let Msg::Saved { result, .. } = rx.recv().await.unwrap() {
                 break result.unwrap();
             }
         }
@@ -39630,7 +39634,7 @@ async fn log_json_shortcut_formats_records_and_keeps_raw_save() {
         .unwrap();
     let saved = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if let Msg::LogsSaved { result, .. } = rx.recv().await.unwrap() {
+            if let Msg::Saved { result, .. } = rx.recv().await.unwrap() {
                 break result.unwrap();
             }
         }

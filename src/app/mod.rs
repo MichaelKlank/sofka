@@ -626,6 +626,8 @@ pub struct Scrollable {
     pub title: String,
     /// Mask sensitive header and status values while this document is visible.
     pub redact_header: bool,
+    /// The document is YAML, so `ctrl-s` saves it as `.yaml`.
+    pub yaml: bool,
     pub lines: VecDeque<String>,
     /// Vertical scroll offset in rendered display rows. `usize` on purpose: a
     /// paused wrapped log buffer can far exceed `u16`.
@@ -2605,6 +2607,8 @@ pub struct App {
     /// Background update checks are allowed (`update_check`). Off until
     /// startup reads the config, so tests never reach the network.
     pub update_check: bool,
+    /// Raw `save_dir` setting for `ctrl-s` saves, resolved when a save runs.
+    pub save_dir: Option<String>,
     /// The latest release the last update check found.
     pub latest_release: Option<crate::update::Release>,
     update_fetcher: UpdateFetcher,
@@ -2940,6 +2944,7 @@ impl App {
             hide_header: false,
             terminal_title: true,
             update_check: false,
+            save_dir: None,
             latest_release: None,
             update_fetcher: default_update_fetcher,
             spec: crate::columns::build_spec("", "", None, None, false),

@@ -1452,6 +1452,7 @@ impl App {
             (Some(Action::Copy), _) if detail => {
                 self.copy_doc();
             }
+            (Some(Action::Save), _) if detail => self.save_doc(),
             // `x` decodes the secret's data from inside its describe/YAML
             // view too — no need to back out to the table first.
             (Some(Action::DecodeSecret), _)

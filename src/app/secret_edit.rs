@@ -273,7 +273,7 @@ fn configured_editor() -> Option<String> {
 
 /// Create `path` readable only by this user and write `contents` to it. It
 /// must not exist yet.
-fn create_private(path: &Path, contents: &str) -> std::io::Result<()> {
+pub(super) fn create_private(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);

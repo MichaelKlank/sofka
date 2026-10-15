@@ -139,6 +139,9 @@ pub struct Config {
     pub remember_sort: Option<bool>,
     /// Check GitHub once a day for a newer release. Defaults to true.
     pub update_check: Option<bool>,
+    /// Directory for `ctrl-s` saves from logs and document views. Defaults to
+    /// the temp directory; see [`save_dir`].
+    pub save_dir: Option<String>,
     /// How `:notify` events are delivered — see [`NotifyConfig`].
     pub notify: NotifyConfig,
     /// Built-in keyboard bindings, validated by [`crate::keymap::Keymap::compile`].
@@ -1394,6 +1397,27 @@ pub fn mouse_scroll_lines(value: Option<u16>, warnings: &mut Vec<String>) -> u16
     }
 }
 
+/// Resolves `save_dir`: unset or blank means the temp directory, and a
+/// leading `~` expands to `$HOME`.
+pub fn save_dir(value: Option<&str>) -> Result<PathBuf, String> {
+    expand_save_dir(value, std::env::var("HOME").ok().as_deref())
+}
+
+fn expand_save_dir(value: Option<&str>, home: Option<&str>) -> Result<PathBuf, String> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(std::env::temp_dir());
+    };
+    let rest = match value.strip_prefix('~') {
+        Some("") => "",
+        Some(rest) if rest.starts_with('/') => &rest[1..],
+        _ => return Ok(PathBuf::from(value)),
+    };
+    let home = home
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| format!("save_dir {value}: HOME is not set"))?;
+    Ok(PathBuf::from(home).join(rest))
+}
+
 /// Validation warnings for guardrails: an unknown `confirmation` mode.
 pub fn guardrail_warnings(guardrails: &[Guardrail]) -> Vec<String> {
     let mut warns = Vec::new();
@@ -1996,6 +2020,38 @@ fn config_dir_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_dir_defaults_to_temp_and_expands_home() {
+        let home = Some("/home/me");
+        assert_eq!(expand_save_dir(None, home), Ok(std::env::temp_dir()));
+        assert_eq!(expand_save_dir(Some("  "), home), Ok(std::env::temp_dir()));
+        assert_eq!(
+            expand_save_dir(Some("~"), home),
+            Ok(PathBuf::from("/home/me"))
+        );
+        assert_eq!(
+            expand_save_dir(Some("~/k8s/dumps"), home),
+            Ok(PathBuf::from("/home/me/k8s/dumps"))
+        );
+        assert_eq!(
+            expand_save_dir(Some("/srv/dumps"), home),
+            Ok(PathBuf::from("/srv/dumps"))
+        );
+        assert_eq!(
+            expand_save_dir(Some("~other/dumps"), home),
+            Ok(PathBuf::from("~other/dumps"))
+        );
+        assert!(
+            expand_save_dir(Some("~/dumps"), None)
+                .unwrap_err()
+                .contains("HOME is not set")
+        );
+        let toml: Config = toml::from_str("save_dir = \"~/dumps\"").unwrap();
+        let yaml: Config = serde_yaml::from_str("save_dir: ~/dumps\n").unwrap();
+        assert_eq!(toml.save_dir.as_deref(), Some("~/dumps"));
+        assert_eq!(yaml.save_dir.as_deref(), Some("~/dumps"));
+    }
 
     #[test]
     fn detail_wrap_defaults_and_formats() {

@@ -237,6 +237,7 @@ terminal_title = true # false disables terminal title changes
 remember_sort     = true   # save and restore sort choices per resource kind
                            # false makes sort changes temporary
 update_check = true # false turns off the daily check for a newer release
+save_dir = "~/k8s/saves" # ctrl-s target for logs and documents; default: temp dir
 
 # Namespaces pinned to the top of the `n` switcher (★); session recents (·)
 # follow them. Keys 1 to 9 select the first nine entries in this fixed order.
@@ -264,6 +265,13 @@ ignored, and also waits a day before the next startup check. Set
 machines. `:check-update` and `sofka check-update` still check on request. sofka
 never downloads or installs a release; upgrade with the package manager that
 installed it.
+
+`save_dir` is where `ctrl-s` writes in logs and document views. It defaults to
+the system temp directory. A leading `~` expands to `$HOME`. sofka creates the
+directory on the first save if it does not exist, and shows the error in the
+status line if it cannot. A relative path is resolved against the directory
+sofka was started in. The option supports cluster and context overrides and
+`:reload`.
 
 Set `hide_header = true` to remove the header and logo and give more space to
 the active view. The default is `false`. This option supports cluster and

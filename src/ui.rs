@@ -3048,6 +3048,10 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String, HelpSecti
             "toggle fullscreen for text selection (no borders or scrollbars)"
         } else if action == Action::Edit && scope == "detail" {
             "edit the displayed resource in $EDITOR (YAML, describe, decoded Secret)"
+        } else if action == Action::Save && scope == "logs" {
+            "save the shown log lines to a file in save_dir"
+        } else if action == Action::Save {
+            "save the whole document to a file in save_dir"
         } else if action == Action::ManagedFields && scope == "detail" {
             "show or hide managedFields (YAML only; hidden when a document opens)"
         } else if action == Action::AutoRefresh && scope == "detail" {
@@ -5806,6 +5810,7 @@ fn navigation_hint(app: &App, width: u16) -> String {
             Action::Wrap,
             Action::Fullscreen,
             Action::Copy,
+            Action::Save,
             Action::PageUp,
             Action::PageDown,
         ][..],

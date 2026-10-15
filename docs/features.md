@@ -419,6 +419,12 @@ include those conditions. Row filters can search the route paths.
   from `PATH` to copy to the Windows clipboard, including inside tmux. This
   requires Windows interoperability. If `clip.exe` is missing or fails, sofka
   tries the other clipboard tools, then OSC 52.
+- **Save to a file** - `ctrl-s` in the YAML, describe, diff, and events views
+  saves the whole document as rendered, so a manifest no longer needs a trip
+  through the clipboard. YAML and diff save as `.yaml`, the others as `.txt`.
+  `ctrl-s` in logs saves the shown lines as `.log`. Both write to `save_dir`,
+  the temp directory by default. See
+  [Document views](keys.md#document-views-yaml-describe-diff-events).
 - **RBAC-aware palette browse** - the empty `:` list hides kinds you cannot
   `list`. An explicit search checks the full discovery catalog, because some
   delegated authorizers return incomplete rule reviews.

@@ -263,6 +263,7 @@ impl App {
         self.detail = Scrollable {
             wrap: self.detail.wrap,
             title: format!("{} v{} — values", rel.name, rel.revision),
+            yaml: true,
             lines: yaml.lines().map(String::from).collect(),
             ..Default::default()
         };

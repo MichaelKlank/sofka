@@ -306,6 +306,7 @@ for those operations.
 | `page_up`        | `pageup`, `ctrl-b`            |
 | `previous_match` | `N`                           |
 | `right`          | `l`, `right`                  |
+| `save`           | `ctrl-s`                      |
 | `up`             | `k`, `up`                     |
 | `wrap`           | `w`                           |
 
@@ -328,6 +329,7 @@ for those operations.
 | `page_up`        | `pageup`, `ctrl-b`            |
 | `previous_match` | `N`                           |
 | `right`          | `l`, `right`                  |
+| `save`           | `ctrl-s`                      |
 | `up`             | `k`, `up`                     |
 | `wrap`           | `w`                           |
 
@@ -358,6 +360,7 @@ for those operations.
 | `page_up`        | `pageup`, `ctrl-b`            |
 | `previous_match` | `N`                           |
 | `right`          | `l`, `right`                  |
+| `save`           | `ctrl-s`                      |
 | `up`             | `k`, `up`                     |
 | `wrap`           | `w`                           |
 

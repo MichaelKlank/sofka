@@ -305,10 +305,11 @@ pub enum Msg {
         claim: StatusClaim,
         result: Result<String, String>,
     },
-    /// Result of an off-thread log save.
-    LogsSaved {
+    /// Result of an off-thread log or document save.
+    Saved {
         generation: u64,
         claim: StatusClaim,
+        what: &'static str,
         result: Result<std::path::PathBuf, String>,
     },
     /// Result of an off-thread clipboard copy.

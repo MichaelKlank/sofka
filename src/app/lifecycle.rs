@@ -1855,6 +1855,7 @@ impl App {
                         managed_fields: false,
                     };
                 }
+                self.detail.yaml = warn.is_some();
                 self.detail.title = title;
                 self.detail.replace_lines(lines.into());
                 match warn {
@@ -2054,14 +2055,15 @@ impl App {
                     );
                 }
             }
-            Msg::LogsSaved {
+            Msg::Saved {
                 generation,
                 claim,
+                what,
                 result,
             } if generation == self.generation => match result {
                 Ok(path) => self.set_claimed_status(
                     claim,
-                    format!("saved logs → {}", path.display()),
+                    format!("saved {what} → {}", path.display()),
                     false,
                 ),
                 Err(e) => self.set_claimed_status(claim, format!("save failed: {e}"), true),
