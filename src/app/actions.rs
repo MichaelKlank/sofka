@@ -1297,6 +1297,16 @@ impl App {
             _ => pod_port_labels(&obj.data),
         };
         items.dedup();
+        self.pf_picker_in_use = items
+            .iter()
+            .map(|item| {
+                let ports = item.split_whitespace().next().unwrap_or(item);
+                let local = ports.split_once(':').map_or(ports, |(local, _)| local);
+                local
+                    .parse::<u16>()
+                    .is_ok_and(|port| matches!(probe_local_port(port), LocalPort::InUse))
+            })
+            .collect();
         items.push("Custom…".into());
 
         self.pf_picker_items = items;
@@ -1355,27 +1365,17 @@ impl App {
         if port == 0 {
             return true;
         }
-        let mut available = false;
-        let mut in_use = false;
-        let mut last_error = None;
-        for address in [
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        ] {
-            match std::net::TcpListener::bind((address, port)) {
-                Ok(_listener) => available = true,
-                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => in_use = true,
-                Err(error) => last_error = Some(error),
-            }
-        }
-        if !available {
-            if in_use {
+        match probe_local_port(port) {
+            LocalPort::Available => true,
+            LocalPort::InUse => {
                 self.flash_warn(&format!("port {port} is already in use"));
-            } else if let Some(error) = last_error {
+                false
+            }
+            LocalPort::Unbindable(error) => {
                 self.flash_warn(&format!("cannot bind local port {port}: {error}"));
+                false
             }
         }
-        available
     }
 
     pub(super) fn start_port_forward(&mut self, ns: String, target: String, ports: String) -> bool {
@@ -3034,6 +3034,33 @@ pub(super) fn forward_target(kind_plural: &str, name: &str) -> String {
         other => other.trim_end_matches('s'),
     };
     format!("{prefix}/{name}")
+}
+
+enum LocalPort {
+    Available,
+    InUse,
+    Unbindable(std::io::Error),
+}
+
+/// Test-bind `port` on both loopback addresses, as `kubectl port-forward`
+/// does: the port is usable when either address binds.
+fn probe_local_port(port: u16) -> LocalPort {
+    let mut in_use = false;
+    let mut last_error = None;
+    for address in [
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    ] {
+        match std::net::TcpListener::bind((address, port)) {
+            Ok(_listener) => return LocalPort::Available,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => in_use = true,
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match last_error {
+        Some(error) if !in_use => LocalPort::Unbindable(error),
+        _ => LocalPort::InUse,
+    }
 }
 
 /// Collect declared ports from a Service manifest as `"port:port  (name)"` labels.

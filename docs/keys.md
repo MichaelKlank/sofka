@@ -100,7 +100,7 @@ ownership scope are cleared. Startup still uses the configured default resource.
 | `:find <text>`                                               | global fuzzy find over object names across common kinds, all namespaces                                                                                                                          |
 | `i`                                                          | set container image                                                                                                                                                                              |
 | `r`                                                          | rollout restart (marked workloads, or current) / force-sync (ExternalSecrets/PushSecrets) / rollback (Helm or rollout history) / refresh (elsewhere)                                             |
-| `f` / `shift-f`                                              | port-forward (pods/services) — picker shows declared ports, or "Custom…" for manual entry; active forwards show `●` next to the name                                                             |
+| `f` / `shift-f`                                              | port-forward (pods/services) — picker shows declared ports, marks busy local ports `in use`, or "Custom…" for remote and local ports; active forwards show `●` next to the name                  |
 | `t`                                                          | Flux and flux-operator: suspend/resume/reconcile (+ force where supported) · ArgoCD: suspend/resume (+ sync, sync with prune for App) · CronJobs: trigger/suspend/resume · pods: file transfer   |
 | `V` / `N`                                                    | CertificateSigningRequests: approve / deny (marked rows, or current); confirm shows requester, signer and usages; already decided requests are skipped                                           |
 | `C` / `U` / `D`                                              | nodes: cordon / uncordon / open drain options                                                                                                                                                    |
@@ -141,13 +141,21 @@ See [Node drain options](features.md#node-drain-options) for defaults and limits
 
 ## Port-forward picker (`f` on a pod or service)
 
-| Key                  | Action                                                         |
-| -------------------- | -------------------------------------------------------------- |
-| `enter`              | start the selected mapping, or open manual input for "Custom…" |
-| `e`                  | edit only the local port of a declared mapping                 |
-| `j` / `k`, `↓` / `↑` | select a mapping                                               |
-| `PgDn` / `PgUp`      | move one page down / up                                        |
-| `esc` / `q`          | close the picker                                               |
+| Key                  | Action                                                                      |
+| -------------------- | --------------------------------------------------------------------------- |
+| `enter`              | start the selected mapping, or ask for remote and local ports for "Custom…" |
+| `e`                  | edit only the local port of a declared mapping                              |
+| `j` / `k`, `↓` / `↑` | select a mapping                                                            |
+| `PgDn` / `PgUp`      | move one page down / up                                                     |
+| `esc` / `q`          | close the picker                                                            |
+
+A mapping whose local port is already bound on both loopback addresses when
+the picker opens shows `in use`. The port can still change before you press
+`enter`, so starting a forward checks it again.
+
+"Custom…" asks for the remote port, a number or a port name, then for the local
+port. The local port starts as the remote port when the remote port is a number.
+Forwards bind to `localhost`, as with the declared mappings.
 
 The local-port prompt contains the current value. `enter` starts the forward;
 `esc` returns to the same picker row. Invalid or unavailable ports keep the

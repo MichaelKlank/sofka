@@ -523,7 +523,7 @@ enum PromptKind {
     Scale {
         targets: Vec<(String, String)>,
     },
-    PortForward {
+    PortForwardRemote {
         ns: String,
         name: String,
     },
@@ -2364,6 +2364,9 @@ pub struct App {
     /// Port-forward picker (`f`): the declared ports of the selected object,
     /// each as a `LOCAL:REMOTE` string, plus a trailing "Custom…" entry.
     pub pf_picker_items: Vec<String>,
+    /// Whether each declared mapping's local port was already bound on both
+    /// loopback addresses when the picker opened.
+    pub pf_picker_in_use: Vec<bool>,
     pub pf_picker_state: ListState,
     /// The `(ns, name)` target the port-forward picker is acting on.
     pub(super) pf_picker_target: Option<(String, String)>,
@@ -2800,6 +2803,7 @@ impl App {
             pf_spawner: default_pf_spawner,
             forwards_cfg: Vec::new(),
             pf_picker_items: Vec::new(),
+            pf_picker_in_use: Vec::new(),
             pf_picker_state: ListState::default(),
             pf_picker_target: None,
             notify_cfg: crate::config::NotifyConfig::default(),

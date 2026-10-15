@@ -796,9 +796,11 @@ include those conditions. Row filters can search the route paths.
   Pressing `f` on a pod or service opens a picker listing the manifest's
   declared ports. Press `enter` to start the selected mapping, or `e` to edit
   only its local port. The edit prompt contains the current local port;
-  `esc` returns to the same picker row. Choose "Custom…" for manual
-  `LOCAL:REMOTE` input. If the local port cannot bind to either loopback address, the input stays open
-  and shows an error so you can choose another port. Active forwards show a teal `●` in a dedicated
+  `esc` returns to the same picker row. Mappings whose local port is already
+  bound show `in use`. Choose "Custom…" to enter a remote port and then a local
+  port, which starts as the remote port. If the local port cannot bind to either
+  loopback address when you start the forward, the input stays open and shows an
+  error so you can choose another port. Active forwards show a teal `●` in a dedicated
   indicator column next to the row name. See [Saved forwards](plugins.md#saved-forwards).
 - **File transfer** (`t` on a pod, or `t` in the container picker for one
   container) - download from or upload to a pod via `kubectl cp`, off-thread

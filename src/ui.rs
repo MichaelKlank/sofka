@@ -3712,7 +3712,8 @@ fn draw_flux_menu(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// Port-forward picker (`f` on a pod/service): lists the object's declared
-/// ports for single-select, plus a "Custom…" entry for manual input.
+/// ports for single-select, plus a "Custom…" entry for manual input. A
+/// mapping whose local port was taken when the picker opened says `in use`.
 fn draw_port_forward_picker(frame: &mut Frame, app: &mut App, area: Rect) {
     let show_scrollbars = app.scrollbars_visible();
     let target = app
@@ -3723,13 +3724,21 @@ fn draw_port_forward_picker(frame: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<Text> = app
         .pf_picker_items
         .iter()
-        .map(|label| {
+        .enumerate()
+        .map(|(i, label)| {
             let color = if *label == "Custom…" {
                 theme::overlay1()
             } else {
                 theme::green()
             };
-            Text::from(Span::styled(label.as_str(), Style::default().fg(color)))
+            let mut spans = vec![Span::styled(label.as_str(), Style::default().fg(color))];
+            if app.pf_picker_in_use.get(i).copied().unwrap_or(false) {
+                spans.push(Span::styled(
+                    "  in use",
+                    Style::default().fg(theme::yellow()),
+                ));
+            }
+            Text::from(Line::from(spans))
         })
         .collect();
     app.picker_page_items = render_popup_list(

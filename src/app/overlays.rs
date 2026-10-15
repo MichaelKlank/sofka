@@ -315,8 +315,12 @@ impl App {
                 // Most prompts start at (and return to) the table; the
                 // lookback and rename-context prompts return to the view
                 // they were opened from.
-                self.mode = if matches!(self.prompt_kind, Some(PromptKind::PortForwardLocal { .. }))
-                {
+                self.mode = if matches!(
+                    self.prompt_kind,
+                    Some(
+                        PromptKind::PortForwardRemote { .. } | PromptKind::PortForwardLocal { .. }
+                    )
+                ) {
                     Mode::PortForwardPicker
                 } else if self.prompt_over_logs() {
                     Mode::Logs
@@ -347,10 +351,14 @@ impl App {
                     self.flash_warn("local port must be a number from 1 to 65535");
                     return;
                 }
-                if matches!(
-                    self.prompt_kind,
-                    Some(PromptKind::PortForward { .. } | PromptKind::PortForwardLocal { .. })
-                ) && !self.local_forward_port_available(&input)
+                if matches!(self.prompt_kind, Some(PromptKind::PortForwardRemote { .. }))
+                    && !valid_remote_port(&input)
+                {
+                    self.flash_warn("remote port must be a number from 1 to 65535 or a port name");
+                    return;
+                }
+                if matches!(self.prompt_kind, Some(PromptKind::PortForwardLocal { .. }))
+                    && !self.local_forward_port_available(&input)
                 {
                     return;
                 }
@@ -370,13 +378,21 @@ impl App {
                         Ok(n) if n >= 0 => self.do_scale(targets, n),
                         _ => self.flash_warn("invalid replica count"),
                     },
-                    Some(PromptKind::PortForward { ns, name }) => {
-                        if input.is_empty() {
-                            self.flash_warn("no ports given");
+                    // Custom… chains two prompts: the remote port first, then
+                    // the local port prefilled with the remote one.
+                    Some(PromptKind::PortForwardRemote { ns, name }) => {
+                        self.prompt_label = format!("Local port for {name}, remote {input}:");
+                        self.prompt_input = if input.parse::<u16>().is_ok() {
+                            input.clone()
                         } else {
-                            let target = forward_target(&self.kind_plural, &name);
-                            self.start_port_forward(ns, target, input);
-                        }
+                            String::new()
+                        };
+                        self.prompt_kind = Some(PromptKind::PortForwardLocal {
+                            ns,
+                            target: forward_target(&self.kind_plural, &name),
+                            remote: input,
+                        });
+                        self.mode = Mode::Prompt;
                     }
                     Some(PromptKind::PortForwardLocal { ns, target, remote }) => {
                         if !self.start_port_forward(
@@ -498,8 +514,8 @@ impl App {
     }
 
     /// Port-forward picker (`f` on a pod/service): single-select over the
-    /// object's declared ports, plus a "Custom…" entry that falls through to
-    /// the typed prompt.
+    /// object's declared ports, plus a "Custom…" entry that asks for the
+    /// remote port and then the local port.
     pub(super) fn key_port_forward_picker(&mut self, key: KeyInput) {
         let len = self.pf_picker_items.len();
         match (key.action, key.code) {
@@ -532,10 +548,9 @@ impl App {
                     if key.action == Some(Action::Edit) {
                         return;
                     }
-                    self.prompt_label =
-                        format!("Port-forward {name} (LOCAL:REMOTE, e.g. 8080:80):");
+                    self.prompt_label = format!("Remote port for {name}:");
                     self.prompt_input.clear();
-                    self.prompt_kind = Some(PromptKind::PortForward { ns, name });
+                    self.prompt_kind = Some(PromptKind::PortForwardRemote { ns, name });
                     self.mode = Mode::Prompt;
                 } else {
                     let ports = item.split_whitespace().next().unwrap_or(&item).to_string();
@@ -564,4 +579,20 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// A remote port for `kubectl port-forward`: a number from 1 to 65535, or a
+/// named port (IANA_SVC_NAME) that kubectl resolves against the target.
+fn valid_remote_port(input: &str) -> bool {
+    if let Ok(port) = input.parse::<u16>() {
+        return port > 0;
+    }
+    (1..=15).contains(&input.len())
+        && input
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && input.bytes().any(|b| b.is_ascii_lowercase())
+        && !input.starts_with('-')
+        && !input.ends_with('-')
+        && !input.contains("--")
 }

@@ -2525,15 +2525,27 @@ async fn port_forward_local_edit_validates_input_and_returns_to_selected_row() {
     assert_eq!(app.mode, Mode::Prompt);
     assert!(matches!(
         app.prompt_kind,
-        Some(PromptKind::PortForward { .. })
+        Some(PromptKind::PortForwardRemote { .. })
     ));
     assert!(app.prompt_input.is_empty());
 }
 
+fn type_prompt(app: &mut App, input: &str) {
+    for _ in 0..app.prompt_input.len() {
+        app.handle_key(press(KeyCode::Backspace)).unwrap();
+    }
+    for ch in input.chars() {
+        app.handle_key(press(KeyCode::Char(ch))).unwrap();
+    }
+}
+
 #[tokio::test]
-async fn port_forward_prompt_preserves_input_and_allows_correction() {
+async fn port_forward_custom_asks_remote_then_prefilled_local_port() {
     let listeners = occupy_forward_port();
-    let port = listeners.0.local_addr().unwrap().port();
+    let busy = listeners.0.local_addr().unwrap().port();
+    let free = occupy_forward_port();
+    let local = free.0.local_addr().unwrap().port();
+    drop(free);
     let (mut app, _rx) = test_app();
     app.switch_kind("services");
     apply(
@@ -2548,35 +2560,174 @@ async fn port_forward_prompt_preserves_input_and_allows_correction() {
     app.handle_key(press(KeyCode::Char('f'))).unwrap();
     app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.mode, Mode::Prompt);
-    for input in [
-        port.to_string(),
-        format!("{port}:80"),
-        format!("{port}:http"),
-    ] {
-        app.prompt_input.clear();
-        for ch in input.chars() {
-            app.handle_key(press(KeyCode::Char(ch))).unwrap();
-        }
+    assert_eq!(app.prompt_label, "Remote port for web:");
+    assert!(app.prompt_input.is_empty());
+
+    for input in ["", "0", "65536", "8080:80", "Http", "-http", "a--b"] {
+        type_prompt(&mut app, input);
         app.handle_key(press(KeyCode::Enter)).unwrap();
         assert_eq!(app.mode, Mode::Prompt);
         assert_eq!(app.prompt_input, input);
         assert!(matches!(
             &app.prompt_kind,
-            Some(PromptKind::PortForward { ns, name }) if ns == "default" && name == "web"
+            Some(PromptKind::PortForwardRemote { ns, name }) if ns == "default" && name == "web"
         ));
-        assert_eq!(app.flash, format!("port {port} is already in use"));
-        assert!(app.port_forwards.is_empty());
+        assert_eq!(
+            app.flash,
+            "remote port must be a number from 1 to 65535 or a port name"
+        );
     }
-    for _ in 0..app.prompt_input.len() {
-        app.handle_key(press(KeyCode::Backspace)).unwrap();
-    }
-    for ch in ":80".chars() {
-        app.handle_key(press(KeyCode::Char(ch))).unwrap();
-    }
+
+    type_prompt(&mut app, &busy.to_string());
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Prompt);
+    assert_eq!(
+        app.prompt_label,
+        format!("Local port for web, remote {busy}:")
+    );
+    assert_eq!(app.prompt_input, busy.to_string());
+    assert!(matches!(
+        &app.prompt_kind,
+        Some(PromptKind::PortForwardLocal { ns, target, remote })
+            if ns == "default" && target == "svc/web" && *remote == busy.to_string()
+    ));
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Prompt);
+    assert_eq!(app.prompt_input, busy.to_string());
+    assert_eq!(app.flash, format!("port {busy} is already in use"));
+    assert!(app.port_forwards.is_empty());
+
+    type_prompt(&mut app, &local.to_string());
     app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.mode, Mode::Table);
     assert_eq!(app.port_forwards.len(), 1);
-    assert_eq!(app.port_forwards[0].ports, ":80");
+    assert_eq!(app.port_forwards[0].ports, format!("{local}:{busy}"));
+    assert_eq!(app.port_forwards[0].target, "svc/web");
+}
+
+#[tokio::test]
+async fn port_forward_custom_named_remote_port_leaves_local_empty() {
+    let free = occupy_forward_port();
+    let local = free.0.local_addr().unwrap().port();
+    drop(free);
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "web"}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('f'))).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    type_prompt(&mut app, "http-alt");
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Prompt);
+    assert!(app.prompt_input.is_empty());
+    assert_eq!(app.prompt_label, "Local port for web, remote http-alt:");
+
+    type_prompt(&mut app, &local.to_string());
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert_eq!(app.port_forwards.len(), 1);
+    assert_eq!(app.port_forwards[0].ports, format!("{local}:http-alt"));
+    assert_eq!(app.port_forwards[0].target, "pod/web");
+}
+
+#[tokio::test]
+async fn port_forward_custom_prompts_return_to_picker_on_esc() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 8080}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('f'))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(matches!(
+        app.prompt_kind,
+        Some(PromptKind::PortForwardRemote { .. })
+    ));
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::PortForwardPicker);
+    assert_eq!(app.pf_picker_state.selected(), Some(1));
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    type_prompt(&mut app, "80");
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(matches!(
+        app.prompt_kind,
+        Some(PromptKind::PortForwardLocal { .. })
+    ));
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.mode, Mode::PortForwardPicker);
+    assert_eq!(app.pf_picker_state.selected(), Some(1));
+    assert!(app.port_forwards.is_empty());
+}
+
+#[tokio::test]
+async fn port_forward_picker_marks_local_ports_already_in_use() {
+    let listeners = occupy_forward_port();
+    let busy = listeners.0.local_addr().unwrap().port();
+    let free = occupy_forward_port();
+    let open = free.0.local_addr().unwrap().port();
+    drop(free);
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "web", "ports": [
+                {"containerPort": busy},
+                {"containerPort": open}
+            ]}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+    app.handle_key(press(KeyCode::Char('f'))).unwrap();
+    assert_eq!(app.mode, Mode::PortForwardPicker);
+    assert_eq!(app.pf_picker_in_use, vec![true, false]);
+
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let rows: Vec<String> = (0..24)
+        .map(|y| {
+            (0..80)
+                .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                .collect()
+        })
+        .collect();
+    let row = |port: u16| {
+        rows.iter()
+            .find(|r| r.contains(&format!("{port}:{port}")))
+            .unwrap_or_else(|| panic!("{port} row rendered: {rows:#?}"))
+    };
+    assert!(row(busy).contains("in use"), "{}", row(busy));
+    assert!(!row(open).contains("in use"), "{}", row(open));
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.contains("Custom") && r.contains("in use"))
+    );
+
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.mode, Mode::PortForwardPicker);
+    assert_eq!(app.flash, format!("port {busy} is already in use"));
+    assert!(app.port_forwards.is_empty());
 }
 
 #[tokio::test]
@@ -2654,7 +2805,7 @@ async fn port_forward_picker_custom_falls_through_to_prompt() {
     app.pf_picker_state.select(Some(custom_idx));
     app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.mode, Mode::Prompt);
-    assert!(app.prompt_label.contains("Port-forward web"));
+    assert_eq!(app.prompt_label, "Remote port for web:");
     assert!(app.prompt_input.is_empty());
 }
 
