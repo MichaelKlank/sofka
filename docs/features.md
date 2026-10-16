@@ -1114,6 +1114,43 @@ satisfies the `baseline` Pod Security Standard - but not `restricted`, which
 also requires `runAsNonRoot`. In a namespace enforcing `restricted` the helper
 pod is rejected; browse through a pod that already mounts the claim instead.
 
+## Manifest browser
+
+`:dir [path]` lists a local directory under the header, so a manifest from
+your repository is one keystroke from the cluster you are looking at. Without
+a path it opens the directory sofka was started from; `~` and relative paths
+work. Only folders and `.yaml`, `.yml`, and `.json` files are listed, folders
+first. Hidden entries and anything that is neither a regular file nor a
+folder, such as a named pipe called `x.yaml`, are skipped. A folder with a
+`kustomization.yaml`, `kustomization.yml`, or `Kustomization` file is marked
+`kustomize`.
+
+- **`enter`** opens a folder, or shows a manifest as a read-only document.
+- **`e`** opens the manifest in `$KUBE_EDITOR` or `$EDITOR`, suspending the TUI.
+- **`a`** shows a `kubectl diff` of the selection. Nothing is applied until you
+  press `a` again in that diff and confirm. When nothing would change, the
+  status line says so and no diff opens.
+- **`d`** deletes the objects the selection describes, with
+  `--ignore-not-found`, after confirmation.
+
+Both start by rendering the selection once with
+`kubectl apply --dry-run=client -o json`: a manifest with `-f`, a folder with
+`-f <folder> -R`, and a kustomization with `-k`. A delete renders with
+`--validate=false`, so a manifest holding only `apiVersion`, `kind`, and
+`metadata.name` works. The rendered objects stay in memory and reach the diff,
+the apply, and the delete on stdin (`-f -`), so a rendered Secret is never
+written to disk. An edit made after the diff opened is not applied; press `a`
+again to see it. Leaving the diff drops the preview.
+
+Rendering fills in each object's namespace, using the context's default for
+objects without one. Guardrails match the `apply` and `delete` actions against
+every rendered object's resource and namespace, like the same action on a table
+row. `max_bulk` counts every object a rule matches across the whole selection,
+whatever its kind. A selection with a kind sofka has not discovered is refused,
+since its guardrails could not be matched reliably. Every command is
+pinned to the current context with `--context`. Apply and delete are blocked in
+read-only mode and recorded in `:journal`.
+
 ## Safety
 
 - **Read-only mode**, **declarative guardrails**, **action-aware authorization**

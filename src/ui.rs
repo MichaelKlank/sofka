@@ -392,6 +392,8 @@ fn draw_base(frame: &mut Frame, app: &mut App) {
         Mode::Fleet => draw_fleet(frame, app, chunks[1]),
         Mode::Find => draw_find(frame, app, chunks[1]),
         Mode::PvcExplore => draw_pvc_explore(frame, app, chunks[1]),
+        Mode::Dir => draw_dir(frame, app, chunks[1]),
+        Mode::Confirm | Mode::Prompt if app.over_dir_browser() => draw_dir(frame, app, chunks[1]),
         // A transfer confirmation or a guardrail prompt raised from the PVC
         // browser keeps the two panes underneath it, so you can still see what
         // is being copied where. Only that dialog: drawing an unrelated one
@@ -451,6 +453,7 @@ fn draw_base(frame: &mut Frame, app: &mut App) {
             Mode::Fleet => draw_fleet(frame, app, chunks[1]),
             Mode::Find => draw_find(frame, app, chunks[1]),
             Mode::PvcExplore => draw_pvc_explore(frame, app, chunks[1]),
+            Mode::Dir => draw_dir(frame, app, chunks[1]),
             Mode::Containers => {
                 draw_table(frame, app, chunks[1]);
                 draw_containers(frame, app, chunks[1]);
@@ -3273,6 +3276,10 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String, HelpSecti
         "toggle watch notifications on the selection · note prefixes its messages",
     ));
     lines.push(bind(
+        ":dir [path]",
+        "browse local manifests · a diffs then applies · d deletes their resources",
+    ));
+    lines.push(bind(
         ":pvc-clean",
         "delete helper pods left behind by a session that exited uncleanly (:pvc-cleanup)",
     ));
@@ -3956,6 +3963,83 @@ fn draw_port_forwards(frame: &mut Frame, app: &mut App, area: Rect) {
         items,
         Span::styled(title, theme::title()),
         &mut app.pf_state,
+    );
+}
+
+fn draw_dir(frame: &mut Frame, app: &mut App, area: Rect) {
+    use crate::app::dir::DirEntryKind;
+    let show_scrollbars = app.scrollbars_visible();
+    let name_w = app
+        .dir
+        .entries
+        .iter()
+        .map(|e| e.name.chars().count() + 1)
+        .max()
+        .unwrap_or(0)
+        .max(4);
+    let items: Vec<ListItem> = app
+        .dir
+        .entries
+        .iter()
+        .map(|e| {
+            let name = if e.kind == DirEntryKind::Manifest {
+                e.name.clone()
+            } else {
+                format!("{}/", e.name)
+            };
+            let size = e
+                .size
+                .map(crate::pvcexplore::human_size)
+                .unwrap_or_default();
+            let name_style = if e.kind == DirEntryKind::Manifest {
+                Style::default().fg(theme::text())
+            } else {
+                Style::default().fg(theme::sky())
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{name:<name_w$}  "), name_style),
+                Span::styled(format!("{:<10}", e.kind.label()), theme::dim()),
+                Span::styled(format!("{size:>8}"), theme::dim()),
+            ]))
+        })
+        .collect();
+    let count = format!(" [{}] ", app.dir.entries.len());
+    let room =
+        usize::from(area.width.saturating_sub(4)).saturating_sub(" Dir ".len() + count.len());
+    let path = crate::app::dir::display_path(&app.dir.path);
+    let chars = path.chars().count();
+    let path = if chars > room {
+        let tail: String = path.chars().skip(chars - room.saturating_sub(1)).collect();
+        format!("…{tail}")
+    } else {
+        path
+    };
+    let title = format!(" Dir {path}{count}");
+    app.picker_page_items = usize::from(area.height.saturating_sub(2)).max(1);
+    if items.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "  no manifests or directories here",
+                theme::dim(),
+            ))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(theme::border_focused())
+                    .title(Span::styled(title, theme::title())),
+            ),
+            area,
+        );
+        return;
+    }
+    render_framed_list(
+        frame,
+        show_scrollbars,
+        area,
+        items,
+        Span::styled(title, theme::title()),
+        &mut app.dir.state,
     );
 }
 
@@ -5858,6 +5942,17 @@ fn navigation_hint(app: &App, width: u16) -> String {
             Action::PageUp,
             Action::PageDown,
         ][..],
+        "diff" if app.dir.preview.is_some() => &[
+            Action::Apply,
+            Action::Back,
+            Action::Filter,
+            Action::NextMatch,
+            Action::PreviousMatch,
+            Action::Wrap,
+            Action::Copy,
+            Action::PageUp,
+            Action::PageDown,
+        ][..],
         "detail" | "diff" | "events" => &[
             Action::Back,
             Action::Filter,
@@ -5869,6 +5964,15 @@ fn navigation_hint(app: &App, width: u16) -> String {
             Action::Save,
             Action::PageUp,
             Action::PageDown,
+        ][..],
+        "dir" => &[
+            Action::Back,
+            Action::Accept,
+            Action::Parent,
+            Action::Edit,
+            Action::Apply,
+            Action::Delete,
+            Action::Refresh,
         ][..],
         "pvc_explore" => &[
             Action::Back,
@@ -6011,7 +6115,7 @@ fn sync_indicator(mode: Mode, doc_filter_return: Mode, synced: bool) -> (&'stati
         Mode::Detail | Mode::Diff | Mode::Explain => true,
         // A directory listing is fetched once by exec, not watched — `r`
         // re-reads it. Calling it live would be a lie.
-        Mode::PvcExplore => true,
+        Mode::PvcExplore | Mode::Dir => true,
         // `/` search over one of those documents — same underlying snapshot.
         Mode::DocFilter => matches!(doc_filter_return, Mode::Detail | Mode::Diff),
         _ => false,

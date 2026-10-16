@@ -458,6 +458,16 @@ pub enum Msg {
         generation: u64,
         row: Box<crate::fleet::FleetRow>,
     },
+    /// A `:dir` selection rendered for apply (with its diff) or delete.
+    DirPlan {
+        generation: u64,
+        claim: StatusClaim,
+        /// Matched against the browser's current request; older ones drop.
+        request: u64,
+        verb: crate::app::dir::DirVerb,
+        path: std::path::PathBuf,
+        result: Box<Result<crate::app::dir::DirPlan, String>>,
+    },
     /// Results of a `:find <text>` sweep across kinds.
     FindResults {
         generation: u64,

@@ -264,7 +264,7 @@ pub(super) fn editor_argv(editor: Option<String>, path: &Path) -> Vec<String> {
     }
 }
 
-fn configured_editor() -> Option<String> {
+pub(super) fn configured_editor() -> Option<String> {
     ["KUBE_EDITOR", "EDITOR"]
         .into_iter()
         .filter_map(|name| std::env::var(name).ok())

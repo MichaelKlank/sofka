@@ -9,6 +9,7 @@ use tokio::sync::mpsc::{self, Receiver};
 #[cfg(unix)]
 mod clipboard;
 mod credentials;
+mod dir;
 mod exec_auth;
 mod flux;
 mod kubeconfig;
@@ -1713,6 +1714,7 @@ async fn navigation_views_share_palette_and_help_shortcuts() {
         Mode::Snapshots,
         Mode::Fleet,
         Mode::Find,
+        Mode::Dir,
     ] {
         app.mode = source;
         app.handle_key(press(KeyCode::Char(':'))).unwrap();
@@ -16757,7 +16759,7 @@ async fn help_paging_updates_after_resize_and_compact_mode() {
     app.handle_key(press(KeyCode::PageDown)).unwrap();
     assert_eq!(app.help_scroll, 21);
 
-    term.backend_mut().resize(120, 800);
+    term.backend_mut().resize(120, 1000);
     term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
     assert_eq!(app.help_scroll, 0);
     assert_eq!(app.help_max_scroll, 0);
@@ -34525,6 +34527,7 @@ fn key_action_fixture(scope: &str) -> (App, Receiver<Msg>) {
         "fleet" => Mode::Fleet,
         "find" => Mode::Find,
         "pvc_explore" => Mode::PvcExplore,
+        "dir" => Mode::Dir,
         "port_forward_picker" => Mode::PortForwardPicker,
         "plugin_form" => {
             let mut plugin = named_plugin("echo", &[]);

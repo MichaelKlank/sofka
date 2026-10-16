@@ -100,6 +100,7 @@ ownership scope are cleared. Startup still uses the configured default resource.
 | `:snapshot [text\|json\|yaml]` / `:snapshots`                | capture the current view to a file · browse, open, and delete saved snapshots                                                                                                                    |
 | `:notify [note]`                                             | toggle watch notifications on the selected object; `note` prefixes its messages                                                                                                                  |
 | `:find <text>`                                               | global fuzzy find over object names across common kinds, all namespaces                                                                                                                          |
+| `:dir [path]`                                                | browse local manifests and apply or delete them (see below)                                                                                                                                      |
 | `i`                                                          | set container image                                                                                                                                                                              |
 | `r`                                                          | rollout restart (marked workloads, or current) / force-sync (ExternalSecrets/PushSecrets) / rollback (Helm or rollout history) / refresh (elsewhere)                                             |
 | `f` / `shift-f`                                              | port-forward (pods/services) — picker shows declared ports, marks busy local ports `in use`, or "Custom…" for remote and local ports; active forwards show `●` next to the name                  |
@@ -180,6 +181,22 @@ point instead. See [PVC explore](features.md#pvc-explore).
 | `s`              | shell into the volume at the directory the remote pane is showing           |
 | `r`              | re-read both panes                                                          |
 | `esc` / `q`      | close (and delete the helper pod, if one was created)                       |
+
+## Manifest browser (`:dir [path]`)
+
+Lists the folders and YAML/JSON manifests in `path`, or in the directory sofka
+was started from. See [Manifest browser](features.md#manifest-browser).
+
+| Key              | Action                                                             |
+| ---------------- | ------------------------------------------------------------------ |
+| `j`/`k`, `g`/`G` | move                                                               |
+| `enter`          | open the selected folder, or show the selected manifest            |
+| `⌫` or `-`       | go up one directory                                                |
+| `e`              | edit the selected manifest in `$KUBE_EDITOR` or `$EDITOR`          |
+| `a`              | diff the selection against the cluster; `a` in the diff applies it |
+| `d`              | delete the resources the selection describes, after confirmation   |
+| `r`              | re-read the directory                                              |
+| `esc` / `q`      | close                                                              |
 
 ## Logs view
 
@@ -391,7 +408,7 @@ configs, conflicts, and invalid values.
 ## What suspends the TUI
 
 Interactive actions (`e`, `s` for shell, `a`) suspend the TUI and shell out to
-`kubectl`. Delete, scale, restart, set-image, suspend, resume, reconcile, and
+`kubectl`. `e` in the manifest browser suspends it for your editor. Delete, scale, restart, set-image, suspend, resume, reconcile, and
 port-forward go through the kube API (or a backgrounded process) directly.
 
 If the first PVC listing fails because required tools are missing, sofka tries

@@ -193,7 +193,7 @@ Each text input mode also has `clear_line = "ctrl-u"` and
 Navigation screens also have `command = ":"` and `help = "?"`. These are the
 table, documents, logs, help, containers, confirm, dashboards, explain, timeline,
 gitops, argocd, adjacent, action menus, port-forwards, skins, snapshots, fleet,
-find, and PVC browser. In help, `?` closes the view instead.
+find, PVC browser, and manifest browser. In help, `?` closes the view instead.
 
 `back` clears a search or returns to the previous view, depending on the mode.
 `close` leaves the view directly. `accept` uses the selected item or input.
@@ -314,6 +314,7 @@ for those operations.
 
 | Action           | Default bindings              |
 | ---------------- | ----------------------------- |
+| `apply`          | `a`                           |
 | `back`           | `esc`                         |
 | `close`          | `q`                           |
 | `copy`           | `c`                           |
@@ -332,6 +333,25 @@ for those operations.
 | `save`           | `ctrl-s`                      |
 | `up`             | `k`, `up`                     |
 | `wrap`           | `w`                           |
+
+### `[keys.dir]`
+
+| Action      | Default bindings     |
+| ----------- | -------------------- |
+| `accept`    | `enter`              |
+| `apply`     | `a`                  |
+| `back`      | `esc`                |
+| `close`     | `q`                  |
+| `delete`    | `d`                  |
+| `down`      | `j`, `down`          |
+| `edit`      | `e`                  |
+| `first`     | `g`, `home`          |
+| `last`      | `G`, `end`           |
+| `page_down` | `pagedown`, `ctrl-f` |
+| `page_up`   | `pageup`, `ctrl-b`   |
+| `parent`    | `backspace`, `-`     |
+| `refresh`   | `r`                  |
+| `up`        | `k`, `up`            |
 
 ### `[keys.doc_filter]`
 

@@ -1445,6 +1445,16 @@ impl App {
                 self.last_error = Some(error.clone());
                 self.borrow_status(error, true);
             }
+            Msg::DirPlan {
+                generation,
+                claim,
+                request,
+                verb,
+                path,
+                result,
+            } if generation == self.generation => {
+                self.finish_dir_plan(claim, request, verb, path, *result)
+            }
             Msg::FindResults {
                 generation,
                 claim,

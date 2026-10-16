@@ -179,6 +179,7 @@ impl App {
                 self.do_helm_uninstall(targets);
                 self.clear_marks();
             }
+            ConfirmAction::Manifest { verb, plan } => self.do_manifest(verb, plan),
             ConfirmAction::NodeDebug {
                 node,
                 image,
@@ -288,11 +289,12 @@ impl App {
             (Some(Action::Back), _) => {
                 // A cancelled PVC shell leaves state (possibly a helper pod)
                 // that only the suspend-and-return path would have cleaned up.
+                let back = self.overlay_return();
                 let cancelled = self.confirm_action.take();
                 if matches!(cancelled, Some(ConfirmAction::PvcShell { .. })) {
                     self.pvc_shell_cancelled();
                 }
-                self.mode = self.overlay_return();
+                self.mode = back;
                 self.confirm_return = Mode::Table;
                 if matches!(cancelled, Some(ConfirmAction::Authenticate { .. })) {
                     self.abandon_switch_destination();
@@ -328,6 +330,8 @@ impl App {
                     Mode::Contexts
                 } else if self.prompt_over_pvc() {
                     Mode::PvcExplore
+                } else if self.over_dir_browser() {
+                    Mode::Dir
                 } else if self.prompt_over_document() {
                     Mode::Detail
                 } else {
@@ -368,6 +372,8 @@ impl App {
                     Mode::Contexts
                 } else if self.prompt_over_pvc() {
                     Mode::PvcExplore
+                } else if self.over_dir_browser() {
+                    Mode::Dir
                 } else if self.prompt_over_document() {
                     Mode::Detail
                 } else {

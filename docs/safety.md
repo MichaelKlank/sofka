@@ -32,7 +32,9 @@ rollout undo, matched against the workload kind), `shell` (exec),
 Argo CD Application sync with prune, matched against `applications`), `pvc-explore`
 (creating a helper pod to mount an unmounted PVC, and the `:pvc-clean` sweep
 that deletes them - both matched against `persistentvolumeclaims`), and
-`pvc-upload` (a file upload into a volume, matched the same way). The PVC
+`pvc-upload` (a file upload into a volume, matched the same way), and `apply`
+and `delete` from the manifest browser, matched against each rendered object's
+resource and namespace. The PVC
 shell and the PVC upload also pass the `shell` and `transfer` rules for the
 pod they reach the volume through, exactly like `s` and `t` on that pod's row -
 a rule that already blocks shells or uploads in prod is not defeated by

@@ -252,8 +252,29 @@ impl App {
             Mode::Fleet => self.key_fleet(key),
             Mode::Find => self.key_find(key),
             Mode::PvcExplore => self.key_pvc_explore(key),
+            Mode::Dir => self.key_dir(key),
             Mode::PortForwardPicker => self.key_port_forward_picker(key),
             Mode::PluginForm => self.key_plugin_form(key),
+        }
+        // An apply preview lives only while its diff is on screen, or under
+        // overlays that eventually return to it (help over the diff, then a
+        // search over help).
+        let mut mode = self.mode;
+        let mut in_preview = false;
+        for _ in 0..4 {
+            mode = match mode {
+                Mode::Diff => {
+                    in_preview = true;
+                    break;
+                }
+                Mode::Command => self.palette_return,
+                Mode::Help => self.help_return,
+                Mode::DocFilter => self.doc_filter_return,
+                _ => break,
+            };
+        }
+        if !in_preview {
+            self.dir.preview = None;
         }
         Ok(())
     }
@@ -301,6 +322,7 @@ impl App {
             Mode::Fleet => "fleet",
             Mode::Find => "find",
             Mode::PvcExplore => "pvc_explore",
+            Mode::Dir => "dir",
             Mode::PortForwardPicker => "port_forward_picker",
             Mode::PluginForm => "plugin_form",
         }
@@ -887,6 +909,7 @@ impl App {
             PaletteAction::Rightsize => self.open_rightsize(),
             PaletteAction::PvcExplore => self.open_pvc_explore(),
             PaletteAction::PvcClean => self.request_pvc_clean(),
+            PaletteAction::Dir => self.open_dir(""),
             PaletteAction::Find => self.flash_warn("usage: :find <text>"),
             PaletteAction::Diff => self.open_diff(),
             PaletteAction::RolloutHistory => self.open_rollout_history(),
@@ -953,6 +976,13 @@ impl App {
             if self.focus_action_row(PaletteAction::Notify) {
                 self.toggle_notify(&cmd[first.len()..]);
             }
+            return true;
+        }
+        // `:dir [path]` browses local manifests; the path may contain spaces.
+        if let Some(first) = cmd.split_whitespace().next()
+            && first == "dir"
+        {
+            self.open_dir(&cmd[first.len()..]);
             return true;
         }
         // `:find <text>` sweeps object names across the common kinds.
@@ -1452,6 +1482,7 @@ impl App {
                 }
                 self.stop_resource_refresh();
                 self.clear_document_source();
+                self.dir.preview = None;
                 self.mode = self.return_mode;
                 if self.return_mode == Mode::Table {
                     self.restore_selection();
@@ -1479,6 +1510,11 @@ impl App {
             }
             (Some(Action::ResetBaseline), _) if self.mode == Mode::Diff => {
                 self.reset_diff_baseline();
+            }
+            (Some(Action::Apply), _)
+                if self.mode == Mode::Diff && self.return_mode == Mode::Dir =>
+            {
+                self.dir_request_apply();
             }
             // Copy the document to the clipboard (k9s `c`), same as the logs
             // view: an active search copies only the matching lines.

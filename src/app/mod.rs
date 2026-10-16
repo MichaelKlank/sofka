@@ -224,6 +224,8 @@ pub enum Mode {
     /// Split-pane PVC browser (`x` on a PVC): local files on the left, the
     /// volume's contents on the right.
     PvcExplore,
+    /// Local manifest browser (`:dir [path]`).
+    Dir,
     /// Port-forward target picker (`f` on a pod/service): lists the object's
     /// declared ports for single-select, plus a "Custom…" entry that falls
     /// through to the typed prompt.
@@ -409,6 +411,11 @@ enum ConfirmAction {
     /// Uninstall one or more Helm releases (`helm uninstall`), `(name, ns)`
     /// per release — bulk when marked, like [`ConfirmAction::Delete`].
     HelmUninstall { targets: Vec<(String, String)> },
+    /// `kubectl apply` or `delete` a rendered manifest snapshot (`:dir`).
+    Manifest {
+        verb: dir::DirVerb,
+        plan: dir::DirPlan,
+    },
     /// Launch a privileged node debug pod (`kubectl debug node/<node>`) after
     /// previewing the host access it grants.
     NodeDebug {
@@ -760,6 +767,7 @@ enum PaletteAction {
     Rightsize,
     PvcExplore,
     PvcClean,
+    Dir,
     Find,
     Diff,
     RolloutHistory,
@@ -905,6 +913,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         action: PaletteAction::Notify,
         names: &["notify", "bell"],
+    },
+    PaletteCommand {
+        action: PaletteAction::Dir,
+        names: &["dir"],
     },
     PaletteCommand {
         action: PaletteAction::Find,
@@ -2353,6 +2365,8 @@ pub struct App {
 
     /// Split-pane PVC browser state (`x` on a PVC row, `:pvc-explore`).
     pub pvc: PvcExplore,
+    /// Local manifest browser state (`:dir`).
+    pub dir: dir::DirBrowser,
     /// `[pvc_explore]` helper-pod defaults.
     pub pvc_cfg: crate::config::PvcExploreConfig,
 
@@ -2813,6 +2827,7 @@ impl App {
             transfer_target: None,
             transfers: Vec::new(),
             pvc: PvcExplore::default(),
+            dir: dir::DirBrowser::default(),
             pvc_cfg: crate::config::PvcExploreConfig::default(),
             confirm_return: Mode::Table,
             auth_offered: None,
@@ -2984,11 +2999,25 @@ impl App {
     pub(super) fn overlay_return(&self) -> Mode {
         if self.confirm_return == Mode::PvcExplore && self.pvc.active {
             Mode::PvcExplore
+        } else if self.over_dir_browser() {
+            Mode::Dir
         } else if self.confirm_over_document() {
             Mode::Detail
         } else {
             Mode::Table
         }
+    }
+
+    /// Whether the open dialog belongs to the manifest browser, so the
+    /// renderer keeps the listing underneath it.
+    pub fn over_dir_browser(&self) -> bool {
+        let manifest = |action: &ConfirmAction| matches!(action, ConfirmAction::Manifest { .. });
+        self.confirm_return == Mode::Dir
+            && (self.confirm_action.as_ref().is_some_and(manifest)
+                || matches!(
+                    &self.prompt_kind,
+                    Some(PromptKind::GuardConfirm { action, .. }) if manifest(action)
+                ))
     }
 
     /// Whether the open dialog belongs to the PVC browser, so the renderer
@@ -3033,6 +3062,7 @@ mod credentials;
 mod dashboards;
 mod details;
 mod diagnostics;
+pub mod dir;
 mod drain;
 mod explain;
 mod find;
