@@ -22,12 +22,13 @@
 //!
 //! [`init`] installs the resolved palette once at startup; every color accessor
 //! (`text()`, `peach()`, …) and semantic style (`title()`, `selected_row()`, …)
-//! reads from it. Swatches not yet wired into a view are kept for completeness.
-#![allow(dead_code)]
+//! reads from it. All 25 palette fields remain available for config overrides.
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(not(test))]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 use ratatui::style::{Color, Modifier, Style};
@@ -256,10 +257,6 @@ fn catppuccin_mocha() -> Palette {
     builtin("catppuccin-mocha").expect("mocha built-in")
 }
 
-fn catppuccin_latte() -> Palette {
-    builtin("catppuccin-latte").expect("latte built-in")
-}
-
 /// Best-effort dark/light detection via an OSC 11 background-color query.
 /// `None` means the terminal didn't answer (unsupported, `TERM=dumb`, piped
 /// output, or the query timed out) — callers should treat that as "assume
@@ -350,7 +347,8 @@ pub fn validate_skin(name: Option<&str>, colors: &HashMap<String, String>) -> Ve
 /// Parse `#rrggbb` (or `rrggbb`) into a `Color::Rgb`. Returns `None` for any
 /// other length or non-hex content.
 fn parse_hex(s: &str) -> Option<Color> {
-    let s = s.trim().trim_start_matches('#');
+    let s = s.trim();
+    let s = s.strip_prefix('#').unwrap_or(s);
     if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
@@ -465,6 +463,7 @@ fn load_active() -> Palette {
 /// Whether views are filled with the skin's own background (`base`) rather than
 /// left transparent. Independent of the active palette so it survives a live
 /// `:skin`/context switch.
+#[cfg(not(test))]
 static BACKGROUND: AtomicBool = AtomicBool::new(false);
 
 /// Enable (or disable) painting the palette's `base` swatch as the app
@@ -817,6 +816,8 @@ mod tests {
         assert_eq!(parse_hex("1e1e2e"), Some(Color::Rgb(30, 30, 46)));
         assert_eq!(parse_hex("#fff"), None);
         assert_eq!(parse_hex("#gggggg"), None);
+        assert_eq!(parse_hex("##010203"), None);
+        assert_eq!(parse_hex("###010203"), None);
     }
 
     #[test]

@@ -1783,6 +1783,7 @@ mod tests {
     #[tokio::test]
     async fn cached_artifacts_are_reused_and_corrupt_ones_are_discarded() {
         let cache = scratch("artifacts");
+        let source = Source::default();
         let bytes = b"package bytes";
         let mut artifact = catalog().plugins[0].versions[0].artifacts[0].clone();
         artifact.size = bytes.len() as u64;
@@ -1792,24 +1793,34 @@ mod tests {
             .join(format!("{}.tar.zst", artifact.blake3));
 
         // Nothing cached: offline is an error that says how to recover.
-        let error = artifact_in(&cache, &artifact, true).await.unwrap_err();
+        let error = artifact_from(&cache, &artifact, true, &source)
+            .await
+            .unwrap_err();
         assert!(error.contains("not cached"), "{error}");
 
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, bytes).unwrap();
-        let cached = artifact_in(&cache, &artifact, true).await.unwrap();
+        let cached = artifact_from(&cache, &artifact, true, &source)
+            .await
+            .unwrap();
         assert_eq!(cached.path(), path);
 
         // A half-written cache entry is removed rather than trusted.
         std::fs::write(&path, b"interrupted").unwrap();
-        let error = artifact_in(&cache, &artifact, true).await.unwrap_err();
+        let error = artifact_from(&cache, &artifact, true, &source)
+            .await
+            .unwrap_err();
         assert!(error.contains("not cached"), "{error}");
         assert!(!path.exists());
 
         // The URL allowlist applies before anything is read or fetched.
         let mut foreign = artifact;
         foreign.url = "https://example.com/package.tar.zst".into();
-        assert!(artifact_in(&cache, &foreign, true).await.is_err());
+        assert!(
+            artifact_from(&cache, &foreign, true, &source)
+                .await
+                .is_err()
+        );
         let _ = std::fs::remove_dir_all(cache);
     }
 

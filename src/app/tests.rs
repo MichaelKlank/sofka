@@ -4206,6 +4206,51 @@ async fn find_opens_picker_and_enter_navigates_to_the_object() {
     assert!(app.flash.contains("incomplete"), "{}", app.flash);
 }
 
+#[tokio::test]
+async fn find_keeps_the_newest_search_when_results_arrive_out_of_order() {
+    for latest in ["api", "web"] {
+        let (mut app, _rx) = test_app();
+        type_resource_query(&mut app, "services");
+        type_resource_query(&mut app, "find web");
+        let old_claim = current_claim(&app);
+        type_resource_query(&mut app, &format!("find {latest}"));
+        assert_eq!(app.mode, Mode::Find);
+        assert_eq!(app.find_query, latest);
+        let generation = app.generation;
+        let newest = crate::store::FindItem {
+            plural: "pods".into(),
+            ns: "default".into(),
+            name: format!("{latest}-new"),
+        };
+        app.handle_msg(Msg::FindResults {
+            generation,
+            claim: current_claim(&app),
+            query: latest.into(),
+            items: vec![newest.clone()],
+            warn: None,
+        });
+        let status = app.flash.clone();
+        app.handle_msg(Msg::FindResults {
+            generation,
+            claim: old_claim,
+            query: "web".into(),
+            items: Vec::new(),
+            warn: Some("old search failed".into()),
+        });
+        assert_eq!(app.find_query, latest);
+        assert_eq!(app.find_items.len(), 1);
+        assert_eq!(app.find_items[0].name, newest.name);
+        assert_eq!(app.find_state.selected(), Some(0));
+        assert_eq!(app.flash, status);
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.mode, Mode::Table);
+        assert_eq!(
+            app.fields.as_deref(),
+            Some(format!("metadata.name={}", newest.name).as_str())
+        );
+    }
+}
+
 // ----- adjacent view ------------------------------------------------------
 
 fn adjacent_item(
@@ -6950,18 +6995,25 @@ async fn every_async_result_is_scoped_to_its_own_operation() {
     // user started later.
     let (mut app, _rx) = test_app();
 
-    let find = app.claim_status("finding 'foo'…");
+    type_resource_query(&mut app, "find foo");
+    let find = current_claim(&app);
     let delete = app.claim_status("deleting 3 pods…");
     app.handle_msg(Msg::FindResults {
         generation: app.generation,
         claim: find,
         query: "foo".into(),
-        items: Vec::new(),
+        items: vec![crate::store::FindItem {
+            plural: "pods".into(),
+            ns: "default".into(),
+            name: "foo-1".into(),
+        }],
         warn: None,
     });
     assert_eq!(app.flash, "deleting 3 pods…");
     // The results still land, only the status is scoped.
     assert_eq!(app.find_query, "foo");
+    assert_eq!(app.find_items.len(), 1);
+    assert_eq!(app.find_items[0].name, "foo-1");
 
     app.handle_msg(Msg::TransferDone {
         generation: app.generation,
@@ -42374,4 +42426,35 @@ fn find_text(buf: &ratatui::buffer::Buffer, text: &str) -> Option<(u16, u16)> {
         let col = line.find(text)?;
         Some((line[..col].chars().count() as u16, y))
     })
+}
+
+#[tokio::test]
+async fn reload_rejects_skin_hex_with_more_than_one_prefix() {
+    let dir = std::env::temp_dir().join(format!("sofka-reload-skin-hex-{}", std::process::id()));
+    write_config(
+        &dir,
+        "[skin]\nname = 'catppuccin-mocha'\n[skin.colors]\nred = '##010203'\n",
+    );
+    let (mut app, _rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "reload".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+
+    assert!(app.flash_err);
+    assert!(
+        app.config_warnings.iter().any(|warning| {
+            warning.contains("skin.colors.red") && warning.contains("invalid hex")
+        }),
+        "{:?}",
+        app.config_warnings
+    );
+    assert_eq!(
+        crate::theme::snapshot().red,
+        crate::theme::builtin("catppuccin-mocha").unwrap().red
+    );
+    std::fs::remove_dir_all(dir).unwrap();
 }
