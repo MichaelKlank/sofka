@@ -587,6 +587,17 @@ include those conditions. Row filters can search the route paths.
   `:policy s:namespace/account` to open a subject by name. Bare `:policy` uses
   the selected service account. Enter on a Role, ClusterRole, RoleBinding, or
   ClusterRoleBinding opens its rules.
+  Rules open as a matrix with one row per resource and API group and a column
+  per standard verb. Rows for the same resource merge verbs from all rules.
+  Other verbs, such as `escalate` or `*`, are listed in `OTHER`. A row marked
+  `(named)` applies only to the objects in `RESOURCE NAMES`. Under a
+  Role or RoleBinding, rows for cluster-scoped resources and non-resource URLs
+  show no ticks because a namespace cannot grant them. A rule for every API
+  group (`*`) is checked against each discovered group with that resource. If
+  only some of them are namespaced, or API discovery skipped a group, the row
+  says it covers namespaced API groups only. Press `t` to switch to the
+  per-rule list. The choice is kept for the session. Set
+  `rbac_rule_list = true` to start with the list.
   Each rule keeps its source binding, source role, namespace scope, resource
   names, subresources, and non-resource URLs. A RoleBinding to a ClusterRole
   remains limited to namespaced resources in the binding's namespace.

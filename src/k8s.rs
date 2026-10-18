@@ -1197,6 +1197,20 @@ impl Cluster {
             .collect()
     }
 
+    /// Whether each discovered kind is namespaced, keyed by lowercased
+    /// `(group, plural)`.
+    pub fn resource_scopes(&self) -> HashMap<(String, String), bool> {
+        self.registry
+            .values()
+            .map(|k| {
+                (
+                    (k.ar.group.to_lowercase(), k.ar.plural.to_lowercase()),
+                    k.namespaced,
+                )
+            })
+            .collect()
+    }
+
     pub fn resolve_in_group(&self, kind: &str, group: &str) -> Option<Kind> {
         let mut found: Vec<&Kind> = self
             .registry
