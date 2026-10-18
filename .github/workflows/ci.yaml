@@ -72,7 +72,9 @@ jobs:
           workspaces: . -> target/llvm-cov-target
 
       - name: Install coverage tool
-        run: cargo install cargo-llvm-cov --version 0.9.1 --locked
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-llvm-cov@0.9.1
 
       - name: Generate coverage report
         run: cargo llvm-cov --locked --html
