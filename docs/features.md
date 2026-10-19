@@ -224,7 +224,8 @@ include those conditions. Row filters can search the route paths.
   Discovery runs at connect. When a `:` lookup matches no known kind, sofka runs
   discovery again in the background and retries the lookup, so a CRD installed
   while sofka runs opens without a restart. It does this at most once every 5
-  seconds; the usual error shows if the kind is still unknown.
+  seconds; the usual error shows if the kind is still unknown, with a note when
+  discovery could not read an API group.
   Sofka can connect when it cannot read one API group. Examples: the
   extension API server is down, or it sends an `apiVersion` that is not `v1`.
   Sofka does not load that group. It shows a warning at startup and a flash

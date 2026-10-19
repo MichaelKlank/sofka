@@ -190,3 +190,28 @@ async fn new_kinds_are_not_hidden_by_the_old_rbac_allow_list() {
             .collect::<Vec<_>>()
     );
 }
+
+#[tokio::test]
+async fn a_miss_names_the_api_groups_discovery_could_not_read() {
+    let mut cluster = Cluster::fake();
+    cluster.register_kind("example.com", "Widget", "widgets", true);
+    cluster.discovery_warnings = vec!["broken.example.com/v1: 503 Service Unavailable".into()];
+    let discovery = || Ok(Box::new(cluster.fake_discovery()));
+
+    let (mut app, _rx) = test_app();
+    palette(&mut app, "gadgets");
+    deliver(&mut app, discovery());
+    assert!(app.flash_err);
+    assert_eq!(
+        app.flash,
+        "No resource matches 'gadgets'; API discovery could not read 1 API group. \
+         Refer to :info for details."
+    );
+
+    // A retry that finds its kind says nothing about the skipped group.
+    app.last_rediscovery = None;
+    palette(&mut app, "widgets");
+    deliver(&mut app, discovery());
+    assert_eq!(app.kind_plural, "widgets");
+    assert!(!app.flash_err, "{}", app.flash);
+}

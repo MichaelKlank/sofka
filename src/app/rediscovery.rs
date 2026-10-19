@@ -13,6 +13,15 @@ pub(super) enum Retry {
     Query(crate::filter::ResourceQuery),
 }
 
+impl Retry {
+    fn resource(&self) -> &str {
+        match self {
+            Retry::Kind { input, .. } => input.trim(),
+            Retry::Query(query) => &query.resource,
+        }
+    }
+}
+
 impl App {
     /// Start API discovery for a lookup that matched no known kind. Returns
     /// `false` when throttled, or while a context switch is replacing the
@@ -26,10 +35,7 @@ impl App {
         {
             return false;
         }
-        let resource = match &retry {
-            Retry::Kind { input, .. } => input.trim().to_string(),
-            Retry::Query(query) => query.resource.clone(),
-        };
+        let resource = retry.resource().to_string();
         self.last_rediscovery = Some(std::time::Instant::now());
         self.rediscovery_request += 1;
         self.pending_rediscovery = Some((self.generation, retry));
@@ -95,9 +101,17 @@ impl App {
         if generation != self.generation || self.mode != Mode::Table {
             return;
         }
+        let resource = retry.resource().to_string();
         match retry {
             Retry::Kind { input, ns } => self.switch_kind_ns(&input, ns.as_deref()),
             Retry::Query(query) => self.apply_resource_query(query),
+        }
+        // The kind may live in an API group discovery could not read; say so
+        // next to the miss rather than leave it unexplained.
+        if self.cluster.resolve(&resource).is_none()
+            && let Some(warning) = self.discovery_warning()
+        {
+            self.flash_warn(&format!("{}; {warning}", self.flash));
         }
     }
 }
