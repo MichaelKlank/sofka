@@ -129,14 +129,23 @@ pub const CRONJOB_MENU_ITEMS: &[&str] = &["Trigger now", "Suspend", "Resume", "C
 /// disables auto-sync by removing `spec.syncPolicy.automated` and stashing the
 /// original value (including `prune`/`selfHeal`/`allowEmpty`) as a base64
 /// annotation; "Resume" restores it from the annotation, or defaults to an
-/// empty `automated: {}` when the annotation is absent. "Sync now" patches
+/// empty `automated: {}` when the annotation is absent. "Refresh" and "Hard
+/// refresh" set the `argocd.argoproj.io/refresh` annotation, which the
+/// controller clears after re-comparing against Git. "Sync now" patches
 /// the top-level `operation` field, which the ArgoCD application controller
 /// picks up — the same mechanism the `argocd app sync` API endpoint uses.
 /// "Sync with prune" sets `prune: true` on that operation, so resources no
 /// longer in Git are deleted, and asks for confirmation first. No `argocd`
 /// binary.
-pub const ARGOCD_MENU_ITEMS: &[&str] =
-    &["Suspend", "Resume", "Sync now", "Sync with prune", "Cancel"];
+pub const ARGOCD_MENU_ITEMS: &[&str] = &[
+    "Suspend",
+    "Resume",
+    "Refresh",
+    "Hard refresh",
+    "Sync now",
+    "Sync with prune",
+    "Cancel",
+];
 
 /// Items in the ArgoCD ApplicationSet action menu (`t`). Suspend/Resume
 /// toggle `spec.syncPolicy.applicationsSync`. There is no `none`/`disabled`
