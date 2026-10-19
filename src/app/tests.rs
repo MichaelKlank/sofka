@@ -14912,6 +14912,10 @@ async fn debug_prompt_prefills_image_then_shells_out_to_kubectl_debug() {
         !argv.iter().any(|a| a.starts_with("--target")),
         "no target when launched from the pod row: {argv:?}"
     );
+    assert!(
+        !argv.iter().any(|a| a.starts_with("--profile")),
+        "no profile unless configured: {argv:?}"
+    );
     // Recorded in the journal as a debug action.
     assert!(app.journal.lines().iter().any(|l| l.contains("debug")));
 }
@@ -14930,6 +14934,38 @@ async fn debug_from_container_picker_pins_target() {
         panic!("expected a debug shell");
     };
     assert!(argv.iter().any(|a| a == "--target=app"), "{argv:?}");
+}
+
+#[tokio::test]
+async fn configured_debug_profile_reaches_prompt_and_recovery_launches() {
+    let (mut app, _rx) = app_with_pod();
+    app.debug = crate::config::DebugConfig {
+        profile: Some("restricted".into()),
+        node_profile: Some("sysadmin".into()),
+        ..Default::default()
+    };
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "debug".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(matches!(app.prompt_kind, Some(PromptKind::Debug { .. })));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let Some(Suspend::Shell(argv)) = app.pending.take() else {
+        panic!("debug should suspend into a kubectl debug shell");
+    };
+    assert!(argv.iter().any(|a| a == "--profile=restricted"), "{argv:?}");
+    assert!(!argv.iter().any(|a| a == "--profile=sysadmin"), "{argv:?}");
+
+    // The `d` recovery from a failed shell launches through the same path.
+    app.handle_key(press(KeyCode::Char('s'))).unwrap();
+    complete_failed_shell(&mut app, MISSING_SHELL);
+    app.handle_key(press(KeyCode::Char('d'))).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let Some(Suspend::Recovery { argv, .. }) = app.pending.take() else {
+        panic!("recovery should launch kubectl debug");
+    };
+    assert!(argv.iter().any(|a| a == "--profile=restricted"), "{argv:?}");
 }
 
 /// A one-node table with the cursor on it.

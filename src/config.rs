@@ -720,6 +720,7 @@ pub fn pvc_explore_warnings(cfg: &PvcExploreConfig) -> Vec<String> {
 /// [debug]
 /// image = "nicolaka/netshoot:latest"   # ephemeral (in-pod) debug image
 /// command = ["bash"]                   # entrypoint; omit for a shell
+/// profile = "restricted"               # pod kubectl debug --profile (optional)
 /// node_image = "nicolaka/netshoot:latest"  # node debug pod image
 /// node_namespace = "default"           # namespace the node debugger lands in
 /// node_profile = "sysadmin"            # kubectl debug --profile (optional)
@@ -731,6 +732,9 @@ pub struct DebugConfig {
     pub image: String,
     /// Entrypoint for the ephemeral container. Empty = an interactive shell.
     pub command: Vec<String>,
+    /// `kubectl debug --profile` for pod debug containers (`restricted`,
+    /// `general`, …). `None` = kubectl's default (`legacy`).
+    pub profile: Option<String>,
     /// Image for a node debug pod (`kubectl debug node/<node>`).
     pub node_image: String,
     /// Namespace the node debugger pod is created in (so `:debug-clean` knows
@@ -747,6 +751,7 @@ impl Default for DebugConfig {
         Self {
             image: "busybox:latest".into(),
             command: Vec::new(),
+            profile: None,
             node_image: "busybox:latest".into(),
             node_namespace: "default".into(),
             node_profile: None,

@@ -1111,6 +1111,9 @@ impl App {
         if let Some(c) = target {
             argv.push(format!("--target={c}"));
         }
+        if let Some(p) = &self.debug.profile {
+            argv.push(format!("--profile={p}"));
+        }
         // No configured command = an interactive shell (bash if the image has
         // it, else sh), mirroring the pod shell; otherwise the configured argv.
         if self.debug.command.is_empty() {
