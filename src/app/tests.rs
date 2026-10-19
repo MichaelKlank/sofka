@@ -23,6 +23,7 @@ mod plugin_form;
 mod popup_wrapping;
 mod proxy;
 mod rbac;
+mod rediscovery;
 mod restart;
 mod resume;
 mod rollout;
